@@ -1,3 +1,6 @@
+import unsloth
+from unsloth import FastLanguageModel, is_bfloat16_supported
+from unsloth.chat_templates import get_chat_template, standardize_sharegpt
 import json
 import os
 
@@ -11,14 +14,11 @@ import wandb
 from datasets import load_dataset
 from transformers import HfArgumentParser
 from trl import SFTConfig, SFTTrainer
-from unsloth import FastLanguageModel, is_bfloat16_supported
-from unsloth.chat_templates import get_chat_template, standardize_sharegpt
 
 from prism.eval.callbacks import EvalCallback
 from prism.eval.run_eval import EvalSample
 from prism.training.utils import (TurnAwareCollator,
-                                  get_formatting_prompts_func,
-                                  train_on_responses_only)
+                                  get_formatting_prompts_func)
 
 
 @dataclass
@@ -31,6 +31,8 @@ class TrainConfig:
     r: int = 16
     base_model: str = "unsloth/Llama-3.2-3B-Instruct"
     wandb_project: str = "SLM-distill"
+    wandb_run_name: str = "spine_lora"
+    wandb_tag: str = "spine"
     epochs: int = 2
     val_frac: float = 0.1  # Fraction of training data to use for validation
     # New parameters for training arguments and model configuration
@@ -38,7 +40,7 @@ class TrainConfig:
     lora_dropout: float = 0.2
     target_modules: List[str] = field(
         default_factory=lambda: [
-            "q_pror",
+            "q_proj",
             "k_proj",
             "v_proj",
             "o_proj",
@@ -109,9 +111,9 @@ def train_model(config: TrainConfig) -> None:
         full_dataset = full_dataset.select(range(min(100, len(full_dataset))))
 
     # Apply preprocessing
-    full_dataset = standardize_sharegpt(full_dataset)
+    full_dataset = standardize_sharegpt(full_dataset,num_proc=1)
     formatting_prompts_func = get_formatting_prompts_func(tokenizer)
-    full_dataset = full_dataset.map(formatting_prompts_func, batched=True)
+    full_dataset = full_dataset.map(formatting_prompts_func, batched=True,num_proc=1)
 
     # Create train/validation split
     if config.val_frac > 0:
@@ -146,6 +148,7 @@ def train_model(config: TrainConfig) -> None:
     sft_config = SFTConfig(
         # max_seq_length=max_seq_length,  # deprecated in updated version
         dataset_text_field="text",
+        dataset_num_proc=1, # WE HAVE very few examples, spawning threads is slower.
         packing=False,
         per_device_train_batch_size=config.per_device_train_batch_size,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
@@ -180,31 +183,32 @@ def train_model(config: TrainConfig) -> None:
     trainer = SFTTrainer(**trainer_kwargs)
 
     # Apply train_on_responses_only which adds the turn field to the dataset
-    trainer = train_on_responses_only(
+    trainer = unsloth.train_on_responses_only(
         trainer,
         instruction_part="<|start_header_id|>user<|end_header_id|>\n\n",
         response_part="<|start_header_id|>assistant<|end_header_id|>\n\n",
+        num_proc=1,
     )
 
     # Load eval samples before training
-    with open(config.eval_data) as f:
-        data = json.load(f)
-        tasks = data["tasks"]
-        graph_data = data["graph"]  # Get the graph data
+    # with open(config.eval_data) as f:
+    #     data = json.load(f)
+    #     tasks = data["tasks"]
+    #     graph_data = data["graph"]  # Get the graph data
 
-    eval_samples = []
-    for entry in tasks:
-        eval_samples.append(
-            EvalSample(
-                task=entry["task"],
-                answer=entry["answer"],
-                graph=graph_data,  # Pass the graph data dictionary directly
-                init_node=entry["init_node"],
-            )
-        )
+    # eval_samples = []
+    # for entry in tasks:
+    #     eval_samples.append(
+    #         EvalSample(
+    #             task=entry["task"],
+    #             answer=entry["answer"],
+    #             graph=graph_data,  # Pass the graph data dictionary directly
+    #             init_node=entry["init_node"],
+    #         )
+    #     )
 
     # Add both callbacks
-    trainer.add_callback(EvalCallback(eval_samples))
+    # trainer.add_callback(EvalCallback(eval_samples))
 
     trainer.train()
 
