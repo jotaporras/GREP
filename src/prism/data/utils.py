@@ -72,18 +72,20 @@ def safe_parse_graph(
         G.add_node(name, coords=coords, type="object", **node)
 
     for edge in data["object_connections"]:
-        c1 = G.nodes[edge[0]]["coords"]
-        c2 = G.nodes[edge[1]]["coords"]
-        # print(f"edge: {edge}, c1, c2: {c1}, {c2}")
-        dist = np.linalg.norm(np.array(c1) - np.array(c2))
-        G.add_edge(edge[0], edge[1], type="object", weight=dist)
+        if edge[0] in G.nodes and edge[1] in G.nodes:
+            c1 = G.nodes[edge[0]]["coords"]
+            c2 = G.nodes[edge[1]]["coords"]
+            # print(f"edge: {edge}, c1, c2: {c1}, {c2}")
+            dist = np.linalg.norm(np.array(c1) - np.array(c2))
+            G.add_edge(edge[0], edge[1], type="object", weight=dist)
 
     for edge in data["region_connections"]:
-        c1 = G.nodes[edge[0]]["coords"]
-        c2 = G.nodes[edge[1]]["coords"]
-        # print(f"edge: {edge}, c1, c2: {c1}, {c2}")
-        dist = np.linalg.norm(np.array(c1) - np.array(c2))
-        G.add_edge(edge[0], edge[1], type="region", weight=dist)
+        if edge[0] in G.nodes and edge[1] in G.nodes:
+            c1 = G.nodes[edge[0]]["coords"]
+            c2 = G.nodes[edge[1]]["coords"]
+            # print(f"edge: {edge}, c1, c2: {c1}, {c2}")
+            dist = np.linalg.norm(np.array(c1) - np.array(c2))
+            G.add_edge(edge[0], edge[1], type="region", weight=dist)
 
     return G, as_str
 
