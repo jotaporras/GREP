@@ -4,6 +4,10 @@ import json
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional
 
+from prism.data.data_col import DataCollatorForGraphAugmentedLLM
+from prism.models.gnn_llm import GraphAugmentedLLM
+from prism.models.r_pearl import RandomGNNPositionalEncodings
+
 # Env first (so W&B picks these up as soon as possible)
 os.environ.setdefault("WANDB_PROJECT", "SLM-distill")
 # Match your original env var usage
@@ -28,6 +32,14 @@ def _bf16_supported() -> bool:
     """Conservative check for bfloat16 support."""
     try:
         return torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    except Exception:
+        return False
+
+
+def _fp16_supported() -> bool:
+    """Conservative check for fp16 support."""
+    try:
+        return torch.cuda.is_available()
     except Exception:
         return False
 
@@ -127,7 +139,7 @@ class TrainConfig:
     checkpoint_dir: str
     data: str
     bit4: bool = False
-    eval_data: str = "../data/eval/eval_1_multi_step.json"
+    eval_data: str = "../data/eval/gpt_gen_formatted.json"
     r: int = 16
     base_model: str = "meta-llama/Llama-3.2-3B-Instruct"
     wandb_project: str = "SLM-distill"
@@ -174,20 +186,49 @@ def train_model(config: TrainConfig):
         )
 
     # Model & tokenizer
-    model = AutoModelForCausalLM.from_pretrained(
+    llm = AutoModelForCausalLM.from_pretrained(
         config.base_model,
         torch_dtype="auto",
         quantization_config=bnb_config,  # None if not 4-bit
         device_map="auto",
     )
     tokenizer = AutoTokenizer.from_pretrained(config.base_model, use_fast=True)
-    _ensure_pad_tokens(tokenizer, model)
+    _ensure_pad_tokens(tokenizer, llm)
     tokenizer.padding_side = "right"
+
+    # R-PEARL model, graph-augmented model & data collator.
+    r_pearl = RandomGNNPositionalEncodings(
+        pe_hidden_channels=256,
+        pe_num_layers=3,
+        d_model=3072,
+        num_samples=40,
+        dropout=0.1,
+        use_layer_norm=True
+    )
+    model = GraphAugmentedLLM(llm, r_pearl, tokenizer)
+    collator = DataCollatorForGraphAugmentedLLM(tokenizer, mlm=False)
 
     # Load & optionally downsample data
     full_dataset = load_dataset("json", data_files=[config.data], split="train")
     if config.debug:
         full_dataset = full_dataset.select(range(min(100, len(full_dataset))))
+
+    # Define data maps.
+    def _add_messages(example):
+        example["messages"] = example["conversations"]
+        return example
+
+    def _tokenize_with_conversations(example):
+        tokenized = tokenizer.apply_chat_template(
+            example["messages"], tokenize=True, return_dict=True
+        )
+        tokenized["conversations"] = example["conversations"]
+        tokenized["messages"] = example["messages"]
+        return tokenized
+
+    # Configure data.
+    full_dataset = full_dataset.map(_add_messages)
+    full_dataset = full_dataset.map(_tokenize_with_conversations)
 
     # Convert to `messages` so TRL can auto-apply chat template
     full_dataset = _standardize_conversations(full_dataset,tokenizer)
@@ -238,7 +279,7 @@ def train_model(config: TrainConfig):
     sft_args = SFTConfig(
         dataset_num_proc=1,
         packing=False,
-        max_length=config.max_seq_length,
+        max_seq_length=None,
         per_device_train_batch_size=config.per_device_train_batch_size,
         per_device_eval_batch_size=config.per_device_eval_batch_size,
         warmup_steps=config.warmup_steps,
@@ -248,7 +289,7 @@ def train_model(config: TrainConfig):
         lr_scheduler_type="linear",
         logging_steps=1,
         # precision
-        fp16=not _bf16_supported(),
+        fp16=_fp16_supported(),
         bf16=_bf16_supported(),
         # misc
         seed=3407,
@@ -265,6 +306,7 @@ def train_model(config: TrainConfig):
 
     trainer = SFTTrainer(
         model=model,
+        data_collator=collator,
         processing_class=tokenizer,
         peft_config=lora_config,
         train_dataset=train_dataset,
