@@ -279,7 +279,7 @@ def train_model(config: TrainConfig):
     sft_args = SFTConfig(
         dataset_num_proc=1,
         packing=False,
-        max_seq_length=None,
+        max_seq_length=config.max_seq_length,
         per_device_train_batch_size=config.per_device_train_batch_size,
         per_device_eval_batch_size=config.per_device_eval_batch_size,
         warmup_steps=config.warmup_steps,
