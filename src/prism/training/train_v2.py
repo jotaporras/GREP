@@ -281,7 +281,7 @@ def train_model(config: TrainConfig):
     sft_args = SFTConfig(
         dataset_num_proc=1,
         packing=False,
-        max_seq_length=config.max_seq_length,
+        max_length=config.max_seq_length,
         per_device_train_batch_size=config.per_device_train_batch_size,
         per_device_eval_batch_size=config.per_device_eval_batch_size,
         warmup_steps=config.warmup_steps,
@@ -302,8 +302,7 @@ def train_model(config: TrainConfig):
         # key behavior parity with unsloth.train_on_responses_only
         # Temporarily disabled because qwen doesn't support it.
         #assistant_only_loss=True,  # train only on assistant tokens
-        remove_unused_columns=False,  
-        save_safetensors=True,
+        remove_unused_columns=False,
     )
 
     trainer = SFTTrainer(
