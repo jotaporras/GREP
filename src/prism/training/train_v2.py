@@ -176,7 +176,7 @@ class TrainConfig:
     num_samples: int = 40
     dropout: float = 0.1
     k: int = 3
-    use_layer_norm: bool = False
+    use_layer_norm: bool = True
     freeze_llm: bool = False
 
 
@@ -218,7 +218,7 @@ def train_model(config: TrainConfig):
         k=config.k,
         use_layer_norm=config.use_layer_norm
     )
-    model = GraphAugmentedLLM(llm, r_pearl, tokenizer)
+    model = GraphAugmentedLLM(llm, r_pearl, tokenizer, pe_dim=config.d_model)
     collator = DataCollatorForGraphAugmentedLLM(tokenizer, mlm=False)
 
     # Freeze the whole llm.
@@ -304,7 +304,7 @@ def train_model(config: TrainConfig):
         learning_rate=config.learning_rate,
         weight_decay=config.weight_decay,
         lr_scheduler_type="linear",
-        logging_steps=1,
+        logging_steps=15,
         # precision
         fp16=_fp16_supported(),
         bf16=_bf16_supported(),
@@ -318,6 +318,10 @@ def train_model(config: TrainConfig):
         # Temporarily disabled because qwen doesn't support it.
         #assistant_only_loss=True,  # train only on assistant tokens
         remove_unused_columns=False,
+        # Validation
+        eval_strategy="steps",
+        eval_steps=100,
+        do_eval=True,
     )
 
     trainer = SFTTrainer(

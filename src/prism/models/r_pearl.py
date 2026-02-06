@@ -27,7 +27,7 @@ class RandomGNNPositionalEncodings(nn.Module):
         num_samples=30,
         dropout=0.1,
         k: int = 3,
-        use_layer_norm=False,
+        use_layer_norm=True,
     ):
         super().__init__()
         # Create a GCN that takes 1-dimensional random features
