@@ -168,6 +168,16 @@ class TrainConfig:
     weight_decay: float = 0.05
     debug: bool = False
     max_seq_length: int = 2048
+    dataset_proportion: float = 0.1
+    # Model args.
+    pe_hidden_channels: int = 256
+    pe_num_layers: int = 3
+    d_model: int = 3072
+    num_samples: int = 40
+    dropout: float = 0.1
+    k: int = 3
+    use_layer_norm: bool = False
+    freeze_llm: bool = False
 
 
 # ----------------------------
@@ -200,20 +210,25 @@ def train_model(config: TrainConfig):
 
     # R-PEARL model, graph-augmented model & data collator.
     r_pearl = RandomGNNPositionalEncodings(
-        pe_hidden_channels=256,
-        pe_num_layers=3,
-        d_model=3072,
-        num_samples=40,
-        dropout=0.1,
-        use_layer_norm=True
+        pe_hidden_channels=config.pe_hidden_channels,
+        pe_num_layers=config.pe_num_layers,
+        d_model=config.d_model,
+        num_samples=config.num_samples,
+        dropout=config.dropout,
+        k=config.k,
+        use_layer_norm=config.use_layer_norm
     )
     model = GraphAugmentedLLM(llm, r_pearl, tokenizer)
     collator = DataCollatorForGraphAugmentedLLM(tokenizer, mlm=False)
 
+    # Freeze the whole llm.
+    if config.freeze_llm:
+        model.llm.requires_grad_(False)
+
     # Load & optionally downsample data
     full_dataset = load_dataset("json", data_files=[config.data], split="train")
     if config.debug:
-        full_dataset = full_dataset.select(range(min(100, len(full_dataset))))
+        full_dataset = full_dataset.select(range(round(len(full_dataset) * config.dataset_proportion)))
 
     # Define data maps.
     def _add_messages(example):
@@ -309,7 +324,7 @@ def train_model(config: TrainConfig):
         model=model,
         data_collator=collator,
         processing_class=tokenizer,
-        peft_config=lora_config,
+        peft_config=lora_config if not config.freeze_llm else None,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         args=sft_args,

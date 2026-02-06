@@ -15,6 +15,8 @@ class RandomGNNPositionalEncodings(nn.Module):
         pe_num_layers (int): Number of layers in the GCN
         d_model (int): Output dimension
         num_samples (int): Number of random samples (M) to use
+        dropout (float): Dropout rate of the GCN associated.
+        k (int): Convolution depth of the GCN.
         use_layer_norm (bool): Whether to use layer normalization
     """
 
@@ -24,12 +26,13 @@ class RandomGNNPositionalEncodings(nn.Module):
         d_model,
         num_samples=30,
         dropout=0.1,
+        k: int = 3,
         use_layer_norm=False,
     ):
         super().__init__()
         # Create a GCN that takes 1-dimensional random features
         self.pe_gcn = GCN(
-            1, pe_hidden_channels, pe_num_layers, skip_connection=True, dropout=dropout
+            1, pe_hidden_channels, pe_num_layers, skip_connection=True, dropout=dropout, k=k
         )
         # Add a final projection to ensure output is d_model dimensions
         self.output_projection = nn.Linear(pe_hidden_channels, d_model)
