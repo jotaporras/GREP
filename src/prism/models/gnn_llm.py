@@ -27,7 +27,6 @@ class GraphAugmentedLLM(nn.Module):
         device = next(llm.parameters()).device
         self.pe_model = pe_model.to(device)
         self.pe_proj = nn.Linear(pe_dim, llm.config.hidden_size, device=device)
-        self.pe_scale = nn.Parameter(torch.tensor(0.01, device=device))
 
     def __getattr__(self, name):
         try:
@@ -71,7 +70,7 @@ class GraphAugmentedLLM(nn.Module):
             for word, token_indices in bucket.items():
                 if word in pos_enc:
                     for pos in token_indices:
-                        embeddings[b, pos, :] = embeddings[b, pos, :] + self.pe_scale * pos_enc[word]
+                        embeddings[b, pos, :] = embeddings[b, pos, :] + pos_enc[word]
 
         # Drop keys we're overriding so the LLM doesn't get duplicate arguments.
         kwargs.pop("inputs_embeds", None)
