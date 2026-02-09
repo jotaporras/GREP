@@ -28,23 +28,12 @@ class GraphAugmentedLLM(nn.Module):
         self.pe_model = pe_model.to(device)
         self.pe_proj = nn.Linear(pe_dim, llm.config.hidden_size, device=device)
         self.pe_scale = nn.Parameter(torch.tensor(0.01, device=device))
-        self.apply(self._init_weights)
 
     def __getattr__(self, name):
         try:
             return super().__getattr__(name)  # defer to nn.Module first
         except AttributeError:
             return getattr(self.llm, name)
-
-    @staticmethod
-    def _init_weights(m):
-        if isinstance(m, nn.Linear):
-            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm) or isinstance(m, nn.BatchNorm1d):
-            nn.init.constant_(m.weight, 1)
-            nn.init.constant_(m.bias, 0)
 
     def forward(
         self,
