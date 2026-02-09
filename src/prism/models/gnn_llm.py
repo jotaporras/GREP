@@ -27,12 +27,24 @@ class GraphAugmentedLLM(nn.Module):
         device = next(llm.parameters()).device
         self.pe_model = pe_model.to(device)
         self.pe_proj = nn.Linear(pe_dim, llm.config.hidden_size, device=device)
+        self.pe_scale = nn.Parameter(torch.tensor(0.01, device=device))
+        self.apply(self._init_weights)
 
     def __getattr__(self, name):
         try:
             return super().__getattr__(name)  # defer to nn.Module first
         except AttributeError:
             return getattr(self.llm, name)
+
+    @staticmethod
+    def _init_weights(m):
+        if isinstance(m, nn.Linear):
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm) or isinstance(m, nn.BatchNorm1d):
+            nn.init.constant_(m.weight, 1)
+            nn.init.constant_(m.bias, 0)
 
     def forward(
         self,
@@ -42,6 +54,7 @@ class GraphAugmentedLLM(nn.Module):
         graphs: list | None = None,
         **kwargs,
     ):
+        # Get the batch size for incoming data.
         batch_size = input_ids.shape[0]
 
         # Associate full words to token indices.
@@ -49,6 +62,7 @@ class GraphAugmentedLLM(nn.Module):
 
         # Get positional encodings per batch element, projected to LLM hidden dim.
         pos_encs = []
+        pe: torch.Tensor | None = None
         for b in range(batch_size):
             graph = graphs[b]
             pe = self.pe_proj(self.pe_model(graph))  # (num_nodes, hidden_size)
@@ -57,18 +71,18 @@ class GraphAugmentedLLM(nn.Module):
                 pos_enc[word] = pe[i]
             pos_encs.append(pos_enc)
 
-        # Add positional encodings to embeddings.
         # Clone so that the in-place-style writes don't break the autograd graph
         # of get_input_embeddings.
         embeddings = self.llm.get_input_embeddings()(input_ids).to(pe.device).clone()
 
+        # Add positional encodings to embeddings.
         for b in range(batch_size):
             bucket = buckets[b]
             pos_enc = pos_encs[b]
             for word, token_indices in bucket.items():
                 if word in pos_enc:
                     for pos in token_indices:
-                        embeddings[b, pos, :] = embeddings[b, pos, :] + pos_enc[word]
+                        embeddings[b, pos, :] = embeddings[b, pos, :] + self.pe_scale * pos_enc[word]
 
         # Drop keys we're overriding so the LLM doesn't get duplicate arguments.
         kwargs.pop("inputs_embeds", None)
@@ -82,7 +96,7 @@ class GraphAugmentedLLM(nn.Module):
         )
 
     @classmethod
-    def bucketize_prompt(cls, input_ids: torch.Tensor | None, tokenizer: nn.Module) -> defaultdict:
+    def bucketize_prompt(cls, input_ids: torch.Tensor | None, tokenizer: nn.Module) -> list[defaultdict]:
         """
         Helper function for associating full prompt words with their corresponding token indices.
         Uses parallel iteration through words alongside the token list.
@@ -121,15 +135,3 @@ class GraphAugmentedLLM(nn.Module):
                     j += 1
             buckets.append(bucket)
         return buckets
-
-    @staticmethod
-    def has_prefix_suffix_match(a: str, b: str) -> bool:
-        """Returns True if any prefix of a matches any suffix of b."""
-        # Check all possible prefixes of a against suffixes of b
-        for i in range(1, len(a)+1):
-            prefix_a = a[:i]
-            for j in range(1, len(b)+1):
-                suffix_b = b[-j:]
-                if prefix_a == suffix_b:
-                    return True
-        return False
