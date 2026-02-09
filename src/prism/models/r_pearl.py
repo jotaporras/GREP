@@ -43,6 +43,7 @@ class RandomGNNPositionalEncodings(nn.Module):
         else:
             self.batch_norm = nn.BatchNorm1d(d_model)
         self.M = num_samples
+        self.apply(self._init_weights)
 
     def forward(self, data):
         # Move input data to the model's device.
