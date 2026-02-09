@@ -9,13 +9,13 @@ python prism/training/train_v2.py \
   --wandb_project GREP-PRISM \
   --wandb_run_name Overfitting \
   --wandb_tag grep-prism \
-  --learning_rate 5e-4 \
+  --learning_rate 3e-3 \
   --debug True \
   --dataset_proportion 0.8 \
-  --pe_hidden_channels 64 \
+  --pe_hidden_channels 32 \
   --pe_num_layers 3 \
-  --num_samples 50 \
+  --num_samples 40 \
   --dropout 0.0 \
-  --k 5 \
+  --k 3 \
   --use_layer_norm True \
   --freeze_llm True
