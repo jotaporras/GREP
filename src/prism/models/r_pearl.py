@@ -43,6 +43,7 @@ class RandomGNNPositionalEncodings(nn.Module):
         else:
             self.batch_norm = nn.BatchNorm1d(d_model)
         self.M = num_samples
+        self.apply(self._init_weights)
 
     def forward(self, data):
         # Move input data to the model's device.
@@ -53,7 +54,10 @@ class RandomGNNPositionalEncodings(nn.Module):
 
         # Generate random node embeddings for positional encoding
         num_nodes = X.shape[0]
-        Q = torch.randn((num_nodes, self.M), device=device)
+        generator = torch.Generator(device=device).manual_seed(
+            hash(tuple(data.edge_index.flatten().tolist())) % (2**31)
+        )
+        Q = torch.randn((num_nodes, self.M), generator=generator, device=device)
 
         # Process random embeddings individually through GCN
         P_m = []

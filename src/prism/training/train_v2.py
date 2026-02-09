@@ -132,6 +132,19 @@ def _standardize_conversations(ds: Dataset,tokenizer) -> Dataset:
     return ds
 
 
+class GraphSFTTrainer(SFTTrainer):
+    def save_model(self, output_dir=None, _internal_call=False):
+        output_dir = output_dir or self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        if self.model.llm.requires_grad_(False):  # frozen LLM path
+            torch.save({
+                'pe_model': self.model.pe_model.state_dict(),
+                'pe_proj': self.model.pe_proj.state_dict(),
+            }, os.path.join(output_dir, "gnn_weights.pt"))
+        else:
+            super().save_model(output_dir, _internal_call)
+
+
 # ----------------------------
 # Config
 # ----------------------------
@@ -324,7 +337,7 @@ def train_model(config: TrainConfig):
         do_eval=True,
     )
 
-    trainer = SFTTrainer(
+    trainer = GraphSFTTrainer(
         model=model,
         data_collator=collator,
         processing_class=tokenizer,
@@ -340,8 +353,14 @@ def train_model(config: TrainConfig):
     trainer.train()
 
     # Optionally: save adapter & tokenizer (adapters are what you’ll push/share)
-    trainer.save_model()  # saves PEFT adapter if peft_config was used
-    tokenizer.save_pretrained(sft_args.output_dir)
+    if config.freeze_llm:
+        torch.save({
+            'pe_model': model.pe_model.state_dict(),
+            'pe_proj': model.pe_proj.state_dict(),
+        }, os.path.join(sft_args.output_dir, "gnn_weights.pt"))
+    else:
+        trainer.save_model()  # saves PEFT adapter if peft_config was used
+        tokenizer.save_pretrained(sft_args.output_dir)
 
     return trainer
 
