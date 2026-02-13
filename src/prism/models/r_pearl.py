@@ -53,10 +53,7 @@ class RandomGNNPositionalEncodings(nn.Module):
 
         # Generate random node embeddings for positional encoding
         num_nodes = X.shape[0]
-        generator = torch.Generator(device=device).manual_seed(
-            hash(tuple(data.edge_index.flatten().tolist())) % (2**31)
-        )
-        Q = torch.randn((num_nodes, self.M), generator=generator, device=device)
+        Q = torch.randn((num_nodes, self.M), device=device)
 
         # Process random embeddings individually through GCN
         P_m = []

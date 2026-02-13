@@ -1,5 +1,5 @@
 import re
-from collections import defaultdict
+from bisect import bisect_left
 
 import torch
 from torch import nn
@@ -38,15 +38,13 @@ class GraphAugmentedLLM(nn.Module):
         self,
         input_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
+        offset_mappings: torch.Tensor | list | None = None,
         labels: torch.Tensor | None = None,
         graphs: list | None = None,
         **kwargs,
     ):
         # Get the batch size for incoming data.
         batch_size = input_ids.shape[0]
-
-        # Associate full words to token indices.
-        buckets = self.bucketize_prompt(input_ids, self.tokenizer)
 
         # Get positional encodings per batch element, projected to LLM hidden dim.
         pos_encs = []
@@ -65,10 +63,30 @@ class GraphAugmentedLLM(nn.Module):
 
         # Add positional encodings to embeddings.
         for b in range(batch_size):
-            bucket = buckets[b]
             pos_enc = pos_encs[b]
+
+            # Format offset_mappings as a list of tuples.
+            offset_mappings[b] = list(map(
+                tuple, offset_mappings[b].tolist()
+                    if isinstance(offset_mappings[b], torch.Tensor) else offset_mappings[b]
+            ))
+
+            # Extract index-ranges of node names within prompt.
+            prompt = self.tokenizer.decode(input_ids[b], skip_special_tokens=True)
+            pattern = re.compile('|'.join(re.escape(node_name) for node_name in pos_enc))
+            matches = pattern.finditer(prompt)
+
+            # Find indices at which to inject NPEs using binary search for tuple ranges.
+            bucket = {}
+            for match in matches:
+                x, y = match.span()
+                A = offset_mappings[b]
+                l = bisect_left(A, (x,))
+                bucket[match.group()] = [i for i in range(l, len(A)) if A[i][1] <= y]
+
+            # Inject NPEs into embeddings in list.
             for word, token_indices in bucket.items():
-                if word in pos_enc:
+                if word in pos_encs[b]:
                     for pos in token_indices:
                         embeddings[b, pos, :] = embeddings[b, pos, :] + pos_enc[word]
 
@@ -82,44 +100,3 @@ class GraphAugmentedLLM(nn.Module):
             labels=labels,
             **kwargs,
         )
-
-    @classmethod
-    def bucketize_prompt(cls, input_ids: torch.Tensor | None, tokenizer: nn.Module) -> list[defaultdict]:
-        """
-        Helper function for associating full prompt words with their corresponding token indices.
-        Uses parallel iteration through words alongside the token list.
-
-        Args:
-            input_ids (torch.Tensor): List of one-hot encodings for prompt.
-            tokenizer (nn.Module): LLM tokenizer required to decode input IDs.
-
-        Returns:
-            bucket (dict): mappings for adding operation of positional encodings
-                to respective tokens.
-        """
-
-        # Get prompt and token list.
-
-        #tokens = tokenizer.convert_ids_to_tokens(input_ids.squeeze())
-        buckets = []
-        for b in range(input_ids.shape[0]):
-            current_seq = input_ids[b,:]
-            words = re.findall(rf'\b[\w_]+\b', tokenizer.decode(current_seq))
-            tokens = tokenizer.convert_ids_to_tokens(current_seq)
-            # Get map of words to token locations.
-            bucket = defaultdict(list)
-            j = 0
-            for word in words:
-                while not (word.startswith(tokens[j]) or tokens[j] in word or word in tokens[j]):
-                    j += 1
-                if word.startswith(tokens[j]):
-                    bucket[word].append(j)
-                    j += 1
-                    while tokens[j] in bucket or word.endswith(tokens[j]):
-                        bucket[word].append(j)
-                        j += 1
-                elif tokens[j] in word or word in tokens[j]:
-                    bucket[word].append(j)
-                    j += 1
-            buckets.append(bucket)
-        return buckets
