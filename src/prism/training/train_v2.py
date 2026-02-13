@@ -1,7 +1,7 @@
 # hf_sft_lora.py
 import os
 import json
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import List, Dict, Any, Optional
 
 from prism.data.data_col import DataCollatorForGraphAugmentedLLM
@@ -13,6 +13,7 @@ os.environ.setdefault("WANDB_PROJECT", "SLM-distill")
 # Match your original env var usage
 os.environ.setdefault("UNSLOTH_RETURN_LOGITS", "1")  # harmless here
 
+import wandb
 import torch
 from datasets import Dataset, load_dataset
 from transformers import (
@@ -191,6 +192,7 @@ class TrainConfig:
     k: int = 3
     use_layer_norm: bool = True
     freeze_llm: bool = False
+    architecture: str = "rpearl_llm"  # "rpearl_llm" or "llm"
 
 
 # ----------------------------
@@ -198,7 +200,7 @@ class TrainConfig:
 # ----------------------------
 def train_model(config: TrainConfig):
     # mirror original SAVE_NAME logic
-    save_name = f"{config.name}_r{config.r}" + ("_4bit" if config.bit4 else "")
+    save_name = f"{config.name}_{config.architecture}_r{config.r}" + ("_4bit" if config.bit4 else "")
 
     # Quantization / dtype
     bnb_config = None
@@ -221,22 +223,31 @@ def train_model(config: TrainConfig):
     _ensure_pad_tokens(tokenizer, llm)
     tokenizer.padding_side = "right"
 
-    # R-PEARL model, graph-augmented model & data collator.
-    r_pearl = RandomGNNPositionalEncodings(
-        pe_hidden_channels=config.pe_hidden_channels,
-        pe_num_layers=config.pe_num_layers,
-        d_model=config.d_model,
-        num_samples=config.num_samples,
-        dropout=config.dropout,
-        k=config.k,
-        use_layer_norm=config.use_layer_norm
-    )
-    model = GraphAugmentedLLM(llm, r_pearl, tokenizer, pe_dim=config.d_model)
-    collator = DataCollatorForGraphAugmentedLLM(tokenizer, mlm=False)
+    if config.architecture == "rpearl_llm":
+        # R-PEARL model, graph-augmented model & data collator.
+        r_pearl = RandomGNNPositionalEncodings(
+            pe_hidden_channels=config.pe_hidden_channels,
+            pe_num_layers=config.pe_num_layers,
+            d_model=config.d_model,
+            num_samples=config.num_samples,
+            dropout=config.dropout,
+            k=config.k,
+            use_layer_norm=config.use_layer_norm
+        )
+        model = GraphAugmentedLLM(llm, r_pearl, tokenizer, pe_dim=config.d_model)
+        collator = DataCollatorForGraphAugmentedLLM(tokenizer, mlm=False)
 
-    # Freeze the whole llm.
-    if config.freeze_llm:
-        model.llm.requires_grad_(False)
+        # Freeze the whole llm.
+        if config.freeze_llm:
+            model.llm.requires_grad_(False)
+    elif config.architecture == "llm":
+        # Pure LLM baseline — scene graph text stays in the prompt as-is.
+        # No custom collator: SFTTrainer's built-in collator handles
+        # tokenization from the `messages` column and padding.
+        model = llm
+        collator = None
+    else:
+        raise ValueError(f"Unknown architecture: {config.architecture!r}. Choose 'rpearl_llm' or 'llm'.")
 
     # Load & optionally downsample data
     full_dataset = load_dataset("json", data_files=[config.data], split="train")
@@ -337,29 +348,45 @@ def train_model(config: TrainConfig):
         do_eval=True,
     )
 
-    trainer = GraphSFTTrainer(
-        model=model,
-        data_collator=collator,
-        processing_class=tokenizer,
-        peft_config=lora_config if not config.freeze_llm else None,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        args=sft_args,
-    )
+    if config.architecture == "rpearl_llm":
+        trainer = GraphSFTTrainer(
+            model=model,
+            data_collator=collator,
+            processing_class=tokenizer,
+            peft_config=lora_config if not config.freeze_llm else None,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            args=sft_args,
+        )
+    else:
+        trainer = SFTTrainer(
+            model=model,
+            processing_class=tokenizer,
+            peft_config=lora_config,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            args=sft_args,
+        )
 
-    
+    # Log all training config parameters to wandb
+    if wandb.run is not None:
+        wandb.config.update(asdict(config), allow_val_change=True)
 
     # Start training
     trainer.train()
 
-    # Optionally: save adapter & tokenizer (adapters are what you’ll push/share)
-    if config.freeze_llm:
-        torch.save({
-            'pe_model': model.pe_model.state_dict(),
-            'pe_proj': model.pe_proj.state_dict(),
-        }, os.path.join(sft_args.output_dir, "gnn_weights.pt"))
+    # Save model artifacts
+    if config.architecture == "rpearl_llm":
+        if config.freeze_llm:
+            torch.save({
+                'pe_model': model.pe_model.state_dict(),
+                'pe_proj': model.pe_proj.state_dict(),
+            }, os.path.join(sft_args.output_dir, "gnn_weights.pt"))
+        else:
+            trainer.save_model()  # saves PEFT adapter if peft_config was used
+            tokenizer.save_pretrained(sft_args.output_dir)
     else:
-        trainer.save_model()  # saves PEFT adapter if peft_config was used
+        trainer.save_model()
         tokenizer.save_pretrained(sft_args.output_dir)
 
     return trainer
@@ -375,6 +402,7 @@ if __name__ == "__main__":
     # Keep your W&B naming convention
     os.environ["WANDB_PROJECT"] = cfg.wandb_project
     os.environ["WANDB_RUN_GROUP"] = cfg.wandb_tag
+    os.environ["WANDB_TAGS"] = cfg.wandb_tag
 
     print(cfg)
     train_model(cfg)
