@@ -15,3 +15,5 @@ wandb/*
 data/*
 *txt
 .env
+src/outputs/
+src/wandb/

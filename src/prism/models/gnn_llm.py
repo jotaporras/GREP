@@ -1,9 +1,7 @@
-import re
-from bisect import bisect_left
+from collections import defaultdict
 
 import torch
 from torch import nn
-
 
 class GraphAugmentedLLM(nn.Module):
     """
@@ -13,7 +11,6 @@ class GraphAugmentedLLM(nn.Module):
         llm (nn.Module): LLM to perform classical planning.
         pe_model (nn.Module): R-PEARL positional-encodings model.
         tokenizer: (nn.Module): Tokenizer associated with LLM.
-        pe_dim (int): Output dimension of pe_model (projected to llm.config.hidden_size).
     """
 
     def __init__(self, llm: nn.Module, pe_model: nn.Module, tokenizer: nn.Module, pe_dim: int):
@@ -38,59 +35,37 @@ class GraphAugmentedLLM(nn.Module):
         self,
         input_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
-        offset_mappings: torch.Tensor | list | None = None,
         labels: torch.Tensor | None = None,
         graphs: list | None = None,
         **kwargs,
     ):
-        # Get the batch size for incoming data.
-        batch_size = input_ids.shape[0]
+        # input_ids: [B,seq_len]
+        
+        
+        # Let's start with LLM embeddings since we can compute them in batch.
+        embeddings = (
+            self.llm.get_input_embeddings()(input_ids)
+                .clone()
+                .to(input_ids.device)
+        ) # [B,seq_len,d]
 
-        # Get positional encodings per batch element, projected to LLM hidden dim.
-        pos_encs = []
-        pe: torch.Tensor | None = None
-        for b in range(batch_size):
+
+        # Now to inject positional encodings.
+        for b in range(input_ids.shape[0]):
             graph = graphs[b]
-            pe = self.pe_proj(self.pe_model(graph))  # (num_nodes, hidden_size)
-            pos_enc = {}
-            for i, word in enumerate(graph.node_names):
-                pos_enc[word] = pe[i]
-            pos_encs.append(pos_enc)
 
-        # Clone so that the in-place-style writes don't break the autograd graph
-        # of get_input_embeddings.
-        embeddings = self.llm.get_input_embeddings()(input_ids).to(pe.device).clone()
+            node_token_seqs = self.tokenizer.encode(graph.node_names)
+            bucket = bucketize_prompt(input_ids[b,:].tolist(), node_token_seqs)
+    
+            # Get positional encodings.
+            pe = self.pe_proj(self.pe_model(graph))  # [n, hidden_size]
+    
+            for node_idx, match_idxes in bucket.items():
+                for start in match_idxes:
+                    max_len = input_ids.shape[1] #TO DO: worst case we'll inject PEs into some padded tokens but would be rare.
+                    end = min(start + len(node_token_seqs[node_idx]), max_len)
+                    embeddings[b,start:end] = embeddings[b,start:end,:] + pe[node_idx,:]
 
-        # Add positional encodings to embeddings.
-        for b in range(batch_size):
-            pos_enc = pos_encs[b]
-
-            # Format offset_mappings as a list of tuples.
-            offset_mappings[b] = list(map(
-                tuple, offset_mappings[b].tolist()
-                    if isinstance(offset_mappings[b], torch.Tensor) else offset_mappings[b]
-            ))
-
-            # Extract index-ranges of node names within prompt.
-            prompt = self.tokenizer.decode(input_ids[b], skip_special_tokens=True)
-            pattern = re.compile('|'.join(re.escape(node_name) for node_name in pos_enc))
-            matches = pattern.finditer(prompt)
-
-            # Find indices at which to inject NPEs using binary search for tuple ranges.
-            bucket = {}
-            for match in matches:
-                x, y = match.span()
-                A = offset_mappings[b]
-                l = bisect_left(A, (x,))
-                bucket[match.group()] = [i for i in range(l, len(A)) if A[i][1] <= y]
-
-            # Inject NPEs into embeddings in list.
-            for word, token_indices in bucket.items():
-                if word in pos_encs[b]:
-                    for pos in token_indices:
-                        embeddings[b, pos, :] = embeddings[b, pos, :] + pos_enc[word]
-
-        # Drop keys we're overriding so the LLM doesn't get duplicate arguments.
         kwargs.pop("inputs_embeds", None)
         kwargs.pop("input_ids", None)
 
@@ -100,3 +75,32 @@ class GraphAugmentedLLM(nn.Module):
             labels=labels,
             **kwargs,
         )
+
+
+def has_match(input_ids_b: list[int], to_match:list[int],start_pos:int):
+    """ 
+        For a single sequence, check if `to_match` is present at `start_pos`
+    """
+    end_pos = min(start_pos + len(to_match),len(input_ids_b))
+    return input_ids_b[start_pos:end_pos] == to_match
+
+def bucketize_prompt(input_ids_b: list, node_token_seqs : list) -> defaultdict:
+    """
+    Helper function for associating full prompt words with their corresponding token indices.
+    Uses parallel iteration through words alongside the token list.
+
+    Args:
+        input_ids (torch.Tensor): List of one-hot encodings for prompt.
+        tokenizer (nn.Module): LLM tokenizer required to decode input IDs.
+
+    Returns:
+        bucket (dict): mappings for adding operation of positional encodings
+            to respective tokens.
+    """
+    # Get map of words to token locations.
+    buckets = defaultdict(set)
+    for p_idx, p_token in enumerate(input_ids_b):
+        for node_idx, node_token_seq in enumerate(node_token_seqs):
+            if has_match(input_ids_b, to_match=node_token_seq,start_pos=p_idx):
+                buckets[node_idx].add(p_idx)
+    return buckets
