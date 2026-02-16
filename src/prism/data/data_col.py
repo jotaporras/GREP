@@ -9,9 +9,35 @@ from transformers.data.data_collator import DataCollatorForLanguageModeling
 from prism.data.utils import safe_parse_graph
 
 
+def remove_edge_list(decoded: str) -> str:
+    """Remove the edge list (object_connections and region_connections) from
+    a decoded prompt string containing a scene graph.
+
+    Parameters
+    ----------
+    decoded : str
+        The full decoded prompt text that contains a scene graph with
+        ``'object_connections': ...`` and ``'region_connections': ...`` entries.
+
+    Returns
+    -------
+    str
+        The prompt with both connection lists removed.
+    """
+    # Match a list that may contain inner lists (one level of nesting):
+    #   \[(?:[^\[\]]|\[[^\[\]]*\])*\]
+    # This handles both [] and [['a','b'], ['c','d'], ...].
+    list_pat = r"\[(?:[^\[\]]|\[[^\[\]]*\])*\]"
+    pattern = r"'object_connections': ?" + list_pat + r", 'region_connections': ?" + list_pat + r", "
+    return re.sub(pattern, "", decoded)
+
+
 class DataCollatorForGraphAugmentedLLM(DataCollatorForLanguageModeling):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, text_edge_list: str = "present", **kwargs):
         super().__init__(*args, **kwargs)
+        if text_edge_list not in ("present", "none"):
+            raise ValueError(f"text_edge_list must be 'present' or 'none', got {text_edge_list!r}")
+        self.text_edge_list = text_edge_list
 
     def __call__(self, features, return_tensors: Optional[str] = None):
         """Attach parsed PyG graphs for each conversation example."""
@@ -49,9 +75,8 @@ class DataCollatorForGraphAugmentedLLM(DataCollatorForLanguageModeling):
                 pyg_graphs.append(pyg_graph)
 
                 # Sanitize input IDs and attention masks.
-                pattern = r"'object_connections':"
                 decoded = self.tokenizer.decode(example['input_ids'])
-                cleaned = re.sub(pattern + r' ?.*,', '', decoded)
+                cleaned = remove_edge_list(decoded) if self.text_edge_list == "none" else decoded
                 encoded = self.tokenizer(cleaned, return_tensors="pt")
                 example['input_ids'] = encoded['input_ids'].squeeze().tolist()
                 example['attention_mask'] = encoded['attention_mask'].squeeze().tolist()

@@ -4,7 +4,7 @@ import json
 from dataclasses import asdict, dataclass, field
 from typing import List, Dict, Any, Optional
 
-from prism.data.data_col import DataCollatorForGraphAugmentedLLM
+from prism.data.data_col import DataCollatorForGraphAugmentedLLM, remove_edge_list
 from prism.models.gnn_llm import GraphAugmentedLLM
 from prism.models.r_pearl import RandomGNNPositionalEncodings
 
@@ -193,6 +193,7 @@ class TrainConfig:
     use_layer_norm: bool = True
     freeze_llm: bool = False
     architecture: str = "rpearl_llm"  # "rpearl_llm" or "llm"
+    text_edge_list: str = "present"   # "present" or "none"
 
 
 # ----------------------------
@@ -235,7 +236,9 @@ def train_model(config: TrainConfig):
             use_layer_norm=config.use_layer_norm
         )
         model = GraphAugmentedLLM(llm, r_pearl, tokenizer, pe_dim=config.d_model)
-        collator = DataCollatorForGraphAugmentedLLM(tokenizer, mlm=False)
+        collator = DataCollatorForGraphAugmentedLLM(
+            tokenizer, mlm=False, text_edge_list=config.text_edge_list
+        )
 
         # Freeze the whole llm.
         if config.freeze_llm:
@@ -269,6 +272,19 @@ def train_model(config: TrainConfig):
 
     # Configure data.
     full_dataset = full_dataset.map(_add_messages)
+
+    # Strip edge lists from the user message text when requested.
+    # For rpearl_llm this is handled later inside the collator; for the llm
+    # baseline the collator is absent so we must do it here on the raw text.
+    if config.text_edge_list == "none" and config.architecture == "llm":
+        def _strip_edges(example):
+            example["messages"] = [
+                {**m, "content": remove_edge_list(m["content"])} if m["role"] == "user" else m
+                for m in example["messages"]
+            ]
+            return example
+        full_dataset = full_dataset.map(_strip_edges)
+
     full_dataset = full_dataset.map(_tokenize_with_conversations)
 
     # Convert to `messages` so TRL can auto-apply chat template
