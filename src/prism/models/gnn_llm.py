@@ -54,7 +54,7 @@ class GraphAugmentedLLM(nn.Module):
         for b in range(input_ids.shape[0]):
             graph = graphs[b]
 
-            node_token_seqs = self.tokenizer.encode(graph.node_names)
+            node_token_seqs = self.tokenizer.encode(graph.node_names,add_special_tokens=False)
             bucket = bucketize_prompt(input_ids[b,:].tolist(), node_token_seqs)
     
             # Get positional encodings.

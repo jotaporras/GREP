@@ -24,11 +24,7 @@ def remove_edge_list(decoded: str) -> str:
     str
         The prompt with both connection lists removed.
     """
-    # Match a list that may contain inner lists (one level of nesting):
-    #   \[(?:[^\[\]]|\[[^\[\]]*\])*\]
-    # This handles both [] and [['a','b'], ['c','d'], ...].
-    list_pat = r"\[(?:[^\[\]]|\[[^\[\]]*\])*\]"
-    pattern = r"'object_connections': ?" + list_pat + r", 'region_connections': ?" + list_pat + r", "
+    pattern = r"'object_connections': .+?, 'region_connections': .+?, (?='robot_location'|\})"
     return re.sub(pattern, "", decoded)
 
 
