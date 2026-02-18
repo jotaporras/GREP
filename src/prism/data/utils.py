@@ -1,9 +1,93 @@
 import json
+from copy import deepcopy
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
+import networkx as nx
+import numpy as np
 from openai import OpenAI
 from openai.types.chat import ChatCompletion
+from scipy.spatial.transform import Rotation
+from spine.mapping.graph_util import parse_graph_coord
+
+
+def safe_parse_graph(
+    data: Dict[str, Dict[str, str]],
+    custom_data: Optional[Dict[str, Dict[str, str]]] = {},
+    rotation: Optional[Rotation] = None,
+    utm_origin: Optional[np.ndarray] = None,
+    flip_coords=False,
+) -> Tuple[nx.Graph, str]:
+    """Parse scene graph in `data` into a networkx object.
+
+    Parameters
+    ----------
+    data : Dict[str, Dict[str, str]]
+        graph where keys-values are nodes-attributes
+    rotation : Optional[Rotation]
+        current rotation of robot
+
+    Returns
+    -------
+    Tuple[nx.Graph, str]
+        Networkx and string of json
+    """
+    origin = np.array([0, 0])
+    data = deepcopy(data)  # don't modify input data
+    as_str = str(data)
+
+    if utm_origin is not None:
+        origin = utm_origin
+
+    if len(custom_data):
+        add_keys = ["regions", "region_connections", "objects", "object_connections"]
+        for key in add_keys:
+            if key in data and key in custom_data:
+                data[key].extend(custom_data[key])
+
+    G = nx.Graph()
+    for node in data["objects"]:
+        coords = parse_graph_coord(node["coords"], origin=origin, rotation=rotation)
+        if flip_coords:
+            raise ValueError()
+            # print("flipping coords")
+            coords = [coords[0], -coords[1]]
+
+        node.pop("coords")
+        name = node.pop("name")
+        G.add_node(name, coords=coords, type="object", **node)
+
+    for node in data["regions"]:
+        assert "coords" in node, node
+        c = node["coords"]
+        # print(f"node: {node}, coords: {c}")
+        coords = parse_graph_coord(node["coords"], origin=origin, rotation=rotation)
+
+        if flip_coords:
+            raise ValueError
+            # print("flipping coords")
+            coords = [coords[0], -coords[1]]
+        node.pop("coords")
+        name = node.pop("name")
+        G.add_node(name, coords=coords, type="object", **node)
+
+    for edge in data["object_connections"]:
+        if edge[0] in G.nodes and edge[1] in G.nodes:
+            c1 = G.nodes[edge[0]]["coords"]
+            c2 = G.nodes[edge[1]]["coords"]
+            # print(f"edge: {edge}, c1, c2: {c1}, {c2}")
+            dist = np.linalg.norm(np.array(c1) - np.array(c2))
+            G.add_edge(edge[0], edge[1], type="object", weight=dist)
+
+    for edge in data["region_connections"]:
+        if edge[0] in G.nodes and edge[1] in G.nodes:
+            c1 = G.nodes[edge[0]]["coords"]
+            c2 = G.nodes[edge[1]]["coords"]
+            # print(f"edge: {edge}, c1, c2: {c1}, {c2}")
+            dist = np.linalg.norm(np.array(c1) - np.array(c2))
+            G.add_edge(edge[0], edge[1], type="region", weight=dist)
+
+    return G, as_str
 
 
 def try_load_json(file):

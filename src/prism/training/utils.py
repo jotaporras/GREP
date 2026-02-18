@@ -376,7 +376,7 @@ def get_formatting_prompts_func(tokenizer):
         convos = examples["conversations"]
         texts = [
             tokenizer.apply_chat_template(
-                convo, tokenize=False, add_generation_prompt=False
+                convo, tokenize=False, add_generation_prompt=False,num_proc=1
             )
             for convo in convos
         ]
