@@ -72,7 +72,7 @@ You're a research scientist, writing code like one. You care about the result of
 
 ## AVOID DEFENSIVE PROGRAMMING.
 
-NEVER WRITE Conde like this
+NEVER WRITE code like this
 
 ```python
 try:
@@ -97,4 +97,16 @@ if wandb_kwargs:
 These are examples of defensive programming. We do not like it. Always assume that 
 the the right code execution path will be taken. The only exception is if the user specifically requests a specific check.
 
+## AVOID SILENT ERRORS.
+
+NEVER CODE for avoiding runtime exceptions on unexpected paths. If an experiment runs into an unexpected branch and doesn't fail, that's not good coding, it's sabotaging our experiments. We want to know when something goes wrong, not avoid it. Neural network development is very sensitive to silent errors and small changes, and we want to always be aware about it.
+
+Never use `try/finally` blocks unless the user explicitly requests one. Write straight-line code instead.
+
+## Cursor Rules
+
+Project-specific AI coding rules live in `.cursor/rules/`. Check there for conventions before making changes to areas covered by those rules.
+
+Current rules:
+- `notebooks.mdc` — path conventions for notebooks in `notebooks/` (use `../` prefixes, never `os.chdir`)
 

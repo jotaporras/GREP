@@ -8,7 +8,8 @@ from spine.spine import SPINE
 
 from prism.data.graph_sim import GraphSim
 from prism.data.planning_sim import PlanningSim
-from prism.models.unsloth import from_pretrained
+from prism.models.inference import GraphAugmentedInMemoryLLM
+from prism.models.loaders import from_pretrained
 
 # Modified to accept either a file path or a graph data dictionary
 EvalSample = namedtuple("EvalSample", ["task", "answer", "graph", "init_node"])
@@ -33,6 +34,11 @@ def correct_keys(answer: Dict[str, str]) -> bool:
 
 
 def eval_answer(parsed_answer: Dict[str, str], answer_key: str):
+    """Check model output for correct JSON format and keyword match against expected answer.
+
+    Validates that the parsed answer has the required keys (primary_goal, relevant_graph,
+    reasoning, plan) and that the answer_key keyword appears in the plan field.
+    """
     formatted = False
     keyphrase = False
     try:
@@ -92,8 +98,19 @@ class Unsloth:
 
 
 def eval_model(
-    *, model_path: str, is_four_bit: bool, eval_samples: List[EvalSample]
+    *,
+    model_path: str = "",
+    is_four_bit: bool = False,
+    eval_samples: List[EvalSample],
+    model=None,
+    tokenizer=None,
 ) -> float:
+    """Run evaluation on a set of samples using the planning simulation loop.
+
+    Accepts either a model_path (load from disk via HuggingFace) or an in-memory
+    model+tokenizer pair (e.g. from an active training run). Sets up GraphSim and
+    SPINE, runs PlanningSim per sample, and returns accuracy as fraction correct.
+    """
     total_correct = 0
 
     multi_turn = True
@@ -101,11 +118,16 @@ def eval_model(
     if multi_turn:
         graph_handler = GraphHandler("")
         graph_sim = GraphSim(graph_handler)
-        llm_planner = SPINE(
-            graph=graph_sim.partial_graph,
-            llm="unsloth",
-            model_path=model_path,
-        )
+        if model is not None and tokenizer is not None:
+            # When model and tokenizer present, we're using an in-memory model (eg for eval during training.)
+            client = GraphAugmentedInMemoryLLM(model=model, tokenizer=tokenizer)
+            llm_planner = SPINE(graph=graph_sim.partial_graph, client=client)
+        else:
+            llm_planner = SPINE(
+                graph=graph_sim.partial_graph,
+                llm="huggingface",
+                model_path=model_path,
+            )
 
         model = PlanningSim(debug=False)
     else:

@@ -24,8 +24,9 @@ class MetricsTrackerCallback(TrainerCallback):
 
 
 class EvalCallback(TrainerCallback):
-    def __init__(self, eval_samples):
+    def __init__(self, eval_samples, tokenizer=None):
         self.eval_samples = eval_samples
+        self.tokenizer = tokenizer
 
     def on_epoch_end(self, args, state, control, **kwargs):
         model = kwargs.get("model")
@@ -33,24 +34,17 @@ class EvalCallback(TrainerCallback):
             print("Model not provided; skipping evaluation.")
             return control
 
-        # Save current model state to a temporary directory
-        import tempfile
+        model.eval()
+        result_correct = eval_model(
+            model=model,
+            tokenizer=self.tokenizer,
+            eval_samples=self.eval_samples,
+        )
 
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            model.save_pretrained(tmp_dir)
-
-            # Run evaluation
-            result_correct = eval_model(
-                model_path=tmp_dir,
-                is_four_bit=False,  # Use same settings as training
-                eval_samples=self.eval_samples,
-            )
-
-            # Log to wandb
-            wandb.log({"eval/accuracy": result_correct, "epoch": state.epoch})
-            self.metrics = {
-                "eval/accuracy": result_correct,
-            }
+        wandb.log({"eval/accuracy": result_correct, "epoch": state.epoch})
+        self.metrics = {
+            "eval/accuracy": result_correct,
+        }
 
         return control
 

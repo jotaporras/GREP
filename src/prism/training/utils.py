@@ -1,7 +1,6 @@
 from typing import List
 
 from transformers import DataCollatorForSeq2Seq
-from unsloth_zoo.training_utils import fix_zero_training_loss
 
 __all__ = [
     "train_on_responses_only",
@@ -367,7 +366,6 @@ def train_on_responses_only(
         pass
     pass
 
-    fix_zero_training_loss(None, tokenizer, trainer.train_dataset)
     return trainer
 
 

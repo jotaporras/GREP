@@ -1,6 +1,3 @@
-import unsloth
-from unsloth import FastLanguageModel, is_bfloat16_supported
-from unsloth.chat_templates import get_chat_template, standardize_sharegpt
 import json
 import os
 
@@ -10,15 +7,18 @@ os.environ["UNSLOTH_RETURN_LOGITS"] = "1"
 from dataclasses import dataclass, field
 from typing import List
 
+import torch
 import wandb
 from datasets import load_dataset
-from transformers import HfArgumentParser
+from peft import LoraConfig, get_peft_model
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, HfArgumentParser
 from trl import SFTConfig, SFTTrainer
 
 from prism.eval.callbacks import EvalCallback
 from prism.eval.run_eval import EvalSample
 from prism.training.utils import (TurnAwareCollator,
-                                  get_formatting_prompts_func)
+                                  get_formatting_prompts_func,
+                                  train_on_responses_only)
 
 
 @dataclass
@@ -29,7 +29,7 @@ class TrainConfig:
     bit4: bool = False
     eval_data: str = "../data/eval/eval_1_multi_step.json"
     r: int = 16
-    base_model: str = "unsloth/Llama-3.2-3B-Instruct"
+    base_model: str = "meta-llama/Llama-3.2-3B-Instruct"
     wandb_project: str = "SLM-distill"
     wandb_run_name: str = "spine_lora"
     wandb_tag: str = "spine"
@@ -60,48 +60,44 @@ class TrainConfig:
 
 
 def train_model(config: TrainConfig) -> None:
-    """Train model via unsloth
-
-    Notes
-    -----
-    Uses Lora SFT.
-    """
+    """Train model via HuggingFace + PEFT LoRA SFT."""
     SAVE_NAME = config.name
-    max_seq_length = 2048
-    load_in_4bit = False
-    dtype = None
+    load_in_4bit = config.bit4
 
     SAVE_NAME += f"_r{config.r}"
-    if config.bit4:
+    if load_in_4bit:
         SAVE_NAME += "_4bit"
-        load_in_4bit = True
 
     base_model = config.base_model
 
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=base_model,
-        max_seq_length=max_seq_length,
-        dtype=dtype,
-        load_in_4bit=load_in_4bit,
-    )
+    bnb_config = None
+    if load_in_4bit:
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        )
 
-    model = FastLanguageModel.get_peft_model(
-        model,
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model,
+        torch_dtype="auto",
+        device_map="auto",
+        quantization_config=bnb_config,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(base_model)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    lora_config = LoraConfig(
         r=config.r,
         target_modules=config.target_modules,
         lora_alpha=config.lora_alpha,
         lora_dropout=config.lora_dropout,
         bias="none",
-        use_gradient_checkpointing="unsloth",
-        random_state=3407,
-        use_rslora=False,
-        loftq_config=None,
+        task_type="CAUSAL_LM",
     )
-
-    tokenizer = get_chat_template(
-        tokenizer,
-        chat_template="llama-3.1",
-    )
+    model = get_peft_model(model, lora_config)
 
     # Load the full dataset
     full_dataset = load_dataset("json", data_files=[config.data], split="train")
@@ -110,8 +106,17 @@ def train_model(config: TrainConfig) -> None:
     if config.debug:
         full_dataset = full_dataset.select(range(min(100, len(full_dataset))))
 
-    # Apply preprocessing
-    full_dataset = standardize_sharegpt(full_dataset,num_proc=1)
+    # Apply preprocessing — convert ShareGPT conversations to messages format
+    def _standardize_sharegpt(example):
+        role_map = {"human": "user", "gpt": "assistant", "system": "system"}
+        conversations = example.get("conversations", [])
+        example["conversations"] = [
+            {"from": role_map.get(c.get("from", "user"), c.get("from", "user")), "value": c.get("value", "")}
+            for c in conversations
+        ]
+        return example
+    full_dataset = full_dataset.map(_standardize_sharegpt, num_proc=1)
+
     formatting_prompts_func = get_formatting_prompts_func(tokenizer)
     full_dataset = full_dataset.map(formatting_prompts_func, batched=True,num_proc=1)
 
@@ -155,8 +160,8 @@ def train_model(config: TrainConfig) -> None:
         warmup_steps=config.warmup_steps,
         num_train_epochs=config.epochs,
         learning_rate=config.learning_rate,
-        fp16=not is_bfloat16_supported(),
-        bf16=is_bfloat16_supported(),
+        fp16=not torch.cuda.is_bf16_supported(),
+        bf16=torch.cuda.is_bf16_supported(),
         logging_steps=1,
         optim="adamw_8bit",
         weight_decay=config.weight_decay,
@@ -183,11 +188,10 @@ def train_model(config: TrainConfig) -> None:
     trainer = SFTTrainer(**trainer_kwargs)
 
     # Apply train_on_responses_only which adds the turn field to the dataset
-    trainer = unsloth.train_on_responses_only(
+    trainer = train_on_responses_only(
         trainer,
         instruction_part="<|start_header_id|>user<|end_header_id|>\n\n",
         response_part="<|start_header_id|>assistant<|end_header_id|>\n\n",
-        num_proc=1,
     )
 
     # Load eval samples before training

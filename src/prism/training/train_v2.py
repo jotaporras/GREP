@@ -5,6 +5,8 @@ from dataclasses import asdict, dataclass, field
 from typing import List, Dict, Any, Optional
 
 from prism.data.data_col import DataCollatorForGraphAugmentedLLM, remove_edge_list
+from prism.eval.callbacks import EvalCallback
+from prism.eval.run_eval import EvalSample
 from prism.models.gnn_llm import GraphAugmentedLLM
 from prism.models.r_pearl import RandomGNNPositionalEncodings
 
@@ -134,15 +136,20 @@ def _standardize_conversations(ds: Dataset,tokenizer) -> Dataset:
 
 
 class GraphSFTTrainer(SFTTrainer):
+    def __init__(self, *args, gnn_config: dict, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.gnn_config = gnn_config
+
     def save_model(self, output_dir=None, _internal_call=False):
         output_dir = output_dir or self.args.output_dir
         os.makedirs(output_dir, exist_ok=True)
-        if self.model.llm.requires_grad_(False):  # frozen LLM path
-            torch.save({
-                'pe_model': self.model.pe_model.state_dict(),
-                'pe_proj': self.model.pe_proj.state_dict(),
-            }, os.path.join(output_dir, "gnn_weights.pt"))
-        else:
+        with open(os.path.join(output_dir, "gnn_config.json"), "w") as f:
+            json.dump(self.gnn_config, f, indent=2)
+        torch.save({
+            'pe_model': self.model.pe_model.state_dict(),
+            'pe_proj': self.model.pe_proj.state_dict(),
+        }, os.path.join(output_dir, "gnn_weights.pt"))
+        if any(p.requires_grad for p in self.model.llm.parameters()):
             super().save_model(output_dir, _internal_call)
 
 
@@ -332,6 +339,8 @@ def train_model(config: TrainConfig):
     # )
     #assert any(enc["assistant_masks"]), "Template still not producing assistant masks."
 
+    output_dir = str(os.path.join(config.checkpoint_dir, save_name))
+
     # SFT trainer configuration
     sft_args = SFTConfig(
         dataset_num_proc=1,
@@ -350,7 +359,7 @@ def train_model(config: TrainConfig):
         bf16=_bf16_supported(),
         # misc
         seed=3407,
-        output_dir=str(os.path.join("outputs", save_name)),
+        output_dir=output_dir,
         report_to=config.report_to,
         run_name=config.wandb_run_name,
         optim=optim,
@@ -358,6 +367,10 @@ def train_model(config: TrainConfig):
         # Temporarily disabled because qwen doesn't support it.
         #assistant_only_loss=True,  # train only on assistant tokens
         remove_unused_columns=False,
+        # Checkpointing
+        save_strategy="steps",
+        save_steps=100,
+        save_total_limit=3,
         # Validation
         eval_strategy="steps",
         eval_steps=100,
@@ -365,6 +378,16 @@ def train_model(config: TrainConfig):
     )
 
     if config.architecture == "rpearl_llm":
+        gnn_config = {
+            "base_model": config.base_model,
+            "pe_hidden_channels": config.pe_hidden_channels,
+            "pe_num_layers": config.pe_num_layers,
+            "d_model": config.d_model,
+            "num_samples": config.num_samples,
+            "dropout": config.dropout,
+            "k": config.k,
+            "use_layer_norm": config.use_layer_norm,
+        }
         trainer = GraphSFTTrainer(
             model=model,
             data_collator=collator,
@@ -373,6 +396,7 @@ def train_model(config: TrainConfig):
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             args=sft_args,
+            gnn_config=gnn_config,
         )
     else:
         trainer = SFTTrainer(
@@ -387,6 +411,26 @@ def train_model(config: TrainConfig):
     # Log all training config parameters to wandb
     if wandb.run is not None:
         wandb.config.update(asdict(config), allow_val_change=True)
+
+    # Load eval samples before training
+    with open(config.eval_data) as f:
+        data = json.load(f)
+        tasks = data["tasks"]
+        graph_data = data["graph"]
+
+    eval_samples = []
+    for entry in tasks:
+        eval_samples.append(
+            EvalSample(
+                task=entry["task"],
+                answer=entry["answer"],
+                graph=graph_data,
+                init_node=entry["init_node"],
+            )
+        )
+
+    # TO DO disabled while we debug the checkpoints. 
+    # trainer.add_callback(EvalCallback(eval_samples, tokenizer=tokenizer))
 
     # Start training
     trainer.train()

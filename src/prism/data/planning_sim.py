@@ -10,6 +10,11 @@ class PlanningSim:
         self.debug = debug
 
     def query_planner(self, llm_input: str, planner: SPINE) -> None:
+        """Send a prompt to the SPINE planner and parse the response into a structured plan.
+
+        Returns the parsed response dict (with 'plan' as a list of (action, arg) tuples)
+        on success, or an empty dict if the planner fails after all retries.
+        """
         resp, success, logs = planner.request(llm_input)
 
         if success:
@@ -48,6 +53,13 @@ class PlanningSim:
         graph_data_gen: GraphSim,
         max_iterations=10,
     ) -> Dict[str, Any]:
+        """Top-level planning loop: query SPINE → execute actions → feed graph diffs back.
+
+        Iterates up to max_iterations times. Each iteration queries the planner for a plan,
+        executes the actions on the GraphSim, and feeds any discovered graph updates back
+        as the next planner input. Stops early when the planner issues an 'answer' action.
+        Returns the final planner response dict.
+        """
         done = False
         planner_input = f"task: {task}"
 

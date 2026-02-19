@@ -12,7 +12,16 @@ import wandb
 from datasets import Dataset, load_dataset
 from torch.utils.data import DataLoader
 from transformers import HfArgumentParser
-from unsloth.chat_templates import standardize_sharegpt
+def standardize_sharegpt(dataset, num_proc=1):
+    role_map = {"human": "user", "gpt": "assistant", "system": "system"}
+    def _convert(example):
+        conversations = example.get("conversations", [])
+        example["conversations"] = [
+            {"from": role_map.get(c.get("from", "user"), c.get("from", "user")), "value": c.get("value", "")}
+            for c in conversations
+        ]
+        return example
+    return dataset.map(_convert, num_proc=num_proc)
 
 from prism.data.data_gen import DataGenerator
 from prism.iterative.utils import spine_data_to_prompt

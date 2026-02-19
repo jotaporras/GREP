@@ -1,4 +1,3 @@
-notebooks/*
 unsloth_compiled_cache/
 ipynb*
 *__pycache__*

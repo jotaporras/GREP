@@ -31,6 +31,26 @@ class GraphAugmentedLLM(nn.Module):
         except AttributeError:
             return getattr(self.llm, name)
 
+    def _augment_embeddings(self, input_ids: torch.Tensor, graphs: list) -> torch.Tensor:
+        """Compute GNN-augmented input embeddings. Shared by forward() and generate()."""
+        embeddings = (
+            self.llm.get_input_embeddings()(input_ids)
+                .clone()
+                .to(input_ids.device)
+        )  # [B, seq_len, d]
+
+        for b in range(input_ids.shape[0]):
+            graph = graphs[b]
+            node_token_seqs = self.tokenizer.encode(graph.node_names, add_special_tokens=False)
+            bucket = bucketize_prompt(input_ids[b, :].tolist(), node_token_seqs)
+            pe = self.pe_proj(self.pe_model(graph))  # [n, hidden_size]
+            for node_idx, match_idxes in bucket.items():
+                for start in match_idxes:
+                    end = min(start + len(node_token_seqs[node_idx]), input_ids.shape[1])
+                    embeddings[b, start:end] = embeddings[b, start:end, :] + pe[node_idx, :]
+
+        return embeddings
+
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -39,32 +59,7 @@ class GraphAugmentedLLM(nn.Module):
         graphs: list | None = None,
         **kwargs,
     ):
-        # input_ids: [B,seq_len]
-        
-        
-        # Let's start with LLM embeddings since we can compute them in batch.
-        embeddings = (
-            self.llm.get_input_embeddings()(input_ids)
-                .clone()
-                .to(input_ids.device)
-        ) # [B,seq_len,d]
-
-
-        # Now to inject positional encodings.
-        for b in range(input_ids.shape[0]):
-            graph = graphs[b]
-
-            node_token_seqs = self.tokenizer.encode(graph.node_names,add_special_tokens=False)
-            bucket = bucketize_prompt(input_ids[b,:].tolist(), node_token_seqs)
-    
-            # Get positional encodings.
-            pe = self.pe_proj(self.pe_model(graph))  # [n, hidden_size]
-    
-            for node_idx, match_idxes in bucket.items():
-                for start in match_idxes:
-                    max_len = input_ids.shape[1] #TO DO: worst case we'll inject PEs into some padded tokens but would be rare.
-                    end = min(start + len(node_token_seqs[node_idx]), max_len)
-                    embeddings[b,start:end] = embeddings[b,start:end,:] + pe[node_idx,:]
+        embeddings = self._augment_embeddings(input_ids, graphs)
 
         kwargs.pop("inputs_embeds", None)
         kwargs.pop("input_ids", None)
