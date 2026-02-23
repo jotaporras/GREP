@@ -2,7 +2,7 @@ from typing import Any, Dict
 
 from spine.spine import SPINE
 
-from prism.data.graph_sim import GraphSim
+from prism.data import graph_sim
 
 
 class PlanningSim:
@@ -41,8 +41,7 @@ class PlanningSim:
 
             return resp
         else:
-            print(f"failed")
-            print(resp)
+            print(f"[planning-sim] FAILED. resp={resp}, logs={logs}")
             return {}
 
     def run_planning(
@@ -50,7 +49,7 @@ class PlanningSim:
         *,
         llm_planner: SPINE,
         task: str,
-        graph_data_gen: GraphSim,
+        graph_data_gen: graph_sim.GraphSim,
         max_iterations=10,
     ) -> Dict[str, Any]:
         """Top-level planning loop: query SPINE → execute actions → feed graph diffs back.

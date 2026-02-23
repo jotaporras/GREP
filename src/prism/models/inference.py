@@ -5,7 +5,7 @@ from typing import List, Dict
 import torch
 import torch_geometric.utils as pyg_utils
 
-from prism.data.utils import safe_parse_graph
+from prism.data import utils
 
 
 class GraphAugmentedInMemoryLLM:
@@ -30,7 +30,7 @@ class GraphAugmentedInMemoryLLM:
                 match = re.search(r"[Ss]cene graph: ?(.*})", m.get("content", ""))
                 if match:
                     scene_graph_dict = literal_eval(match.group(1))
-                    nx_graph, _ = safe_parse_graph(scene_graph_dict)
+                    nx_graph, _ = utils.safe_parse_graph(scene_graph_dict)
                     node_names = list(nx_graph.nodes)
                     coords = torch.tensor(
                         [nx_graph.nodes[n]["coords"] for n in node_names], dtype=torch.float32
@@ -44,12 +44,17 @@ class GraphAugmentedInMemoryLLM:
                     return pyg_graph
         return None
 
-    def query_llm(self, msg: List[Dict], max_new_tokens: int = 4048):
+    def query_llm(self, msg: List[Dict], max_new_tokens: int = 256):
         pyg_graph = self._parse_pyg_graph(msg)
+
+        robot_loc = pyg_graph.robot_location if pyg_graph is not None else None
+        print(f"[spine-llm] graph_found={pyg_graph is not None}, robot_location={robot_loc}")
 
         input_ids = self.tokenizer.apply_chat_template(
             msg, tokenize=True, add_generation_prompt=True, return_tensors="pt"
         )["input_ids"].to(self.device)
+
+        print(f"[spine-llm] prompt_tokens={input_ids.shape[1]}")
 
         with torch.no_grad():
             if pyg_graph is not None:
@@ -66,4 +71,5 @@ class GraphAugmentedInMemoryLLM:
 
         out = self.tokenizer.batch_decode(outputs)
         planner_response = out[0].split("end_header_id|>")[-1].split("<|eot_id|>")[0]
+        print(f"[spine-llm] raw_output (first 500 chars): {planner_response[:500]}")
         return planner_response, True

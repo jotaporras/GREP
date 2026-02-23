@@ -23,7 +23,10 @@ class GraphAugmentedLLM(nn.Module):
         # wrapping (which only touches LoRA target modules) doesn't leave them on CPU.
         device = next(llm.parameters()).device
         self.pe_model = pe_model.to(device)
-        self.pe_proj = nn.Linear(pe_dim, llm.config.hidden_size, device=device)
+        self.pe_proj = nn.Sequential(
+            nn.Linear(pe_dim, llm.config.hidden_size, device=device),
+            nn.LayerNorm(llm.config.hidden_size, device=device),
+        )
 
     def __getattr__(self, name):
         try:
@@ -44,6 +47,7 @@ class GraphAugmentedLLM(nn.Module):
             node_token_seqs = self.tokenizer.encode(graph.node_names, add_special_tokens=False)
             bucket = bucketize_prompt(input_ids[b, :].tolist(), node_token_seqs)
             pe = self.pe_proj(self.pe_model(graph))  # [n, hidden_size]
+            
             for node_idx, match_idxes in bucket.items():
                 for start in match_idxes:
                     end = min(start + len(node_token_seqs[node_idx]), input_ids.shape[1])

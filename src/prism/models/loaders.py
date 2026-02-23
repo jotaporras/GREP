@@ -6,8 +6,8 @@ import torch
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, PreTrainedTokenizer
 
-from prism.models.gnn_llm import GraphAugmentedLLM
-from prism.models.r_pearl import RandomGNNPositionalEncodings
+from prism.models import gnn_llm
+from prism.models import r_pearl
 
 
 def _bnb_config(load_in_4bit: bool):
@@ -40,7 +40,7 @@ def from_pretrained(
 def graph_augmented_llm_from_pretrained(
     path: str,
     load_in_4bit: bool = False,
-) -> Tuple[GraphAugmentedLLM, PreTrainedTokenizer]:
+) -> Tuple[gnn_llm.GraphAugmentedLLM, PreTrainedTokenizer]:
     """Load a GraphAugmentedLLM checkpoint saved by GraphSFTTrainer.
 
     Expects the checkpoint directory to contain:
@@ -66,7 +66,7 @@ def graph_augmented_llm_from_pretrained(
 
     tokenizer = AutoTokenizer.from_pretrained(path)
 
-    r_pearl = RandomGNNPositionalEncodings(
+    r_pearl_model = r_pearl.RandomGNNPositionalEncodings(
         pe_hidden_channels=gnn_cfg["pe_hidden_channels"],
         pe_num_layers=gnn_cfg["pe_num_layers"],
         d_model=gnn_cfg["d_model"],
@@ -76,7 +76,7 @@ def graph_augmented_llm_from_pretrained(
         use_layer_norm=gnn_cfg["use_layer_norm"],
     )
 
-    model = GraphAugmentedLLM(llm, r_pearl, tokenizer, pe_dim=gnn_cfg["d_model"])
+    model = gnn_llm.GraphAugmentedLLM(llm, r_pearl_model, tokenizer, pe_dim=gnn_cfg["d_model"])
 
     gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
     model.pe_model.load_state_dict(gnn_weights["pe_model"])

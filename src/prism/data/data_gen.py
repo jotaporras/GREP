@@ -7,10 +7,10 @@ import numpy as np
 from spine.mapping.graph_util import GraphHandler
 from spine.spine import SPINE
 
-from prism.data.graph_gen import TaskGraphGen
-from prism.data.graph_sim import GraphSim
-from prism.data.planning_sim import PlanningSim
-from prism.data.utils import aggregate
+from prism.data import graph_gen
+from prism.data import graph_sim
+from prism.data import planning_sim
+from prism.data import utils
 
 
 class DataGenerator:
@@ -23,8 +23,8 @@ class DataGenerator:
         self.unknown_pcts = graph_unknown
         self.n_regions_list = n_region_list
         self.n_objects_list = n_objects_list
-        self.context_gen = TaskGraphGen()
-        self.planning_sim = PlanningSim()
+        self.context_gen = graph_gen.TaskGraphGen()
+        self.planning_sim = planning_sim.PlanningSim()
 
     def generate(
         self, log_dir: str, n_samples: int, n_tasks: int, description: str = ""
@@ -75,7 +75,7 @@ class DataGenerator:
                 #    rnd_data["graph"],
                 #    current_location=,
                 # )
-                graph_data_gen = GraphSim(graph_handle)
+                graph_data_gen = graph_sim.GraphSim(graph_handle)
                 # breakpoint()
                 # TODO: fix node removal
                 unknown_pct = self.unknown_pcts[task_idx % len(self.unknown_pcts)]
@@ -100,7 +100,7 @@ class DataGenerator:
 
                 data_counter += 1
 
-        aggregate(
+        utils.aggregate(
             root_dir=log_dir,
             glob_str="sample*json",
             out_file=f"{log_dir}/formatted.json",

@@ -1,6 +1,9 @@
 import json
 import os
 
+from dotenv import load_dotenv
+load_dotenv()
+
 os.environ["WANDB_PROJECT"] = "SLM-distill"
 os.environ["UNSLOTH_RETURN_LOGITS"] = "1"
 
@@ -14,11 +17,9 @@ from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, HfArgumentParser
 from trl import SFTConfig, SFTTrainer
 
-from prism.eval.callbacks import EvalCallback
-from prism.eval.run_eval import EvalSample
-from prism.training.utils import (TurnAwareCollator,
-                                  get_formatting_prompts_func,
-                                  train_on_responses_only)
+from prism.eval import callbacks
+from prism.eval import run_eval
+from prism.training import utils
 
 
 @dataclass
@@ -117,7 +118,7 @@ def train_model(config: TrainConfig) -> None:
         return example
     full_dataset = full_dataset.map(_standardize_sharegpt, num_proc=1)
 
-    formatting_prompts_func = get_formatting_prompts_func(tokenizer)
+    formatting_prompts_func = utils.get_formatting_prompts_func(tokenizer)
     full_dataset = full_dataset.map(formatting_prompts_func, batched=True,num_proc=1)
 
     # Create train/validation split
@@ -175,7 +176,7 @@ def train_model(config: TrainConfig) -> None:
         "model": model,
         "tokenizer": tokenizer,
         "train_dataset": dataset,
-        "data_collator": TurnAwareCollator(
+        "data_collator": utils.TurnAwareCollator(
             tokenizer=tokenizer, padding="longest", include_turns=False
         ),
         "args": sft_config,
@@ -187,8 +188,8 @@ def train_model(config: TrainConfig) -> None:
 
     trainer = SFTTrainer(**trainer_kwargs)
 
-    # Apply train_on_responses_only which adds the turn field to the dataset
-    trainer = train_on_responses_only(
+    # Apply utils.train_on_responses_only which adds the turn field to the dataset
+    trainer = utils.train_on_responses_only(
         trainer,
         instruction_part="<|start_header_id|>user<|end_header_id|>\n\n",
         response_part="<|start_header_id|>assistant<|end_header_id|>\n\n",
@@ -203,7 +204,7 @@ def train_model(config: TrainConfig) -> None:
     # eval_samples = []
     # for entry in tasks:
     #     eval_samples.append(
-    #         EvalSample(
+    #         run_eval.EvalSample(
     #             task=entry["task"],
     #             answer=entry["answer"],
     #             graph=graph_data,  # Pass the graph data dictionary directly
@@ -212,7 +213,7 @@ def train_model(config: TrainConfig) -> None:
     #     )
 
     # Add both callbacks
-    # trainer.add_callback(EvalCallback(eval_samples))
+    # trainer.add_callback(callbacks.EvalCallback(eval_samples))
 
     trainer.train()
 

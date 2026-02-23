@@ -2,11 +2,10 @@
 """Run the iterative training pipeline."""
 from transformers import HfArgumentParser
 
-from prism.iterative.iterative_training import (IterativePipelineConfig,
-                                                run_iterative_training)
-from prism.training.train import TrainConfig
+from prism.iterative import iterative_training
+from prism.training import train
 
 if __name__ == "__main__":
-    parser = HfArgumentParser((IterativePipelineConfig, TrainConfig))
+    parser = HfArgumentParser((iterative_training.IterativePipelineConfig, train.TrainConfig))
     pipeline_args, train_args = parser.parse_args_into_dataclasses()
-    run_iterative_training(pipeline_args, train_args)
+    iterative_training.run_iterative_training(pipeline_args, train_args)

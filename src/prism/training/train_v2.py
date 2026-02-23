@@ -4,11 +4,14 @@ import json
 from dataclasses import asdict, dataclass, field
 from typing import List, Dict, Any, Optional
 
-from prism.data.data_col import DataCollatorForGraphAugmentedLLM, remove_edge_list
-from prism.eval.callbacks import EvalCallback
-from prism.eval.run_eval import EvalSample
-from prism.models.gnn_llm import GraphAugmentedLLM
-from prism.models.r_pearl import RandomGNNPositionalEncodings
+from dotenv import load_dotenv
+load_dotenv()
+
+from prism.data import data_col
+from prism.eval import callbacks
+from prism.eval import run_eval
+from prism.models import gnn_llm
+from prism.models import r_pearl
 
 # Env first (so W&B picks these up as soon as possible)
 os.environ.setdefault("WANDB_PROJECT", "SLM-distill")
@@ -162,7 +165,7 @@ class TrainConfig:
     checkpoint_dir: str
     data: str
     bit4: bool = False
-    eval_data: str = "../data/eval/gpt_gen_formatted.json"
+    eval_data: str = "../data/eval/eval_1_multi_step.json"
     r: int = 16
     base_model: str = "meta-llama/Llama-3.2-3B-Instruct"
     wandb_project: str = "SLM-distill"
@@ -233,7 +236,7 @@ def train_model(config: TrainConfig):
 
     if config.architecture == "rpearl_llm":
         # R-PEARL model, graph-augmented model & data collator.
-        r_pearl = RandomGNNPositionalEncodings(
+        r_pearl_model = r_pearl.RandomGNNPositionalEncodings(
             pe_hidden_channels=config.pe_hidden_channels,
             pe_num_layers=config.pe_num_layers,
             d_model=config.d_model,
@@ -242,8 +245,8 @@ def train_model(config: TrainConfig):
             k=config.k,
             use_layer_norm=config.use_layer_norm
         )
-        model = GraphAugmentedLLM(llm, r_pearl, tokenizer, pe_dim=config.d_model)
-        collator = DataCollatorForGraphAugmentedLLM(
+        model = gnn_llm.GraphAugmentedLLM(llm, r_pearl_model, tokenizer, pe_dim=config.d_model)
+        collator = data_col.DataCollatorForGraphAugmentedLLM(
             tokenizer, mlm=False, text_edge_list=config.text_edge_list
         )
 
@@ -286,7 +289,7 @@ def train_model(config: TrainConfig):
     if config.text_edge_list == "none" and config.architecture == "llm":
         def _strip_edges(example):
             example["messages"] = [
-                {**m, "content": remove_edge_list(m["content"])} if m["role"] == "user" else m
+                {**m, "content": data_col.remove_edge_list(m["content"])} if m["role"] == "user" else m
                 for m in example["messages"]
             ]
             return example
@@ -373,7 +376,7 @@ def train_model(config: TrainConfig):
         save_total_limit=3,
         # Validation
         eval_strategy="steps",
-        eval_steps=100,
+        eval_steps=15,
         do_eval=True,
     )
 
@@ -421,7 +424,7 @@ def train_model(config: TrainConfig):
     eval_samples = []
     for entry in tasks:
         eval_samples.append(
-            EvalSample(
+            run_eval.EvalSample(
                 task=entry["task"],
                 answer=entry["answer"],
                 graph=graph_data,
@@ -429,8 +432,10 @@ def train_model(config: TrainConfig):
             )
         )
 
-    # TO DO disabled while we debug the checkpoints. 
-    # trainer.add_callback(EvalCallback(eval_samples, tokenizer=tokenizer))
+    trainer.add_callback(callbacks.EvalCallback(eval_samples, tokenizer=tokenizer))
+
+    if config.architecture == "rpearl_llm":
+        trainer.add_callback(callbacks.GradientDebugCallback())
 
     # Start training
     trainer.train()

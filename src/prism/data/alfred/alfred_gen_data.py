@@ -6,7 +6,7 @@ from typing import Dict, List
 from llm_planner_alfred.hlp_planner import LLM_Planner, clean_llm_output
 from tqdm import tqdm
 
-from prism.data.utils import GPTQueryClient, aggregate
+from prism.data import utils
 
 QUERY = """
 You are a data generator for synthesizing tasks for the ALFRED simulator.
@@ -40,7 +40,7 @@ task_schema = {
 
 class AlfredDataGen:
     def __init__(self, log_dir: str):
-        self.client = GPTQueryClient()
+        self.client = utils.GPTQueryClient()
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -103,7 +103,7 @@ class AlfredDataGen:
                 planner = LLM_Planner(llm="gpt-4o", log_name=log_path)
                 prompt = planner.generate_prompt(input_data, k=k)
                 out = planner.call_llm(prompt=prompt)
-        aggregate(
+        utils.aggregate(
             self.log_dir,
             glob_str="sample*json",
             out_file=str(self.log_dir / "formatted.json"),

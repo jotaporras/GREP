@@ -23,10 +23,10 @@ def standardize_sharegpt(dataset, num_proc=1):
         return example
     return dataset.map(_convert, num_proc=num_proc)
 
-from prism.data.data_gen import DataGenerator
-from prism.iterative.utils import spine_data_to_prompt
-from prism.training.train import TrainConfig, train_model
-from prism.training.utils import TurnAwareCollator, get_formatting_prompts_func
+from prism.data import data_gen
+from prism.iterative import utils
+from prism.training import train
+from prism.training import utils as training_utils
 
 
 @dataclass
@@ -64,7 +64,7 @@ class IterativeTrainingPipeline:
     def __init__(
         self,
         pipeline_config: IterativePipelineConfig,
-        train_config: TrainConfig,
+        train_config: train.TrainConfig,
     ):
         """
         Initialize the iterative training pipeline.
@@ -90,7 +90,7 @@ class IterativeTrainingPipeline:
 
     def _get_data_gen_prompt_from_example(self, example: str) -> str:
         if self.pipeline_config.data_format == "spine":
-            return spine_data_to_prompt(example)
+            return utils.spine_data_to_prompt(example)
         else:
             raise ValueError(f"{self.pipeline_config.data_format} is not supported")
 
@@ -145,7 +145,7 @@ class IterativeTrainingPipeline:
             episode_config.data = str(dataset_path)
 
         # Train the model
-        trainer = train_model(episode_config)
+        trainer = train.train_model(episode_config)
 
         # Return path to the trained model
         return trainer
@@ -186,7 +186,7 @@ class IterativeTrainingPipeline:
         # Vary graph unknowns (percentage of nodes removed) for difficulty
         graph_unknown = self.pipeline_config.graph_unknown
 
-        data_generator = DataGenerator(
+        data_generator = data_gen.DataGenerator(
             graph_unknown=graph_unknown,
             n_region_list=n_regions_list,
             n_objects_list=n_objects_list,
@@ -321,7 +321,7 @@ class IterativeTrainingPipeline:
 
         # Get the correct dataloader
         if split == "train":
-            collator = TurnAwareCollator(
+            collator = training_utils.TurnAwareCollator(
                 tokenizer=trainer.tokenizer, padding="longest", include_turns=False
             )
             dataloader = DataLoader(
@@ -401,7 +401,7 @@ class IterativeTrainingPipeline:
         tokenizer = trainer.tokenizer
 
         # Function to format examples as in train.py
-        formatting_prompts_func = get_formatting_prompts_func(tokenizer)
+        formatting_prompts_func = training_utils.get_formatting_prompts_func(tokenizer)
 
         # Load dataset if provided, otherwise use trainer's datasets
         if data_path:
@@ -546,7 +546,7 @@ class IterativeTrainingPipeline:
 
 
 def run_iterative_training(
-    pipeline_config: IterativePipelineConfig, train_config: TrainConfig
+    pipeline_config: IterativePipelineConfig, train_config: train.TrainConfig
 ):
     pipeline = IterativeTrainingPipeline(
         pipeline_config=pipeline_config,
@@ -557,7 +557,7 @@ def run_iterative_training(
 
 def main():
     # Use HuggingFace's ArgumentParser to parse both configs
-    parser = HfArgumentParser((IterativePipelineConfig, TrainConfig))
+    parser = HfArgumentParser((IterativePipelineConfig, train.TrainConfig))
     pipeline_args, train_args = parser.parse_args_into_dataclasses()
 
     # Initialize pipeline
@@ -567,7 +567,7 @@ def main():
     )
     # Run pipeline
     pipeline.run_pipeline()
-    # train_model(train_args)
+    # train.train_model(train_args)
 
 
 if __name__ == "__main__":

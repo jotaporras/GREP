@@ -6,10 +6,10 @@ from typing import Dict, List, Tuple
 from spine.mapping.graph_util import GraphHandler
 from spine.spine import SPINE
 
-from prism.data.graph_sim import GraphSim
-from prism.data.planning_sim import PlanningSim
-from prism.models.inference import GraphAugmentedInMemoryLLM
-from prism.models.loaders import from_pretrained
+from prism.data import graph_sim
+from prism.data import planning_sim
+from prism.models import inference
+from prism.models import loaders
 
 # Modified to accept either a file path or a graph data dictionary
 EvalSample = namedtuple("EvalSample", ["task", "answer", "graph", "init_node"])
@@ -49,7 +49,8 @@ def eval_answer(parsed_answer: Dict[str, str], answer_key: str):
         )
 
         return EvalResult(formatted=formatted, plan_keyword=keyphrase), parsed_answer
-    except:
+    except Exception as e:
+        print(f"[eval] eval_answer exception: {e}")
         return EvalResult(False, False), parsed_answer
 
 
@@ -57,13 +58,13 @@ def to_json(output: str) -> Tuple[str, bool]:
     try:
         s = json.loads(output)
         return s, True
-    except:
-        output, False
+    except Exception:
+        return output, False
 
 
 class Unsloth:
     def __init__(self, model_path: str, is_four_bit: bool):
-        self.model, self.tokenizer = from_pretrained(
+        self.model, self.tokenizer = loaders.from_pretrained(
             path=model_path, inference=True, load_in_4bit=is_four_bit
         )
 
@@ -117,19 +118,19 @@ def eval_model(
 
     if multi_turn:
         graph_handler = GraphHandler("")
-        graph_sim = GraphSim(graph_handler)
+        graph_sim_inst = graph_sim.GraphSim(graph_handler)
         if model is not None and tokenizer is not None:
             # When model and tokenizer present, we're using an in-memory model (eg for eval during training.)
-            client = GraphAugmentedInMemoryLLM(model=model, tokenizer=tokenizer)
-            llm_planner = SPINE(graph=graph_sim.partial_graph, client=client)
+            client = inference.GraphAugmentedInMemoryLLM(model=model, tokenizer=tokenizer)
+            llm_planner = SPINE(graph=graph_sim_inst.partial_graph, client=client)
         else:
             llm_planner = SPINE(
-                graph=graph_sim.partial_graph,
+                graph=graph_sim_inst.partial_graph,
                 llm="huggingface",
                 model_path=model_path,
             )
 
-        model = PlanningSim(debug=False)
+        model = planning_sim.PlanningSim(debug=False)
     else:
         model = Unsloth(model_path=model_path, is_four_bit=is_four_bit)
 
@@ -140,13 +141,13 @@ def eval_model(
         answer = eval_sample.answer
 
         if multi_turn:
-            graph_sim.reset(graph_as_dict=graph_path, current_location=init_node)
-            llm_planner.graph = graph_sim.partial_graph
+            graph_sim_inst.reset(graph_as_dict=graph_path, current_location=init_node)
+            llm_planner.graph = graph_sim_inst.partial_graph
 
             planner_response = model.run_planning(
                 llm_planner=llm_planner,
                 task=task,
-                graph_data_gen=graph_sim,
+                graph_data_gen=graph_sim_inst,
                 max_iterations=10,
             )
 

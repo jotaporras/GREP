@@ -6,7 +6,7 @@ import torch
 import torch_geometric.utils as pyg_utils
 from transformers.data.data_collator import DataCollatorForLanguageModeling
 
-from prism.data.utils import safe_parse_graph
+from prism.data import utils
 
 
 def remove_edge_list(decoded: str) -> str:
@@ -53,7 +53,7 @@ class DataCollatorForGraphAugmentedLLM(DataCollatorForLanguageModeling):
                 raise ValueError(f"No scene graph found in prompt: {prompt}")
 
             try:
-                nx_graph, _ = safe_parse_graph(scene_graph_dict)
+                nx_graph, _ = utils.safe_parse_graph(scene_graph_dict)
                 node_names = list(nx_graph.nodes)
                 coords = torch.tensor(
                     [nx_graph.nodes[node]["coords"] for node in node_names],
