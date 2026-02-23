@@ -6,11 +6,10 @@ PRISM is a framework to distill on-device robot planners. PRISM takes as input a
 
 ## Installation
 
-Clone this repo, install requirements, and install
+Clone this repo and install with uv:
 ```
 git clone git@github.com:KumarRobotics/PRISM.git && cd PRISM
-python -m pip install -r requirements.txt
-python -m pip install -e .
+uv sync
 ```
 
 

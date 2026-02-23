@@ -38,8 +38,7 @@ You're a research scientist, writing code like one. You care about the result of
   Ensure SPINE is importable (editable install or `PYTHONPATH`).
 
 ## Build, Test, and Development Commands
-- `python -m pip install -r requirements.txt` restores the broader CUDA-ready toolchain after the minimal set above.
-- `python -m pip install -e .` enables `prism.*` imports in scripts and notebooks.
+- `uv sync` installs all dependencies and the `prism` package in editable mode.
 - `python scripts/generate_data_spine.py --n-samples 10 --n-tasks 3 --name demo` creates SPINE training data; other generators share similar flags.
 - `python scripts/train_llama3_llora.py --name llama3_demo --data data/gpt_gen_formatted.json` launches LoRA SFT; adjust `--bit4`/`--r` as needed.
 - `python scripts/eval.py` scores checkpoints against `data/eval/` tasks; capture accuracy for review.
@@ -63,7 +62,7 @@ You're a research scientist, writing code like one. You care about the result of
 
 ## Package Management
 - NEVER install, upgrade, or remove packages without explicitly telling the user first and getting approval.
-- The full working conda env is `GREP-PRISM`. Always activate it before running Python.
+- Use `uv` to manage the environment. Run `uv sync` to install dependencies.
 
 ## Security & Configuration Tips
 - Keep API keys (OpenAI, Hugging Face, WANDB) and filesystem paths in environment variables or `.env`; never commit secrets.
