@@ -3,7 +3,7 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 from torch_geometric.data import Data
 
-from prism.models.gcn import GCN
+from prism.models import gcn
 
 
 class RandomGNNPositionalEncodings(nn.Module):
@@ -31,7 +31,7 @@ class RandomGNNPositionalEncodings(nn.Module):
     ):
         super().__init__()
         # Create a GCN that takes 1-dimensional random features
-        self.pe_gcn = GCN(
+        self.pe_gcn = gcn.GCN(
             1, pe_hidden_channels, pe_num_layers, skip_connection=True, dropout=dropout, k=k
         )
         # Add a final projection to ensure output is d_model dimensions

@@ -1,12 +1,18 @@
 # hf_sft_lora.py
 import os
+import sys
 import json
 from dataclasses import asdict, dataclass, field
 from typing import List, Dict, Any, Optional
 
-from prism.data.data_col import DataCollatorForGraphAugmentedLLM, remove_edge_list
-from prism.models.gnn_llm import GraphAugmentedLLM
-from prism.models.r_pearl import RandomGNNPositionalEncodings
+from dotenv import load_dotenv
+load_dotenv()
+
+from prism.data import data_col
+from prism.eval import callbacks
+from prism.eval import run_eval
+from prism.models import gnn_llm
+from prism.models import r_pearl
 
 # Env first (so W&B picks these up as soon as possible)
 os.environ.setdefault("WANDB_PROJECT", "SLM-distill")
@@ -134,15 +140,20 @@ def _standardize_conversations(ds: Dataset,tokenizer) -> Dataset:
 
 
 class GraphSFTTrainer(SFTTrainer):
+    def __init__(self, *args, gnn_config: dict, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.gnn_config = gnn_config
+
     def save_model(self, output_dir=None, _internal_call=False):
         output_dir = output_dir or self.args.output_dir
         os.makedirs(output_dir, exist_ok=True)
-        if self.model.llm.requires_grad_(False):  # frozen LLM path
-            torch.save({
-                'pe_model': self.model.pe_model.state_dict(),
-                'pe_proj': self.model.pe_proj.state_dict(),
-            }, os.path.join(output_dir, "gnn_weights.pt"))
-        else:
+        with open(os.path.join(output_dir, "gnn_config.json"), "w") as f:
+            json.dump(self.gnn_config, f, indent=2)
+        torch.save({
+            'pe_model': self.model.pe_model.state_dict(),
+            'pe_proj': self.model.pe_proj.state_dict(),
+        }, os.path.join(output_dir, "gnn_weights.pt"))
+        if any(p.requires_grad for p in self.model.llm.parameters()):
             super().save_model(output_dir, _internal_call)
 
 
@@ -155,7 +166,7 @@ class TrainConfig:
     checkpoint_dir: str
     data: str
     bit4: bool = False
-    eval_data: str = "../data/eval/gpt_gen_formatted.json"
+    eval_data: str = "data/eval/eval_1_multi_step.json"
     r: int = 16
     base_model: str = "meta-llama/Llama-3.2-3B-Instruct"
     wandb_project: str = "SLM-distill"
@@ -199,7 +210,7 @@ class TrainConfig:
 # ----------------------------
 # Training
 # ----------------------------
-def train_model(config: TrainConfig):
+def train_model(config: TrainConfig, config_file: str = None):
     # mirror original SAVE_NAME logic
     save_name = f"{config.name}_{config.architecture}_r{config.r}" + ("_4bit" if config.bit4 else "")
 
@@ -226,7 +237,7 @@ def train_model(config: TrainConfig):
 
     if config.architecture == "rpearl_llm":
         # R-PEARL model, graph-augmented model & data collator.
-        r_pearl = RandomGNNPositionalEncodings(
+        r_pearl_model = r_pearl.RandomGNNPositionalEncodings(
             pe_hidden_channels=config.pe_hidden_channels,
             pe_num_layers=config.pe_num_layers,
             d_model=config.d_model,
@@ -235,8 +246,8 @@ def train_model(config: TrainConfig):
             k=config.k,
             use_layer_norm=config.use_layer_norm
         )
-        model = GraphAugmentedLLM(llm, r_pearl, tokenizer, pe_dim=config.d_model)
-        collator = DataCollatorForGraphAugmentedLLM(
+        model = gnn_llm.GraphAugmentedLLM(llm, r_pearl_model, tokenizer, pe_dim=config.d_model)
+        collator = data_col.DataCollatorForGraphAugmentedLLM(
             tokenizer, mlm=False, text_edge_list=config.text_edge_list
         )
 
@@ -279,7 +290,7 @@ def train_model(config: TrainConfig):
     if config.text_edge_list == "none" and config.architecture == "llm":
         def _strip_edges(example):
             example["messages"] = [
-                {**m, "content": remove_edge_list(m["content"])} if m["role"] == "user" else m
+                {**m, "content": data_col.remove_edge_list(m["content"])} if m["role"] == "user" else m
                 for m in example["messages"]
             ]
             return example
@@ -332,6 +343,8 @@ def train_model(config: TrainConfig):
     # )
     #assert any(enc["assistant_masks"]), "Template still not producing assistant masks."
 
+    output_dir = str(os.path.join(config.checkpoint_dir, save_name))
+
     # SFT trainer configuration
     sft_args = SFTConfig(
         dataset_num_proc=1,
@@ -350,7 +363,7 @@ def train_model(config: TrainConfig):
         bf16=_bf16_supported(),
         # misc
         seed=3407,
-        output_dir=str(os.path.join("outputs", save_name)),
+        output_dir=output_dir,
         report_to=config.report_to,
         run_name=config.wandb_run_name,
         optim=optim,
@@ -358,13 +371,27 @@ def train_model(config: TrainConfig):
         # Temporarily disabled because qwen doesn't support it.
         #assistant_only_loss=True,  # train only on assistant tokens
         remove_unused_columns=False,
+        # Checkpointing
+        save_strategy="steps",
+        save_steps=100,
+        save_total_limit=3,
         # Validation
         eval_strategy="steps",
-        eval_steps=100,
+        eval_steps=15,
         do_eval=True,
     )
 
     if config.architecture == "rpearl_llm":
+        gnn_config = {
+            "base_model": config.base_model,
+            "pe_hidden_channels": config.pe_hidden_channels,
+            "pe_num_layers": config.pe_num_layers,
+            "d_model": config.d_model,
+            "num_samples": config.num_samples,
+            "dropout": config.dropout,
+            "k": config.k,
+            "use_layer_norm": config.use_layer_norm,
+        }
         trainer = GraphSFTTrainer(
             model=model,
             data_collator=collator,
@@ -373,6 +400,7 @@ def train_model(config: TrainConfig):
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             args=sft_args,
+            gnn_config=gnn_config,
         )
     else:
         trainer = SFTTrainer(
@@ -387,6 +415,31 @@ def train_model(config: TrainConfig):
     # Log all training config parameters to wandb
     if wandb.run is not None:
         wandb.config.update(asdict(config), allow_val_change=True)
+        if config_file is not None:
+            with open(config_file) as f:
+                wandb.config.update({"_config_yaml": f.read()}, allow_val_change=True)
+
+    # Load eval samples before training
+    with open(config.eval_data) as f:
+        data = json.load(f)
+        tasks = data["tasks"]
+        graph_data = data["graph"]
+
+    eval_samples = []
+    for entry in tasks[:2]:
+        eval_samples.append(
+            run_eval.EvalSample(
+                task=entry["task"],
+                answer=entry["answer"],
+                graph=graph_data,
+                init_node=entry["init_node"],
+            )
+        )
+
+    trainer.add_callback(callbacks.EvalCallback(eval_samples, tokenizer=tokenizer, eval_epoch_interval=1.0))
+
+    if config.architecture == "rpearl_llm":
+        trainer.add_callback(callbacks.GradientDebugCallback())
 
     # Start training
     trainer.train()
@@ -413,12 +466,16 @@ def train_model(config: TrainConfig):
 # ----------------------------
 if __name__ == "__main__":
     parser = HfArgumentParser(TrainConfig)
-    (cfg,) = parser.parse_args_into_dataclasses()
+    if len(sys.argv) == 2 and sys.argv[1].endswith((".yaml", ".yml")):
+        (cfg,) = parser.parse_yaml_file(sys.argv[1])
+        config_file = sys.argv[1]
+    else:
+        (cfg,) = parser.parse_args_into_dataclasses()
+        config_file = None
 
-    # Keep your W&B naming convention
     os.environ["WANDB_PROJECT"] = cfg.wandb_project
     os.environ["WANDB_RUN_GROUP"] = cfg.wandb_tag
     os.environ["WANDB_TAGS"] = cfg.wandb_tag
 
     print(cfg)
-    train_model(cfg)
+    train_model(cfg, config_file=config_file)

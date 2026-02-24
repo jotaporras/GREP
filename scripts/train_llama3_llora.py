@@ -1,5 +1,8 @@
 import os
 
+from dotenv import load_dotenv
+load_dotenv()
+
 os.environ["WANDB_PROJECT"] = "SLM-distill"
 os.environ["UNSLOTH_RETURN_LOGITS"] = "1"
 

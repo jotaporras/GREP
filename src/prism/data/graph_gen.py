@@ -5,7 +5,7 @@ from openai import OpenAI
 from openai.types.chat import ChatCompletion
 from spine.mapping.graph_util import GraphHandler
 
-from prism.data.utils import GPTQueryClient
+from prism.data import utils
 
 QUERY = """
 You are generating data for training an llm-based planner, like the SPINE paper from ravichandran et al.
@@ -89,7 +89,7 @@ Your response should be a JSON with a "description" key, the value be the descri
 
 class TaskGraphGen:
     def __init__(self):
-        self.client = GPTQueryClient()  # OpenAI()
+        self.client = utils.GPTQueryClient()  # OpenAI()
 
     def _build_prompt(self, n_regions=10, n_objects=10, n_tasks=2, prior=""):
         query = (

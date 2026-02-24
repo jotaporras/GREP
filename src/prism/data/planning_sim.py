@@ -2,7 +2,7 @@ from typing import Any, Dict
 
 from spine.spine import SPINE
 
-from prism.data.graph_sim import GraphSim
+from prism.data import graph_sim
 
 
 class PlanningSim:
@@ -10,6 +10,11 @@ class PlanningSim:
         self.debug = debug
 
     def query_planner(self, llm_input: str, planner: SPINE) -> None:
+        """Send a prompt to the SPINE planner and parse the response into a structured plan.
+
+        Returns the parsed response dict (with 'plan' as a list of (action, arg) tuples)
+        on success, or an empty dict if the planner fails after all retries.
+        """
         resp, success, logs = planner.request(llm_input)
 
         if success:
@@ -24,7 +29,7 @@ class PlanningSim:
             # pprint.PrettyPrinter().pprint(resp)
 
             plan = resp["plan"]
-            reason = resp["reasoning"]
+            reason = resp.get("reasoning", "UNDISCLOSED REASONING")
 
             if self.debug:
                 print(f"plan:")
@@ -36,8 +41,7 @@ class PlanningSim:
 
             return resp
         else:
-            print(f"failed")
-            print(resp)
+            print(f"[planning-sim] FAILED. resp={resp}, logs={logs}")
             return {}
 
     def run_planning(
@@ -45,9 +49,16 @@ class PlanningSim:
         *,
         llm_planner: SPINE,
         task: str,
-        graph_data_gen: GraphSim,
+        graph_data_gen: graph_sim.GraphSim,
         max_iterations=10,
     ) -> Dict[str, Any]:
+        """Top-level planning loop: query SPINE → execute actions → feed graph diffs back.
+
+        Iterates up to max_iterations times. Each iteration queries the planner for a plan,
+        executes the actions on the GraphSim, and feeds any discovered graph updates back
+        as the next planner input. Stops early when the planner issues an 'answer' action.
+        Returns the final planner response dict.
+        """
         done = False
         planner_input = f"task: {task}"
 

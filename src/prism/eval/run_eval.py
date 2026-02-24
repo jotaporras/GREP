@@ -6,9 +6,11 @@ from typing import Dict, List, Tuple
 from spine.mapping.graph_util import GraphHandler
 from spine.spine import SPINE
 
-from prism.data.graph_sim import GraphSim
-from prism.data.planning_sim import PlanningSim
-from prism.models.unsloth import from_pretrained
+from prism.data import graph_sim
+from prism.data import planning_sim
+from prism.models import gnn_llm
+from prism.models import inference
+from prism.models import loaders
 
 # Modified to accept either a file path or a graph data dictionary
 EvalSample = namedtuple("EvalSample", ["task", "answer", "graph", "init_node"])
@@ -33,6 +35,11 @@ def correct_keys(answer: Dict[str, str]) -> bool:
 
 
 def eval_answer(parsed_answer: Dict[str, str], answer_key: str):
+    """Check model output for correct JSON format and keyword match against expected answer.
+
+    Validates that the parsed answer has the required keys (primary_goal, relevant_graph,
+    reasoning, plan) and that the answer_key keyword appears in the plan field.
+    """
     formatted = False
     keyphrase = False
     try:
@@ -43,7 +50,8 @@ def eval_answer(parsed_answer: Dict[str, str], answer_key: str):
         )
 
         return EvalResult(formatted=formatted, plan_keyword=keyphrase), parsed_answer
-    except:
+    except Exception as e:
+        print(f"[eval] eval_answer exception: {e}")
         return EvalResult(False, False), parsed_answer
 
 
@@ -51,13 +59,13 @@ def to_json(output: str) -> Tuple[str, bool]:
     try:
         s = json.loads(output)
         return s, True
-    except:
-        output, False
+    except Exception:
+        return output, False
 
 
 class Unsloth:
     def __init__(self, model_path: str, is_four_bit: bool):
-        self.model, self.tokenizer = from_pretrained(
+        self.model, self.tokenizer = loaders.from_pretrained(
             path=model_path, inference=True, load_in_4bit=is_four_bit
         )
 
@@ -91,23 +99,51 @@ class Unsloth:
         return planner_response
 
 
+def _is_graph_augmented(model) -> bool:
+    """Check if model is a GraphAugmentedLLM, even under PEFT wrapping."""
+    if isinstance(model, gnn_llm.GraphAugmentedLLM):
+        return True
+    # PEFT wrapping: PeftModel.base_model.model is the original module
+    inner = getattr(getattr(model, 'base_model', None), 'model', None)
+    return isinstance(inner, gnn_llm.GraphAugmentedLLM)
+
+
 def eval_model(
-    *, model_path: str, is_four_bit: bool, eval_samples: List[EvalSample]
+    *,
+    model_path: str = "",
+    is_four_bit: bool = False,
+    eval_samples: List[EvalSample],
+    model=None,
+    tokenizer=None,
 ) -> float:
+    """Run evaluation on a set of samples using the planning simulation loop.
+
+    Accepts either a model_path (load from disk via HuggingFace) or an in-memory
+    model+tokenizer pair (e.g. from an active training run). Sets up GraphSim and
+    SPINE, runs PlanningSim per sample, and returns accuracy as fraction correct.
+    """
     total_correct = 0
 
     multi_turn = True
 
     if multi_turn:
         graph_handler = GraphHandler("")
-        graph_sim = GraphSim(graph_handler)
-        llm_planner = SPINE(
-            graph=graph_sim.partial_graph,
-            llm="unsloth",
-            model_path=model_path,
-        )
+        graph_sim_inst = graph_sim.GraphSim(graph_handler)
+        if model is not None and tokenizer is not None:
+            # When model and tokenizer present, we're using an in-memory model (eg for eval during training.)
+            if _is_graph_augmented(model):
+                client = inference.GraphAugmentedInMemoryLLM(model=model, tokenizer=tokenizer)
+            else:
+                client = inference.InMemoryLLM(model=model, tokenizer=tokenizer)
+            llm_planner = SPINE(graph=graph_sim_inst.partial_graph, client=client)
+        else:
+            llm_planner = SPINE(
+                graph=graph_sim_inst.partial_graph,
+                llm="huggingface",
+                model_path=model_path,
+            )
 
-        model = PlanningSim(debug=False)
+        model = planning_sim.PlanningSim(debug=False)
     else:
         model = Unsloth(model_path=model_path, is_four_bit=is_four_bit)
 
@@ -118,13 +154,13 @@ def eval_model(
         answer = eval_sample.answer
 
         if multi_turn:
-            graph_sim.reset(graph_as_dict=graph_path, current_location=init_node)
-            llm_planner.graph = graph_sim.partial_graph
+            graph_sim_inst.reset(graph_as_dict=graph_path, current_location=init_node)
+            llm_planner.graph = graph_sim_inst.partial_graph
 
             planner_response = model.run_planning(
                 llm_planner=llm_planner,
                 task=task,
-                graph_data_gen=graph_sim,
+                graph_data_gen=graph_sim_inst,
                 max_iterations=10,
             )
 

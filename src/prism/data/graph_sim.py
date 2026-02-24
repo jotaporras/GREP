@@ -8,6 +8,11 @@ from spine.spine_util import UpdatePromptFormer
 
 class GraphSim:
     def __init__(self, graph: GraphHandler):
+        """Initialize simulation from a ground-truth graph.
+
+        Deep copies the ground-truth graph to create a partial (observed) graph,
+        then strips all descriptions to simulate an agent that hasn't explored yet.
+        """
         self.graph = graph
 
         for node in self.graph.graph.nodes:
@@ -18,6 +23,12 @@ class GraphSim:
         self.init_partial_graph()
 
     def init_partial_graph(self):
+        """Strip descriptions from the partial graph and reset tracking state.
+
+        Removes all node descriptions from the partial graph (agent starts with no
+        knowledge of contents) and initializes the UpdatePromptFormer that tracks
+        what the agent has discovered since the last query.
+        """
         for node in self.partial_graph.graph.nodes:
             self.partial_graph.graph.nodes[node].pop("description", 0)
 
@@ -36,6 +47,11 @@ class GraphSim:
     def randomly_remove_nodes(
         self, *, pct: float = 0, n_nodes: float = 0, to_remove=[]
     ):
+        """Remove nodes from the partial graph to simulate unexplored areas.
+
+        Difficulty can be set by percentage of nodes (pct), exact count (n_nodes),
+        or an explicit list (to_remove). The agent's current location is never removed.
+        """
         all_nodes = list(self.partial_graph.graph.nodes)
 
         # first check if we should randomly remove
@@ -91,6 +107,13 @@ class GraphSim:
         self.have_updates = True
 
     def take_action(self, action, argument) -> bool:
+        """Execute a planner action against the ground-truth graph.
+
+        Handles explore/map (reveals neighbors and descriptions), inspect (reveals
+        object description), goto (updates agent location), and extend_map. Reveals
+        discovered information in the partial graph and records diffs in the updator.
+        Returns True if new information was added to the partial graph.
+        """
         if action == "map_region" or action == "explore_region":
             if action == "explore_region":
                 current_location = argument[0]
