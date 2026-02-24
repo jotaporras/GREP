@@ -15,3 +15,4 @@ data/*
 .env
 src/outputs/
 src/wandb/
+checkpoints

@@ -19,3 +19,4 @@ openai
 bitsandbytes
 tiktoken
 scipy
+dotenv

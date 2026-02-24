@@ -102,6 +102,10 @@ options:
 ```
 
 
+## Data fixes
+
+The training/eval data files were post-processed with `scripts/fix_training_json.py` to fix malformed JSON in 17 of 1,345 assistant responses (missing commas between key-value pairs and one unquoted string value). A backup of the original data is in `data_backup/`.
+
 ## Code style
 
 - This project uses `black`, `isort`, and `flake8` for enforcing code style. See `requirements.txt` for version numbers.

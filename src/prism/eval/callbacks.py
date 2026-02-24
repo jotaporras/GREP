@@ -6,6 +6,53 @@ from prism.eval import run_eval
 from prism.models import gnn_llm
 
 
+class EvalCallback(TrainerCallback):
+    def __init__(self, eval_samples, tokenizer=None, eval_epoch_interval: float = 1.0):
+        self.eval_samples = eval_samples
+        self.tokenizer = tokenizer
+        self.eval_epoch_interval = eval_epoch_interval
+        self._steps_per_interval: int | None = None
+        self._last_eval_step: int = -1
+        self.metrics = {}
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        steps_per_epoch = state.max_steps / args.num_train_epochs
+        self._steps_per_interval = max(1, round(steps_per_epoch * self.eval_epoch_interval))
+
+    def _run_eval(self, state, **kwargs):
+        model = kwargs.get("model")
+        if model is None:
+            print("Model not provided; skipping evaluation.")
+            return
+
+        model.eval()
+        result_correct = run_eval.eval_model(
+            model=model,
+            tokenizer=self.tokenizer,
+            eval_samples=self.eval_samples,
+        )
+        model.train()
+
+        wandb.log({"eval/accuracy": result_correct, "epoch": state.epoch})
+        self.metrics = {
+            "eval/accuracy": result_correct,
+        }
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if self._steps_per_interval is None:
+            return control
+        if (
+            state.global_step % self._steps_per_interval == 0
+            and state.global_step != self._last_eval_step
+            and state.global_step > 0
+        ):
+            self._last_eval_step = state.global_step
+            self._run_eval(state, **kwargs)
+        return control
+
+    def get_latest_metrics(self):
+        return self.metrics
+
 class GradientDebugCallback(TrainerCallback):
     """Logs per-component gradient norms, PE magnitudes, and injection counts to W&B.
 
@@ -107,70 +154,3 @@ class MetricsTrackerCallback(TrainerCallback):
         """Capture metrics during logging"""
         if logs:
             self.trainer.latest_metrics.update(logs)
-
-
-class EvalCallback(TrainerCallback):
-    def __init__(self, eval_samples, tokenizer=None):
-        self.eval_samples = eval_samples
-        self.tokenizer = tokenizer
-
-    def on_epoch_end(self, args, state, control, **kwargs):
-        if state.epoch < args.num_train_epochs:
-            return control
-
-        model = kwargs.get("model")
-        if model is None:
-            print("Model not provided; skipping evaluation.")
-            return control
-
-        model.eval()
-        result_correct = run_eval.eval_model(
-            model=model,
-            tokenizer=self.tokenizer,
-            eval_samples=self.eval_samples,
-        )
-
-        wandb.log({"eval/accuracy": result_correct, "epoch": state.epoch})
-        self.metrics = {
-            "eval/accuracy": result_correct,
-        }
-
-        return control
-
-    def get_latest_metrics(self):
-        return self.metrics
-
-
-"""'
-class EvalCallback(TrainerCallback):
-    def __init__(self, eval_samples):
-        self.eval_samples = eval_samples
-
-    def on_epoch_end(self, args, state, control, **kwargs):
-        model = kwargs.get("model")
-        if model is None:
-            print("Model not provided; skipping evaluation.")
-            return control
-
-        # Save current model state to a temporary directory
-        import tempfile
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            model.save_pretrained(tmp_dir)
-
-            # Run evaluation
-            result_correct = eval_model(
-                model_path=tmp_dir,
-                is_four_bit=False,  # Use same settings as training
-                eval_samples=self.eval_samples
-            )
-
-            # Log to wandb
-            wandb.log({
-                "eval/accuracy": result_correct,
-                "epoch": state.epoch
-            })
-            if result_correct > 0.9:
-                model.save_pretrained("lora_gpt_r8")
-
-        return control
-"""

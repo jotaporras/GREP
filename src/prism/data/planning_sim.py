@@ -29,7 +29,7 @@ class PlanningSim:
             # pprint.PrettyPrinter().pprint(resp)
 
             plan = resp["plan"]
-            reason = resp["reasoning"]
+            reason = resp.get("reasoning", "UNDISCLOSED REASONING")
 
             if self.debug:
                 print(f"plan:")

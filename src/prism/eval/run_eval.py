@@ -8,6 +8,7 @@ from spine.spine import SPINE
 
 from prism.data import graph_sim
 from prism.data import planning_sim
+from prism.models import gnn_llm
 from prism.models import inference
 from prism.models import loaders
 
@@ -98,6 +99,15 @@ class Unsloth:
         return planner_response
 
 
+def _is_graph_augmented(model) -> bool:
+    """Check if model is a GraphAugmentedLLM, even under PEFT wrapping."""
+    if isinstance(model, gnn_llm.GraphAugmentedLLM):
+        return True
+    # PEFT wrapping: PeftModel.base_model.model is the original module
+    inner = getattr(getattr(model, 'base_model', None), 'model', None)
+    return isinstance(inner, gnn_llm.GraphAugmentedLLM)
+
+
 def eval_model(
     *,
     model_path: str = "",
@@ -121,7 +131,10 @@ def eval_model(
         graph_sim_inst = graph_sim.GraphSim(graph_handler)
         if model is not None and tokenizer is not None:
             # When model and tokenizer present, we're using an in-memory model (eg for eval during training.)
-            client = inference.GraphAugmentedInMemoryLLM(model=model, tokenizer=tokenizer)
+            if _is_graph_augmented(model):
+                client = inference.GraphAugmentedInMemoryLLM(model=model, tokenizer=tokenizer)
+            else:
+                client = inference.InMemoryLLM(model=model, tokenizer=tokenizer)
             llm_planner = SPINE(graph=graph_sim_inst.partial_graph, client=client)
         else:
             llm_planner = SPINE(

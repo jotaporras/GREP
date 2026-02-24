@@ -94,14 +94,26 @@ if wandb_kwargs:
       wandb.init(**wandb_kwargs)
 ```
 
-These are examples of defensive programming. We do not like it. Always assume that 
-the the right code execution path will be taken. The only exception is if the user specifically requests a specific check.
+These are examples of defensive programming. We do not like it. Always assume that
+the right code execution path will be taken. The only exception is if the user specifically requests a specific check.
+
+This also includes **`if x is not None`** guards and fallback branches. For example, do NOT write:
+```python
+if EVAL_TOKEN_ACC is not None:
+    # ... do the real work ...
+else:
+    print("Column not found, here are the available columns:")
+```
+If a variable is expected to have a value, use it directly. Let it fail loudly if the assumption is wrong.
 
 ## AVOID SILENT ERRORS.
 
 NEVER CODE for avoiding runtime exceptions on unexpected paths. If an experiment runs into an unexpected branch and doesn't fail, that's not good coding, it's sabotaging our experiments. We want to know when something goes wrong, not avoid it. Neural network development is very sensitive to silent errors and small changes, and we want to always be aware about it.
 
 Never use `try/finally` blocks unless the user explicitly requests one. Write straight-line code instead.
+
+## Data Modifications
+- The training/eval JSON files (`data/gen/spine_exp1/formatted.json`, `data/gpt_gen_formatted.json`, `data/eval/gpt_gen_formatted.json`) were post-processed with `scripts/fix_training_json.py` to fix malformed JSON in 17 assistant responses (missing commas between key-value pairs and one unquoted string value).
 
 ## Cursor Rules
 

@@ -1,5 +1,6 @@
 # hf_sft_lora.py
 import os
+import sys
 import json
 from dataclasses import asdict, dataclass, field
 from typing import List, Dict, Any, Optional
@@ -165,7 +166,7 @@ class TrainConfig:
     checkpoint_dir: str
     data: str
     bit4: bool = False
-    eval_data: str = "../data/eval/eval_1_multi_step.json"
+    eval_data: str = "data/eval/eval_1_multi_step.json"
     r: int = 16
     base_model: str = "meta-llama/Llama-3.2-3B-Instruct"
     wandb_project: str = "SLM-distill"
@@ -209,7 +210,7 @@ class TrainConfig:
 # ----------------------------
 # Training
 # ----------------------------
-def train_model(config: TrainConfig):
+def train_model(config: TrainConfig, config_file: str = None):
     # mirror original SAVE_NAME logic
     save_name = f"{config.name}_{config.architecture}_r{config.r}" + ("_4bit" if config.bit4 else "")
 
@@ -414,6 +415,9 @@ def train_model(config: TrainConfig):
     # Log all training config parameters to wandb
     if wandb.run is not None:
         wandb.config.update(asdict(config), allow_val_change=True)
+        if config_file is not None:
+            with open(config_file) as f:
+                wandb.config.update({"_config_yaml": f.read()}, allow_val_change=True)
 
     # Load eval samples before training
     with open(config.eval_data) as f:
@@ -422,7 +426,7 @@ def train_model(config: TrainConfig):
         graph_data = data["graph"]
 
     eval_samples = []
-    for entry in tasks:
+    for entry in tasks[:2]:
         eval_samples.append(
             run_eval.EvalSample(
                 task=entry["task"],
@@ -432,7 +436,7 @@ def train_model(config: TrainConfig):
             )
         )
 
-    trainer.add_callback(callbacks.EvalCallback(eval_samples, tokenizer=tokenizer))
+    trainer.add_callback(callbacks.EvalCallback(eval_samples, tokenizer=tokenizer, eval_epoch_interval=1.0))
 
     if config.architecture == "rpearl_llm":
         trainer.add_callback(callbacks.GradientDebugCallback())
@@ -462,12 +466,16 @@ def train_model(config: TrainConfig):
 # ----------------------------
 if __name__ == "__main__":
     parser = HfArgumentParser(TrainConfig)
-    (cfg,) = parser.parse_args_into_dataclasses()
+    if len(sys.argv) == 2 and sys.argv[1].endswith((".yaml", ".yml")):
+        (cfg,) = parser.parse_yaml_file(sys.argv[1])
+        config_file = sys.argv[1]
+    else:
+        (cfg,) = parser.parse_args_into_dataclasses()
+        config_file = None
 
-    # Keep your W&B naming convention
     os.environ["WANDB_PROJECT"] = cfg.wandb_project
     os.environ["WANDB_RUN_GROUP"] = cfg.wandb_tag
     os.environ["WANDB_TAGS"] = cfg.wandb_tag
 
     print(cfg)
-    train_model(cfg)
+    train_model(cfg, config_file=config_file)
