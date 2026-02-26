@@ -115,8 +115,9 @@ class GraphSim:
         Returns True if new information was added to the partial graph.
         """
         if action == "map_region" or action == "explore_region":
-            if action == "explore_region":
-                current_location = argument[0]
+            # Extract just the region name; LLM may produce extra args (e.g. "bridge_1, 3")
+            if "," in argument:
+                current_location = argument.split(",")[0].strip()
             else:
                 current_location = argument
 

@@ -24,15 +24,35 @@ def _bnb_config(load_in_4bit: bool):
 def from_pretrained(
     path: str,
     load_in_4bit: bool = False,
+    base_model: str = None,
     **kwargs,
 ) -> Tuple[AutoModelForCausalLM, PreTrainedTokenizer]:
-    """Load a plain LLM checkpoint (LoRA or full fine-tune) from a local path or HuggingFace Hub."""
-    model = AutoModelForCausalLM.from_pretrained(
-        path,
-        torch_dtype="auto",
-        device_map="auto",
-        quantization_config=_bnb_config(load_in_4bit),
-    )
+    """Load a plain LLM checkpoint (LoRA or full fine-tune) from a local path or HuggingFace Hub.
+
+    For LoRA checkpoints (detected by the presence of adapter_config.json),
+    the base model is loaded first and the adapter is applied on top.  The
+    base model path is read from adapter_config.json unless ``base_model``
+    is provided explicitly.
+    """
+    adapter_cfg_path = os.path.join(path, "adapter_config.json")
+    if os.path.exists(adapter_cfg_path):
+        if base_model is None:
+            with open(adapter_cfg_path) as f:
+                base_model = json.load(f)["base_model_name_or_path"]
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model,
+            torch_dtype="auto",
+            device_map="auto",
+            quantization_config=_bnb_config(load_in_4bit),
+        )
+        model = PeftModel.from_pretrained(model, path)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            path,
+            torch_dtype="auto",
+            device_map="auto",
+            quantization_config=_bnb_config(load_in_4bit),
+        )
     tokenizer = AutoTokenizer.from_pretrained(path)
     return model, tokenizer
 

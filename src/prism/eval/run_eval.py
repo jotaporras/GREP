@@ -1,5 +1,6 @@
 import json
 import re
+import traceback as traceback_mod
 from collections import namedtuple
 from typing import Dict, List, Tuple
 
@@ -115,7 +116,7 @@ def eval_model(
     eval_samples: List[EvalSample],
     model=None,
     tokenizer=None,
-) -> float:
+) -> Tuple[float, List[Dict]]:
     """Run evaluation on a set of samples using the planning simulation loop.
 
     Accepts either a model_path (load from disk via HuggingFace) or an in-memory
@@ -123,6 +124,7 @@ def eval_model(
     SPINE, runs PlanningSim per sample, and returns accuracy as fraction correct.
     """
     total_correct = 0
+    sample_results = []
 
     multi_turn = True
 
@@ -147,42 +149,78 @@ def eval_model(
     else:
         model = Unsloth(model_path=model_path, is_four_bit=is_four_bit)
 
-    for eval_sample in eval_samples:
+    for i, eval_sample in enumerate(eval_samples):
         graph_path = eval_sample.graph
         init_node = eval_sample.init_node
         task = eval_sample.task
         answer = eval_sample.answer
 
-        if multi_turn:
-            graph_sim_inst.reset(graph_as_dict=graph_path, current_location=init_node)
-            llm_planner.graph = graph_sim_inst.partial_graph
+        planner_response = None
+        try:
+            if multi_turn:
+                graph_sim_inst.reset(graph_as_dict=graph_path, current_location=init_node)
+                llm_planner.graph = graph_sim_inst.partial_graph
 
-            planner_response = model.run_planning(
-                llm_planner=llm_planner,
-                task=task,
-                graph_data_gen=graph_sim_inst,
-                max_iterations=10,
-            )
+                planner_response = model.run_planning(
+                    llm_planner=llm_planner,
+                    task=task,
+                    graph_data_gen=graph_sim_inst,
+                    max_iterations=10,
+                )
 
-        else:
-            planner_response = model(task=task, graph_handler=graph_handler)
+            else:
+                planner_response = model(task=task, graph_handler=graph_handler)
 
-            try:
-                planner_response = json.loads(planner_response)
-            except:
-                planner_response = {"wrong": planner_response}
+                try:
+                    planner_response = json.loads(planner_response)
+                except:
+                    planner_response = {"wrong": planner_response}
 
-        result, formatted_answer = eval_answer(planner_response, answer)
+            result, formatted_answer = eval_answer(planner_response, answer)
 
-        if result.formatted:
-            print(formatted_answer)
-        else:
-            print(f"incorrect formatting\n{formatted_answer}")
+            if result.formatted:
+                print(formatted_answer)
+            else:
+                print(f"incorrect formatting\n{formatted_answer}")
 
-        print(f"correct answer: {result.plan_keyword}")
+            print(f"correct answer: {result.plan_keyword}")
+
+            sample_results.append({
+                "idx": i,
+                "task": task,
+                "answer_key": answer,
+                "response": planner_response,
+                "formatted": result.formatted,
+                "plan_keyword": result.plan_keyword,
+                "correct": result.is_correct(),
+                "error": None,
+                "traceback": None,
+            })
+
+        except Exception as e:
+            tb_str = traceback_mod.format_exc()
+            print("!" * 80)
+            print(f"[EVAL CRASH] Sample {i}/{len(eval_samples)} FAILED with unhandled exception!")
+            print(f"[EVAL CRASH] Task: {task}")
+            print(f"[EVAL CRASH] Error: {type(e).__name__}: {e}")
+            print(tb_str)
+            print("!" * 80)
+            result = EvalResult(formatted=False, plan_keyword=False)
+
+            sample_results.append({
+                "idx": i,
+                "task": task,
+                "answer_key": answer,
+                "response": None,
+                "formatted": False,
+                "plan_keyword": False,
+                "correct": False,
+                "error": f"{type(e).__name__}: {e}",
+                "traceback": tb_str,
+            })
 
         print(f"\n=====\n")
 
         total_correct += result.plan_keyword
 
-    return total_correct / len(eval_samples)
+    return total_correct / len(eval_samples), sample_results

@@ -53,6 +53,21 @@ def _fp16_supported() -> bool:
         return False
 
 
+def _model_short_name(base_model: str) -> str:
+    """Extract a short filesystem-safe slug from a HuggingFace model ID.
+
+    Examples:
+        meta-llama/Llama-3.1-8B-Instruct → llama-3.1-8b
+        Qwen/Qwen2.5-0.5B-Instruct       → qwen2.5-0.5b
+    """
+    import re
+    name = base_model.split("/")[-1]          # drop org prefix
+    name = re.sub(r"-[Ii]nstruct$", "", name) # drop -Instruct suffix
+    name = name.lower()
+    name = re.sub(r"-+", "-", name)           # collapse consecutive hyphens
+    return name
+
+
 def _ensure_pad_tokens(tokenizer, model):
     # Many chat models use EOS as PAD during training
     if tokenizer.pad_token is None:
@@ -205,6 +220,7 @@ class TrainConfig:
     freeze_llm: bool = False
     architecture: str = "rpearl_llm"  # "rpearl_llm" or "llm"
     text_edge_list: str = "present"   # "present" or "none"
+    overwrite_ok: bool = False
 
 
 # ----------------------------
@@ -212,7 +228,8 @@ class TrainConfig:
 # ----------------------------
 def train_model(config: TrainConfig, config_file: str = None):
     # mirror original SAVE_NAME logic
-    save_name = f"{config.name}_{config.architecture}_r{config.r}" + ("_4bit" if config.bit4 else "")
+    model_slug = _model_short_name(config.base_model)
+    save_name = f"{config.name}_{config.architecture}_{model_slug}_r{config.r}" + ("_4bit" if config.bit4 else "")
 
     # Quantization / dtype
     bnb_config = None
@@ -345,6 +362,13 @@ def train_model(config: TrainConfig, config_file: str = None):
 
     output_dir = str(os.path.join(config.checkpoint_dir, save_name))
 
+    if os.path.isdir(output_dir) and os.listdir(output_dir) and not config.overwrite_ok:
+        raise RuntimeError(
+            f"Checkpoint directory already exists and is non-empty: {output_dir}\n"
+            f"Set overwrite_ok: true in your config to allow overwriting, "
+            f"or delete the directory manually."
+        )
+
     # SFT trainer configuration
     sft_args = SFTConfig(
         dataset_num_proc=1,
@@ -426,7 +450,7 @@ def train_model(config: TrainConfig, config_file: str = None):
         graph_data = data["graph"]
 
     eval_samples = []
-    for entry in tasks[:2]:
+    for entry in tasks:
         eval_samples.append(
             run_eval.EvalSample(
                 task=entry["task"],
