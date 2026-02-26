@@ -46,7 +46,10 @@ class RandomGNNPositionalEncodings(nn.Module):
 
     def forward(self, data):
         # Move input data to the model's device.
-        device = next(self.parameters()).device
+        try:
+            device = next(self.parameters()).device
+        except StopIteration:
+            device = data.x.device
         data.x = data.x.to(device)
         data.edge_index = data.edge_index.to(device)
         X, edge_index = data.x, data.edge_index

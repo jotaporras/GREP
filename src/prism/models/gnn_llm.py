@@ -21,7 +21,10 @@ class GraphAugmentedLLM(nn.Module):
 
         # Place pe_model and pe_proj on the same device as the LLM so PEFT
         # wrapping (which only touches LoRA target modules) doesn't leave them on CPU.
-        device = next(llm.parameters()).device
+        try:
+            device = next(self.parameters()).device
+        except StopIteration:
+            device = llm.device
         self.pe_model = pe_model.to(device)
         self.pe_proj = nn.Sequential(
             nn.Linear(pe_dim, llm.config.hidden_size, device=device),
@@ -78,19 +81,19 @@ class GraphAugmentedLLM(nn.Module):
 
 def has_match(input_ids_b: list[int], to_match:list[int],start_pos:int):
     """ 
-        For a single sequence, check if `to_match` is present at `start_pos`
+    For a single sequence, check if `to_match` is present at `start_pos`
     """
     end_pos = min(start_pos + len(to_match),len(input_ids_b))
     return input_ids_b[start_pos:end_pos] == to_match
 
-def bucketize_prompt(input_ids_b: list, node_token_seqs : list) -> defaultdict:
+def bucketize_prompt(input_ids_b: list, node_token_seqs: list) -> defaultdict:
     """
     Helper function for associating full prompt words with their corresponding token indices.
     Uses parallel iteration through words alongside the token list.
 
     Args:
-        input_ids (torch.Tensor): List of one-hot encodings for prompt.
-        tokenizer (nn.Module): LLM tokenizer required to decode input IDs.
+        input_ids_b (torch.Tensor): List of encodings for prompt.
+        node_token_seqs (nn.Module): List of encoding sequences for nodes.
 
     Returns:
         bucket (dict): mappings for adding operation of positional encodings
