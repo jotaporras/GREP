@@ -1,0 +1,9 @@
+{
+    "python.defaultInterpreterPath": "/home/jporras/miniconda3/envs/GREP-PRISM/bin/python",
+    "python.analysis.extraPaths": [
+        "src"
+    ],
+    "python.analysis.include": [
+        "src/**"
+    ]
+}

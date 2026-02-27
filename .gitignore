@@ -6,7 +6,6 @@ scripts/outputs
 scripts/unsloth_compiled_cache
 scripts/data
 scripts/trained_models
-*json
 models/*
 outputs/*
 wandb/*
