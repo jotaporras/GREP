@@ -16,3 +16,5 @@ data/*
 src/outputs/
 src/wandb/
 checkpoints
+outputs/
+outputs_dev/

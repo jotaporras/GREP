@@ -221,15 +221,36 @@ class TrainConfig:
     architecture: str = "rpearl_llm"  # "rpearl_llm" or "llm"
     text_edge_list: str = "present"   # "present" or "none"
     overwrite_ok: bool = False
+    # Optional override for the checkpoint subdirectory name.
+    # Default (None): auto-generated as "{name}_{architecture}_{model_slug}_r{r}[_4bit]_{wandb_run_id}"
+    # Override: "{save_name}_{wandb_run_id}" — the run ID is always appended.
+    save_name: str = None
 
 
 # ----------------------------
 # Training
 # ----------------------------
 def train_model(config: TrainConfig, config_file: str = None):
-    # mirror original SAVE_NAME logic
+    os.environ["WANDB_PROJECT"] = config.wandb_project
+    os.environ["WANDB_RUN_GROUP"] = config.wandb_tag
+    os.environ["WANDB_TAGS"] = config.wandb_tag
+
+    wandb.init(
+        project=config.wandb_project,
+        name=config.wandb_run_name,
+        tags=[config.wandb_tag],
+        group=config.wandb_tag,
+    )
+    wandb_run_id = wandb.run.id
+
+    # Checkpoint subdirectory name.
+    # Format: "{name}_{architecture}_{model_slug}_r{r}[_4bit]_{wandb_run_id}"
+    # Override with --save_name to use "{save_name}_{wandb_run_id}" instead.
     model_slug = _model_short_name(config.base_model)
-    save_name = f"{config.name}_{config.architecture}_{model_slug}_r{config.r}" + ("_4bit" if config.bit4 else "")
+    if config.save_name is not None:
+        save_name = f"{config.save_name}_{wandb_run_id}"
+    else:
+        save_name = f"{config.name}_{config.architecture}_{model_slug}_r{config.r}" + ("_4bit" if config.bit4 else "") + f"_{wandb_run_id}"
 
     # Quantization / dtype
     bnb_config = None
@@ -496,10 +517,6 @@ if __name__ == "__main__":
     else:
         (cfg,) = parser.parse_args_into_dataclasses()
         config_file = None
-
-    os.environ["WANDB_PROJECT"] = cfg.wandb_project
-    os.environ["WANDB_RUN_GROUP"] = cfg.wandb_tag
-    os.environ["WANDB_TAGS"] = cfg.wandb_tag
 
     print(cfg)
     train_model(cfg, config_file=config_file)
