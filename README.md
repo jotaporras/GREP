@@ -17,10 +17,10 @@ The planner is evaluated on multi-turn SPINE planning tasks using scene graphs f
 
 ```bash
 git clone <this-repo> && cd GREP-PRISM
-conda create -n GREP-PRISM python=3.10
+conda create -n GREP-PRISM python=3.10 uv pip -c conda-forge
 conda activate GREP-PRISM
-pip install -r requirements.txt
-pip install -e .
+uv pip install -r requirements.txt
+uv pip install -e .
 ```
 
 ### SPINE dependency
@@ -32,7 +32,7 @@ git clone git@github.com:KumarRobotics/SPINE.git
 cd SPINE
 git checkout feature/prism
 git pull
-pip install -e .
+uv pip install -e .
 ```
 
 Ensure SPINE is importable before running any data generation or evaluation scripts.
