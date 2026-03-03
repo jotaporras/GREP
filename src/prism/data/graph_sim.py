@@ -106,6 +106,32 @@ class GraphSim:
         self.partial_graph.graph.add_edge(source, target, **edge_info)
         self.have_updates = True
 
+    def _reveal_region(self, current_location: str) -> None:
+        """Reveal neighbors and description of `current_location` in the partial graph."""
+        neighbors = self.graph.get_neighbors(current_location)
+
+        for n in neighbors:
+            if n not in self.partial_graph.graph.nodes:
+                self.add_new_node(current_location, n)
+
+            gt_edges = [
+                sorted(e)
+                for e in list(self.partial_graph.get_edges(current_location).keys())
+            ]
+
+            query_edge = sorted((current_location, n))
+            if query_edge not in gt_edges:
+                self.add_edges(query_edge[0], query_edge[1])
+
+        assert (
+            "description" in self.graph.graph.nodes[current_location]
+        ), f"{current_location} has no description"
+        description = self.graph.graph.nodes[current_location]["description"]
+        self.partial_graph.graph.nodes[current_location]["description"] = description
+        self.updator.update(
+            attribute_updates=[{"name": current_location, "description": description}]
+        )
+
     def take_action(self, action, argument) -> bool:
         """Execute a planner action against the ground-truth graph.
 
@@ -114,40 +140,13 @@ class GraphSim:
         discovered information in the partial graph and records diffs in the updator.
         Returns True if new information was added to the partial graph.
         """
-        if action == "map_region" or action == "explore_region":
-            # Extract just the region name; LLM may produce extra args (e.g. "bridge_1, 3")
-            if "," in argument:
-                current_location = argument.split(",")[0].strip()
-            else:
-                current_location = argument
+        if action == "map_region":
+            current_location = argument
+            self._reveal_region(current_location)
 
-            neighbors = self.graph.get_neighbors(current_location)
-
-            for n in neighbors:
-                if n not in self.partial_graph.graph.nodes:
-                    self.add_new_node(current_location, n)
-
-                gt_edges = [
-                    sorted(e)
-                    for e in list(self.partial_graph.get_edges(current_location).keys())
-                ]
-
-                query_edge = sorted((current_location, n))
-                if query_edge not in gt_edges:
-                    self.add_edges(query_edge[0], query_edge[1])
-
-            assert (
-                "description" in self.graph.graph.nodes[current_location]
-            ), f"{current_location} has no description"
-            description = self.graph.graph.nodes[current_location]["description"]
-            self.partial_graph.graph.nodes[current_location][
-                "description"
-            ] = description
-            self.updator.update(
-                attribute_updates=[
-                    {"name": current_location, "description": description}
-                ]
-            )
+        elif action == "explore_region":
+            current_location, radius = argument
+            self._reveal_region(current_location)
 
         # TODO incomplete
         elif action == "extend_map":

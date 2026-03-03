@@ -51,9 +51,10 @@ You're a research scientist, writing code like one. You care about the result of
 - Avoid defaults in Python class `__init__`, prefer defaults in argparse arguments instead.
 
 ## Testing Guidelines
-- No pytest suite yet; rely on `scripts/eval.py` plus lightweight feature-specific smoke checks.
-- Expand `data/eval/` fixtures for new scenarios and document added metrics.
-- If you add automated tests, place them under `tests/`, prefer `pytest`, and keep repro artifacts small.
+- Tests live under `tests/`; run with `conda run -n GREP-PRISM python -m pytest tests/ -v`.
+- Existing suites: `test_scene_graph_parser.py`, `test_sim.py`, `test_bucketize_prompt.py`, `test_remove_edge_list.py`.
+- `test_sim.py` covers `GraphSim.take_action` and SPINE plan parsing; uses an inline `_DummyClient` to avoid LLM calls.
+- Keep repro artifacts small; expand `data/eval/` fixtures for new eval scenarios.
 
 ## Commit & Pull Request Guidelines
 - Keep commit subjects short, Title Case (e.g., `Update README.md`), and isolate unrelated edits.

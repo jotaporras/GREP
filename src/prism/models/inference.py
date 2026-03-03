@@ -3,9 +3,9 @@ from ast import literal_eval
 from typing import List, Dict
 
 import torch
-import torch_geometric.utils as pyg_utils
 
 from prism.data import utils
+from prism.models.gnn_llm import build_injection_map
 
 
 class InMemoryLLM:
@@ -63,18 +63,7 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
                 match = re.search(r"[Ss]cene graph: ?(.*})", m.get("content", ""))
                 if match:
                     scene_graph_dict = literal_eval(match.group(1))
-                    nx_graph, _ = utils.safe_parse_graph(scene_graph_dict)
-                    node_names = list(nx_graph.nodes)
-                    coords = torch.tensor(
-                        [nx_graph.nodes[n]["coords"] for n in node_names], dtype=torch.float32
-                    )
-                    pyg_graph = pyg_utils.from_networkx(nx_graph)
-                    pyg_graph.coords = coords
-                    pyg_graph.x = torch.zeros((coords.size(0), 1), dtype=torch.float32)
-                    pyg_graph.node_names = node_names
-                    pyg_graph.node_types = [nx_graph.nodes[n]["type"] for n in node_names]
-                    pyg_graph.robot_location = scene_graph_dict.get("robot_location")
-                    return pyg_graph
+                    return utils.scene_graph_dict_to_pyg(scene_graph_dict)
         return None
 
     def _generate_tokens(self, input_ids, msg, max_new_tokens):
@@ -86,9 +75,18 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
         print(f"[spine-llm] graph_found={pyg_graph is not None}, robot_location={robot_loc}")
 
         if pyg_graph is None:
-            return super()._generate(input_ids, msg, max_new_tokens)
+            return super()._generate_tokens(input_ids, msg, max_new_tokens)
 
-        augmented_embeds = self.model._augment_embeddings(input_ids, [pyg_graph])
+        # Build injection map for the single-sequence batch.
+        node_token_seqs = [
+            self.tokenizer.encode(name, add_special_tokens=False)
+            for name in pyg_graph.node_names
+        ]
+        injection_map = build_injection_map(input_ids[0].tolist(), node_token_seqs)
+
+        augmented_embeds = self.model._augment_embeddings(
+            input_ids, [pyg_graph], [injection_map]
+        )
         return self.model.generate(
             inputs_embeds=augmented_embeds,
             max_new_tokens=max_new_tokens, use_cache=True, temperature=0.01, min_p=0.1,

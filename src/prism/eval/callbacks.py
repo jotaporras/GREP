@@ -5,7 +5,6 @@ from pathlib import Path
 from transformers.trainer_callback import TrainerCallback
 
 from prism.eval import run_eval
-from prism.models import gnn_llm
 
 
 class EvalCallback(TrainerCallback):
@@ -99,21 +98,17 @@ class GradientDebugCallback(TrainerCallback):
         # Hook 2: capture embedding norm + injection count by wrapping _augment_embeddings.
         orig_augment = model._augment_embeddings
 
-        def _wrapped_augment(input_ids, graphs):
+        def _wrapped_augment(input_ids, graphs, injection_maps):
             # Capture base embedding norm before injection.
             with torch.no_grad():
                 callback._emb_norm = model.llm.get_input_embeddings()(input_ids).norm().item()
-            # Count injections without redoing the logic: peek at buckets.
+            # Count injections directly from pre-computed injection maps.
             total = 0
-            for b in range(input_ids.shape[0]):
-                node_token_seqs = model.tokenizer.encode(
-                    graphs[b].node_names, add_special_tokens=False
-                )
-                bucket = gnn_llm.bucketize_prompt(input_ids[b, :].tolist(), node_token_seqs)
-                total += sum(len(v) for v in bucket.values())
+            for imap in injection_maps:
+                total += sum(len(spans) for spans in imap.values())
             callback._num_injections = total
             # Call the real method — no duplicated injection logic.
-            return orig_augment(input_ids, graphs)
+            return orig_augment(input_ids, graphs, injection_maps)
 
         model._augment_embeddings = _wrapped_augment
         self._hooked = True

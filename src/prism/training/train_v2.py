@@ -1,4 +1,9 @@
-# hf_sft_lora.py
+from prism.data import data_col
+from prism.eval import callbacks
+from prism.eval import run_eval
+from prism.models import gnn_llm
+from prism.models import r_pearl
+
 import os
 import sys
 import json
@@ -7,12 +12,6 @@ from typing import List, Dict, Any, Optional
 
 from dotenv import load_dotenv
 load_dotenv()
-
-from prism.data import data_col
-from prism.eval import callbacks
-from prism.eval import run_eval
-from prism.models import gnn_llm
-from prism.models import r_pearl
 
 # Env first (so W&B picks these up as soon as possible)
 os.environ.setdefault("WANDB_PROJECT", "SLM-distill")
@@ -284,8 +283,8 @@ def train_model(config: TrainConfig, config_file: str = None):
             k=config.k,
             use_layer_norm=config.use_layer_norm
         )
-        model = gnn_llm.GraphAugmentedLLM(llm, r_pearl_model, tokenizer, pe_dim=config.d_model)
-        collator = data_col.DataCollatorForGraphAugmentedLLM(
+        model = gnn_llm.GraphAugmentedLLM(llm, r_pearl_model, pe_dim=config.d_model)
+        collator = data_col.SpineDataCollator(
             tokenizer, mlm=False, text_edge_list=config.text_edge_list
         )
 

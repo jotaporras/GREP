@@ -96,7 +96,7 @@ def graph_augmented_llm_from_pretrained(
         use_layer_norm=gnn_cfg["use_layer_norm"],
     )
 
-    model = gnn_llm.GraphAugmentedLLM(llm, r_pearl_model, tokenizer, pe_dim=gnn_cfg["d_model"])
+    model = gnn_llm.GraphAugmentedLLM(llm, r_pearl_model, pe_dim=gnn_cfg["d_model"])
 
     gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
     model.pe_model.load_state_dict(gnn_weights["pe_model"])
