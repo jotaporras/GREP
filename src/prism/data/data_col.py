@@ -62,23 +62,20 @@ class DataCollatorForGraphAugmentedLLM(DataCollatorForLanguageModeling):
         sanitized_examples = []
 
         for example in features:
-            try:
-                pyg_graph, injection_map, input_ids, attention_mask = self._extract_graph(example)
-                pyg_graphs.append(pyg_graph)
-                injection_maps.append(injection_map)
+            pyg_graph, injection_map, input_ids, attention_mask = self._extract_graph(example)
+            pyg_graphs.append(pyg_graph)
+            injection_maps.append(injection_map)
 
-                example['input_ids'] = input_ids
-                example['attention_mask'] = attention_mask
+            example['input_ids'] = input_ids
+            example['attention_mask'] = attention_mask
 
-                sanitized_examples.append(
-                    {
-                        k: v
-                        for k, v in example.items()
-                        if k not in {"conversations", "scene_graph", "messages", "text"}
-                    }
-                )
-            except Exception as e:
-                print(f"Error parsing graph: {e}")
+            sanitized_examples.append(
+                {
+                    k: v
+                    for k, v in example.items()
+                    if k not in {"conversations", "scene_graph", "messages", "text"}
+                }
+            )
 
         batch = super().__call__(sanitized_examples)
         batch["graphs"] = Batch.from_data_list(pyg_graphs)
@@ -102,13 +99,18 @@ class SpineDataCollator(DataCollatorForGraphAugmentedLLM):
     def _extract_graph(self, example):
         """Parse SPINE scene graph from example and return graph + injection map."""
         pattern = r"[Ss]cene graph:"
-        prompt = self.tokenizer.decode(example['input_ids'])
 
-        if re.search(pattern=pattern, string=prompt):
-            scene_graph_text = re.findall(pattern + r" ?(.*})", prompt)[0]
+        # Use full messages text to avoid truncation issues from max_seq_length.
+        if 'messages' in example:
+            full_text = self.tokenizer.apply_chat_template(example['messages'], tokenize=False)
+        else:
+            full_text = self.tokenizer.decode(example['input_ids'])
+
+        if re.search(pattern=pattern, string=full_text):
+            scene_graph_text = re.findall(pattern + r" ?(.*})", full_text)[0]
             scene_graph_dict = literal_eval(scene_graph_text)
         else:
-            raise ValueError(f"No scene graph found in prompt: {prompt}")
+            raise ValueError(f"No scene graph found in prompt")
 
         pyg_graph = utils.scene_graph_dict_to_pyg(scene_graph_dict)
 
