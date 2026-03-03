@@ -1,0 +1,27 @@
+name: deleteme
+architecture: rpearl_llm
+wandb_project: GREP-PRISM
+wandb_run_name: deleteme_debug_eval
+wandb_tag: deleteme_debug
+checkpoint_dir: outputs/deleteme
+data: data/gen/spine_exp1/formatted.json
+base_model: Qwen/Qwen2.5-0.5B-Instruct
+bit4: false
+per_device_train_batch_size: 1
+learning_rate: 0.0002
+epochs: 1
+r: 4
+debug: true
+dataset_proportion: 0.01
+max_seq_length: 512
+text_edge_list: present
+# R-PEARL GNN params — minimal for speed
+d_model: 256
+pe_hidden_channels: 64
+pe_num_layers: 2
+num_samples: 10
+dropout: 0.0
+k: 2
+use_layer_norm: false
+freeze_llm: false
+overwrite_ok: true
