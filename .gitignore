@@ -17,3 +17,10 @@ src/wandb/
 checkpoints
 outputs/
 outputs_dev/
+
+*.bak
+SPINE/
+*.zip
+data_backup/
+*.png
+trainer_output/
