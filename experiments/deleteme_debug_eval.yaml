@@ -6,13 +6,13 @@ wandb_tag: deleteme_debug
 checkpoint_dir: outputs/deleteme
 data: data/gen/spine_exp1/formatted.json
 base_model: Qwen/Qwen2.5-0.5B-Instruct
-bit4: false
+bit4: true
 per_device_train_batch_size: 1
 learning_rate: 0.0002
-epochs: 1
+epochs: 5
 r: 4
 debug: true
-dataset_proportion: 0.01
+dataset_proportion: 0.25
 max_seq_length: 512
 text_edge_list: present
 # R-PEARL GNN params — minimal for speed
@@ -22,6 +22,6 @@ pe_num_layers: 2
 num_samples: 10
 dropout: 0.0
 k: 2
-use_layer_norm: false
+use_layer_norm: true
 freeze_llm: false
 overwrite_ok: true

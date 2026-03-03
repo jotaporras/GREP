@@ -23,15 +23,16 @@ class InMemoryLLM:
         return [{"role": "user", "content": f"task: {base_request}. scene graph {graph_as_json}"}]
 
     def _decode(self, outputs) -> str:
-        out = self.tokenizer.batch_decode(outputs)
-        return out[0].split("end_header_id|>")[-1].split("<|eot_id|>")[0]
+        return self.tokenizer.batch_decode(outputs, skip_special_tokens=True)[0].strip()
 
     def _generate_tokens(self, input_ids, msg, max_new_tokens):
         """Abstracts token generation. In the base case, it's just calling `model.generate`"""
-        return self.model.generate(
+        outputs = self.model.generate(
             input_ids=input_ids,
             max_new_tokens=max_new_tokens, use_cache=True, temperature=0.01, min_p=0.1,
         )
+        # Strip the input prefix — keep only newly generated tokens.
+        return outputs[:, input_ids.shape[-1]:]
 
     def query_llm(self, msg: List[Dict], max_new_tokens: int = 256):
         input_ids = self.tokenizer.apply_chat_template(
