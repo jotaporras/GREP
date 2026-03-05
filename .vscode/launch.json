@@ -2,14 +2,14 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "PRISM: DEV: Fast Run (1% data, no eval)",
+      "name": "PRISM: DEV: Fast Run (1% data, no wandb, ETA )",
       "type": "debugpy",
       "request": "launch",
       "module": "prism.training.train_v2",
       "cwd": "${workspaceFolder}",
       "justMyCode": false,
       "env": {
-        "WANDB_MODE": "disabled",
+        // "WANDB_MODE": "disabled",
         "UNSLOTH_RETURN_LOGITS": "1"
       },
       "args": [
@@ -25,7 +25,10 @@
         "data/gen/spine_exp1/formatted.json",
         "--base_model",
         //"meta-llama/Llama-3.2-3B-Instruct",
-        "Qwen/Qwen2.5-0.5B-Instruct",
+        //"Qwen/Qwen2.5-0.5B-Instruct",
+        "HuggingFaceTB/SmolLM2-135M-Instruct",
+        "--per_device_train_batch_size",
+        "8",
         "--bit4",
         "false",
         "--epochs",
@@ -33,11 +36,9 @@
         "--debug",
         "false",
         "--dataset_proportion",
-        "0.01",
+        "1.0",
         "--warmup_steps",
         "1",
-        "--per_device_train_batch_size",
-        "2",
         "--gradient_accumulation_steps",
         "2",
         "--learning_rate",
@@ -66,8 +67,12 @@
         "true",
         "--freeze_llm",
         "false",
-        "--report_to",
-        "none"
+        "--wandb_project",
+        "GREP-PRISM",
+        "--wandb_run_name",
+        "fast_run",
+        "--wandb_tag",
+        "deleteme_dev_qwen"
       ]
     },
     {
@@ -384,6 +389,28 @@
       ]
     },
     
+    {
+      "name": "PRISM: Evaluate Checkpoint",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/evaluate.py",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src"
+      },
+      "args": [
+        // LLM Checkpoint 
+        //"outputs/e2_rpearl_improvements/e2_llm_llama-3.1-8b_r16_4bit_1x0xqg4q",
+        // R-PEARL Checkpoint
+        "outputs/e2_rpearl_improvements/e2_rpearl_llm_llama-3.1-8b_r16_4bit_0wkv3lic",
+        "--four-bit",
+        "--eval-data",
+        "data/eval/eval_1_multi_step.json",
+        "--output",
+        "results.json"
+      ]
+    },
     {
       "name": "PRISM: Debug Eval Chain",
       "type": "debugpy",

@@ -5,6 +5,7 @@ import torch
 from torch import nn
 from transformers import PreTrainedModel
 from torch_geometric.data import Batch
+from torch.nn import functional as F
 
 class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
     """
@@ -71,6 +72,11 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
 
         for b in range(input_ids.shape[0]):
             pe = self.pe_proj(self.pe_model(graphs[b]))  # [n, hidden_size]
+            # Rescale PE to match embedding norm. pe_proj ends with LayerNorm
+            # which forces output to norm ≈ sqrt(d_model), while LLM embeddings
+            # (pre-RMSNorm) are much smaller. Without rescaling, PE overwhelms.
+            target_norm = embeddings[b].norm(dim=-1).mean().detach()
+            pe = F.normalize(pe, dim=-1) * target_norm
             for node_idx, spans in injection_maps[b].items():
                 for start, end in spans:
                     end = min(end, input_ids.shape[1])

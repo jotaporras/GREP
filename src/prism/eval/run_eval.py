@@ -2,6 +2,7 @@ import json
 import re
 import traceback as traceback_mod
 from collections import namedtuple
+from dataclasses import asdict
 from typing import Dict, List, Tuple
 
 from spine.mapping.graph_util import GraphHandler
@@ -156,17 +157,19 @@ def eval_model(
         answer = eval_sample.answer
 
         planner_response = None
+        planning_result = None
         try:
             if multi_turn:
                 graph_sim_inst.reset(graph_as_dict=graph_path, current_location=init_node)
                 llm_planner.graph = graph_sim_inst.partial_graph
 
-                planner_response = model.run_planning(
+                planning_result = model.run_planning(
                     llm_planner=llm_planner,
                     task=task,
                     graph_data_gen=graph_sim_inst,
                     max_iterations=10,
                 )
+                planner_response = planning_result.response
 
             else:
                 planner_response = model(task=task, graph_handler=graph_handler)
@@ -190,6 +193,8 @@ def eval_model(
                 "task": task,
                 "answer_key": answer,
                 "response": planner_response,
+                "interaction_trace": [asdict(s) for s in planning_result.trace] if planning_result else [],
+                "terminated_by": planning_result.terminated_by if planning_result else None,
                 "formatted": result.formatted,
                 "plan_keyword": result.plan_keyword,
                 "correct": result.is_correct(),
@@ -212,6 +217,8 @@ def eval_model(
                 "task": task,
                 "answer_key": answer,
                 "response": None,
+                "interaction_trace": [asdict(s) for s in planning_result.trace] if planning_result else [],
+                "terminated_by": planning_result.terminated_by if planning_result else "exception",
                 "formatted": False,
                 "plan_keyword": False,
                 "correct": False,

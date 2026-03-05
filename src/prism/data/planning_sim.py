@@ -1,8 +1,25 @@
-from typing import Any, Dict
+from dataclasses import dataclass, field
+from typing import Any, Dict, List
 
 from spine.spine import SPINE
 
 from prism.data import graph_sim
+
+
+@dataclass
+class PlanningStep:
+    iteration: int
+    planner_input: str
+    planner_response: Dict[str, Any]
+    actions_executed: List[tuple]
+    environment_feedback: str
+
+
+@dataclass
+class PlanningResult:
+    response: Dict[str, Any]
+    trace: List[PlanningStep]
+    terminated_by: str  # "answer" | "bad_plan" | "max_iterations"
 
 
 class PlanningSim:
@@ -51,38 +68,52 @@ class PlanningSim:
         task: str,
         graph_data_gen: graph_sim.GraphSim,
         max_iterations=10,
-    ) -> Dict[str, Any]:
+    ) -> "PlanningResult":
         """Top-level planning loop: query SPINE → execute actions → feed graph diffs back.
 
         Iterates up to max_iterations times. Each iteration queries the planner for a plan,
         executes the actions on the GraphSim, and feeds any discovered graph updates back
         as the next planner input. Stops early when the planner issues an 'answer' action.
-        Returns the final planner response dict.
+        Returns a PlanningResult with the final response and a full interaction trace.
         """
+        trace = []
         done = False
         planner_input = f"task: {task}"
+        terminated_by = "max_iterations"
+        out = {}
 
-        for _ in range(max_iterations):
+        for iteration in range(max_iterations):
             out = self.query_planner(planner_input, llm_planner)
+
+            step = PlanningStep(
+                iteration=iteration,
+                planner_input=planner_input,
+                planner_response=out,
+                actions_executed=[],
+                environment_feedback="",
+            )
 
             # if plan is badly formed just return
             if "plan" not in out:
-                return {"response": out}
+                trace.append(step)
+                terminated_by = "bad_plan"
+                return PlanningResult(response=out, trace=trace, terminated_by=terminated_by)
 
-            for step in out["plan"]:
-                function, arg = step
-
-                if function == "answer":
+            for action, arg in out["plan"]:
+                if action == "answer":
                     done = True
-
-                have_updates = graph_data_gen.take_action(function, arg)
-
+                step.actions_executed.append((action, arg))
+                have_updates = graph_data_gen.take_action(action, arg)
                 if have_updates:
                     break
 
             if done:
+                trace.append(step)
+                terminated_by = "answer"
                 break
 
             planner_input = graph_data_gen.get_updator().form_updates()
+            step.environment_feedback = planner_input
+            trace.append(step)
 
-        return out
+        return PlanningResult(response=out, trace=trace, terminated_by=terminated_by)

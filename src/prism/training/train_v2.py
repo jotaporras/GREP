@@ -13,11 +13,6 @@ from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 load_dotenv()
 
-# Env first (so W&B picks these up as soon as possible)
-os.environ.setdefault("WANDB_PROJECT", "SLM-distill")
-# Match your original env var usage
-os.environ.setdefault("UNSLOTH_RETURN_LOGITS", "1")  # harmless here
-
 import wandb
 import torch
 from datasets import Dataset, load_dataset
@@ -391,8 +386,8 @@ def train_model(config: TrainConfig, config_file: str = None):
 
     # SFT trainer configuration
     sft_args = SFTConfig(
-        dataset_num_proc=1,
-        packing=False,
+        dataset_num_proc=16,
+        packing=False, # packing combines multiple examples into a single input_id. Keep disabled to avoid graph contamination.
         max_length=config.max_seq_length,
         per_device_train_batch_size=config.per_device_train_batch_size,
         per_device_eval_batch_size=config.per_device_eval_batch_size,

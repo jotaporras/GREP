@@ -90,19 +90,35 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
             .to(input_ids.device)
         )
 
-        # Additively apply GNN positional encodings for each scene graph
+        # Inject GNN positional encodings for the real task graph (last one).
+        # NOTE: We intentionally only inject PE for the last graph to avoid
+        # cross-contamination between ICL example graphs and the real task.
+        # build_injection_map does a global token search, so if we injected
+        # for all graphs, shared node names (e.g. "shed_1", "field_11") would
+        # cause PEs from different spatial layouts to accumulate on the same
+        # token positions — a distribution shift never seen during training.
+        # TODO: To support multi-graph injection (e.g. per-graph scoped PE),
+        # we'd need per-message token boundaries so each graph's injection map
+        # is restricted to its own message's token range.
+        pyg_graph = pyg_graphs[-1]
         input_ids_list = input_ids[0].tolist()
-        for pyg_graph in pyg_graphs:
-            node_token_seqs = [
-                self.tokenizer.encode(name, add_special_tokens=False)
-                for name in pyg_graph.node_names
-            ]
-            injection_map = build_injection_map(input_ids_list, node_token_seqs)
-            pe = self.model.pe_proj(self.model.pe_model(pyg_graph))  # [n, hidden_size]
-            for node_idx, spans in injection_map.items():
-                for start, end in spans:
-                    end = min(end, input_ids.shape[1])
-                    embeddings[0, start:end] = embeddings[0, start:end] + pe[node_idx]
+        node_token_seqs = [
+            self.tokenizer.encode(name, add_special_tokens=False)
+            for name in pyg_graph.node_names
+        ]
+        injection_map = build_injection_map(input_ids_list, node_token_seqs)
+        pe = self.model.pe_proj(self.model.pe_model(pyg_graph))  # [n, hidden_size]
+
+        # Rescale PE to match embedding norm. pe_proj ends with LayerNorm which
+        # forces output to norm ≈ sqrt(d_model) ≈ 64, while LLM embeddings
+        # (pre-RMSNorm) sit at ~0.5. Without rescaling, PE overwhelms embeddings.
+        target_norm = embeddings.norm(dim=-1).mean()
+        pe = torch.nn.functional.normalize(pe, dim=-1) * target_norm
+
+        for node_idx, spans in injection_map.items():
+            for start, end in spans:
+                end = min(end, input_ids.shape[1])
+                embeddings[0, start:end] = embeddings[0, start:end] + pe[node_idx]
 
         return self.model.generate(
             inputs_embeds=embeddings,

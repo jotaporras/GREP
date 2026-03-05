@@ -113,6 +113,16 @@ NEVER CODE for avoiding runtime exceptions on unexpected paths. If an experiment
 
 Never use `try/finally` blocks unless the user explicitly requests one. Write straight-line code instead.
 
+## Known Architectural Limitations
+
+### Multi-graph PE injection is not yet supported
+During inference with ICL (in-context learning) examples, SPINE prompts contain multiple scene graphs — one per ICL example plus the real task graph. Currently, `_generate_tokens` in `src/prism/models/inference.py` only injects PE for the **last** graph (the real task). This is because `build_injection_map` does a global token-sequence search across the entire prompt, and shared node names between graphs (e.g. `shed_1`, `field_11`, `example_node_1`) cause PE from different spatial layouts to contaminate each other's token positions — a distribution shift never seen during training (which always has exactly one graph per sequence).
+
+**To properly support multi-graph PE injection**, the injection pipeline needs per-message token boundaries so each graph's `build_injection_map` call is restricted to only its source message's token range. This requires:
+1. Tracking which message each parsed graph came from (`_parse_all_pyg_graphs`)
+2. Computing per-message token offsets from `apply_chat_template` (e.g. via incremental tokenization or `return_offsets_mapping`)
+3. Passing `(start_offset, end_offset)` into `build_injection_map` / `bucketize_prompt`
+
 ## Data Modifications
 - The training/eval JSON files (`data/gen/spine_exp1/formatted.json`, `data/gpt_gen_formatted.json`, `data/eval/gpt_gen_formatted.json`) were post-processed with `scripts/fix_training_json.py` to fix malformed JSON in 17 assistant responses (missing commas between key-value pairs and one unquoted string value).
 

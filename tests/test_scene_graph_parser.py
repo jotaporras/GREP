@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import pytest  # type: ignore[import-not-found]
 from datasets import Dataset
 
-sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
+#sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
 from prism.scene_graph_parser import (  # noqa: E402  pylint: disable=wrong-import-position
     _parse_scene_graph_dictionary_from_conversation,

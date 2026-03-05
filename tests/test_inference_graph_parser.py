@@ -2,14 +2,10 @@
 from __future__ import annotations
 
 import json
-import sys
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
-import pytest
 import torch
 
-sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
 from prism.models.inference import GraphAugmentedInMemoryLLM  # noqa: E402
 
@@ -157,8 +153,8 @@ TOKEN_BETA  = 20   # fake token ID for "beta_node"
 TOKEN_OTHER = 99   # unrelated token
 
 
-def test_generate_tokens_injects_pe_at_correct_positions():
-    """PE for each graph's nodes must be added only to the matching token positions."""
+def test_generate_tokens_only_injects_last_graph_pe():
+    """Only the last graph (real task) should have its PE injected."""
     H = 4  # hidden size
 
     llm = _make_llm()
@@ -199,20 +195,21 @@ def test_generate_tokens_injects_pe_at_correct_positions():
 
     embeds = captured["embeds"]  # shape [1, 4, H]
 
+    # Only graph_b (last graph) PE should be injected.
     # Position 0 (OTHER): unchanged
     assert torch.all(embeds[0, 0] == 0), "OTHER token should not be modified"
-    # Position 1 (ALPHA): should have pe_alpha added
-    assert torch.allclose(embeds[0, 1], pe_alpha[0]), \
-        f"alpha_node position: expected {pe_alpha[0]}, got {embeds[0, 1]}"
-    # Position 2 (BETA): should have pe_beta added
+    # Position 1 (ALPHA): unchanged — graph_a PE is NOT injected
+    assert torch.all(embeds[0, 1] == 0), \
+        f"alpha_node from ICL graph should NOT get PE, got {embeds[0, 1]}"
+    # Position 2 (BETA): should have pe_beta added (last graph's node)
     assert torch.allclose(embeds[0, 2], pe_beta[0]), \
         f"beta_node position: expected {pe_beta[0]}, got {embeds[0, 2]}"
     # Position 3 (OTHER): unchanged
     assert torch.all(embeds[0, 3] == 0), "trailing OTHER token should not be modified"
 
 
-def test_generate_tokens_pe_is_additive_not_overwrite():
-    """When the same node appears in two graphs, its PE contributions accumulate."""
+def test_generate_tokens_uses_only_last_graph_even_with_shared_nodes():
+    """With last-graph-only injection, PE is applied once even if multiple graphs share a node."""
     H = 4
     llm = _make_llm()
 
@@ -242,9 +239,9 @@ def test_generate_tokens_pe_is_additive_not_overwrite():
     llm._generate_tokens(input_ids, msg, max_new_tokens=16)
 
     embeds = captured["embeds"]
-    expected = pe_val[0] * 2   # applied twice additively
-    assert torch.allclose(embeds[0, 0], expected), \
-        f"Expected additive PE {expected}, got {embeds[0, 0]}"
+    # Only last graph is used → PE applied once, not twice
+    assert torch.allclose(embeds[0, 0], pe_val[0]), \
+        f"Expected single PE {pe_val[0]}, got {embeds[0, 0]}"
 
 
 def test_graph_order_matches_message_order():
