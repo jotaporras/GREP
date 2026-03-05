@@ -17,3 +17,5 @@ exclude = [
 invalid-argument-type = "ignore"
 # PyG Data uses dynamic attrs (coords, x, node_names, …) that ty can't resolve.
 unresolved-attribute = "ignore"
+# AutoTokenizer.from_pretrained returns a union; padding_side setter isn't resolved.
+# invalid-assignment = "ignore"

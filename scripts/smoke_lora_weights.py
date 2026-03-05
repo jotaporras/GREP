@@ -17,7 +17,7 @@ from prism.training.train_v2 import (
     _model_short_name,
     _standardize_conversations,
 )
-from prism.data import data_col
+from prism.data import data
 from prism.models import gnn_llm
 from prism.models import loaders
 from prism.models import r_pearl
@@ -195,7 +195,7 @@ def test_rpearl_llm():
     )
     model = gnn_llm.GraphAugmentedLLM(llm, pe_model, tokenizer, pe_dim=d_model)
 
-    collator = data_col.DataCollatorForGraphAugmentedLLM(tokenizer, mlm=False, text_edge_list="present")
+    collator = data.SpineDataCollator(tokenizer, mlm=False)
     ds = _make_dataset(tokenizer)
 
     gnn_config = {

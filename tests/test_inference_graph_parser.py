@@ -162,8 +162,9 @@ def test_generate_tokens_only_injects_last_graph_pe():
     # input_ids: [OTHER, ALPHA, BETA, OTHER]  (batch size 1)
     input_ids = torch.tensor([[TOKEN_OTHER, TOKEN_ALPHA, TOKEN_BETA, TOKEN_OTHER]])
 
-    # Base embeddings: all zeros so any addition is easy to see
-    base = torch.zeros(1, 4, H)
+    # Non-zero base embeddings so the PE normalization step (which scales by
+    # embeddings.norm) does not zero out the injected PE.
+    base = torch.full((1, 4, H), 0.1)
     llm.model.llm.get_input_embeddings.return_value = MagicMock(
         return_value=base.clone()
     )
@@ -176,7 +177,8 @@ def test_generate_tokens_only_injects_last_graph_pe():
         }[name]
     llm.tokenizer.encode.side_effect = _encode
 
-    # PE values: graph_a node gets [1,0,0,0], graph_b node gets [0,1,0,0]
+    # Unit-norm PE values so direction is preserved after normalization:
+    # graph_a node -> [1,0,0,0], graph_b node -> [0,1,0,0]
     pe_alpha = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
     pe_beta  = torch.tensor([[0.0, 1.0, 0.0, 0.0]])
     llm.model.pe_model.side_effect = lambda g: g   # pass-through
@@ -194,18 +196,18 @@ def test_generate_tokens_only_injects_last_graph_pe():
     llm._generate_tokens(input_ids, _make_two_graph_msg(), max_new_tokens=16)
 
     embeds = captured["embeds"]  # shape [1, 4, H]
+    base_row = base[0, 0]  # all rows identical: [0.1, 0.1, 0.1, 0.1]
 
     # Only graph_b (last graph) PE should be injected.
-    # Position 0 (OTHER): unchanged
-    assert torch.all(embeds[0, 0] == 0), "OTHER token should not be modified"
-    # Position 1 (ALPHA): unchanged — graph_a PE is NOT injected
-    assert torch.all(embeds[0, 1] == 0), \
+    assert torch.allclose(embeds[0, 0], base_row), "OTHER token should not be modified"
+    assert torch.allclose(embeds[0, 1], base_row), \
         f"alpha_node from ICL graph should NOT get PE, got {embeds[0, 1]}"
-    # Position 2 (BETA): should have pe_beta added (last graph's node)
-    assert torch.allclose(embeds[0, 2], pe_beta[0]), \
-        f"beta_node position: expected {pe_beta[0]}, got {embeds[0, 2]}"
-    # Position 3 (OTHER): unchanged
-    assert torch.all(embeds[0, 3] == 0), "trailing OTHER token should not be modified"
+    # Position 2 (BETA): PE added in direction of pe_beta — change must be in dim 1 only
+    delta = embeds[0, 2] - base_row
+    assert delta[1] > 0, f"Expected PE change in pe_beta direction (dim 1), got delta={delta}"
+    assert torch.allclose(delta[[0, 2, 3]], torch.zeros(3)), \
+        f"Expected zero change in non-pe_beta dims, got delta={delta}"
+    assert torch.allclose(embeds[0, 3], base_row), "trailing OTHER token should not be modified"
 
 
 def test_generate_tokens_uses_only_last_graph_even_with_shared_nodes():
@@ -215,7 +217,8 @@ def test_generate_tokens_uses_only_last_graph_even_with_shared_nodes():
 
     # One node name shared across both graphs
     input_ids = torch.tensor([[TOKEN_ALPHA]])
-    base = torch.zeros(1, 1, H)
+    # Non-zero base so the PE normalization step doesn't zero out injected PE.
+    base = torch.full((1, 1, H), 0.1)
     llm.model.llm.get_input_embeddings.return_value = MagicMock(return_value=base.clone())
 
     llm.tokenizer.encode.return_value = [TOKEN_ALPHA]
@@ -239,9 +242,12 @@ def test_generate_tokens_uses_only_last_graph_even_with_shared_nodes():
     llm._generate_tokens(input_ids, msg, max_new_tokens=16)
 
     embeds = captured["embeds"]
-    # Only last graph is used → PE applied once, not twice
-    assert torch.allclose(embeds[0, 0], pe_val[0]), \
-        f"Expected single PE {pe_val[0]}, got {embeds[0, 0]}"
+    # Only last graph is used → PE applied exactly once.
+    # Compute the expected embedding: base + normalized(pe_val) * target_norm
+    target_norm = base.norm(dim=-1).mean()
+    expected = base[0, 0] + torch.nn.functional.normalize(pe_val, dim=-1)[0] * target_norm
+    assert torch.allclose(embeds[0, 0], expected, atol=1e-5), \
+        f"Expected single PE application {expected}, got {embeds[0, 0]}"
 
 
 def test_graph_order_matches_message_order():
