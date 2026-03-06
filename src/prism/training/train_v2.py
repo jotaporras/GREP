@@ -182,12 +182,14 @@ class TrainConfig:
     per_device_train_batch_size: int = 1
     per_device_eval_batch_size: int = 1
     gradient_accumulation_steps: int = 2
+    dataloader_num_workers: int = 4
     report_to: str = "wandb"
     learning_rate: float = 2e-4
     warmup_steps: int = 5 # TODO consider warmup_steps: float= 0.03
     weight_decay: float = 0.05
     debug: bool = False
     max_seq_length: int = 2048
+    dataset_num_proc: int = 8
     dataset_proportion: float = 0.1
     # Model args.
     pe_hidden_channels: int = 256
@@ -200,6 +202,7 @@ class TrainConfig:
     freeze_llm: bool = False
     architecture: str = "rpearl_llm"  # "rpearl_llm" or "llm"
     text_edge_list: str = "present"   # "present" or "none"
+    device: int = -1                  # GPU index to pin the model to; -1 = let device_map="auto" decide
     overwrite_ok: bool = False
     # Optional override for the checkpoint subdirectory name.
     # Default (None): auto-generated as "{name}_{architecture}_{model_slug}_r{r}[_4bit]_{wandb_run_id}"
@@ -259,11 +262,12 @@ def train_model(config: TrainConfig, config_file: str = None):
         )
 
     # Model & tokenizer
+    device_map = {"": config.device} if config.device >= 0 else "auto"
     llm = AutoModelForCausalLM.from_pretrained(
         config.base_model,
         torch_dtype="auto",
         quantization_config=bnb_config,  # None if not 4-bit
-        device_map="auto",
+        device_map=device_map,
     )
     tokenizer = AutoTokenizer.from_pretrained(config.base_model, use_fast=True)
     _ensure_pad_tokens(tokenizer, llm)
@@ -349,11 +353,13 @@ def train_model(config: TrainConfig, config_file: str = None):
 
     # SFT trainer configuration
     sft_args = SFTConfig(
-        dataset_num_proc=16,
+        dataset_num_proc=config.dataset_num_proc,
+        dataloader_num_workers=config.dataloader_num_workers,
         packing=False, # packing combines multiple examples into a single input_id. Keep disabled to avoid graph contamination.
         max_length=config.max_seq_length,
         per_device_train_batch_size=config.per_device_train_batch_size,
         per_device_eval_batch_size=config.per_device_eval_batch_size,
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
         warmup_steps=config.warmup_steps,
         num_train_epochs=config.epochs,
         learning_rate=config.learning_rate,

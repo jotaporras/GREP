@@ -10,7 +10,8 @@
       "justMyCode": false,
       "env": {
         // "WANDB_MODE": "disabled",
-        "UNSLOTH_RETURN_LOGITS": "1"
+        "UNSLOTH_RETURN_LOGITS": "1",
+        "CUDA_VISIBLE_DEVICES": "1"
       },
       "args": [
         "--name",
@@ -24,13 +25,15 @@
         "--data",
         "data/gen/spine_exp1/formatted.json",
         "--base_model",
-        //"meta-llama/Llama-3.2-3B-Instruct",
+        // "meta-llama/Llama-3.2-3B-Instruct",
+        "meta-llama/Llama-3.1-8B-Instruct",
         //"Qwen/Qwen2.5-0.5B-Instruct",
-        "HuggingFaceTB/SmolLM2-135M-Instruct",
+        // "HuggingFaceTB/SmolLM2-135M-Instruct",
         "--per_device_train_batch_size",
-        "8",
+        // "8",
+        "1",
         "--bit4",
-        "false",
+        "true",
         "--epochs",
         "2",
         "--debug",
@@ -72,7 +75,12 @@
         "--wandb_run_name",
         "fast_run",
         "--wandb_tag",
-        "deleteme_dev_qwen"
+        "deleteme_dev_qwen",
+        // For debugging
+        "--dataset_num_proc",
+        "1",
+        "--dataloader_num_workers",
+        "1"
       ]
     },
     {
