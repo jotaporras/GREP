@@ -1,0 +1,19 @@
+[environment]
+python-version = "3.10"
+
+[src]
+# Exclude dev notebooks, the vendored SPINE subproject, and data artifacts.
+exclude = [
+    "*.ipynb",
+    "SPINE/",
+    "data/",
+    "data_backup/",
+    "output/",
+    "trainer_output/",
+]
+
+[rules]
+# Third-party stubs / site-packages are too noisy to fix here.
+invalid-argument-type = "ignore"
+# PyG Data uses dynamic attrs (coords, x, node_names, …) that ty can't resolve.
+unresolved-attribute = "ignore"

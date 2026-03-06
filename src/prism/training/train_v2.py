@@ -1,4 +1,9 @@
-# hf_sft_lora.py
+from prism.data import data_col
+from prism.eval import callbacks
+from prism.eval import run_eval
+from prism.models import gnn_llm
+from prism.models import r_pearl
+
 import os
 import sys
 import json
@@ -7,17 +12,6 @@ from typing import List, Dict, Any, Optional
 
 from dotenv import load_dotenv
 load_dotenv()
-
-from prism.data import data_col
-from prism.eval import callbacks
-from prism.eval import run_eval
-from prism.models import gnn_llm
-from prism.models import r_pearl
-
-# Env first (so W&B picks these up as soon as possible)
-os.environ.setdefault("WANDB_PROJECT", "SLM-distill")
-# Match your original env var usage
-os.environ.setdefault("UNSLOTH_RETURN_LOGITS", "1")  # harmless here
 
 import wandb
 import torch
@@ -51,6 +45,21 @@ def _fp16_supported() -> bool:
         return torch.cuda.is_available()
     except Exception:
         return False
+
+
+def _model_short_name(base_model: str) -> str:
+    """Extract a short filesystem-safe slug from a HuggingFace model ID.
+
+    Examples:
+        meta-llama/Llama-3.1-8B-Instruct → llama-3.1-8b
+        Qwen/Qwen2.5-0.5B-Instruct       → qwen2.5-0.5b
+    """
+    import re
+    name = base_model.split("/")[-1]          # drop org prefix
+    name = re.sub(r"-[Ii]nstruct$", "", name) # drop -Instruct suffix
+    name = name.lower()
+    name = re.sub(r"-+", "-", name)           # collapse consecutive hyphens
+    return name
 
 
 def _ensure_pad_tokens(tokenizer, model):
@@ -205,14 +214,37 @@ class TrainConfig:
     freeze_llm: bool = False
     architecture: str = "rpearl_llm"  # "rpearl_llm" or "llm"
     text_edge_list: str = "present"   # "present" or "none"
+    overwrite_ok: bool = False
+    # Optional override for the checkpoint subdirectory name.
+    # Default (None): auto-generated as "{name}_{architecture}_{model_slug}_r{r}[_4bit]_{wandb_run_id}"
+    # Override: "{save_name}_{wandb_run_id}" — the run ID is always appended.
+    save_name: str = None
 
 
 # ----------------------------
 # Training
 # ----------------------------
 def train_model(config: TrainConfig, config_file: str = None):
-    # mirror original SAVE_NAME logic
-    save_name = f"{config.name}_{config.architecture}_r{config.r}" + ("_4bit" if config.bit4 else "")
+    os.environ["WANDB_PROJECT"] = config.wandb_project
+    os.environ["WANDB_RUN_GROUP"] = config.wandb_tag
+    os.environ["WANDB_TAGS"] = config.wandb_tag
+
+    wandb.init(
+        project=config.wandb_project,
+        name=config.wandb_run_name,
+        tags=[config.wandb_tag],
+        group=config.wandb_tag,
+    )
+    wandb_run_id = wandb.run.id
+
+    # Checkpoint subdirectory name.
+    # Format: "{name}_{architecture}_{model_slug}_r{r}[_4bit]_{wandb_run_id}"
+    # Override with --save_name to use "{save_name}_{wandb_run_id}" instead.
+    model_slug = _model_short_name(config.base_model)
+    if config.save_name is not None:
+        save_name = f"{config.save_name}_{wandb_run_id}"
+    else:
+        save_name = f"{config.name}_{config.architecture}_{model_slug}_r{config.r}" + ("_4bit" if config.bit4 else "") + f"_{wandb_run_id}"
 
     # Quantization / dtype
     bnb_config = None
@@ -246,8 +278,8 @@ def train_model(config: TrainConfig, config_file: str = None):
             k=config.k,
             use_layer_norm=config.use_layer_norm
         )
-        model = gnn_llm.GraphAugmentedLLM(llm, r_pearl_model, tokenizer, pe_dim=config.d_model)
-        collator = data_col.DataCollatorForGraphAugmentedLLM(
+        model = gnn_llm.GraphAugmentedLLM(llm, r_pearl_model, pe_dim=config.d_model)
+        collator = data_col.SpineDataCollator(
             tokenizer, mlm=False, text_edge_list=config.text_edge_list
         )
 
@@ -345,10 +377,17 @@ def train_model(config: TrainConfig, config_file: str = None):
 
     output_dir = str(os.path.join(config.checkpoint_dir, save_name))
 
+    if os.path.isdir(output_dir) and os.listdir(output_dir) and not config.overwrite_ok:
+        raise RuntimeError(
+            f"Checkpoint directory already exists and is non-empty: {output_dir}\n"
+            f"Set overwrite_ok: true in your config to allow overwriting, "
+            f"or delete the directory manually."
+        )
+
     # SFT trainer configuration
     sft_args = SFTConfig(
-        dataset_num_proc=1,
-        packing=False,
+        dataset_num_proc=16,
+        packing=False, # packing combines multiple examples into a single input_id. Keep disabled to avoid graph contamination.
         max_length=config.max_seq_length,
         per_device_train_batch_size=config.per_device_train_batch_size,
         per_device_eval_batch_size=config.per_device_eval_batch_size,
@@ -426,7 +465,7 @@ def train_model(config: TrainConfig, config_file: str = None):
         graph_data = data["graph"]
 
     eval_samples = []
-    for entry in tasks[:2]:
+    for entry in tasks:
         eval_samples.append(
             run_eval.EvalSample(
                 task=entry["task"],
@@ -472,10 +511,6 @@ if __name__ == "__main__":
     else:
         (cfg,) = parser.parse_args_into_dataclasses()
         config_file = None
-
-    os.environ["WANDB_PROJECT"] = cfg.wandb_project
-    os.environ["WANDB_RUN_GROUP"] = cfg.wandb_tag
-    os.environ["WANDB_TAGS"] = cfg.wandb_tag
 
     print(cfg)
     train_model(cfg, config_file=config_file)

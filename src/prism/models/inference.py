@@ -3,9 +3,9 @@ from ast import literal_eval
 from typing import List, Dict
 
 import torch
-import torch_geometric.utils as pyg_utils
 
 from prism.data import utils
+from prism.models.gnn_llm import build_injection_map
 
 
 class InMemoryLLM:
@@ -23,15 +23,16 @@ class InMemoryLLM:
         return [{"role": "user", "content": f"task: {base_request}. scene graph {graph_as_json}"}]
 
     def _decode(self, outputs) -> str:
-        out = self.tokenizer.batch_decode(outputs)
-        return out[0].split("end_header_id|>")[-1].split("<|eot_id|>")[0]
+        return self.tokenizer.batch_decode(outputs, skip_special_tokens=True)[0].strip()
 
     def _generate_tokens(self, input_ids, msg, max_new_tokens):
         """Abstracts token generation. In the base case, it's just calling `model.generate`"""
-        return self.model.generate(
+        outputs = self.model.generate(
             input_ids=input_ids,
             max_new_tokens=max_new_tokens, use_cache=True, temperature=0.01, min_p=0.1,
         )
+        # Strip the input prefix — keep only newly generated tokens.
+        return outputs[:, input_ids.shape[-1]:]
 
     def query_llm(self, msg: List[Dict], max_new_tokens: int = 256):
         input_ids = self.tokenizer.apply_chat_template(
@@ -56,40 +57,70 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
     Falls back to plain LLM generation when no graph is found in the prompt.
     """
 
-    def _parse_pyg_graph(self, msg: List[Dict]):
-        """Extract scene graph from SPINE message list and convert to PyG Data object."""
-        for m in reversed(msg):
-            if m.get("role") == "user":
-                match = re.search(r"[Ss]cene graph: ?(.*})", m.get("content", ""))
-                if match:
+    def _parse_all_pyg_graphs(self, msg: List[Dict]) -> List:
+        """Extract all scene graphs from SPINE message list and convert to PyG Data objects."""
+        graphs = []
+        for m in msg:
+            if m.get("role") != "user":
+                continue
+            for match in re.finditer(r"[Ss]cene graph: ?(.*})", m.get("content", ""), re.DOTALL):
+                try:
                     scene_graph_dict = literal_eval(match.group(1))
-                    nx_graph, _ = utils.safe_parse_graph(scene_graph_dict)
-                    node_names = list(nx_graph.nodes)
-                    coords = torch.tensor(
-                        [nx_graph.nodes[n]["coords"] for n in node_names], dtype=torch.float32
-                    )
-                    pyg_graph = pyg_utils.from_networkx(nx_graph)
-                    pyg_graph.coords = coords
-                    pyg_graph.x = torch.zeros((coords.size(0), 1), dtype=torch.float32)
-                    pyg_graph.node_names = node_names
-                    pyg_graph.node_types = [nx_graph.nodes[n]["type"] for n in node_names]
-                    pyg_graph.robot_location = scene_graph_dict.get("robot_location")
-                    return pyg_graph
-        return None
+                    graphs.append(utils.scene_graph_dict_to_pyg(scene_graph_dict))
+                except Exception:
+                    continue
+        return graphs
 
     def _generate_tokens(self, input_ids, msg, max_new_tokens):
         """
         Generate model tokens by injecting graph embeddings and calling `model.generate`.
         """
-        pyg_graph = self._parse_pyg_graph(msg)
-        robot_loc = pyg_graph.robot_location if pyg_graph is not None else None
-        print(f"[spine-llm] graph_found={pyg_graph is not None}, robot_location={robot_loc}")
+        pyg_graphs = self._parse_all_pyg_graphs(msg)
 
-        if pyg_graph is None:
-            return super()._generate(input_ids, msg, max_new_tokens)
+        robot_loc = pyg_graphs[-1].robot_location if pyg_graphs else None
+        print(f"[spine-llm] graph_found={bool(pyg_graphs)}, n_graphs={len(pyg_graphs)}, robot_location={robot_loc}")
 
-        augmented_embeds = self.model._augment_embeddings(input_ids, [pyg_graph])
+        if not pyg_graphs:
+            return super()._generate_tokens(input_ids, msg, max_new_tokens)
+
+        # Compute base embeddings once
+        embeddings = (
+            self.model.llm.get_input_embeddings()(input_ids)
+            .clone()
+            .to(input_ids.device)
+        )
+
+        # Inject GNN positional encodings for the real task graph (last one).
+        # NOTE: We intentionally only inject PE for the last graph to avoid
+        # cross-contamination between ICL example graphs and the real task.
+        # build_injection_map does a global token search, so if we injected
+        # for all graphs, shared node names (e.g. "shed_1", "field_11") would
+        # cause PEs from different spatial layouts to accumulate on the same
+        # token positions — a distribution shift never seen during training.
+        # TODO: To support multi-graph injection (e.g. per-graph scoped PE),
+        # we'd need per-message token boundaries so each graph's injection map
+        # is restricted to its own message's token range.
+        pyg_graph = pyg_graphs[-1]
+        input_ids_list = input_ids[0].tolist()
+        node_token_seqs = [
+            self.tokenizer.encode(name, add_special_tokens=False)
+            for name in pyg_graph.node_names
+        ]
+        injection_map = build_injection_map(input_ids_list, node_token_seqs)
+        pe = self.model.pe_proj(self.model.pe_model(pyg_graph))  # [n, hidden_size]
+
+        # Rescale PE to match embedding norm. pe_proj ends with LayerNorm which
+        # forces output to norm ≈ sqrt(d_model) ≈ 64, while LLM embeddings
+        # (pre-RMSNorm) sit at ~0.5. Without rescaling, PE overwhelms embeddings.
+        target_norm = embeddings.norm(dim=-1).mean()
+        pe = torch.nn.functional.normalize(pe, dim=-1) * target_norm
+
+        for node_idx, spans in injection_map.items():
+            for start, end in spans:
+                end = min(end, input_ids.shape[1])
+                embeddings[0, start:end] = embeddings[0, start:end] + pe[node_idx]
+
         return self.model.generate(
-            inputs_embeds=augmented_embeds,
+            inputs_embeds=embeddings,
             max_new_tokens=max_new_tokens, use_cache=True, temperature=0.01, min_p=0.1,
         )

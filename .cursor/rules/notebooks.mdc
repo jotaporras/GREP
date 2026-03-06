@@ -1,0 +1,25 @@
+---
+description: Notebook path conventions for this project
+globs: notebooks/**/*.ipynb
+alwaysApply: false
+---
+
+# Notebook Path Conventions
+
+Notebooks live in `notebooks/` and the kernel cwd is `notebooks/` at startup.
+
+- Use `../` prefixes for all repo-relative paths — never `os.chdir`
+- `sys.path` entries: `"../src"`, `"../SPINE/src"`
+- Data/checkpoint paths: `"../data/..."`, `"../checkpoints/..."`
+
+```python
+# ✅ CORRECT
+sys.path.insert(0, "../src")
+CKPT = "../checkpoints/my_run/my_checkpoint"
+DATA = "../data/gen/spine_exp1/formatted.json"
+
+# ❌ WRONG
+os.chdir("..")
+sys.path.insert(0, "src")
+CKPT = "checkpoints/my_run/my_checkpoint"
+```

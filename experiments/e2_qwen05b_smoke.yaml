@@ -1,0 +1,16 @@
+name: smoke
+architecture: llm
+checkpoint_dir: outputs/smoke_test
+data: data/gen/spine_exp1/formatted.json
+base_model: Qwen/Qwen2.5-0.5B-Instruct
+per_device_train_batch_size: 1
+learning_rate: 0.0002
+epochs: 2
+r: 8
+debug: true
+dataset_proportion: 0.01
+max_seq_length: 1024
+text_edge_list: present
+wandb_project: GREP-PRISM
+wandb_run_name: smoke_eval_logging
+wandb_tag: smoke

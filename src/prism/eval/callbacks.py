@@ -1,9 +1,10 @@
+import json
 import torch
 import wandb
+from pathlib import Path
 from transformers.trainer_callback import TrainerCallback
 
 from prism.eval import run_eval
-from prism.models import gnn_llm
 
 
 class EvalCallback(TrainerCallback):
@@ -18,24 +19,37 @@ class EvalCallback(TrainerCallback):
     def on_train_begin(self, args, state, control, **kwargs):
         steps_per_epoch = state.max_steps / args.num_train_epochs
         self._steps_per_interval = max(1, round(steps_per_epoch * self.eval_epoch_interval))
+        self._eval_log_dir = Path(args.output_dir) / "eval_logs"
+        self._eval_log_dir.mkdir(parents=True, exist_ok=True)
 
-    def _run_eval(self, state, **kwargs):
-        model = kwargs.get("model")
-        if model is None:
-            print("Model not provided; skipping evaluation.")
-            return
-
+    def _run_eval(self, args, state, **kwargs):
+        model = kwargs["model"]
         model.eval()
-        result_correct = run_eval.eval_model(
+        accuracy, sample_results = run_eval.eval_model(
             model=model,
             tokenizer=self.tokenizer,
-            eval_samples=self.eval_samples,
+        eval_samples=self.eval_samples,
         )
         model.train()
 
-        wandb.log({"eval/accuracy": result_correct, "epoch": state.epoch})
+        log_data = {
+            "step": state.global_step,
+            "epoch": state.epoch,
+            "accuracy": accuracy,
+            "num_samples": len(sample_results),
+            "num_correct": sum(r["correct"] for r in sample_results),
+            "samples": sample_results,
+        }
+        log_file = self._eval_log_dir / f"step_{state.global_step:06d}_epoch_{state.epoch:.3f}.json"
+        with open(log_file, "w") as f:
+            json.dump(log_data, f, indent=2, default=str)
+
+        if wandb.run is not None:
+            wandb.save(str(log_file), base_path=str(self._eval_log_dir))
+
+        wandb.log({"eval/accuracy": accuracy, "epoch": state.epoch})
         self.metrics = {
-            "eval/accuracy": result_correct,
+            "eval/accuracy": accuracy,
         }
 
     def on_step_end(self, args, state, control, **kwargs):
@@ -47,7 +61,7 @@ class EvalCallback(TrainerCallback):
             and state.global_step > 0
         ):
             self._last_eval_step = state.global_step
-            self._run_eval(state, **kwargs)
+            self._run_eval(args, state, **kwargs)
         return control
 
     def get_latest_metrics(self):
@@ -84,21 +98,17 @@ class GradientDebugCallback(TrainerCallback):
         # Hook 2: capture embedding norm + injection count by wrapping _augment_embeddings.
         orig_augment = model._augment_embeddings
 
-        def _wrapped_augment(input_ids, graphs):
+        def _wrapped_augment(input_ids, graphs, injection_maps):
             # Capture base embedding norm before injection.
             with torch.no_grad():
                 callback._emb_norm = model.llm.get_input_embeddings()(input_ids).norm().item()
-            # Count injections without redoing the logic: peek at buckets.
+            # Count injections directly from pre-computed injection maps.
             total = 0
-            for b in range(input_ids.shape[0]):
-                node_token_seqs = model.tokenizer.encode(
-                    graphs[b].node_names, add_special_tokens=False
-                )
-                bucket = gnn_llm.bucketize_prompt(input_ids[b, :].tolist(), node_token_seqs)
-                total += sum(len(v) for v in bucket.values())
+            for imap in injection_maps:
+                total += sum(len(spans) for spans in imap.values())
             callback._num_injections = total
             # Call the real method — no duplicated injection logic.
-            return orig_augment(input_ids, graphs)
+            return orig_augment(input_ids, graphs, injection_maps)
 
         model._augment_embeddings = _wrapped_augment
         self._hooked = True
@@ -110,11 +120,11 @@ class GradientDebugCallback(TrainerCallback):
         return torch.cat([g.detach().flatten() for g in grads]).norm().item()
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
-        if model is not None and hasattr(model, "pe_model"):
+        if hasattr(model, "pe_model"):
             self._install_hooks(model)
 
     def on_log(self, args, state, control, model=None, logs=None, **kwargs):
-        if model is None or not hasattr(model, "pe_model"):
+        if not hasattr(model, "pe_model"):
             return
 
         gnn_norm = self._grad_norm(model.pe_model.parameters())

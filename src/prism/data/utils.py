@@ -5,6 +5,9 @@ from typing import Dict, Optional, Tuple
 
 import networkx as nx
 import numpy as np
+import torch
+import torch_geometric.utils as pyg_utils
+from torch_geometric.data import Data
 from openai import OpenAI
 from openai.types.chat import ChatCompletion
 from scipy.spatial.transform import Rotation
@@ -88,6 +91,55 @@ def safe_parse_graph(
             G.add_edge(edge[0], edge[1], type="region", weight=dist)
 
     return G, as_str
+
+
+def scene_graph_dict_to_pyg(scene_graph_dict: dict) -> Data:
+    """Convert a scene graph dict to a PyG Data object.
+
+    Parameters
+    ----------
+    scene_graph_dict : dict
+        Scene graph with the following expected keys:
+
+        - ``"objects"`` : list of dicts, each with at minimum:
+            - ``"name"`` (str) — unique node identifier
+            - ``"coords"`` (list[float]) — 2-D or 3-D spatial coordinates
+            - any additional attributes are preserved as node features
+        - ``"regions"`` : list of dicts, same schema as ``"objects"``
+        - ``"object_connections"`` : list of 2-element lists ``[name_a, name_b]``
+          representing undirected edges between object nodes
+        - ``"region_connections"`` : list of 2-element lists ``[name_a, name_b]``
+          representing undirected edges between region nodes
+        - ``"robot_location"`` (optional) : any value indicating where the robot
+          is in the scene; stored verbatim on the returned graph
+
+    Returns
+    -------
+    Data
+        PyG Data object with attributes:
+        ``coords``, ``x``, ``edge_index``, ``node_names``, ``node_types``,
+        ``robot_location``, and ``raw_scene_graph``.
+    """
+    nx_graph, _ = safe_parse_graph(scene_graph_dict)
+    node_names = list(nx_graph.nodes)
+    coords = torch.tensor(
+        [nx_graph.nodes[n]["coords"] for n in node_names], dtype=torch.float32
+    )
+    pyg_graph = pyg_utils.from_networkx(nx_graph)
+    # Drop all networkx node/edge attributes that are not explicitly set below.
+    # from_networkx copies every attr (type, weight, …); graphs with no edges/nodes
+    # won't have the edge attrs, causing Batch.from_data_list to fail when mixing
+    # empty and non-empty graphs.
+    for attr in ("edge_type", "edge_weight", "weight", "type"):
+        if hasattr(pyg_graph, attr):
+            delattr(pyg_graph, attr)
+    pyg_graph.coords = coords
+    pyg_graph.x = torch.zeros((coords.size(0), 1), dtype=torch.float32)
+    pyg_graph.node_names = node_names
+    pyg_graph.node_types = [nx_graph.nodes[n]["type"] for n in node_names]
+    pyg_graph.robot_location = scene_graph_dict.get("robot_location")
+    pyg_graph.raw_scene_graph = scene_graph_dict
+    return pyg_graph
 
 
 def try_load_json(file):
