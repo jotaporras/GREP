@@ -19,7 +19,7 @@ import re
 import pytest
 from transformers import AutoTokenizer
 
-from prism.data.data_col import remove_edge_list
+from prism.data.data import remove_edge_list
 
 # ── fixtures ────────────────────────────────────────────────────────────
 

@@ -1,4 +1,4 @@
-from prism.data import data_col
+from prism.data import data 
 from prism.eval import callbacks
 from prism.eval import run_eval
 from prism.models import gnn_llm
@@ -8,14 +8,14 @@ import os
 import sys
 import json
 from dataclasses import asdict, dataclass, field
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, no_type_check
 
 from dotenv import load_dotenv
 load_dotenv()
 
 import wandb
 import torch
-from datasets import Dataset, load_dataset
+import datasets
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -133,20 +133,6 @@ def _sharegpt_to_messages(example: Dict[str, Any]) -> Optional[List[Dict[str, st
     return None
 
 
-def _standardize_conversations(ds: Dataset,tokenizer) -> Dataset:
-    """
-    Maps the 'conversations' column from the ShareGPT format to the Hugging Face 'messages' format,
-    then apply the chat template to train with trl.
-    """
-    if not tokenizer.apply_chat_template:
-        raise ValueError("Tokenizer does not support apply_chat_template. Make sure you're loading an Instruct version of the model.")
-    # for text-based trl.
-    #return ds.map(lambda e: apply_chat_template({"messages": e['conversations']},tokenizer=tokenizer,num_proc=1),num_proc=1,remove_columns=['conversations'])
-    # for SFT on conversations, use the following:
-    ds = ds.map(lambda e: {"messages": e['conversations']},num_proc=1,remove_columns=['conversations'])
-    ds = ds.filter(lambda e: any(m.get("role") == "assistant" for m in e["messages"]))
-    return ds
-
 
 class GraphSFTTrainer(SFTTrainer):
     def __init__(self, *args, gnn_config: dict, **kwargs):
@@ -196,12 +182,14 @@ class TrainConfig:
     per_device_train_batch_size: int = 1
     per_device_eval_batch_size: int = 1
     gradient_accumulation_steps: int = 2
+    dataloader_num_workers: int = 4
     report_to: str = "wandb"
     learning_rate: float = 2e-4
-    warmup_steps: int = 5
+    warmup_steps: int = 5 # TODO consider warmup_steps: float= 0.03
     weight_decay: float = 0.05
     debug: bool = False
     max_seq_length: int = 2048
+    dataset_num_proc: int = 8
     dataset_proportion: float = 0.1
     # Model args.
     pe_hidden_channels: int = 256
@@ -214,11 +202,28 @@ class TrainConfig:
     freeze_llm: bool = False
     architecture: str = "rpearl_llm"  # "rpearl_llm" or "llm"
     text_edge_list: str = "present"   # "present" or "none"
+    device: int = -1                  # GPU index to pin the model to; -1 = let device_map="auto" decide
     overwrite_ok: bool = False
     # Optional override for the checkpoint subdirectory name.
     # Default (None): auto-generated as "{name}_{architecture}_{model_slug}_r{r}[_4bit]_{wandb_run_id}"
     # Override: "{save_name}_{wandb_run_id}" — the run ID is always appended.
     save_name: str = None
+
+
+def _load_eval_samples(eval_data_path: str) -> list:
+    with open(eval_data_path) as f:
+        data = json.load(f)
+    tasks = data["tasks"]
+    graph_data = data["graph"]
+    return [
+        run_eval.EvalSample(
+            task=entry["task"],
+            answer=entry["answer"],
+            graph=graph_data,
+            init_node=entry["init_node"],
+        )
+        for entry in tasks
+    ]
 
 
 # ----------------------------
@@ -257,15 +262,16 @@ def train_model(config: TrainConfig, config_file: str = None):
         )
 
     # Model & tokenizer
+    device_map = {"": config.device} if config.device >= 0 else "auto"
     llm = AutoModelForCausalLM.from_pretrained(
         config.base_model,
         torch_dtype="auto",
         quantization_config=bnb_config,  # None if not 4-bit
-        device_map="auto",
+        device_map=device_map,
     )
     tokenizer = AutoTokenizer.from_pretrained(config.base_model, use_fast=True)
     _ensure_pad_tokens(tokenizer, llm)
-    tokenizer.padding_side = "right"
+    tokenizer.padding_side = "right" # ty: ignore[invalid-assignment]
 
     if config.architecture == "rpearl_llm":
         # R-PEARL model, graph-augmented model & data collator.
@@ -279,9 +285,7 @@ def train_model(config: TrainConfig, config_file: str = None):
             use_layer_norm=config.use_layer_norm
         )
         model = gnn_llm.GraphAugmentedLLM(llm, r_pearl_model, pe_dim=config.d_model)
-        collator = data_col.SpineDataCollator(
-            tokenizer, mlm=False, text_edge_list=config.text_edge_list
-        )
+        collator = data.SpineDataCollator(tokenizer, mlm=False)
 
         # Freeze the whole llm.
         if config.freeze_llm:
@@ -296,42 +300,15 @@ def train_model(config: TrainConfig, config_file: str = None):
         raise ValueError(f"Unknown architecture: {config.architecture!r}. Choose 'rpearl_llm' or 'llm'.")
 
     # Load & optionally downsample data
-    full_dataset = load_dataset("json", data_files=[config.data], split="train")
+    full_dataset = datasets.load_dataset("json", data_files=[config.data], split="train")
     if config.debug:
         full_dataset = full_dataset.select(range(round(len(full_dataset) * config.dataset_proportion)))
 
-    # Define data maps.
-    def _add_messages(example):
-        example["messages"] = example["conversations"]
-        return example
-
-    def _tokenize_with_conversations(example):
-        tokenized = tokenizer.apply_chat_template(
-            example["messages"], tokenize=True, return_dict=True
-        )
-        tokenized["conversations"] = example["conversations"]
-        tokenized["messages"] = example["messages"]
-        return tokenized
-
-    # Configure data.
-    full_dataset = full_dataset.map(_add_messages)
-
-    # Strip edge lists from the user message text when requested.
-    # For rpearl_llm this is handled later inside the collator; for the llm
-    # baseline the collator is absent so we must do it here on the raw text.
-    if config.text_edge_list == "none" and config.architecture == "llm":
-        def _strip_edges(example):
-            example["messages"] = [
-                {**m, "content": data_col.remove_edge_list(m["content"])} if m["role"] == "user" else m
-                for m in example["messages"]
-            ]
-            return example
-        full_dataset = full_dataset.map(_strip_edges)
-
-    full_dataset = full_dataset.map(_tokenize_with_conversations)
-
-    # Convert to `messages` so TRL can auto-apply chat template
-    full_dataset = _standardize_conversations(full_dataset,tokenizer)
+    full_dataset = data.preprocess_dataset(
+        full_dataset, tokenizer,
+        architecture=config.architecture,
+        text_edge_list=config.text_edge_list,
+    )
 
     # Train/val split
     if config.val_frac and config.val_frac > 0.0:
@@ -365,16 +342,6 @@ def train_model(config: TrainConfig, config_file: str = None):
     # Optimizer choice: use 8-bit AdamW when bitsandbytes is active; else fused AdamW
     optim = "adamw_bnb_8bit" if config.bit4 else "adamw_torch_fused"
 
-    # probe = [
-    #     {"role":"system","content":"You are helpful."},
-    #     {"role":"user","content":"Say hi."},
-    #     {"role":"assistant","content":"Hello!"},
-    # ]   
-    # enc = tokenizer.apply_chat_template(
-    #     probe, tokenize=True, return_assistant_tokens_mask=True,return_dict=True
-    # )
-    #assert any(enc["assistant_masks"]), "Template still not producing assistant masks."
-
     output_dir = str(os.path.join(config.checkpoint_dir, save_name))
 
     if os.path.isdir(output_dir) and os.listdir(output_dir) and not config.overwrite_ok:
@@ -386,11 +353,13 @@ def train_model(config: TrainConfig, config_file: str = None):
 
     # SFT trainer configuration
     sft_args = SFTConfig(
-        dataset_num_proc=16,
+        dataset_num_proc=config.dataset_num_proc,
+        dataloader_num_workers=config.dataloader_num_workers,
         packing=False, # packing combines multiple examples into a single input_id. Keep disabled to avoid graph contamination.
         max_length=config.max_seq_length,
         per_device_train_batch_size=config.per_device_train_batch_size,
         per_device_eval_batch_size=config.per_device_eval_batch_size,
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
         warmup_steps=config.warmup_steps,
         num_train_epochs=config.epochs,
         learning_rate=config.learning_rate,
@@ -411,12 +380,11 @@ def train_model(config: TrainConfig, config_file: str = None):
         #assistant_only_loss=True,  # train only on assistant tokens
         remove_unused_columns=False,
         # Checkpointing
-        save_strategy="steps",
-        save_steps=100,
+        save_strategy="epoch",
         save_total_limit=3,
         # Validation
-        eval_strategy="steps",
-        eval_steps=15,
+        eval_strategy="epoch",
+        eval_steps=0.5,
         do_eval=True,
     )
 
@@ -458,23 +426,7 @@ def train_model(config: TrainConfig, config_file: str = None):
             with open(config_file) as f:
                 wandb.config.update({"_config_yaml": f.read()}, allow_val_change=True)
 
-    # Load eval samples before training
-    with open(config.eval_data) as f:
-        data = json.load(f)
-        tasks = data["tasks"]
-        graph_data = data["graph"]
-
-    eval_samples = []
-    for entry in tasks:
-        eval_samples.append(
-            run_eval.EvalSample(
-                task=entry["task"],
-                answer=entry["answer"],
-                graph=graph_data,
-                init_node=entry["init_node"],
-            )
-        )
-
+    eval_samples = _load_eval_samples(config.eval_data)
     trainer.add_callback(callbacks.EvalCallback(eval_samples, tokenizer=tokenizer, eval_epoch_interval=1.0))
 
     if config.architecture == "rpearl_llm":
@@ -484,18 +436,8 @@ def train_model(config: TrainConfig, config_file: str = None):
     trainer.train()
 
     # Save model artifacts
-    if config.architecture == "rpearl_llm":
-        if config.freeze_llm:
-            torch.save({
-                'pe_model': model.pe_model.state_dict(),
-                'pe_proj': model.pe_proj.state_dict(),
-            }, os.path.join(sft_args.output_dir, "gnn_weights.pt"))
-        else:
-            trainer.save_model()  # saves PEFT adapter if peft_config was used
-            tokenizer.save_pretrained(sft_args.output_dir)
-    else:
-        trainer.save_model()
-        tokenizer.save_pretrained(sft_args.output_dir)
+    trainer.save_model()
+    tokenizer.save_pretrained(sft_args.output_dir)
 
     return trainer
 
