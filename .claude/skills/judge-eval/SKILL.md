@@ -53,9 +53,12 @@ One row per task. The Notes column must be brief enough to fit on one line.
 Where:
 - **#**: sample index
 - **Task**: first ~50 chars of the task
-- **Answer Key**: the regex pattern
+- **Answer Key**: the regex pattern (use `OR` instead of `|` to avoid breaking markdown tables)
 - **Callback**: PASS or FAIL
-- **Judge**: PASS or FAIL
+- **Judge**: PASS, PASS*, or FAIL
+  - **PASS**: correct answer, no unnecessary traversals
+  - **PASS***: correct answer but with unnecessary traversal(s) — add a footnote `*correct answer but with unnecessary traversal(s)` below the table
+  - **FAIL**: wrong or missing answer
 - **Notes**: one short phrase (≤10 words) — e.g. "regex too narrow", "correct reasoning bad format", "genuine fail"
 
 ### Summary table
@@ -64,6 +67,7 @@ Where:
 |--------|----------|-------|
 | Correct | X/N | X/N |
 | Accuracy | X.X% | X.X% |
+| Correct w/ unnecessary trav | — | X/N |
 
 Do NOT add a separate disagreements section — all reasoning belongs in the Notes column of the table.
 
@@ -75,6 +79,16 @@ Do NOT add a separate disagreements section — all reasoning belongs in the Not
 - If `response` is null and `error` is set, that's a crash — mark FAIL.
 - If the interaction_trace shows the model explored correctly but the final response format was wrong, note "correct reasoning, bad format".
 - Plans using `goto()`, `explore_region()`, `inspect()`, `answer()` actions are the expected format for this environment.
+
+### Unnecessary traversal detection
+
+Review the `interaction_trace` for each sample and flag any of the following as unnecessary traversals (mark Judge as PASS*):
+- `map_region` called on a field node (e.g. `map_region(field_6)`) — field nodes return empty descriptions and yield no useful information
+- `goto` to the wrong location (e.g. navigating to a field that doesn't contain the target object)
+- `inspect` called on an irrelevant object not related to the task
+- Any action that triggers a navigation warning about repeating the same call type
+
+These are planning inefficiencies that waste interaction turns. They do not make a correct answer incorrect, but should be flagged.
 
 ## IMPORTANT RESTRICTIONS
 
