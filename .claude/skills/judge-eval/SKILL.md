@@ -39,7 +39,7 @@ For each sample:
    - Did the model identify the right target object/location?
    - Is the reasoning sound?
    - Would this plan actually work in the simulated environment?
-4. Note whether you **agree or disagree** with the callback's `correct` verdict.
+4. Compare the model's behavior against the **Acceptance Criterion** for each task (see answer sheet below).
 
 ## Output format
 
@@ -47,16 +47,18 @@ For each sample:
 
 One row per task. The Notes column must be brief enough to fit on one line.
 
-| # | Task | Answer Key | Callback | Judge | Agree? | Notes |
-|---|------|-----------|----------|-------|--------|-------|
+| # | Task | Answer Key | Callback | Judge | Notes |
+|---|------|-----------|----------|-------|-------|
 
 Where:
 - **#**: sample index
 - **Task**: first ~50 chars of the task
-- **Answer Key**: the regex pattern
+- **Answer Key**: the regex pattern (use `OR` instead of `|` to avoid breaking markdown tables)
 - **Callback**: PASS or FAIL
-- **Judge**: PASS or FAIL
-- **Agree?**: Y or N
+- **Judge**: PASS, PASS*, or FAIL
+  - **PASS**: correct answer, no unnecessary traversals
+  - **PASS***: correct answer but with unnecessary traversal(s) — add a footnote `*correct answer but with unnecessary traversal(s)` below the table
+  - **FAIL**: wrong or missing answer
 - **Notes**: one short phrase (≤10 words) — e.g. "regex too narrow", "correct reasoning bad format", "genuine fail"
 
 ### Summary table
@@ -65,7 +67,7 @@ Where:
 |--------|----------|-------|
 | Correct | X/N | X/N |
 | Accuracy | X.X% | X.X% |
-| Agreement | — | X/N (X.X%) |
+| Correct w/ unnecessary trav | — | X/N |
 
 Do NOT add a separate disagreements section — all reasoning belongs in the Notes column of the table.
 
@@ -78,6 +80,16 @@ Do NOT add a separate disagreements section — all reasoning belongs in the Not
 - If the interaction_trace shows the model explored correctly but the final response format was wrong, note "correct reasoning, bad format".
 - Plans using `goto()`, `explore_region()`, `inspect()`, `answer()` actions are the expected format for this environment.
 
+### Unnecessary traversal detection
+
+Review the `interaction_trace` for each sample and flag any of the following as unnecessary traversals (mark Judge as PASS*):
+- `map_region` called on a field node (e.g. `map_region(field_6)`) — field nodes return empty descriptions and yield no useful information
+- `goto` to the wrong location (e.g. navigating to a field that doesn't contain the target object)
+- `inspect` called on an irrelevant object not related to the task
+- Any action that triggers a navigation warning about repeating the same call type
+
+These are planning inefficiencies that waste interaction turns. They do not make a correct answer incorrect, but should be flagged.
+
 ## IMPORTANT RESTRICTIONS
 
 When using this skill, you are NOT ALLOWED to: make changes to any code or files (except writing the output if requested), or run any scripts. This is a read-only analysis task.
@@ -88,18 +100,18 @@ When using this skill, you are NOT ALLOWED to: make changes to any code or files
 
 All tasks start at `init_node: field_1` (robot start location).
 
-| # | Task | Answer regex |
-|---|------|-------------|
-| 0 | is there a boat in the scene? | `yes\|boat\|sailboat` |
-| 1 | Find me something I can drive in | `truck` |
-| 2 | I lost my keys. I last saw them when I parked my truck. | `truck` |
-| 3 | communications are down. Why? | `internet\|damaged` |
-| 4 | Is the light poles damaged? | `no\|i did not find\|not\|unable` |
-| 5 | Is the truck damaged? | `no\|i did not find\|not\|unable` |
-| 6 | Is the boat damaged? | `no` |
-| 7 | Find me a place to stay for the night? | `cabin` |
-| 8 | Where are tools likely to be? | `shed` |
-| 9 | Can I cross the bridge? | `yes\|i did not find\|not` |
+| # | Task | Answer regex | Acceptance Criterion |
+|---|------|-------------|----------------------|
+| 0 | is there a boat in the scene? | `yes\|boat\|sailboat` | The planner should call `inspect(sail_boat_1)` or `goto(field_7)` because the boat is at field_7; then answer confirming the boat exists. |
+| 1 | Find me something I can drive in | `truck` | The planner should call `inspect(pickup_truck_1)` or `goto(field_6)` because the truck is at field_6; then answer mentioning the truck. |
+| 2 | I lost my keys. I last saw them when I parked my truck. | `truck` | The planner should call `inspect(pickup_truck_1)` because the truck "has keys"; then answer directing the user to the truck. |
+| 3 | communications are down. Why? | `internet\|damaged` | The planner should call `inspect(internet_tower_2)` or `goto(field_9)` because the internet tower is damaged at field_9; then answer identifying the damaged tower. |
+| 4 | Is the light poles damaged? | `no\|i did not find\|not\|unable` | The planner should call `inspect(light_pole_1)` or `goto(field_9)` because the light pole is at field_9; then answer that it is not damaged (ground truth: no damage attribute). |
+| 5 | Is the truck damaged? | `no\|i did not find\|not\|unable` | The planner should call `inspect(pickup_truck_1)` because the truck is at field_6; then answer that no damage was found (ground truth: "has keys", no damage attribute). |
+| 6 | Is the boat damaged? | `no` | The planner should call `inspect(sail_boat_1)` because the boat is at field_7; then answer "no" (ground truth: "not damaged"). |
+| 7 | Find me a place to stay for the night? | `cabin` | The planner should call `inspect(cabin_1)` or `goto(field_6)` because cabin_1 is at field_6 (cabin_2 at field_8); then answer recommending a cabin. |
+| 8 | Where are tools likely to be? | `shed` | The planner should call `inspect(shed_1)` or `goto(field_13)` because the shed is at field_13; then answer pointing to the shed. |
+| 9 | Can I cross the bridge? | `yes\|i did not find\|not` | The planner should call `map_region(bridge_1)` or `goto(bridge_1)` because the bridge must be checked for damage; then answer that it is traversable (ground truth: "not damaged"). |
 
 ---
 

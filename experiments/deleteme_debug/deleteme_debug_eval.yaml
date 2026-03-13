@@ -9,10 +9,10 @@ base_model: Qwen/Qwen2.5-0.5B-Instruct
 bit4: true
 per_device_train_batch_size: 1
 learning_rate: 0.0002
-epochs: 5
+epochs: 3
 r: 4
 debug: true
-dataset_proportion: 0.25
+dataset_proportion: 0.4
 max_seq_length: 512
 text_edge_list: present
 # R-PEARL GNN params — minimal for speed
