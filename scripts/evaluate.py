@@ -38,6 +38,16 @@ def parse_args():
         default=None,
         help="Optional path to save per-sample JSON results.",
     )
+    parser.add_argument(
+        "--text-edge-list",
+        choices=["present", "none"],
+        default=None,
+        help=(
+            "Whether the edge list is included in the LLM text prompt. "
+            "For graph-augmented checkpoints this is read automatically from gnn_config.json; "
+            "for plain LLM checkpoints you must set this explicitly (default: present)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -64,21 +74,35 @@ def main():
     print(f"Loading checkpoint: {checkpoint}")
     if os.path.exists(gnn_config_path):
         print("Detected graph-augmented architecture (gnn_config.json found).")
+        with open(gnn_config_path) as f:
+            gnn_cfg = json.load(f)
+        # text_edge_list is written by train_v2.py; fall back to "present" for
+        # older checkpoints that predate this key.
+        text_edge_list = gnn_cfg.get("text_edge_list", "present")
+        if args.text_edge_list is not None and args.text_edge_list != text_edge_list:
+            print(
+                f"WARNING: --text-edge-list={args.text_edge_list!r} overrides "
+                f"checkpoint value {text_edge_list!r}"
+            )
+            text_edge_list = args.text_edge_list
         model, tokenizer = loaders.graph_augmented_llm_from_pretrained(
             path=checkpoint, load_in_4bit=args.four_bit
         )
     else:
         print("Detected plain LLM architecture.")
+        text_edge_list = args.text_edge_list if args.text_edge_list is not None else "present"
         model, tokenizer = loaders.from_pretrained(
             path=checkpoint, load_in_4bit=args.four_bit
         )
 
+    print(f"text_edge_list={text_edge_list!r}")
     print(f"Loading eval data: {args.eval_data}")
     eval_samples = load_eval_samples(args.eval_data)
     print(f"Running eval on {len(eval_samples)} samples...")
 
     accuracy, sample_results = eval_model(
-        eval_samples=eval_samples, model=model, tokenizer=tokenizer
+        eval_samples=eval_samples, model=model, tokenizer=tokenizer,
+        text_edge_list=text_edge_list,
     )
 
     print(f"\n{'='*60}")

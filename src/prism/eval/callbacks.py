@@ -8,10 +8,11 @@ from prism.eval import run_eval
 
 
 class EvalCallback(TrainerCallback):
-    def __init__(self, eval_samples, tokenizer=None, eval_epoch_interval: float = 1.0):
+    def __init__(self, eval_samples, tokenizer=None, eval_epoch_interval: float = 1.0, text_edge_list: str = "present"):
         self.eval_samples = eval_samples
         self.tokenizer = tokenizer
         self.eval_epoch_interval = eval_epoch_interval
+        self.text_edge_list = text_edge_list
         self._steps_per_interval: int | None = None
         self._last_eval_step: int = -1
         self.metrics = {}
@@ -28,7 +29,8 @@ class EvalCallback(TrainerCallback):
         accuracy, sample_results = run_eval.eval_model(
             model=model,
             tokenizer=self.tokenizer,
-        eval_samples=self.eval_samples,
+            eval_samples=self.eval_samples,
+            text_edge_list=self.text_edge_list,
         )
         model.train()
 
