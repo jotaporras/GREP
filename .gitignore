@@ -15,8 +15,10 @@ data/*
 src/outputs/
 src/wandb/
 checkpoints
+output/
 outputs/
 outputs_dev/
+extra/
 
 *.bak
 SPINE/
