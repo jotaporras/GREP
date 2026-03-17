@@ -104,6 +104,7 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         return self.llm(
             inputs_embeds=embeddings,
             attention_mask=attention_mask,
+            pad_token_id=self.tokenizer.eos_token_id,
             labels=labels,
             **kwargs,
         )

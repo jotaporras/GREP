@@ -1,9 +1,11 @@
 import json
 import os
+import re
 from typing import Tuple
 
 import torch
-from peft import PeftModel
+from peft import PeftConfig, get_peft_model
+from safetensors.torch import load_file
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, PreTrainedTokenizer
 
 from prism.models import gnn_llm
@@ -45,7 +47,11 @@ def from_pretrained(
             device_map="auto",
             quantization_config=_bnb_config(load_in_4bit),
         )
-        model = PeftModel.from_pretrained(model, path)
+        peft_model = get_peft_model(model, PeftConfig.from_pretrained(path))
+        state_dict = load_file(os.path.join(path, "adapter_model.safetensors"))
+        remapped = {re.sub(r'base_model\.model\.llm\.model\.', 'base_model.model.model.', k): v
+                    for k, v in state_dict.items()}
+        peft_model.load_state_dict(remapped, strict=False)
     else:
         model = AutoModelForCausalLM.from_pretrained(
             path,
@@ -54,6 +60,7 @@ def from_pretrained(
             quantization_config=_bnb_config(load_in_4bit),
         )
     tokenizer = AutoTokenizer.from_pretrained(path)
+    model.eval()
     return model, tokenizer
 
 
@@ -82,7 +89,12 @@ def graph_augmented_llm_from_pretrained(
     )
 
     if os.path.exists(os.path.join(path, "adapter_config.json")):
-        llm = PeftModel.from_pretrained(llm, path)
+        peft_model = get_peft_model(llm, PeftConfig.from_pretrained(path))
+        state_dict = load_file(os.path.join(path, "adapter_model.safetensors"))
+        remapped = {re.sub(r'base_model\.model\.llm\.model\.', 'base_model.model.model.', k): v
+                    for k, v in state_dict.items()}
+        peft_model.load_state_dict(remapped, strict=False)
+        llm = peft_model.merge_and_unload()
 
     tokenizer = AutoTokenizer.from_pretrained(path)
 
@@ -102,4 +114,5 @@ def graph_augmented_llm_from_pretrained(
     model.pe_model.load_state_dict(gnn_weights["pe_model"])
     model.pe_proj.load_state_dict(gnn_weights["pe_proj"])
 
+    model.eval()
     return model, tokenizer

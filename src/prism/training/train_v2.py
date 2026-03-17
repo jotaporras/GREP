@@ -398,6 +398,7 @@ def train_model(config: TrainConfig, config_file: str = None):
             "dropout": config.dropout,
             "k": config.k,
             "use_layer_norm": config.use_layer_norm,
+            "text_edge_list": config.text_edge_list,
         }
         trainer = GraphSFTTrainer(
             model=model,
@@ -427,7 +428,7 @@ def train_model(config: TrainConfig, config_file: str = None):
                 wandb.config.update({"_config_yaml": f.read()}, allow_val_change=True)
 
     eval_samples = _load_eval_samples(config.eval_data)
-    trainer.add_callback(callbacks.EvalCallback(eval_samples, tokenizer=tokenizer, eval_epoch_interval=1.0))
+    trainer.add_callback(callbacks.EvalCallback(eval_samples, tokenizer=tokenizer, eval_epoch_interval=1.0, text_edge_list=config.text_edge_list))
 
     if config.architecture == "rpearl_llm":
         trainer.add_callback(callbacks.GradientDebugCallback())

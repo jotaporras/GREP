@@ -72,19 +72,33 @@ def remove_edge_list(decoded: str) -> str:
     """Remove the edge list (object_connections and region_connections) from
     a decoded prompt string containing a scene graph.
 
+    Handles both single-quoted Python repr (training data) and double-quoted
+    multiline JSON (SPINE ``GraphHandler.to_json_str`` with ``indent=2``).
+
     Parameters
     ----------
     decoded : str
         The full decoded prompt text that contains a scene graph with
-        ``'object_connections': ...`` and ``'region_connections': ...`` entries.
+        ``object_connections`` and ``region_connections`` entries.
 
     Returns
     -------
     str
         The prompt with both connection lists removed.
     """
-    pattern = r"'object_connections': .+?, 'region_connections': .+?, (?='robot_location'|\})"
-    return re.sub(pattern, "", decoded)
+    # Training data: single-quoted, single-line Python repr
+    decoded = re.sub(
+        r"'object_connections': .+?, 'region_connections': .+?, (?='robot_location'|\})",
+        "", decoded,
+    )
+    # SPINE eval: double-quoted, multiline JSON (json.dumps with indent=2).
+    # Keys are separated by ,\n<indent> rather than ", " so we use ,\s* between them.
+    # Trailing comma is optional (absent when region_connections is the last key).
+    decoded = re.sub(
+        r'"object_connections":\s*.+?,\s*"region_connections":\s*.+?,?\s*(?="robot_location"|\})',
+        "", decoded, flags=re.DOTALL,
+    )
+    return decoded
 
 
 class SpineDataCollator(DataCollatorForLanguageModeling):
