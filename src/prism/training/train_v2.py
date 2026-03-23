@@ -1,12 +1,14 @@
-from prism.data import data 
+import os
+import re
+import sys
+
+from prism.data import data
 from prism.eval import callbacks
 from prism.eval import run_eval
 from prism.models import gnn_llm
 from prism.models import r_pearl as r_pearl_module
 from prism.models import gt as gt_module
 
-import os
-import sys
 import json
 from dataclasses import asdict, dataclass, field
 from typing import List, Dict, Any, Optional, no_type_check
@@ -238,7 +240,7 @@ class TrainConfig:
         self.eps = float(self.eps)
     k_gt: int = 3
     text_edge_list: str = "present"   # "present" or "none"
-    device: int = -1                  # GPU index to pin the model to; -1 = let device_map="auto" decide
+    device: int = 0                   # GPU index to pin the model to; -1 = let device_map="auto" decide
     overwrite_ok: bool = False
     # Optional override for the checkpoint subdirectory name.
     # Default (None): auto-generated as "{name}_{architecture}_{model_slug}_r{r}[_4bit]_{wandb_run_id}"

@@ -127,7 +127,8 @@ class GradientDebugCallback(TrainerCallback):
             # Capture base embedding norm before injection.
             with torch.no_grad():
                 # Count injections directly from pre-computed injection maps.
-                callback._emb_norm = inner.llm.get_input_embeddings()(input_ids).norm().item()
+                emb_table = inner.llm.get_input_embeddings()
+                callback._emb_norm = emb_table(input_ids.to(emb_table.weight.device)).norm().item()
             total = 0
             for imap in injection_maps:
                 total += sum(len(spans) for spans in imap.values())

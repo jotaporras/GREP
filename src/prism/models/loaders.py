@@ -39,7 +39,7 @@ def from_pretrained(
     is provided explicitly.
 
     Args:
-        device: GPU index to place the model on. -1 uses device_map="auto".
+        device: Physical GPU index (e.g. 0, 1). -1 uses device_map="auto".
     """
     device_map = {"": device} if device >= 0 else "auto"
     adapter_cfg_path = os.path.join(path, "adapter_config.json")
@@ -84,7 +84,7 @@ def graph_augmented_llm_from_pretrained(
       - tokenizer files
 
     Args:
-        device: GPU index to place the model on. -1 uses device_map="auto".
+        device: Physical GPU index (e.g. 0, 1). -1 uses device_map="auto".
     """
     device_map = {"": device} if device >= 0 else "auto"
 
@@ -131,7 +131,7 @@ def graph_augmented_llm_from_pretrained(
         )
         model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=gnn_cfg["d_model"], eps=gnn_cfg["eps"])
         gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
-        model.pe_model.load_state_dict(gnn_weights["gt_model"])
+        model.pe_model.load_state_dict(gnn_weights["gt_model"], strict=False)
         model.pe_proj.load_state_dict(gnn_weights["pe_proj"])
     else:
         pe_model = r_pearl.RandomGNNPositionalEncodings(
@@ -146,7 +146,7 @@ def graph_augmented_llm_from_pretrained(
         )
         model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=gnn_cfg["d_model"], eps=gnn_cfg["eps"])
         gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
-        model.pe_model.load_state_dict(gnn_weights["pe_model"])
+        model.pe_model.load_state_dict(gnn_weights["pe_model"], strict=False)
         model.pe_proj.load_state_dict(gnn_weights["pe_proj"])
 
     model.eval()
