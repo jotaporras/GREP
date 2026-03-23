@@ -12,6 +12,17 @@ import json
 import os
 import sys
 
+# Isolate the target GPU BEFORE any torch/CUDA imports.  Without this, PyTorch
+# initializes a CUDA context on every visible GPU at import time, consuming
+# memory and blocking other processes from using those GPUs.  Each evaluate.py
+# process sets its own CUDA_VISIBLE_DEVICES, so parallel runs on different GPUs
+# (e.g. --device 0 and --device 1 in separate terminals) coexist safely.
+_early_parser = argparse.ArgumentParser(add_help=False)
+_early_parser.add_argument("--device", type=int, default=0)
+_early_args, _ = _early_parser.parse_known_args()
+if _early_args.device >= 0:
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(_early_args.device)
+
 # Allow running from the repo root without installing the package
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -53,6 +64,16 @@ def parse_args():
         type=int,
         default=0,
         help="GPU index to load the model on (default: 0). Set to -1 for device_map='auto'.",
+    )
+    parser.add_argument(
+        "--use-icl",
+        type=str,
+        choices=["true", "false"],
+        default=None,
+        help=(
+            "Whether to include ICL examples in the SPINE prompt. "
+            "Default: auto (off for GNN models, on for plain LLMs)."
+        ),
     )
     return parser.parse_args()
 
@@ -106,9 +127,10 @@ def main():
     eval_samples = load_eval_samples(args.eval_data)
     print(f"Running eval on {len(eval_samples)} samples...")
 
+    use_icl = {"true": True, "false": False}.get(args.use_icl)
     accuracy, sample_results = eval_model(
         eval_samples=eval_samples, model=model, tokenizer=tokenizer,
-        text_edge_list=text_edge_list,
+        text_edge_list=text_edge_list, use_icl=use_icl,
     )
 
     print(f"\n{'='*60}")

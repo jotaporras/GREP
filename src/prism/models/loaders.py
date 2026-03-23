@@ -41,7 +41,7 @@ def from_pretrained(
     Args:
         device: Physical GPU index (e.g. 0, 1). -1 uses device_map="auto".
     """
-    device_map = {"": device} if device >= 0 else "auto"
+    device_map = {"": 0} if device >= 0 else "auto"
     adapter_cfg_path = os.path.join(path, "adapter_config.json")
     if os.path.exists(adapter_cfg_path):
         if base_model is None:
@@ -86,7 +86,7 @@ def graph_augmented_llm_from_pretrained(
     Args:
         device: Physical GPU index (e.g. 0, 1). -1 uses device_map="auto".
     """
-    device_map = {"": device} if device >= 0 else "auto"
+    device_map = {"": 0} if device >= 0 else "auto"
 
     with open(os.path.join(path, "gnn_config.json")) as f:
         gnn_cfg = json.load(f)

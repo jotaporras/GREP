@@ -135,6 +135,7 @@ def eval_model(
     model=None,
     tokenizer=None,
     text_edge_list: str = "present",
+    use_icl: bool | None = None,
 ) -> Tuple[float, List[Dict]]:
     """Run evaluation on a set of samples using the planning simulation loop.
 
@@ -158,7 +159,8 @@ def eval_model(
                 client = inference.GraphAugmentedInMemoryLLM(model=model, tokenizer=tokenizer, strip_edges=strip_edges)
             else:
                 client = inference.InMemoryLLM(model=model, tokenizer=tokenizer, strip_edges=strip_edges)
-            llm_planner = SPINE(graph=graph_sim_inst.partial_graph, client=client, use_icl=not is_gnn)
+            llm_planner = SPINE(graph=graph_sim_inst.partial_graph, client=client,
+                                use_icl=use_icl if use_icl is not None else not is_gnn)
         else:
             llm_planner = SPINE(
                 graph=graph_sim_inst.partial_graph,
