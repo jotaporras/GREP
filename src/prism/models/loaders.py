@@ -28,6 +28,7 @@ def from_pretrained(
     path: str,
     load_in_4bit: bool = False,
     base_model: str = None,
+    device: int = -1,
     **kwargs,
 ) -> Tuple[AutoModelForCausalLM, PreTrainedTokenizer]:
     """Load a plain LLM checkpoint (LoRA or full fine-tune) from a local path or HuggingFace Hub.
@@ -36,7 +37,11 @@ def from_pretrained(
     the base model is loaded first and the adapter is applied on top.  The
     base model path is read from adapter_config.json unless ``base_model``
     is provided explicitly.
+
+    Args:
+        device: GPU index to place the model on. -1 uses device_map="auto".
     """
+    device_map = {"": device} if device >= 0 else "auto"
     adapter_cfg_path = os.path.join(path, "adapter_config.json")
     if os.path.exists(adapter_cfg_path):
         if base_model is None:
@@ -45,7 +50,7 @@ def from_pretrained(
         model = AutoModelForCausalLM.from_pretrained(
             base_model,
             torch_dtype="auto",
-            device_map="auto",
+            device_map=device_map,
             quantization_config=_bnb_config(load_in_4bit),
         )
         peft_model = get_peft_model(model, PeftConfig.from_pretrained(path))
@@ -57,7 +62,7 @@ def from_pretrained(
         model = AutoModelForCausalLM.from_pretrained(
             path,
             torch_dtype="auto",
-            device_map="auto",
+            device_map=device_map,
             quantization_config=_bnb_config(load_in_4bit),
         )
     tokenizer = AutoTokenizer.from_pretrained(path)
@@ -68,6 +73,7 @@ def from_pretrained(
 def graph_augmented_llm_from_pretrained(
     path: str,
     load_in_4bit: bool = False,
+    device: int = -1,
 ) -> Tuple[gnn_llm.GraphAugmentedLLM, PreTrainedTokenizer]:
     """Load a GraphAugmentedLLM checkpoint saved by GraphSFTTrainer.
 
@@ -76,7 +82,12 @@ def graph_augmented_llm_from_pretrained(
       - gnn_weights.pt       pe_model and pe_proj state dicts
       - adapter_config.json  (optional — present when freeze_llm=False)
       - tokenizer files
+
+    Args:
+        device: GPU index to place the model on. -1 uses device_map="auto".
     """
+    device_map = {"": device} if device >= 0 else "auto"
+
     with open(os.path.join(path, "gnn_config.json")) as f:
         gnn_cfg = json.load(f)
 
@@ -85,7 +96,7 @@ def graph_augmented_llm_from_pretrained(
     llm = AutoModelForCausalLM.from_pretrained(
         base_model_path,
         torch_dtype="auto",
-        device_map="auto",
+        device_map=device_map,
         quantization_config=_bnb_config(load_in_4bit),
     )
 

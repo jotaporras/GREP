@@ -48,6 +48,12 @@ def parse_args():
             "for plain LLM checkpoints you must set this explicitly (default: present)."
         ),
     )
+    parser.add_argument(
+        "--device",
+        type=int,
+        default=1,
+        help="GPU index to load the model on (default: 1). Set to -1 for device_map='auto'.",
+    )
     return parser.parse_args()
 
 
@@ -86,13 +92,13 @@ def main():
             )
             text_edge_list = args.text_edge_list
         model, tokenizer = loaders.graph_augmented_llm_from_pretrained(
-            path=checkpoint, load_in_4bit=args.four_bit
+            path=checkpoint, load_in_4bit=args.four_bit, device=args.device
         )
     else:
         print("Detected plain LLM architecture.")
         text_edge_list = args.text_edge_list if args.text_edge_list is not None else "present"
         model, tokenizer = loaders.from_pretrained(
-            path=checkpoint, load_in_4bit=args.four_bit
+            path=checkpoint, load_in_4bit=args.four_bit, device=args.device
         )
 
     print(f"text_edge_list={text_edge_list!r}")

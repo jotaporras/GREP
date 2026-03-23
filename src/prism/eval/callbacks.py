@@ -73,8 +73,13 @@ class GradientDebugCallback(TrainerCallback):
     """Logs per-component gradient norms, PE magnitudes, and injection counts to W&B.
 
     Attaches to the model's _augment_embeddings to capture PE norms and bucket
-    stats at every forward pass, and logs gradient norms split by component
-    aftfmaxer every backward pass.
+    stats at every forward pass. Gradient norms are captured by
+    ``_capture_grad_norms`` (called from ``GraphSFTTrainer.training_step``
+    after backward, before zero_grad) so they reflect actual gradients.
+
+    Architecture-aware: when pe_model is a GraphTransformer (rpearl_gt_llm),
+    logs separate gradient norms for the inner R-PEARL, GT attention blocks,
+    and GT output norm.
     """
 
     def __init__(self):
@@ -83,28 +88,46 @@ class GradientDebugCallback(TrainerCallback):
         self._emb_norm = float("nan")
         self._num_injections = 0
         self._hooked = False
+        self._captured_grad_norms = {}
+
+    @staticmethod
+    def _unwrap_peft(model):
+        """Navigate PeftModel → LoraModel → GraphAugmentedLLM."""
+        inner = model
+        if hasattr(inner, 'base_model'):
+            inner = inner.base_model
+        if hasattr(inner, 'model') and hasattr(inner.model, 'pe_proj'):
+            inner = inner.model
+        return inner
 
     def _install_hooks(self, model):
-        """Install lightweight hooks that observe without duplicating logic."""
+        """Install lightweight hooks that observe without duplicating logic.
+
+        Unwraps PEFT so that the _augment_embeddings wrapper lives on the
+        actual GraphAugmentedLLM instance (whose forward() calls
+        self._augment_embeddings), not on the PeftModel wrapper.
+        """
         if self._hooked:
             return
         callback = self
+        inner = self._unwrap_peft(model)
 
-        # Hook 1: capture PE norm from pe_proj output via a forward hook on pe_proj.
+        # Hook 1: capture PE norm from pe_proj output via a forward hook.
         def _pe_proj_hook(_module, _input, output):
             callback._pe_norm = output.detach().norm().item()
             callback._pe_has_nan = bool(output.detach().isnan().any())
 
-        model.pe_proj.register_forward_hook(_pe_proj_hook)
+        inner.pe_proj.register_forward_hook(_pe_proj_hook)
 
-        # Hook 2: capture embedding norm + injection count by wrapping _augment_embeddings.
-        orig_augment = model._augment_embeddings
+        # Hook 2: wrap _augment_embeddings on the actual GraphAugmentedLLM so
+        # that self._augment_embeddings() inside forward() hits our wrapper.
+        orig_augment = inner._augment_embeddings
 
         def _wrapped_augment(input_ids, graphs, injection_maps):
             # Capture base embedding norm before injection.
             with torch.no_grad():
-                callback._emb_norm = model.llm.get_input_embeddings()(input_ids).norm().item()
-            # Count injections directly from pre-computed injection maps.
+                # Count injections directly from pre-computed injection maps.
+                callback._emb_norm = inner.llm.get_input_embeddings()(input_ids).norm().item()
             total = 0
             for imap in injection_maps:
                 total += sum(len(spans) for spans in imap.values())
@@ -112,14 +135,33 @@ class GradientDebugCallback(TrainerCallback):
             # Call the real method — no duplicated injection logic.
             return orig_augment(input_ids, graphs, injection_maps)
 
-        model._augment_embeddings = _wrapped_augment
+        inner._augment_embeddings = _wrapped_augment
         self._hooked = True
 
-    def _grad_norm(self, params):
-        grads = [p.grad for p in params if p.grad is not None]
-        if not grads:
-            return 0.0
-        return torch.cat([g.detach().flatten() for g in grads]).norm().item()
+    @staticmethod
+    def _grad_norm(params):
+        sq_sum = 0.0
+        for p in params:
+            if p.grad is not None:
+                sq_sum += p.grad.detach().float().norm().item() ** 2
+        return sq_sum ** 0.5
+
+    def _capture_grad_norms(self, model):
+        """Snapshot per-component gradient norms.
+
+        Must be called after backward() but before zero_grad() — i.e. from
+        GraphSFTTrainer.training_step.  HF Trainer zeroes gradients before
+        on_log fires, so reading .grad in on_log always returns 0.
+        """
+        self._captured_grad_norms["gnn"] = self._grad_norm(model.pe_model.parameters())
+        self._captured_grad_norms["pe_proj"] = self._grad_norm(model.pe_proj.parameters())
+        lora_params = [p for n, p in model.llm.named_parameters() if p.requires_grad]
+        self._captured_grad_norms["lora"] = self._grad_norm(lora_params)
+
+        if hasattr(model.pe_model, "blocks"):
+            self._captured_grad_norms["rpearl"] = self._grad_norm(model.pe_model.pe_model.parameters())
+            self._captured_grad_norms["gt_blocks"] = self._grad_norm(model.pe_model.blocks.parameters())
+            self._captured_grad_norms["gt_output_norm"] = self._grad_norm(model.pe_model.output_norm.parameters())
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
         if hasattr(model, "pe_model"):
@@ -129,22 +171,24 @@ class GradientDebugCallback(TrainerCallback):
         if not hasattr(model, "pe_model"):
             return
 
-        gnn_norm = self._grad_norm(model.pe_model.parameters())
-        proj_norm = self._grad_norm(model.pe_proj.parameters())
-        lora_params = [p for n, p in model.llm.named_parameters() if p.requires_grad]
-        lora_norm = self._grad_norm(lora_params)
-
         lr = state.log_history[-1].get("learning_rate", float("nan")) if state.log_history else float("nan")
         metrics = {
-            "debug/grad_norm_gnn": gnn_norm,
-            "debug/grad_norm_pe_proj": proj_norm,
-            "debug/grad_norm_lora": lora_norm,
+            "debug/grad_norm_gnn": self._captured_grad_norms.get("gnn", 0.0),
+            "debug/grad_norm_pe_proj": self._captured_grad_norms.get("pe_proj", 0.0),
+            "debug/grad_norm_lora": self._captured_grad_norms.get("lora", 0.0),
             "debug/pe_output_norm": self._pe_norm,
             "debug/pe_has_nan": int(self._pe_has_nan),
             "debug/embedding_norm": self._emb_norm,
             "debug/num_injections": self._num_injections,
             "debug/lr": lr,
         }
+
+        # rpearl_gt_llm: split gradient norms by GT sub-component.
+        if hasattr(model.pe_model, "blocks"):
+            metrics["debug/grad_norm_rpearl"] = self._captured_grad_norms.get("rpearl", 0.0)
+            metrics["debug/grad_norm_gt_blocks"] = self._captured_grad_norms.get("gt_blocks", 0.0)
+            metrics["debug/grad_norm_gt_output_norm"] = self._captured_grad_norms.get("gt_output_norm", 0.0)
+
         if wandb.run is not None:
             wandb.log(metrics, step=state.global_step)
 

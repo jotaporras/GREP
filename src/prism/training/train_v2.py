@@ -146,6 +146,16 @@ class GraphSFTTrainer(SFTTrainer):
         for p in self.model.pe_proj.parameters():
             p.requires_grad = True
 
+    def training_step(self, model, inputs, num_items_in_batch=None, **kwargs):
+        loss = super().training_step(model, inputs, num_items_in_batch=num_items_in_batch, **kwargs)
+        # Gradients exist now (backward already ran inside super().training_step).
+        # Capture norms before the training loop calls zero_grad().
+        for cb in self.callback_handler.callbacks:
+            if isinstance(cb, callbacks.GradientDebugCallback):
+                cb._capture_grad_norms(model)
+                break
+        return loss
+
     def save_model(self, output_dir=None, _internal_call=False):
         output_dir = output_dir or self.args.output_dir
         os.makedirs(output_dir, exist_ok=True)
