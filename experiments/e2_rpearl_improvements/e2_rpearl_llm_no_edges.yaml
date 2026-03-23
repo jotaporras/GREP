@@ -17,11 +17,12 @@ dataset_proportion: 1.0
 max_seq_length: 2048
 text_edge_list: none
 # R-PEARL GNN params
-d_model: 3072
+d_model: 1024
 pe_hidden_channels: 256
 pe_num_layers: 5
 num_samples: 40
 dropout: 0.1
-k: 3
+k_pe: 3
+eps: 1e-6
 use_layer_norm: true
 freeze_llm: false

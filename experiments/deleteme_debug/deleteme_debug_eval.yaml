@@ -21,7 +21,7 @@ pe_hidden_channels: 64
 pe_num_layers: 2
 num_samples: 10
 dropout: 0.0
-k: 2
+k_pe: 2
 use_layer_norm: true
 freeze_llm: false
 overwrite_ok: true

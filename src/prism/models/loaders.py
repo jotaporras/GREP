@@ -10,6 +10,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from prism.models import gnn_llm
 from prism.models import r_pearl
+from prism.models import gt as gt_module
 
 
 def _bnb_config(load_in_4bit: bool):
@@ -91,28 +92,51 @@ def graph_augmented_llm_from_pretrained(
     if os.path.exists(os.path.join(path, "adapter_config.json")):
         peft_model = get_peft_model(llm, PeftConfig.from_pretrained(path))
         state_dict = load_file(os.path.join(path, "adapter_model.safetensors"))
-        remapped = {re.sub(r'base_model\.model\.llm\.model\.', 'base_model.model.model.', k): v
-                    for k, v in state_dict.items()}
+        remapped = {}
+        for k, v in state_dict.items():
+            k = re.sub(r'base_model\.model\.llm\.model\.', 'base_model.model.model.', k)
+            k = re.sub(r'\.lora_([AB])\.weight', r'.lora_\1.default.weight', k)
+            remapped[k] = v
         peft_model.load_state_dict(remapped, strict=False)
         llm = peft_model.merge_and_unload()
 
     tokenizer = AutoTokenizer.from_pretrained(path)
 
-    r_pearl_model = r_pearl.RandomGNNPositionalEncodings(
-        pe_hidden_channels=gnn_cfg["pe_hidden_channels"],
-        pe_num_layers=gnn_cfg["pe_num_layers"],
-        d_model=gnn_cfg["d_model"],
-        num_samples=gnn_cfg["num_samples"],
-        dropout=gnn_cfg["dropout"],
-        k=gnn_cfg["k"],
-        use_layer_norm=gnn_cfg["use_layer_norm"],
-    )
+    architecture = gnn_cfg.get("architecture", "rpearl_llm")
 
-    model = gnn_llm.GraphAugmentedLLM(llm, r_pearl_model, pe_dim=gnn_cfg["d_model"])
-
-    gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
-    model.pe_model.load_state_dict(gnn_weights["pe_model"])
-    model.pe_proj.load_state_dict(gnn_weights["pe_proj"])
+    if architecture == "rpearl_gt_llm":
+        pe_model = gt_module.GraphTransformer(
+            num_layers=gnn_cfg["gt_num_layers"],
+            pe_hidden_channels=gnn_cfg["pe_hidden_channels"],
+            pe_num_layers=gnn_cfg["pe_num_layers"],
+            d_model=gnn_cfg["d_model"],
+            heads=gnn_cfg["gt_heads"],
+            num_samples=gnn_cfg["num_samples"],
+            dropout=gnn_cfg["dropout"],
+            k_pe=gnn_cfg["k_pe"],
+            k_gt=gnn_cfg["k_gt"],
+            eps=gnn_cfg["eps"],
+            use_layer_norm=gnn_cfg["use_layer_norm"],
+        )
+        model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=gnn_cfg["d_model"], eps=gnn_cfg["eps"])
+        gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
+        model.pe_model.load_state_dict(gnn_weights["gt_model"])
+        model.pe_proj.load_state_dict(gnn_weights["pe_proj"])
+    else:
+        pe_model = r_pearl.RandomGNNPositionalEncodings(
+            pe_hidden_channels=gnn_cfg["pe_hidden_channels"],
+            pe_num_layers=gnn_cfg["pe_num_layers"],
+            d_model=gnn_cfg["d_model"],
+            num_samples=gnn_cfg["num_samples"],
+            dropout=gnn_cfg["dropout"],
+            k=gnn_cfg["k_pe"],
+            eps=gnn_cfg["eps"],
+            use_layer_norm=gnn_cfg["use_layer_norm"],
+        )
+        model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=gnn_cfg["d_model"], eps=gnn_cfg["eps"])
+        gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
+        model.pe_model.load_state_dict(gnn_weights["pe_model"])
+        model.pe_proj.load_state_dict(gnn_weights["pe_proj"])
 
     model.eval()
     return model, tokenizer

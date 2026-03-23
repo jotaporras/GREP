@@ -3,24 +3,35 @@ from collections import defaultdict
 
 import torch
 from torch import nn
-from transformers import PreTrainedModel
-from torch_geometric.data import Batch
 from torch.nn import functional as F
+from torch.nn.utils import spectral_norm
+from torch_geometric.data import Batch
+from transformers import PreTrainedModel
+
+from prism.models.utils import LipschitzNorm
+
 
 class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
     """
     Graph-Augmented LLM (GREP-PRISM).
 
     Domain-agnostic: receives pre-computed injection maps that specify where
-    to add GNN positional encodings into the LLM input embeddings.
+    to add graph positional encodings into the LLM input embeddings.
+
+    The graph encoder (``pe_model``) can be any module with the interface
+    ``forward(data) -> Tensor[n, d_model]``.  Two options are supported:
+      - ``RandomGNNPositionalEncodings`` (R-PEARL only, no GT blocks)
+      - ``GraphTransformer`` (full Sparse GT with R-PEARL inside)
 
     Args:
-        llm (nn.Module): LLM to perform classical planning.
-        pe_model (nn.Module): R-PEARL positional-encodings model.
-        pe_dim (int): Dimensionality of the positional encodings.
+        llm (nn.Module): LLM to perform classical planning
+        pe_model (nn.Module): R-PEARL positional-encodings model
+        d_model (int): Dimensionality of the positional encodings
+        eps (float): Lipschitz normalization epsilon for the projection head
     """
 
-    def __init__(self, llm: nn.Module, pe_model: nn.Module, pe_dim: int):
+    def __init__(self, llm: nn.Module, pe_model: nn.Module,
+                 d_model: int, eps: float = 1e-8):
         # GraphAugmentedLLM is not a registered HF architecture, so
         # PreTrainedModel rejects SDPA/flash-attn.  Force "eager" on the
         # wrapper config — the inner self.llm keeps its own attn impl.
@@ -37,8 +48,8 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             device = llm.device
         self.pe_model = pe_model.to(device)
         self.pe_proj = nn.Sequential(
-            nn.Linear(pe_dim, llm.config.hidden_size, device=device),
-            nn.LayerNorm(llm.config.hidden_size, device=device),
+            spectral_norm(nn.Linear(d_model, llm.config.hidden_size, device=device)),
+            LipschitzNorm(llm.config.hidden_size, eps=eps, device=device),
         )
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
@@ -59,7 +70,7 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         graphs: Batch,
         injection_maps: list[dict[int, list[tuple[int, int]]]],
     ) -> torch.Tensor:
-        """Compute GNN-augmented input embeddings. Shared by forward() and generate().
+        """Compute GNN/GT-augmented input embeddings. Shared by forward() and generate().
 
         Args:
             input_ids: [B, seq_len] token IDs.
@@ -67,6 +78,9 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             injection_maps: Per-batch-element dict mapping node index to a list
                 of (start, end) token spans where that node's PE should be added.
         """
+        # Clone so that in-place additions below don't corrupt the embedding table's
+        # gradient. The clone itself is in the autograd graph, so gradients flow
+        # through the additions back to pe_model / pe_proj normally.
         embeddings = (
             self.llm.get_input_embeddings()(input_ids)
                 .clone()
@@ -75,7 +89,7 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
 
         for b in range(input_ids.shape[0]):
             pe = self.pe_proj(self.pe_model(graphs[b]))  # [n, hidden_size]
-            # Rescale PE to match embedding norm. pe_proj ends with LayerNorm
+            # Rescale PE to match embedding norm. pe_proj ends with LipschitzNorm
             # which forces output to norm ≈ sqrt(d_model), while LLM embeddings
             # (pre-RMSNorm) are much smaller. Without rescaling, PE overwhelms.
             target_norm = embeddings[b].norm(dim=-1).mean().detach()
@@ -83,7 +97,8 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             for node_idx, spans in injection_maps[b].items():
                 for start, end in spans:
                     end = min(end, input_ids.shape[1])
-                    embeddings[b, start:end] = embeddings[b, start:end, :] + pe[node_idx, :]
+                    if start < end:
+                        embeddings[b, start:end] = embeddings[b, start:end] + pe[node_idx]
 
         return embeddings
 
@@ -104,7 +119,6 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         return self.llm(
             inputs_embeds=embeddings,
             attention_mask=attention_mask,
-            pad_token_id=self.tokenizer.eos_token_id,
             labels=labels,
             **kwargs,
         )

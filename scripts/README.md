@@ -1,0 +1,12 @@
+## Experimental Section #1
+This section experiments with the R-PEARL model, $\renewcommand{\utilde}[1]{\underset{\sim}{#1}}\Phi\Big(\mathbf{q}^{(m)}, \utilde{S}, \mathcal{H}\Big)$, to investigate the spectral clustering properties of the filter banks of the model's PE GNN.
+The premise of the spectral clustering experiment is as follows:
+1. For an R-PEARL, we have the following equation:
+$$\utilde{S} = \utilde{V} \Lambda \utilde{V}^H \qquad {\utilde{X}}^{(l)} = \sigma\bigg[\sum_{k = 0}^{K} {\utilde{S}}^k {\utilde{X}}^{(l - 1)} {\utilde{H}}^{(l)}_{k}\bigg]$$
+2. We know from ESE 5140: "Graph Neural Networks" with Professor Alejandro Ribeiro that the frequency response for a MIMO GNN is defined as such:
+$$\tilde{\utilde{H}}^{(l)}(\lambda) = \sum_{k = 0}^k {\utilde{H}}^{(l)}_{k} \lambda^k \in \mathbb{R}^{G_l \times F_l}$$
+3. Thus, we assemble a spectral "sensitivity" diagonal matrix for output feature $f$ that stores the vector modulus of each column of the Frequency Response $\tilde{\utilde{H}}^{(l)}(\lambda_i)$ of the $k$ Graph Filter Banks ${\utilde{H}^{(l)}_k}$ for each eigenvalue $\lambda_i$ of the Graph Shift Operator $\utilde{S} = \utilde{V} \operatorname{diag}(\mathbf{\lambda}) \utilde{V}^H$. Therefore, each element of the resulting ${\utilde{Q}}^{(l)}_{f}$ matrix essentially stores the magnitude of Column $f$ of the convolution of Graph Filter Banks for Layer $l$ with $\utilde{S}$'s $i^{\text{th}}$ eigenvalue $\lambda_i$ in the frequency domain.
+$${\utilde{Q}}^{(l)}_{f} = \operatorname{diag}\Bigg(\bigg\Vert \tilde{\utilde{H}}^{(l)}(\lambda_i) \cdot \mathbf{e}_f \bigg\Vert^2\Bigg)$$
+4. After obtaining the spectral sensitivity matrix ${\utilde{Q}}^{(l)}_{f}$ for output feature $f$ and Layer $l$, we can finally compose the nodal spectral-clustering coloring vector $c^{(l)}_f \in \mathbb{R}^n$ for Hermitian GSOs $\utilde{S}$:
+  $$\mathbf{c}^{(l)}_f = \Big(\utilde{V} \odot \utilde{V}^*\Big) \ \utilde{Q}^{(l)}_f \ \mathbf{1}$$
+  We seek to self-multiply the modal (eigenvector) matrix of the Graph Shift Operator by itself using the Hadammard product with its complex conjugate to ensure that all values are positive, real numbers while maintaining monotonicity and thus relative ordering of element magnitudes (through respective moduli). Thus, we can multiply the result by the spectral sensitivities and sum by row to retrieve the vector of relative color values for visual clustering operations.

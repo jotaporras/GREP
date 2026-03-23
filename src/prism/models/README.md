@@ -11,11 +11,10 @@ _Note_: The training loop will remove the final softmax layer of the transformer
 
 ## The R-PEARL GNN
 
-The Random Positional Encoding (R-PEARL) GNN architecture is a PE generator that inputs white noise and processes it over an undirected graph $\mathcal{G} = (\mathcal{V}, \mathcal{E}, \mathcal{W})$. In this work, the graph is represented by an adjacency matrix $\utilde{A}$, and the GNN composes [Topology Adaptive Graph (TAG)](https://arxiv.org/abs/1710.10370) Convolutional Layers with pointwise nonlinearities (demodulators).
+The Random Positional Encoding (R-PEARL) GNN architecture is a PE generator that inputs white noise and processes it over an undirected graph $\mathcal{G} = (\mathcal{V}, \mathcal{E}, \mathcal{W})$. In this work, the graph is represented by an adjacency matrix $\renewcommand{\utilde}[1]{\underset{\sim}{#1}}\utilde{A}$, and the GNN composes [Topology Adaptive Graph (TAG)](https://arxiv.org/abs/1710.10370) Convolutional Layers with pointwise nonlinearities (demodulators).
 
 ### Graph Convolutional Network (GNN)
 The code below establishes this project's implementation of a Graph Convolutional Network, which is the foundational architecture comprising R-PEARL. The equation to demonstrate the internal architecture of this NN as follows (in most cases, $P(\cdot) = I(\cdot)$, where $I$ is the identity function):
-$\renewcommand{\utilde}[1]{\underset{\sim}{#1}}$
 $$\Phi(\utilde{X}, \utilde{S}, \mathcal{H}) = \utilde{X}^{(L)}$$
 $$\utilde{X}^{(0)} = \utilde{X} \qquad \utilde{X}^{(l)} = P\Bigg[\sigma\Bigg(\sum_{k = 0}^{K^{(l)} - 1} \utilde{S}^k\utilde{X}^{(l - 1)}{\utilde{H}}_k^{(l)}\Bigg)\Bigg]$$
 

@@ -53,7 +53,7 @@ def preprocess_dataset(
     
     ds = ds.map(lambda e: {"messages": e["conversations"]})
 
-    if architecture == "rpearl_llm":
+    if architecture in ("rpearl_llm", "rpearl_gt_llm"):
         ds = ds.map(_parse_scene_graph)
     if text_edge_list == "none":
         def _strip_edges(example):

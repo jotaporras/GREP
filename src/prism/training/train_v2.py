@@ -2,7 +2,8 @@ from prism.data import data
 from prism.eval import callbacks
 from prism.eval import run_eval
 from prism.models import gnn_llm
-from prism.models import r_pearl
+from prism.models import r_pearl as r_pearl_module
+from prism.models import gt as gt_module
 
 import os
 import sys
@@ -138,16 +139,33 @@ class GraphSFTTrainer(SFTTrainer):
     def __init__(self, *args, gnn_config: dict, **kwargs):
         super().__init__(*args, **kwargs)
         self.gnn_config = gnn_config
+        # PEFT freezes all non-LoRA parameters. Re-enable gradients for the
+        # graph encoder and projection head so they actually train.
+        for p in self.model.pe_model.parameters():
+            p.requires_grad = True
+        for p in self.model.pe_proj.parameters():
+            p.requires_grad = True
 
     def save_model(self, output_dir=None, _internal_call=False):
         output_dir = output_dir or self.args.output_dir
         os.makedirs(output_dir, exist_ok=True)
         with open(os.path.join(output_dir, "gnn_config.json"), "w") as f:
             json.dump(self.gnn_config, f, indent=2)
-        torch.save({
-            'pe_model': self.model.pe_model.state_dict(),
-            'pe_proj': self.model.pe_proj.state_dict(),
-        }, os.path.join(output_dir, "gnn_weights.pt"))
+        if self.gnn_config.get("architecture") == "rpearl_gt_llm":
+            # Full GT: save the whole GraphTransformer (includes R-PEARL inside) + projection head.
+            torch.save({
+                'gt_model': self.model.pe_model.state_dict(),
+                'pe_proj': self.model.pe_proj.state_dict(),
+            }, os.path.join(output_dir, "gnn_weights.pt"))
+            # Also save the inner R-PEARL separately for analysis / reuse.
+            torch.save({
+                'rpearl': self.model.pe_model.pe_model.state_dict(),
+            }, os.path.join(output_dir, "rpearl_weights.pt"))
+        else:
+            torch.save({
+                'pe_model': self.model.pe_model.state_dict(),
+                'pe_proj': self.model.pe_proj.state_dict(),
+            }, os.path.join(output_dir, "gnn_weights.pt"))
         if any(p.requires_grad for p in self.model.llm.parameters()):
             super().save_model(output_dir, _internal_call)
 
@@ -197,10 +215,18 @@ class TrainConfig:
     d_model: int = 3072
     num_samples: int = 40
     dropout: float = 0.1
-    k: int = 3
+    k_pe: int = 3
     use_layer_norm: bool = True
     freeze_llm: bool = False
-    architecture: str = "rpearl_llm"  # "rpearl_llm" or "llm"
+    architecture: str = "rpearl_llm"  # "rpearl_llm", "rpearl_gt_llm", or "llm"
+    # GT-specific params (used when architecture == "rpearl_gt_llm")
+    gt_num_layers: int = 3
+    gt_heads: int = 8
+    eps: float = 1e-8
+
+    def __post_init__(self):
+        self.eps = float(self.eps)
+    k_gt: int = 3
     text_edge_list: str = "present"   # "present" or "none"
     device: int = -1                  # GPU index to pin the model to; -1 = let device_map="auto" decide
     overwrite_ok: bool = False
@@ -274,20 +300,40 @@ def train_model(config: TrainConfig, config_file: str = None):
     tokenizer.padding_side = "right" # ty: ignore[invalid-assignment]
 
     if config.architecture == "rpearl_llm":
-        # R-PEARL model, graph-augmented model & data collator.
-        r_pearl_model = r_pearl.RandomGNNPositionalEncodings(
+        # R-PEARL only: GCN positional encodings, no GT attention blocks.
+        pe_model = r_pearl_module.RandomGNNPositionalEncodings(
             pe_hidden_channels=config.pe_hidden_channels,
             pe_num_layers=config.pe_num_layers,
             d_model=config.d_model,
             num_samples=config.num_samples,
             dropout=config.dropout,
-            k=config.k,
-            use_layer_norm=config.use_layer_norm
+            k=config.k_pe,
+            eps=config.eps,
+            use_layer_norm=config.use_layer_norm,
         )
-        model = gnn_llm.GraphAugmentedLLM(llm, r_pearl_model, pe_dim=config.d_model)
+        model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=config.d_model, eps=config.eps)
         collator = data.SpineDataCollator(tokenizer, mlm=False)
 
-        # Freeze the whole llm.
+        if config.freeze_llm:
+            model.llm.requires_grad_(False)
+    elif config.architecture == "rpearl_gt_llm":
+        # Full Graph Transformer: R-PEARL inside Sparse Attention blocks.
+        pe_model = gt_module.GraphTransformer(
+            num_layers=config.gt_num_layers,
+            pe_hidden_channels=config.pe_hidden_channels,
+            pe_num_layers=config.pe_num_layers,
+            d_model=config.d_model,
+            heads=config.gt_heads,
+            num_samples=config.num_samples,
+            dropout=config.dropout,
+            k_pe=config.k_pe,
+            k_gt=config.k_gt,
+            eps=config.eps,
+            use_layer_norm=config.use_layer_norm,
+        )
+        model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=config.d_model, eps=config.eps)
+        collator = data.SpineDataCollator(tokenizer, mlm=False)
+
         if config.freeze_llm:
             model.llm.requires_grad_(False)
     elif config.architecture == "llm":
@@ -297,7 +343,7 @@ def train_model(config: TrainConfig, config_file: str = None):
         model = llm
         collator = None
     else:
-        raise ValueError(f"Unknown architecture: {config.architecture!r}. Choose 'rpearl_llm' or 'llm'.")
+        raise ValueError(f"Unknown architecture: {config.architecture!r}. Choose 'rpearl_llm', 'rpearl_gt_llm', or 'llm'.")
 
     # Load & optionally downsample data
     full_dataset = datasets.load_dataset("json", data_files=[config.data], split="train")
@@ -388,17 +434,22 @@ def train_model(config: TrainConfig, config_file: str = None):
         do_eval=True,
     )
 
-    if config.architecture == "rpearl_llm":
+    if config.architecture in ("rpearl_llm", "rpearl_gt_llm"):
         gnn_config = {
+            "architecture": config.architecture,
             "base_model": config.base_model,
             "pe_hidden_channels": config.pe_hidden_channels,
             "pe_num_layers": config.pe_num_layers,
             "d_model": config.d_model,
             "num_samples": config.num_samples,
             "dropout": config.dropout,
-            "k": config.k,
+            "k_pe": config.k_pe,
             "use_layer_norm": config.use_layer_norm,
             "text_edge_list": config.text_edge_list,
+            "eps": config.eps,
+            **({"k_gt": config.k_gt, "gt_num_layers": config.gt_num_layers,
+                "gt_heads": config.gt_heads}
+               if config.architecture == "rpearl_gt_llm" else {}),
         }
         trainer = GraphSFTTrainer(
             model=model,
@@ -430,7 +481,7 @@ def train_model(config: TrainConfig, config_file: str = None):
     eval_samples = _load_eval_samples(config.eval_data)
     trainer.add_callback(callbacks.EvalCallback(eval_samples, tokenizer=tokenizer, eval_epoch_interval=1.0, text_edge_list=config.text_edge_list))
 
-    if config.architecture == "rpearl_llm":
+    if config.architecture in ("rpearl_llm", "rpearl_gt_llm"):
         trainer.add_callback(callbacks.GradientDebugCallback())
 
     # Start training

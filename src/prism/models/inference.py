@@ -73,6 +73,10 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
     edges remain in the text and PE is additive.  Graph parsing always runs on the
     original unmodified message so the GNN retains complete edge information
     regardless of this setting.
+
+    Extra ICL examples are omitted by the caller (SPINE with use_icl=False),
+    keeping only the system prompt and one ICL example. PE injection operates
+    over the full input_ids without per-message offset correction.
     """
 
     def _parse_all_pyg_graphs(self, msg: List[Dict]) -> List:
@@ -109,35 +113,27 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
         input_ids = input["input_ids"].to(self.device)
         attention_mask = input["attention_mask"].to(self.device)
 
-        # Find the last user message containing a scene graph (the real task).
-        # PE injection should be scoped to the task message + history only,
-        # matching training where no ICL/system prefix exists.
-        task_msg_idx = 0
-        for i, m in enumerate(msg):
-            if m.get("role") == "user" and re.search(r"[Ss]cene graph:", m.get("content", "")):
-                task_msg_idx = i
-        prefix_len = 0
-        if task_msg_idx > 0:
-            prefix_len = len(self.tokenizer.apply_chat_template(
-                llm_msg[:task_msg_idx], tokenize=True, add_generation_prompt=False
-            ))
-
-        print(f"[spine-llm] client={type(self).__name__}, prompt_tokens={input_ids.shape[1]}, pe_scope_offset={prefix_len}")
+        print(f"[spine-llm] client={type(self).__name__}, prompt_tokens={input_ids.shape[1]}")
 
         with torch.no_grad():
-            outputs = self._generate_tokens(input_ids, attention_mask, pyg_graphs, max_new_tokens, prefix_len=prefix_len)
+            outputs = self._generate_tokens(input_ids, attention_mask, pyg_graphs, max_new_tokens)
 
         planner_response = self._decode(outputs)
         print(f"[spine-llm] raw_output (first 500 chars): {planner_response[:500]}")
         return planner_response, True
 
-    def _generate_tokens(self, input_ids, attention_mask, pyg_graphs, max_new_tokens, prefix_len=0):
+    def _generate_tokens(self, input_ids, attention_mask, pyg_graphs, max_new_tokens):
         """Inject R-PEARL PE into token embeddings and run model.generate."""
         robot_loc = pyg_graphs[-1].robot_location if pyg_graphs else None
         print(f"[spine-llm] graph_found={bool(pyg_graphs)}, n_graphs={len(pyg_graphs)}, robot_location={robot_loc}")
 
         if not pyg_graphs:
-            return super()._generate_tokens(input_ids, attention_mask, None, max_new_tokens)
+            outputs = self.model.llm.generate(
+                input_ids=input_ids, attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens, use_cache=True, temperature=0.01, min_p=0.1,
+                pad_token_id=self.tokenizer.eos_token_id,
+            )
+            return outputs[:, input_ids.shape[-1]:]
 
         # Compute base embeddings once
         embeddings = (
@@ -146,25 +142,16 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
             .to(input_ids.device)
         )
 
-        # Inject GNN positional encodings for the real task graph (last one).
-        # Scope the injection map to only the task message + history tokens
-        # (skip ICL examples and system prompt) to match training, where
-        # input_ids contain only the single-conversation training example.
         pyg_graph = pyg_graphs[-1]
         input_ids_list = input_ids[0].tolist()
         node_token_seqs = [
             self.tokenizer.encode(name, add_special_tokens=False)
             for name in pyg_graph.node_names
         ]
-        task_ids = input_ids_list[prefix_len:]
-        injection_map_local = build_injection_map(task_ids, node_token_seqs)
-        injection_map = {
-            nid: [(s + prefix_len, e + prefix_len) for s, e in spans]
-            for nid, spans in injection_map_local.items()
-        }
+        injection_map = build_injection_map(input_ids_list, node_token_seqs)
         pe = self.model.pe_proj(self.model.pe_model(pyg_graph))  # [n, hidden_size]
 
-        # Rescale PE to match embedding norm. pe_proj ends with LayerNorm which
+        # Rescale PE to match embedding norm. pe_proj ends with LipschitzNorm which
         # forces output to norm ≈ sqrt(d_model) ≈ 64, while LLM embeddings
         # (pre-RMSNorm) sit at ~0.5. Without rescaling, PE overwhelms embeddings.
         target_norm = embeddings.norm(dim=-1).mean()

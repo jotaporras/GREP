@@ -193,7 +193,7 @@ def test_rpearl_llm():
         k=2,
         use_layer_norm=True,
     )
-    model = gnn_llm.GraphAugmentedLLM(llm, pe_model, tokenizer, pe_dim=d_model)
+    model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=d_model)
 
     collator = data.SpineDataCollator(tokenizer, mlm=False)
     ds = _make_dataset(tokenizer)
@@ -205,7 +205,7 @@ def test_rpearl_llm():
         "d_model": d_model,
         "num_samples": 5,
         "dropout": 0.1,
-        "k": 2,
+        "k_pe": 2,
         "use_layer_norm": True,
     }
 

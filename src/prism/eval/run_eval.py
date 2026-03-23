@@ -7,6 +7,23 @@ from typing import Dict, List, Tuple
 
 from spine.mapping.graph_util import GraphHandler
 from spine.spine import SPINE
+import spine.prompts.prompts as _spine_prompts
+from spine.prompts.examples import EXAMPLE_1, EXAMPLE_2, EXAMPLE_3, EXAMPLE_4, EXAMPLE_5
+
+# Fix operator-precedence bug in SPINE's get_base_prompt_update_graph.
+_orig_get_base_prompt = _spine_prompts.get_base_prompt_update_graph
+
+def _fixed_get_base_prompt(request, scene_graph, use_icl=True):
+    if use_icl:
+        return _orig_get_base_prompt(request, scene_graph, use_icl=True)
+    header = [_spine_prompts.SYS_PROMPT] + EXAMPLE_1 + [
+        {"role": "user",
+         "content": f"{request}\nAdvice: \n- Recall the scene may be incomplete. \n- Carefully explain your reasoning in a step-by-step manner.\n- Reason over   connections, coordinates, and semantic relationships between objects and regions in the scene.\n\n"
+                    f"Scene graph:{scene_graph}"}
+    ]
+    return header
+
+_spine_prompts.get_base_prompt_update_graph = _fixed_get_base_prompt
 
 from prism.data import graph_sim
 from prism.data import planning_sim
@@ -136,11 +153,12 @@ def eval_model(
         if model is not None and tokenizer is not None:
             # When model and tokenizer present, we're using an in-memory model (eg for eval during training.)
             strip_edges = text_edge_list == "none"
-            if _is_graph_augmented(model):
+            is_gnn = _is_graph_augmented(model)
+            if is_gnn:
                 client = inference.GraphAugmentedInMemoryLLM(model=model, tokenizer=tokenizer, strip_edges=strip_edges)
             else:
                 client = inference.InMemoryLLM(model=model, tokenizer=tokenizer, strip_edges=strip_edges)
-            llm_planner = SPINE(graph=graph_sim_inst.partial_graph, client=client)
+            llm_planner = SPINE(graph=graph_sim_inst.partial_graph, client=client, use_icl=not is_gnn)
         else:
             llm_planner = SPINE(
                 graph=graph_sim_inst.partial_graph,

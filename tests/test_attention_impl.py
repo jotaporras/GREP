@@ -115,7 +115,7 @@ def test_live_dispatch():
             num_samples=4, dropout=0.0, k=2, use_layer_norm=True,
         )
 
-        graph_llm = GraphAugmentedLLM(llm, pe_model, pe_dim=llm.config.hidden_size)
+        graph_llm = GraphAugmentedLLM(llm, pe_model, d_model=llm.config.hidden_size)
 
         print(f"  graph_llm.llm.config._attn_implementation    : {graph_llm.llm.config._attn_implementation!r}")
         print(f"  graph_llm.config._attn_implementation        : {graph_llm.config._attn_implementation!r}")

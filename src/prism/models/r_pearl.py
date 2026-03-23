@@ -1,9 +1,11 @@
 import torch
 from torch import nn
+from torch.nn.utils.parametrizations import spectral_norm
 from torch.utils.checkpoint import checkpoint
 from torch_geometric.data import Data
 
 from prism.models import gcn
+from prism.models.utils import LipschitzNorm
 
 
 class RandomGNNPositionalEncodings(nn.Module):
@@ -17,7 +19,8 @@ class RandomGNNPositionalEncodings(nn.Module):
         num_samples (int): Number of random samples (M) to use
         dropout (float): Dropout rate of the GCN associated.
         k (int): Convolution depth of the GCN.
-        use_layer_norm (bool): Whether to use layer normalization
+        use_layer_norm (bool): Whether to use Lipschitz layer normalization
+        eps (float): The Lipschitz constant for layer normalization
     """
 
     def __init__(self,
@@ -27,22 +30,60 @@ class RandomGNNPositionalEncodings(nn.Module):
         num_samples=30,
         dropout=0.1,
         k: int = 3,
+        eps=1e-8,
         use_layer_norm=True,
     ):
         super().__init__()
         # Create a GCN that takes 1-dimensional random features
         self.pe_gcn = gcn.GCN(
-            1, pe_hidden_channels, pe_num_layers, skip_connection=True, dropout=dropout, k=k
+            1, pe_hidden_channels, pe_num_layers,
+            skip_connection=True, dropout=dropout, k=k, eps=eps
         )
         # Add a final projection to ensure output is d_model dimensions
-        self.output_projection = nn.Linear(pe_hidden_channels, d_model)
+        self.output_projection = spectral_norm(nn.Linear(pe_hidden_channels, d_model))
         self.dropout = nn.Dropout(dropout)
         self.use_layer_norm = use_layer_norm
         if self.use_layer_norm:
-            self.layer_norm = nn.LayerNorm(d_model)
+            self.norm = LipschitzNorm(d_model, eps=eps)
         else:
-            self.batch_norm = nn.BatchNorm1d(d_model)
+            self.norm = nn.BatchNorm1d(d_model)
         self.M = num_samples
+        self.eps = eps
+
+    def _batched_gcn_forward(self, Q: torch.Tensor, edge_index: torch.Tensor,
+                             num_nodes: int, device=None) -> torch.Tensor:
+        """Process all M random samples through the GCN in a single batched call.
+
+        Creates M copies of the graph, each with a different random feature column,
+        and processes them as a single PyG Batch for GPU-parallel execution.
+
+        Args:
+            Q: Random features [num_nodes, M].
+            edge_index: Graph edge indices [2, num_edges].
+            num_nodes: Number of nodes in the graph.
+
+        Returns:
+            Pooled positional encodings [num_nodes, d_model].
+        """
+
+        # Stack Q columns as a single [M*N, 1] feature with repeated edge_index.
+        x_stacked = Q.T.reshape(-1, 1)
+
+        # Build batch edge_index by offsetting
+        offsets = torch.arange(self.M, device=device) * num_nodes
+        edge_batch = edge_index.unsqueeze(0) + offsets.view(-1, 1, 1)
+        edge_batch = edge_batch.permute(1, 0, 2).reshape(2, -1)
+        batch_data = Data(x=x_stacked, edge_index=edge_batch, num_nodes=self.M * num_nodes)
+
+        # Single batched GCN forward pass over all M copies.
+        pe_all = self.pe_gcn(batch_data)
+        pe_all = self.dropout(pe_all)
+        pe_all = self.output_projection(pe_all)
+
+        # Reshape [M*N, d_model] -> [M, N, d_model] and mean-pool over samples.
+        pe_all = pe_all.view(self.M, num_nodes, -1)
+        pooled_pe = pe_all.mean(dim=0)
+        return pooled_pe
 
     def forward(self, data):
         # Move input data to the model's device.
@@ -58,27 +99,15 @@ class RandomGNNPositionalEncodings(nn.Module):
         num_nodes = X.shape[0]
         Q = torch.randn((num_nodes, self.M), device=device)
 
-        # Process random embeddings individually through GCN
-        P_m = []
+        # Gradient checkpoint: recompute the batched GCN on backward to save memory.
+        # The dummy tensor ensures at least one input requires grad (needed by checkpoint).
+        dummy = Q.new_ones(1, requires_grad=True)
+        pooled_pe = checkpoint(
+            lambda q, ei, d, dev: self._batched_gcn_forward(q, ei, num_nodes, device=dev),
+            Q, edge_index, dummy, device,
+            use_reentrant=False,
+        )
 
-        for i in range(self.M):
-
-            def _pe_block(q_col, edge_idx, _dummy):
-                q_data = Data(x=q_col.unsqueeze(-1), edge_index=edge_idx)
-                pe_local = self.pe_gcn(q_data)
-                pe_local = self.dropout(pe_local)
-                pe_local = self.output_projection(pe_local)
-                return pe_local
-
-            dummy = Q.new_ones(1, requires_grad=True, device=device)
-            pe = checkpoint(_pe_block, Q[:, i], edge_index, dummy, use_reentrant=False)
-            P_m.append(pe)
-        # checkpoint
-
-        P = torch.stack(P_m, dim=-1)
-        pooled_pe = P.mean(dim=-1)
-        if self.use_layer_norm:
-            pooled_pe = self.layer_norm(pooled_pe)
-        else:
-            pooled_pe = self.batch_norm(pooled_pe)
+        pooled_pe = self.norm(pooled_pe)
         return pooled_pe
+
