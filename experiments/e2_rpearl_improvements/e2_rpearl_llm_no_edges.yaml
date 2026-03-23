@@ -4,7 +4,7 @@ wandb_project: GREP-PRISM
 wandb_run_name: e2_rpearl_newdata_no_edges
 wandb_tag: e2_rpearl_improvements
 checkpoint_dir: outputs/e2_rpearl_improvements_no_edges
-data: data/gen/spine_exp1/formatted.json
+data: data/eval/gpt_gen_formatted.json
 #base_model: meta-llama/Llama-3.2-3B-Instruct
 base_model: meta-llama/Llama-3.1-8B-Instruct
 bit4: true
@@ -26,3 +26,4 @@ k_pe: 3
 eps: 1e-6
 use_layer_norm: true
 freeze_llm: false
+device: -1

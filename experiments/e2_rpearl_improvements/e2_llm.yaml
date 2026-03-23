@@ -16,3 +16,4 @@ debug: true
 dataset_proportion: 1.0
 max_seq_length: 2048
 text_edge_list: present
+device: -1

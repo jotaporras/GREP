@@ -15,10 +15,10 @@ class InMemoryLLM:
     Tokenizes, generates, and decodes. No graph logic.
     """
 
-    def __init__(self, model, tokenizer, device="cuda", strip_edges: bool = False):
+    def __init__(self, model, tokenizer, device=None, strip_edges: bool = False):
         self.model = model
         self.tokenizer = tokenizer
-        self.device = device
+        self.device = device if device is not None else next(model.parameters()).device
         self.strip_edges = strip_edges
 
     def format_prompt(self, base_request: str, graph_as_json: str) -> List[Dict]:

@@ -51,8 +51,8 @@ def parse_args():
     parser.add_argument(
         "--device",
         type=int,
-        default=1,
-        help="GPU index to load the model on (default: 1). Set to -1 for device_map='auto'.",
+        default=0,
+        help="GPU index to load the model on (default: 0). Set to -1 for device_map='auto'.",
     )
     return parser.parse_args()
 

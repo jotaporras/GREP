@@ -103,7 +103,7 @@ class Unsloth:
             tokenize=True,
             add_generation_prompt=True,  # Must add for generation
             return_tensors="pt",
-        ).to("cuda")
+        ).to(next(self.model.parameters()).device)
 
         outputs = self.model.generate(
             input_ids=inputs,
