@@ -67,7 +67,7 @@ class SparseGraphAttention(nn.Module):
         v = (self.W_V(x) * self.c_v.clamp(0, 1)).view(
             N, self.heads, self.head_dim).permute(1, 0, 2)
 
-        values = torch.ones(edge_index.shape[1], device=x.device)
+        values = torch.ones(edge_index.shape[1], device=x.device, dtype=x.dtype)
         A = torch.sparse_coo_tensor(
             indices=edge_index, values=values, size=(N, N)
         ).coalesce().to_sparse_csr()
@@ -109,6 +109,12 @@ class _SafeBatchedSparseAttn(torch.autograd.Function):
     def forward(ctx, QX, KX, VX, A_csr, scale, attn_dropout, training):
         # Initialize variables.
         H, N, F_head = QX.shape
+        orig_dtype = QX.dtype
+
+        # sampled_addmm only supports float32 — cast up front.
+        QX = QX.float()
+        KX = KX.float()
+        VX = VX.float()
 
         # Flatten heads into the node dimension.
         QX_flat = QX.reshape(H * N, F_head)
@@ -123,7 +129,7 @@ class _SafeBatchedSparseAttn(torch.autograd.Function):
             *(crow[1:] + i * col.shape[0] for i in range(H))
         ])
         block_col = torch.cat([col + i * N for i in range(H)])
-        block_vals = torch.ones(H * col.shape[0], device=QX.device)
+        block_vals = torch.ones(H * col.shape[0], device=QX.device, dtype=QX.dtype)
 
         A_block = torch.sparse_csr_tensor(
             block_crow, block_col, block_vals, size=(H * N, H * N)
@@ -156,11 +162,13 @@ class _SafeBatchedSparseAttn(torch.autograd.Function):
 
         # Reshape the output.
         attn_out = out_flat.reshape(H, N, F_head).permute(1, 0, 2).reshape(N, H * F_head)
+        attn_out = attn_out.to(orig_dtype)
 
-        # Save for backward.
-        ctx.save_for_backward(QX, KX, VX, A_csr, scale)
+        # Save for backward (keep float32 copies for backward sampled_addmm).
+        ctx.save_for_backward(QX, KX, VX, A_csr.float(), scale)
+        ctx.orig_dtype = orig_dtype
         ctx.attn_dropout = attn_dropout
-        ctx.training = training
+        ctx.is_training = training
 
         return attn_out
 
@@ -170,7 +178,7 @@ class _SafeBatchedSparseAttn(torch.autograd.Function):
         H, N, F_head = QX.shape
 
         # Reshape grad to (H, N, F_head).
-        grad_out = grad_output.reshape(N, H, F_head).permute(1, 0, 2)
+        grad_out = grad_output.float().reshape(N, H, F_head).permute(1, 0, 2)
 
         grad_QX = torch.zeros_like(QX)
         grad_KX = torch.zeros_like(KX)
@@ -189,7 +197,7 @@ class _SafeBatchedSparseAttn(torch.autograd.Function):
                 )
 
                 # Apply sparse attention-score dropout.
-                if ctx.training and ctx.attn_dropout is not None:
+                if ctx.is_training and ctx.attn_dropout is not None:
                     unnormalized = ctx.attn_dropout(unnormalized)
 
                 # Extract CSR structure for neighborhood softmax.
@@ -216,7 +224,8 @@ class _SafeBatchedSparseAttn(torch.autograd.Function):
             grad_VX[i] = vi.grad
 
         # 7 inputs to forward: QX, KX, VX, A_csr, scale, attn_dropout, training.
-        return grad_QX, grad_KX, grad_VX, None, None, None, None
+        orig_dtype = ctx.orig_dtype
+        return grad_QX.to(orig_dtype), grad_KX.to(orig_dtype), grad_VX.to(orig_dtype), None, None, None, None
 
 
 class SparseTransformerBlock(nn.Module):
