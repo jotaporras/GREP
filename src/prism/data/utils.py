@@ -7,11 +7,11 @@ import networkx as nx
 import numpy as np
 import torch
 import torch_geometric.utils as pyg_utils
-from torch_geometric.data import Data
 from openai import OpenAI
 from openai.types.chat import ChatCompletion
 from scipy.spatial.transform import Rotation
 from spine.mapping.graph_util import parse_graph_coord
+from torch_geometric.data import Data
 
 
 def safe_parse_graph(
@@ -182,10 +182,10 @@ class GPTQueryClient:
         self,
         query: str,
         temperature: Optional[float] = 0.31,
-        max_tokens: Optional[int] = 2048,
+        max_tokens: Optional[int] = 10240,
     ) -> ChatCompletion:
         response = self.client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4.1",
             messages=[
                 {
                     "role": "user",

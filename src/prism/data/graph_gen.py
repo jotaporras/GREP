@@ -10,7 +10,7 @@ from prism.data import utils
 QUERY = """
 You are generating data for training an llm-based planner, like the SPINE paper from ravichandran et al.
 
-Generate a scene graph for training in the following format
+You will be given a base scene graph in the following format
 
 {
         "objects": [{"name": "object_1_name", "coords": [west_east_coordinate, south_north_coordinate]}, ...],
@@ -56,7 +56,52 @@ For example,
 "robot_location": "ground_1"
 }
 
-Make sure all nodes referenced in the conntections are listed in the objects and regions list.
+You must populate the base graph using the following steps:
+
+### Step 1: Choose theme
+
+**Independence rule:** Each graph must be filled completely independently. Do NOT reuse themes, region types, object types, naming patterns, or task wordings from any previously filled graph in this conversation or any other. Treat each skeleton as if it is the only one you have ever seen. Choose a fresh, distinct theme every time.
+
+If the user provides a theme, use it. Otherwise, infer a coherent theme from the topology (e.g., a graph with 3-4 communities of 5-10 regions suggests a rural area with distinct zones like fields, roads, and wooded areas). Vary your theme choices widely — do not default to the same genre (e.g., rural farmland) across multiple invocations.
+
+### Step 2: Rename regions
+
+Each community gets a coherent region type. Names follow the `type_N` convention with **globally unique names across all regions AND objects**.
+
+**Uniqueness rule:** Every node name in the entire graph must be unique. A name like `field_1` may only appear once — it cannot be both a region and an object. Each `type` string (the prefix before `_N`) may appear at most **twice** in the entire graph (regions + objects combined). For example, you may have `desert_1` and `desert_2`, but not `desert_3`. If a community has more nodes than 2, use multiple distinct types within that community (e.g., `field_1`, `field_2`, `meadow_1`, `meadow_2`, `clearing_1`).
+
+Examples of community → type mappings:
+- Community 0 (5 nodes) → `field_1`, `field_2`, `meadow_1`, `meadow_2`, `clearing_1`
+- Community 1 (5 nodes) → `road_1`, `road_2`, `highway_1`, `intersection_1`, `parking_lot_1`
+- Community 2 (5 nodes) → `trail_1`, `trail_2`, `path_1`, `path_2`, `bridge_1`
+
+Choose types that make sense for the theme. Types used across different communities should be distinct where possible. Maintain a rename map: `{"region_1": "field_1", "region_2": "meadow_1", ...}`.
+
+### Step 3: Rename objects
+
+Give objects realistic names matching their host region context. Use the `type_N` convention.
+
+Examples: `pickup_truck_1`, `cabin_1`, `shed_1`, `light_pole_1`, `sail_boat_1`, `internet_tower_1`.
+
+**Uniqueness rule (same as regions):** Each object name must be globally unique across all regions AND objects. Each `type` prefix may appear at most **twice** in the entire graph. Maximize diversity — avoid repeating the same type for every object. Consider what makes sense near each region type.
+
+### Step 4: Fill descriptions
+
+For objects with `description: "__FILL__"`, assign short attribute strings that create interesting planning scenarios:
+- `"damaged"`, `"not damaged"`, `"has keys"`, `"locked"`, `"empty"`, `"operational"`
+
+For objects with `description: ""`, leave them as `""`.
+
+Then, provide tasks that present interesting planning scenarios. The tasks should assess the ability of the planner to do one of the following
+1. understanding node existance (is a semantic type in the graph)?
+2. understand the position of a node (what is the northmost region, etc.)?
+3. assess reachability (is one node connected to another node)?
+4. understand navigation (give a path from node a to node b)
+
+
+The planner should be able to respond to your tasks via the answer() function. This should not require mapping, navigation, etc.
+
+
 Provide your answer in the following JSON format:
 
 {
@@ -70,7 +115,7 @@ Add a "description" attribute to each node that provides information.
 These will be hidden from the robot
 
 Task generation instructions
-- DO NOT reference specific objects or nodes. Make the planner infer theese.
+- DO NOT reference specific objects or nodes. Make the planner infer these.
 - Tasks should request specific information, not general exploration. Make the planner map or inspect certain entities. For example, start tasks with phrases such as "what", "I heard", "find out", "map", "inspect", "Can I", "is there", and likewise
 
 """
@@ -91,11 +136,20 @@ class TaskGraphGen:
     def __init__(self):
         self.client = utils.GPTQueryClient()  # OpenAI()
 
-    def _build_prompt(self, n_regions=10, n_objects=10, n_tasks=2, prior=""):
+    def _build_prompt(
+        self,
+        base_graph: str,
+        n_tasks: Optional[int] = 2,
+        prior: Optional[str] = "",
+        previous_tasks: Optional[str] = "",
+    ):
         query = (
             QUERY
-            + f"\nYour graph should have {n_regions} regions, {n_objects} objects, and you should generate {n_tasks} tasks"
+            + f"\nYour graph should populate the base gras provided below and you should generate {n_tasks} tasks.\nBase graph:\b{base_graph}"
         )
+
+        if previous_tasks is not "":
+            query += f"\nPrevious tasks are: {previous_tasks}\nTry not to duplicate"
 
         if prior != "":
             query += f"\nYour tasks and scene should be like the following: {prior}"
@@ -103,7 +157,11 @@ class TaskGraphGen:
         return query
 
     def get_tasks(
-        self, n_regions=10, n_objects=10, n_tasks=2, description=""
+        self,
+        base_graph: str,
+        n_tasks: int = 2,
+        description="",
+        previous_tasks: str = "",
     ) -> List[str]:
         """Get GPT generated tasks for putting planner data
 
@@ -123,21 +181,12 @@ class TaskGraphGen:
         List[str]
             list of tasks
         """
-
-        if description == "":
-            description = self.client.query_gpt(
-                query=SCENE_PRIOR, temperature=0.95, max_tokens=256
-            )
-            description = json.loads(description.choices[0].message.content)[
-                "description"
-            ]
-
         response = self.client.query_gpt(
             query=self._build_prompt(
-                n_regions=n_regions,
-                n_objects=n_objects,
                 n_tasks=n_tasks,
                 prior=description,
+                base_graph=base_graph,
+                previous_tasks=previous_tasks,
             )
         )
 
