@@ -3,7 +3,6 @@ import os
 from pathlib import Path
 from typing import List, Union
 
-import numpy as np
 from spine.mapping.graph_util import GraphHandler
 from spine.spine import SPINE
 

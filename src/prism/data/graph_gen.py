@@ -1,8 +1,6 @@
 import json
 from typing import List, Optional
 
-from openai import OpenAI
-from openai.types.chat import ChatCompletion
 from spine.mapping.graph_util import GraphHandler
 
 from prism.data import utils
