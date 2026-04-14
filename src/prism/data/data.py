@@ -1,5 +1,5 @@
+import json
 import re
-from ast import literal_eval
 from typing import Optional, no_type_check
 
 import datasets
@@ -37,9 +37,9 @@ def preprocess_dataset(
 
     def _parse_scene_graph(example):
         full_text = tokenizer.apply_chat_template(example["messages"], tokenize=False)
-        pattern = r"[Ss]cene graph:"
-        scene_graph_text = re.findall(pattern + r" ?(.*})", full_text)[0]
-        sg = literal_eval(scene_graph_text)
+        m = re.search(r"[Ss]cene graph:", full_text)
+        start = full_text.index("{", m.end())
+        sg, _ = json.JSONDecoder().raw_decode(full_text[start:])
         all_names = [n["name"] for n in sg["objects"] + sg["regions"]]
         seen, duplicates = set(), set()
         for name in all_names:

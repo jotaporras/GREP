@@ -2,19 +2,6 @@ import os
 import re
 import sys
 
-# Isolate the target GPU BEFORE any torch/CUDA imports.  Without this, PyTorch
-# initializes a CUDA context on every visible GPU, blocking parallel runs.
-# Each process sets its own CUDA_VISIBLE_DEVICES from the YAML config's
-# `device:` field, so concurrent training/eval sessions coexist safely.
-if __name__ == "__main__":
-    for _arg in sys.argv[1:]:
-        if _arg.endswith(('.yaml', '.yml')) and os.path.exists(_arg):
-            with open(_arg) as _f:
-                _m = re.search(r'^device:\s*(\d+)', _f.read(), re.MULTILINE)
-            if _m:
-                os.environ["CUDA_VISIBLE_DEVICES"] = _m.group(1)
-            break
-
 from prism.data import data
 from prism.eval import callbacks
 from prism.eval import run_eval
