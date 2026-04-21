@@ -1,5 +1,49 @@
+import random
+from copy import deepcopy
+
 import torch
 from torch import nn
+
+
+class Permutation:
+    """Records a reproducible node-index permutation for equivariance experiments.
+
+    Created with a fixed seed; the actual permutation array is generated
+    on first call to ``apply`` and stored for reporting.
+    """
+
+    def __init__(self, seed: int):
+        self.seed = seed
+        self.perm = None
+
+    def apply(self, edge_index: torch.Tensor, num_nodes: int, device: torch.device = None) -> torch.Tensor:
+        device = device or edge_index.device
+        if self.perm is None or self.perm.shape[0] != num_nodes:
+            g = torch.Generator(device="cpu").manual_seed(self.seed)
+            self.perm = torch.randperm(num_nodes, generator=g, device="cpu").to(device)
+        return self.perm[edge_index]
+
+    def to_dict(self) -> dict:
+        return {
+            "seed": self.seed,
+            "num_nodes": len(self.perm) if self.perm is not None else None,
+            "permutation": self.perm.cpu().tolist() if self.perm is not None else None,
+        }
+
+    def __repr__(self):
+        if self.perm is None:
+            return f"Permutation(seed={self.seed})"
+        return f"Permutation(seed={self.seed}, n={len(self.perm)}, perm={self.perm.cpu().tolist()})"
+
+
+def permute_graph_dict(graph_dict: dict, seed: int) -> dict:
+    """Shuffle node and edge list ordering in a graph dict for text equivariance testing."""
+    rng = random.Random(seed)
+    out = deepcopy(graph_dict)
+    for key in ("objects", "regions", "object_connections", "region_connections"):
+        if key in out and isinstance(out[key], list):
+            rng.shuffle(out[key])
+    return out
 
 
 class LipschitzNorm(nn.Module):

@@ -1,11 +1,13 @@
 """Standalone evaluation script for PRISM checkpoints.
 
+Saves a named report to results/<checkpoint_name>_<eval_name>.json.
+
 Usage:
-    python scripts/evaluate.py <checkpoint_path> [--four-bit] [--eval-data PATH] [--output PATH]
+    python scripts/evaluate.py <checkpoint_path> [--four-bit] [--eval-data PATH] [--output DIR]
 
 Examples:
     python scripts/evaluate.py outputs/e2_rpearl_improvements/e2_llm_llama-3.1-8b_r16_4bit_1x0xqg4q --four-bit
-    python scripts/evaluate.py outputs/... --four-bit --eval-data data/eval/eval_1_multi_step.json --output results.json
+    python scripts/evaluate.py outputs/... --four-bit --eval-data data/eval/eval_1_multi_step.json --output results/
 """
 import argparse
 import json
@@ -28,6 +30,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from prism.eval.run_eval import EvalSample, eval_model
 from prism.models import loaders
+from prism.models.utils import Permutation
 
 
 def parse_args():
@@ -46,8 +49,8 @@ def parse_args():
     )
     parser.add_argument(
         "--output",
-        default=None,
-        help="Optional path to save per-sample JSON results.",
+        default="results",
+        help="Directory to save named result files (default: results/).",
     )
     parser.add_argument(
         "--text-edge-list",
@@ -74,6 +77,13 @@ def parse_args():
             "Whether to include ICL examples in the SPINE prompt. "
             "Default: auto (off for GNN models, on for plain LLMs)."
         ),
+    )
+    parser.add_argument(
+        "--permutation-seed",
+        type=int,
+        nargs="+",
+        default=None,
+        help="One or more random seeds for node-index permutation (equivariance experiment). Omit to disable.",
     )
     return parser.parse_args()
 
@@ -128,27 +138,46 @@ def main():
     print(f"Running eval on {len(eval_samples)} samples...")
 
     use_icl = {"true": True, "false": False}.get(args.use_icl)
-    accuracy, sample_results = eval_model(
-        eval_samples=eval_samples, model=model, tokenizer=tokenizer,
-        text_edge_list=text_edge_list, use_icl=use_icl,
-    )
+    ckpt_name = os.path.basename(os.path.normpath(checkpoint))
+    eval_name = os.path.splitext(os.path.basename(args.eval_data))[0]
 
-    print(f"\n{'='*60}")
-    print(f"Accuracy: {accuracy:.4f} ({sum(r['correct'] for r in sample_results)}/{len(sample_results)})")
-    print(f"{'='*60}\n")
+    permutations = [Permutation(s) for s in args.permutation_seed] if args.permutation_seed else [None]
 
-    if args.output:
+    for permutation in permutations:
+        seed_tag = f"perm_{permutation.seed}" if permutation is not None else None
+        if seed_tag:
+            print(f"\n{'#'*60}")
+            print(f"  PERMUTATION SEED: {permutation.seed}")
+            print(f"{'#'*60}")
+
+        accuracy, sample_results = eval_model(
+            eval_samples=eval_samples, model=model, tokenizer=tokenizer,
+            text_edge_list=text_edge_list, use_icl=use_icl,
+            permutation=permutation,
+        )
+
+        print(f"\n{'='*60}")
+        print(f"Accuracy: {accuracy:.4f} ({sum(r['correct'] for r in sample_results)}/{len(sample_results)})")
+        if permutation is not None:
+            print(f"Permutation: {permutation}")
+        print(f"{'='*60}\n")
+
+        out_dir = os.path.join(args.output, seed_tag) if seed_tag else args.output
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, f"{ckpt_name}_{eval_name}.json")
+
         output_data = {
             "checkpoint": checkpoint,
             "eval_data": args.eval_data,
             "accuracy": accuracy,
             "num_correct": sum(r["correct"] for r in sample_results),
             "num_total": len(sample_results),
+            "permutation": permutation.to_dict() if permutation is not None else None,
             "samples": sample_results,
         }
-        with open(args.output, "w") as f:
+        with open(out_path, "w") as f:
             json.dump(output_data, f, indent=2)
-        print(f"Results saved to {args.output}")
+        print(f"Results saved to {out_path}")
 
 
 if __name__ == "__main__":

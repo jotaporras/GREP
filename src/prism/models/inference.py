@@ -79,6 +79,10 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
     over the full input_ids without per-message offset correction.
     """
 
+    def __init__(self, model, tokenizer, device=None, strip_edges: bool = False, permutation=None):
+        super().__init__(model, tokenizer, device, strip_edges)
+        self.permutation = permutation
+
     def _parse_all_pyg_graphs(self, msg: List[Dict]) -> List:
         """Extract all scene graphs from SPINE message list and convert to PyG Data objects."""
         graphs = []
@@ -149,7 +153,7 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
             for name in pyg_graph.node_names
         ]
         injection_map = build_injection_map(input_ids_list, node_token_seqs)
-        pe = self.model.pe_proj(self.model.pe_model(pyg_graph))  # [n, hidden_size]
+        pe = self.model.pe_proj(self.model.pe_model(pyg_graph, permutation=self.permutation))  # [n, hidden_size]
 
         # Rescale PE to match embedding norm. pe_proj ends with LipschitzNorm which
         # forces output to norm ≈ sqrt(d_model) ≈ 64, while LLM embeddings

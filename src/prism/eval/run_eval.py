@@ -25,6 +25,7 @@ def _fixed_get_base_prompt(request, scene_graph, use_icl=True):
 
 _spine_prompts.get_base_prompt_update_graph = _fixed_get_base_prompt
 
+from prism.models.utils import permute_graph_dict
 from prism.data import graph_sim
 from prism.data import planning_sim
 from prism.models import gnn_llm
@@ -136,6 +137,7 @@ def eval_model(
     tokenizer=None,
     text_edge_list: str = "present",
     use_icl: bool | None = None,
+    permutation=None,
 ) -> Tuple[float, List[Dict]]:
     """Run evaluation on a set of samples using the planning simulation loop.
 
@@ -156,7 +158,7 @@ def eval_model(
             strip_edges = text_edge_list == "none"
             is_gnn = _is_graph_augmented(model)
             if is_gnn:
-                client = inference.GraphAugmentedInMemoryLLM(model=model, tokenizer=tokenizer, strip_edges=strip_edges)
+                client = inference.GraphAugmentedInMemoryLLM(model=model, tokenizer=tokenizer, strip_edges=strip_edges, permutation=permutation)
             else:
                 client = inference.InMemoryLLM(model=model, tokenizer=tokenizer, strip_edges=strip_edges)
             llm_planner = SPINE(graph=graph_sim_inst.partial_graph, client=client,
@@ -182,7 +184,10 @@ def eval_model(
         planning_result = None
         try:
             if multi_turn:
-                graph_sim_inst.reset(graph_as_dict=graph_path, current_location=init_node)
+                graph_dict = graph_path
+                if permutation is not None and not is_gnn:
+                    graph_dict = permute_graph_dict(graph_dict, seed=permutation.seed)
+                graph_sim_inst.reset(graph_as_dict=graph_dict, current_location=init_node)
                 llm_planner.graph = graph_sim_inst.partial_graph
 
                 planning_result = model.run_planning(

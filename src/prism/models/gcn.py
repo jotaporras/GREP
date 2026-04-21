@@ -32,7 +32,7 @@ class GCN(nn.Module):
         use_batch_norm=False,
         dropout=0.5,
         k: int = 3,
-        eps: float = 1e-8
+        eps: float = 1e-8,
     ):
         super().__init__()
         if num_layers < 2:
