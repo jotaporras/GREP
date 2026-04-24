@@ -176,7 +176,7 @@ def main():
             "samples": sample_results,
         }
         with open(out_path, "w") as f:
-            json.dump(output_data, f, indent=2)
+            json.dump(output_data, f, indent=2, default=str)
         print(f"Results saved to {out_path}")
 
 

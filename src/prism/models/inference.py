@@ -37,7 +37,7 @@ class InMemoryLLM:
         # Strip the input prefix — keep only newly generated tokens.
         return outputs[:, input_ids.shape[-1]:]
 
-    def query_llm(self, msg: List[Dict], max_new_tokens: int = 256):
+    def query_llm(self, msg: List[Dict], max_new_tokens: int = 2048):
         if self.strip_edges:
             msg = [
                 {**m, "content": remove_edge_list(m["content"])} if m["role"] == "user" else m
@@ -97,7 +97,7 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
                     continue
         return graphs
 
-    def query_llm(self, msg: List[Dict], max_new_tokens: int = 256):
+    def query_llm(self, msg: List[Dict], max_new_tokens: int = 2048):
         # Always parse PyG graphs from the original message so the GNN has full
         # connectivity regardless of text_edge_list setting.
         pyg_graphs = self._parse_all_pyg_graphs(msg)
