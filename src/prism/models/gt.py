@@ -4,6 +4,7 @@ import torch
 from torch import nn, Tensor
 from torch.nn.utils.parametrizations import spectral_norm
 from torch.utils.checkpoint import checkpoint
+from torch_geometric.data import Data
 from torch_geometric.utils import add_self_loops, coalesce, softmax
 
 from prism.models.r_pearl import RandomGNNPositionalEncodings
@@ -352,7 +353,7 @@ class GraphTransformer(nn.Module):
         # Return the coalesced edge index.
         return coalesce(expanded_edge_index, num_nodes=num_nodes)
 
-    def forward(self, data) -> Tensor:
+    def forward(self, data, permutation=None) -> Tensor:
         # Move input data to the Graph Transformer's device.
         try:
             device = next(self.parameters()).device
@@ -361,20 +362,28 @@ class GraphTransformer(nn.Module):
         data.x = data.x.to(device)
         data.edge_index = data.edge_index.to(device)
 
+        edge_index = data.edge_index
+        if permutation is not None:
+            edge_index = permutation.apply(edge_index, data.x.size(0), device=device)
+            pe_data = Data(x=data.x, edge_index=edge_index)
+        else:
+            pe_data = data
+
         # Gather positional encodings as input to the Graph Transformer.
-        x = self.pe_model(data)
+        x = self.pe_model(pe_data)
 
         # Precompute k-hop neighborhood diffusions.
-        if not hasattr(data, '_khop_edge_index'):
-            data._khop_edge_index = self._expand_edge_index(data.edge_index, x.size(0))
-        edge_index = data._khop_edge_index
+        if permutation is not None:
+            khop_edge_index = self._expand_edge_index(edge_index, x.size(0))
+        else:
+            if not hasattr(data, '_khop_edge_index'):
+                data._khop_edge_index = self._expand_edge_index(edge_index, x.size(0))
+            khop_edge_index = data._khop_edge_index
 
         # Run signal through all Transformer Blocks.
         for block in self.blocks:
-            x = block(x, edge_index)
+            x = block(x, khop_edge_index)
 
         # Apply Output Lipschitz Normalizer.
         x = self.output_norm(x)
-
-        # Return output.
         return x

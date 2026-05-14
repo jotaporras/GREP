@@ -1,14 +1,16 @@
 """Batch evaluation wrapper — run evaluate.py logic across multiple eval graphs.
 
 Loads the model once, then evaluates every eval JSON matching a glob pattern
-(sorted alphabetically). Prints a summary table at the end.
+(sorted alphabetically). Saves named per-trial reports to
+results/<checkpoint_name>_<eval_name>.json and a summary to
+results/<checkpoint_name>_summary.json.
 
 Usage:
     python scripts/evaluate_suite.py <checkpoint> --pattern "data/eval/eval_graph_unique_*.json" [--four-bit] [--device 0]
 
 Examples:
     python scripts/evaluate_suite.py outputs/my_checkpoint --pattern "data/eval/eval_graph_unique_*.json" --four-bit
-    python scripts/evaluate_suite.py outputs/my_checkpoint --pattern "data/eval/eval_graph_*.json" --output results/
+    python scripts/evaluate_suite.py outputs/my_checkpoint --pattern "data/eval/eval_graph_*.json" --output my_results/
 """
 import argparse
 import glob
@@ -40,6 +42,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from prism.eval.run_eval import EvalSample, eval_model
 from prism.models import loaders
+from prism.models.utils import Permutation
 
 
 def parse_args():
@@ -83,8 +86,15 @@ def parse_args():
     )
     parser.add_argument(
         "--output",
+        default="results",
+        help="Directory to save named per-trial JSON results (default: results/).",
+    )
+    parser.add_argument(
+        "--permutation-seed",
+        type=int,
+        nargs="+",
         default=None,
-        help="Directory to save per-trial JSON results. One file per eval graph.",
+        help="One or more random seeds for node-index permutation (equivariance experiment). Omit to disable.",
     )
     return parser.parse_args()
 
@@ -225,67 +235,84 @@ def main():
     print(f"text_edge_list={text_edge_list!r}\n")
 
     use_icl = {"true": True, "false": False}.get(args.use_icl)
+    ckpt_name = os.path.basename(os.path.normpath(args.checkpoint))
 
-    if args.output:
-        os.makedirs(args.output, exist_ok=True)
+    permutations = [Permutation(s) for s in args.permutation_seed] if args.permutation_seed else [None]
 
-    trial_results = []
+    preloaded_samples = {path: load_eval_samples(path) for path in eval_files}
 
-    for eval_path in eval_files:
-        trial_name = os.path.basename(eval_path)
-        print(f"\n{'='*60}")
-        print(f"  TRIAL: {trial_name}")
-        print(f"{'='*60}")
+    for permutation in permutations:
+        seed_tag = f"perm_{permutation.seed}" if permutation is not None else None
+        out_dir = os.path.join(args.output, seed_tag) if seed_tag else args.output
+        os.makedirs(out_dir, exist_ok=True)
 
-        eval_samples = load_eval_samples(eval_path)
-        n_nodes = _graph_node_count(eval_samples[0].graph)
-        trial_use_icl = True if n_nodes >= 100 else use_icl
-        print(f"  {len(eval_samples)} samples, {n_nodes} nodes, use_icl={trial_use_icl}")
+        if seed_tag:
+            print(f"\n{'#'*60}")
+            print(f"  PERMUTATION SEED: {permutation.seed}")
+            print(f"{'#'*60}")
 
-        t0 = time.time()
-        accuracy, sample_results = eval_model(
-            eval_samples=eval_samples,
-            model=model,
-            tokenizer=tokenizer,
-            text_edge_list=text_edge_list,
-            use_icl=trial_use_icl,
-        )
-        elapsed = time.time() - t0
+        trial_results = []
 
-        num_correct = sum(r["correct"] for r in sample_results)
-        num_formatted = sum(r["formatted"] for r in sample_results)
-        num_keyword = sum(r["plan_keyword"] for r in sample_results)
-        num_errors = sum(1 for r in sample_results if r["error"] is not None)
+        for eval_path in eval_files:
+            trial_name = os.path.basename(eval_path)
+            trial_stem = os.path.splitext(trial_name)[0]
+            print(f"\n{'='*60}")
+            print(f"  TRIAL: {trial_name}")
+            print(f"{'='*60}")
 
-        print(f"\n  => {trial_name}: {num_correct}/{len(sample_results)} correct ({accuracy:.1%}) in {elapsed:.1f}s")
+            eval_samples = preloaded_samples[eval_path]
+            n_nodes = _graph_node_count(eval_samples[0].graph)
+            trial_use_icl = True if n_nodes >= 100 else use_icl
+            print(f"  {len(eval_samples)} samples, {n_nodes} nodes, use_icl={trial_use_icl}")
 
-        trial_record = {
-            "name": trial_name,
-            "path": eval_path,
-            "num_total": len(sample_results),
-            "num_correct": num_correct,
-            "accuracy": accuracy,
-            "num_formatted": num_formatted,
-            "num_keyword": num_keyword,
-            "num_errors": num_errors,
-            "elapsed_s": elapsed,
-            "samples": sample_results,
-        }
-        trial_results.append(trial_record)
+            t0 = time.time()
+            accuracy, sample_results = eval_model(
+                eval_samples=eval_samples,
+                model=model,
+                tokenizer=tokenizer,
+                text_edge_list=text_edge_list,
+                use_icl=trial_use_icl,
+                permutation=permutation,
+            )
+            elapsed = time.time() - t0
 
-        if args.output:
-            out_path = os.path.join(args.output, trial_name.replace(".json", "_results.json"))
+            num_correct = sum(r["correct"] for r in sample_results)
+            num_formatted = sum(r["formatted"] for r in sample_results)
+            num_keyword = sum(r["plan_keyword"] for r in sample_results)
+            num_errors = sum(1 for r in sample_results if r["error"] is not None)
+
+            print(f"\n  => {trial_name}: {num_correct}/{len(sample_results)} correct ({accuracy:.1%}) in {elapsed:.1f}s")
+
+            trial_record = {
+                "name": trial_name,
+                "path": eval_path,
+                "num_total": len(sample_results),
+                "num_correct": num_correct,
+                "accuracy": accuracy,
+                "num_formatted": num_formatted,
+                "num_keyword": num_keyword,
+                "num_errors": num_errors,
+                "elapsed_s": elapsed,
+                "permutation": permutation.to_dict() if permutation is not None else None,
+                "samples": sample_results,
+            }
+            trial_results.append(trial_record)
+
+            out_path = os.path.join(out_dir, f"{ckpt_name}_{trial_stem}.json")
             with open(out_path, "w") as f:
                 json.dump(trial_record, f, indent=2, cls=_NumpyEncoder)
             print(f"  Saved: {out_path}")
 
-    print_summary_table(trial_results)
+        print_summary_table(trial_results)
 
-    if args.output:
-        summary_path = os.path.join(args.output, "summary.json")
+        if permutation is not None:
+            print(f"\nPermutation: {permutation}")
+
+        summary_path = os.path.join(out_dir, f"{ckpt_name}_summary.json")
         summary = {
             "checkpoint": args.checkpoint,
             "pattern": args.pattern,
+            "permutation": permutation.to_dict() if permutation is not None else None,
             "trials": [
                 {k: v for k, v in r.items() if k != "samples"}
                 for r in trial_results

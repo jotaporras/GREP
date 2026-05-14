@@ -19,6 +19,11 @@ output/
 outputs/
 outputs_dev/
 extra/
+results/
+docs/
+.idea/
+.cursor/
+.DS_Store
 
 *.bak
 SPINE/
@@ -26,3 +31,4 @@ SPINE/
 data_backup/
 *.png
 trainer_output/
+results/

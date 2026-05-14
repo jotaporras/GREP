@@ -85,7 +85,7 @@ class RandomGNNPositionalEncodings(nn.Module):
         pooled_pe = pe_all.mean(dim=0)
         return pooled_pe
 
-    def forward(self, data):
+    def forward(self, data, permutation=None):
         # Move input data to the model's device.
         try:
             device = next(self.parameters()).device
@@ -95,8 +95,11 @@ class RandomGNNPositionalEncodings(nn.Module):
         data.edge_index = data.edge_index.to(device)
         X, edge_index = data.x, data.edge_index
 
-        # Generate random node embeddings for positional encoding
         num_nodes = X.shape[0]
+        if permutation is not None:
+            edge_index = permutation.apply(edge_index, num_nodes, device=device)
+
+        # Generate random node embeddings for positional encoding
         Q = torch.randn((num_nodes, self.M), device=device)
 
         # Gradient checkpoint: recompute the batched GCN on backward to save memory.

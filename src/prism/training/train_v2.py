@@ -198,6 +198,7 @@ class TrainConfig:
     wandb_run_name: str = "spine_lora"
     wandb_tag: str = "spine"
     epochs: int = 2
+    max_steps: int = -1  # If > 0, overrides epochs and switches eval/save to step-based (dev use)
     val_frac: float = 0.1
     # LoRA
     lora_alpha: int = 16
@@ -420,6 +421,7 @@ def train_model(config: TrainConfig, config_file: str = None):
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         warmup_steps=config.warmup_steps,
         num_train_epochs=config.epochs,
+        max_steps=config.max_steps,
         learning_rate=config.learning_rate,
         weight_decay=config.weight_decay,
         lr_scheduler_type="linear",
@@ -437,12 +439,12 @@ def train_model(config: TrainConfig, config_file: str = None):
         # Temporarily disabled because qwen doesn't support it.
         #assistant_only_loss=True,  # train only on assistant tokens
         remove_unused_columns=False,
-        # Checkpointing
-        save_strategy="epoch",
+        # Checkpointing / Validation: step-based when max_steps is set (dev), else epoch-based.
+        save_strategy="steps" if config.max_steps > 0 else "epoch",
+        save_steps=max(1, config.max_steps // 2) if config.max_steps > 0 else 500,
         save_total_limit=3,
-        # Validation
-        eval_strategy="epoch",
-        eval_steps=0.5,
+        eval_strategy="steps" if config.max_steps > 0 else "epoch",
+        eval_steps=max(1, config.max_steps // 2) if config.max_steps > 0 else 0.5,
         do_eval=True,
     )
 

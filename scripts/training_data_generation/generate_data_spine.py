@@ -7,11 +7,7 @@ from prism.data.data_gen import DataGenerator
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--n-samples", type=int, default=1)
-    parser.add_argument("--n-tasks", type=int, default=25)
     parser.add_argument("--name", type=str, default="non-iterative-data")
-    parser.add_argument("--description", type=str, default="")
-    parser.add_argument("--temperature", type=float, default=0.31)
     parser.add_argument("--data-dir", type=str, help="path to base graphs")
 
     args = parser.parse_args()
@@ -20,7 +16,13 @@ if __name__ == "__main__":
     with open(f"{args.name}/data_gen_params.json", "w") as f:
         json.dump(vars(args), f)
 
-    graphs = Path(args.data_dir).glob("*json")
+    graph_paths = sorted(Path(args.data_dir).glob("*graph*json"))
+
+    graphs = []
+    for graph_path in graph_paths:
+        print(graph_path)
+        with open(graph_path) as f:
+            graphs.append(str(json.load(f)))
 
     log_dir = args.name
 
@@ -38,7 +40,7 @@ if __name__ == "__main__":
     graph_dir = Path(log_dir) / "populated_graphs"
     graph_dir.mkdir(exist_ok=True)
 
-    # data_generator.populate_graphs_and_tasks(graphs, log_dir=graph_dir)
+    data_generator.populate_graphs_and_tasks(graphs, log_dir=graph_dir)
 
     plan_dir = Path(log_dir) / "generated_plans"
     generated_data = sorted(graph_dir.glob("*data_gen*json"))

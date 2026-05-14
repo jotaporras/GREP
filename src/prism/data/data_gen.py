@@ -91,10 +91,6 @@ class DataGenerator:
         data_counter = 0
 
         for idx, data_path in enumerate(generated_data):
-
-            if idx <= 7:
-                continue
-
             try:
 
                 with open(data_path) as f:
