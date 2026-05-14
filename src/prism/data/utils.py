@@ -183,7 +183,33 @@ class GPTQueryClient:
         query: str,
         temperature: Optional[float] = 0.31,
         max_tokens: Optional[int] = 10240,
-    ) -> ChatCompletion:
+    ):
+        return self.query_gpt_5(query, temperature, max_tokens)
+
+    def query_gpt_5(
+        self,
+        query: str,
+        temperature: Optional[float] = 0.31,
+        max_tokens: Optional[int] = 10240,
+    ) -> str:
+
+        response = self.client.responses.create(
+            model="gpt-5.1",
+            input=[
+                {"role": "user", "content": [{"type": "input_text", "text": query}]}
+            ],
+            text={"format": {"type": "text"}, "verbosity": "low"},
+            reasoning={"effort": "none", "summary": "auto"},
+        )
+
+        return response.output_text
+
+    def query_gpt_4(
+        self,
+        query: str,
+        temperature: Optional[float] = 0.31,
+        max_tokens: Optional[int] = 10240,
+    ) -> str:
         response = self.client.chat.completions.create(
             model="gpt-4.1",
             messages=[
@@ -200,4 +226,4 @@ class GPTQueryClient:
             presence_penalty=0,
         )
 
-        return response
+        return response.choices[0].message.content
