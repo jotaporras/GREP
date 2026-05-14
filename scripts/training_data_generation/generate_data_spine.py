@@ -7,12 +7,15 @@ from prism.data.data_gen import DataGenerator
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--n-samples", type=int, default=1)
-    parser.add_argument("--n-tasks", type=int, default=25)
+
     parser.add_argument("--name", type=str, default="non-iterative-data")
+    parser.add_argument("--data-dir", type=str, help="path to base graphs")
+
+    # note: the following args are not used
     parser.add_argument("--description", type=str, default="")
     parser.add_argument("--temperature", type=float, default=0.31)
-    parser.add_argument("--data-dir", type=str, help="path to base graphs")
+    parser.add_argument("--n-samples", type=int, default=1)
+    parser.add_argument("--n-tasks", type=int, default=25)
 
     args = parser.parse_args()
 
