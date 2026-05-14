@@ -41,7 +41,7 @@ if __name__ == "__main__":
     graph_dir = Path(log_dir) / "populated_graphs"
     graph_dir.mkdir(exist_ok=True)
 
-    # data_generator.populate_graphs_and_tasks(graphs, log_dir=graph_dir)
+    data_generator.populate_graphs_and_tasks(graphs, log_dir=graph_dir)
 
     plan_dir = Path(log_dir) / "generated_plans"
     generated_data = sorted(graph_dir.glob("*data_gen*json"))
@@ -50,14 +50,14 @@ if __name__ == "__main__":
         generated_data=generated_data, log_dir=plan_dir
     )
 
-    for graph in graphs:
-        with open(graph) as f:
-            base_graph = json.load(f)
+    # for graph in graphs:
+    #     with open(graph) as f:
+    #         base_graph = json.load(f)
 
-        data_generator.generate(
-            log_dir=log_dir,
-            base_graph=base_graph,
-            n_samples=args.n_samples,
-            n_tasks=args.n_tasks,
-         description=args.description,
-        )
+    #     data_generator.generate(
+    #         log_dir=log_dir,
+    #         base_graph=base_graph,
+    #         n_samples=args.n_samples,
+    #         n_tasks=args.n_tasks,
+    #      description=args.description,
+    #     )
