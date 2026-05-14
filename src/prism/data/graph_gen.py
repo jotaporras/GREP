@@ -56,6 +56,22 @@ For example,
 
 You must populate the base graph using the following steps:
 
+### CRITICAL GRAPH INVARIANTS (MUST NOT BE VIOLATED)
+
+You are given a base graph. You MUST preserve the following exactly:
+
+- DO NOT modify any coordinates under any circumstance.
+- DO NOT reorder or alter coordinate values.
+- DO NOT add, remove, or perturb coordinates.
+- The "coords" field for every region and object must remain EXACTLY as provided.
+
+The ONLY allowed modifications are:
+- renaming nodes (name field)
+- adding descriptions (only when explicitly allowed)
+- generating tasks
+
+If any coordinate is changed, the output is INVALID.
+
 ### Step 1: Choose theme
 
 **Independence rule:** Each graph must be filled completely independently. Do NOT reuse themes, region types, object types, naming patterns, or task wordings from any previously filled graph in this conversation or any other. Treat each skeleton as if it is the only one you have ever seen. Choose a fresh, distinct theme every time.
@@ -83,12 +99,21 @@ Examples: `pickup_truck_1`, `cabin_1`, `shed_1`, `light_pole_1`, `sail_boat_1`, 
 
 **Uniqueness rule (same as regions):** Each object name must be globally unique across all regions AND objects. Each `type` prefix may appear at most **twice** in the entire graph. Maximize diversity — avoid repeating the same type for every object. Consider what makes sense near each region type.
 
-### Step 4: Fill descriptions
+### Step 4: Fill descriptions (STRICT)
 
-For objects with `description: "__FILL__"`, assign short attribute strings that create interesting planning scenarios:
-- `"damaged"`, `"not damaged"`, `"has keys"`, `"locked"`, `"empty"`, `"operational"`
+Each node has a "description" field that is either:
+- "__FILL__" → MUST be replaced with a short attribute string
+- "" (empty string) → MUST remain EXACTLY "" (do not modify)
 
-For objects with `description: ""`, leave them as `""`.
+Rules:
+- DO NOT add descriptions to entries with "".
+- DO NOT change "" to any other value.
+- DO NOT remove descriptions that already exist.
+- ONLY replace "__FILL__".
+
+If you modify an empty string "", the output is INVALID.
+
+### Step 4: Planning
 
 Then, provide tasks that present interesting planning scenarios. The tasks should assess the ability of the planner to do one of the following
 1. understanding node existance (is a semantic type in the graph)?
@@ -130,6 +155,189 @@ Your response should be a JSON with a "description" key, the value be the descri
 """
 
 
+QUERY = """
+You are generating high-quality evaluation data for an LLM-based planner (PRISM-style).
+
+You will be given a graph skeleton JSON. Your job is to transform it into a fully populated evaluation JSON.
+
+You must follow ALL instructions exactly. Any violation makes the output invalid.
+
+--------------------------------------------------
+CRITICAL GRAPH INVARIANTS (MUST NOT BE VIOLATED)
+--------------------------------------------------
+
+You are given a base graph. You MUST preserve:
+
+- DO NOT modify any coordinates under any circumstance
+- DO NOT reorder coordinate arrays
+- DO NOT change graph topology (connections)
+- DO NOT add or remove nodes
+
+The ONLY allowed changes:
+- rename nodes (name fields)
+- fill descriptions (ONLY when allowed)
+- generate tasks
+- update robot_location to renamed value
+
+If any coordinate or connection changes, the output is INVALID.
+
+--------------------------------------------------
+INPUT FORMAT
+--------------------------------------------------
+
+You will receive a JSON:
+
+{
+  "graph": {
+    "objects": [{"name": "...", "coords": [...], "description": "" | "__FILL__"}],
+    "regions": [{"name": "...", "coords": [...], "description": ""}],
+    "object_connections": [[...]],
+    "region_connections": [[...]],
+    "robot_location": "region_X"
+  },
+  "tasks": [],
+  "_metadata": {...}
+}
+
+--------------------------------------------------
+STEP 1: UNDERSTAND GRAPH
+--------------------------------------------------
+
+Use `_metadata`:
+- number of communities
+- region assignments
+- number of tasks (n_tasks)
+
+--------------------------------------------------
+STEP 2: CHOOSE THEME
+--------------------------------------------------
+
+Each graph must be completely independent.
+
+- DO NOT reuse themes or naming patterns
+- Choose a distinct, realistic environment
+- Infer theme from topology if not provided
+
+--------------------------------------------------
+STEP 3: RENAME REGIONS
+--------------------------------------------------
+
+Rename all regions using:
+
+type_N format
+
+Rules:
+- All names globally unique (regions + objects)
+- Each type prefix may appear at most TWICE
+- Use multiple types per community if needed
+
+--------------------------------------------------
+STEP 4: RENAME OBJECTS
+--------------------------------------------------
+
+Rename objects using realistic names:
+
+Examples:
+pickup_truck_1, antenna_1, generator_1
+
+Rules:
+- Same uniqueness + prefix limits as regions
+- Must match region context
+
+--------------------------------------------------
+STEP 5: FILL DESCRIPTIONS (STRICT)
+--------------------------------------------------
+
+Each object description is either:
+- "__FILL__" → MUST replace with short attribute
+- "" → MUST remain EXACTLY "" (DO NOT CHANGE)
+
+Allowed values:
+"damaged", "not damaged", "locked", "empty", "operational", etc.
+
+If you modify "" → INVALID
+
+--------------------------------------------------
+STEP 6: GENERATE TASKS
+--------------------------------------------------
+
+Generate EXACTLY n_tasks tasks:
+
+Each task:
+{
+  "task": "...",
+  "answer": "...",
+  "init_node": "..."
+}
+
+Rules:
+
+- NO node names in task text
+- Must be solvable from graph
+- Mix types:
+  - existence
+  - location
+  - condition
+  - reachability
+
+Answer regex rules:
+- Include synonyms
+- Avoid ambiguous substrings
+- No false positives
+- Yes/no must match correct polarity only
+
+--------------------------------------------------
+STEP 7: UPDATE ROBOT LOCATION
+--------------------------------------------------
+
+Rename robot_location to new region name
+
+--------------------------------------------------
+STEP 8: REMOVE METADATA
+--------------------------------------------------
+
+Remove "_metadata" completely
+
+--------------------------------------------------
+STEP 9: VALIDATION (REQUIRED)
+--------------------------------------------------
+
+Before output, verify:
+
+1. ALL coordinates EXACTLY unchanged
+2. NO "" descriptions modified
+3. NO "__FILL__" remains
+4. All names unique globally
+5. Each type prefix appears ≤ 2 times
+6. All connections reference valid nodes
+7. No original placeholder names remain
+8. tasks length == n_tasks
+9. robot_location valid
+10. All init_node values valid
+
+If any condition fails → fix before output
+
+--------------------------------------------------
+OUTPUT FORMAT
+--------------------------------------------------
+
+Return ONLY valid JSON:
+
+{
+  "graph": {
+    "objects": [...],
+    "regions": [...],
+    "object_connections": [...],
+    "region_connections": [...],
+    "robot_location": "..."
+  },
+  "tasks": [...]
+}
+
+NO extra text.
+"""
+
+
 class TaskGraphGen:
     def __init__(self):
         self.client = utils.GPTQueryClient()  # OpenAI()
@@ -157,7 +365,7 @@ class TaskGraphGen:
     def get_tasks(
         self,
         base_graph: str,
-        n_tasks: int = 2,
+        n_tasks: int = 10,
         description="",
         previous_tasks: str = "",
     ) -> List[str]:
@@ -189,9 +397,10 @@ class TaskGraphGen:
         )
 
         # try to load the graph for error handling
-        json_content = json.loads(response.choices[0].message.content)
+        print(response)
+        json_content = json.loads(response)
         json_content["description"] = description
-        graph_handle = GraphHandler(graph_path="")
+        graph_handle = GraphHandler(graph="")
         graph_handle.reset(
             json_content["graph"],
             current_location=json_content["graph"]["robot_location"],

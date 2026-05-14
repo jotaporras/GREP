@@ -52,10 +52,11 @@ class DataGenerator:
                 except Exception as ex:
                     print(f"graph generator invalid: {ex}")
 
-            tasks = rnd_data["tasks"]
+            tasks = [entry["task"] for entry in rnd_data["tasks"]]
 
             previous_tasks += ",".join(tasks)
 
+            print(f"logging to: {log_dir}")
             with open(f"{log_dir}/data_gen_{idx:03d}.json", "w") as f:
                 json_str = json.dumps(rnd_data, indent=2)
                 f.write(json_str)
@@ -91,37 +92,48 @@ class DataGenerator:
 
         for idx, data_path in enumerate(generated_data):
 
-            with open(data_path) as f:
-                data = json.load(f)
+            if idx <= 7:
+                continue
 
-            tasks = data["tasks"]
+            try:
 
-            print(f"Generating example data for tasks: {tasks}")
+                with open(data_path) as f:
+                    data = json.load(f)
 
-            graph = data["graph"]
-            init_location = graph["robot_location"]
-            assert isinstance(graph, dict)
+                tasks = [entry["task"] for entry in data["tasks"]]
 
-            for task_idx, task in enumerate(tasks):
-                graph_handle = GraphHandler(graph=graph, init_node=init_location)
-                graph_data_gen = graph_sim.GraphSim(graph_handle)
-                unknown_pct = self.unknown_pcts[task_idx % len(self.unknown_pcts)]
-                graph_data_gen.randomly_remove_nodes(pct=unknown_pct)
-                log_name = f"{log_dir}/sample_{idx:03d}_{task_idx:03d}.json"
-                planner = SPINE(graph=graph_data_gen.partial_graph, log_name=log_name)
-                out = self.planning_sim.run_planning(
-                    llm_planner=planner, task=task, graph_data_gen=graph_data_gen
-                )
-                # some simple verification. Mark plans that don't come up with an answer
-                try:
-                    if not out.response["plan"][-1][0].startswith("answer"):
+                print(f"Generating example data for tasks: {tasks}")
+
+                graph = data["graph"]
+                init_location = graph["robot_location"]
+                assert isinstance(graph, dict)
+
+                for task_idx, task in enumerate(tasks):
+                    graph_handle = GraphHandler(graph=graph, init_node=init_location)
+                    graph_data_gen = graph_sim.GraphSim(graph_handle)
+                    unknown_pct = self.unknown_pcts[task_idx % len(self.unknown_pcts)]
+                    graph_data_gen.randomly_remove_nodes(pct=unknown_pct)
+                    log_name = f"{log_dir}/sample_{idx:03d}_{task_idx:03d}.json"
+                    planner = SPINE(
+                        graph=graph_data_gen.partial_graph, log_name=log_name
+                    )
+                    out = self.planning_sim.run_planning(
+                        llm_planner=planner, task=task, graph_data_gen=graph_data_gen
+                    )
+                    # some simple verification. Mark plans that don't come up with an answer
+                    try:
+                        if not out.response["plan"][-1][0].startswith("answer"):
+                            os.rename(
+                                log_name, log_name.replace(".json", "_failed") + ".json"
+                            )
+                    except:
                         os.rename(
-                            log_name, log_name.replace(".json", "_failed") + ".json"
+                            log_name, log_name.replace(".json", "failed") + ".json"
                         )
-                except:
-                    os.rename(log_name, log_name.replace(".json", "failed") + ".json")
 
-                data_counter += 1
+                    data_counter += 1
+            except Exception as ex:
+                print(f"data generation produced exception: {ex}")
 
         utils.aggregate(
             root_dir=log_dir,
