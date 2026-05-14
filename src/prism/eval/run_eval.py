@@ -71,7 +71,12 @@ def eval_answer(parsed_answer: Dict[str, str], answer_key: str):
 
         return EvalResult(formatted=formatted, plan_keyword=keyphrase), parsed_answer
     except Exception as e:
-        print(f"[eval] eval_answer exception: {e}")
+        import traceback as _tb
+        if not parsed_answer:
+            print(f"[eval] eval_answer received empty response — SPINE likely exhausted retries "
+                  f"(all attempts produced unparseable JSON). exception: {e}")
+        else:
+            print(f"[eval] eval_answer exception: {e}\n{_tb.format_exc()}")
         return EvalResult(False, False), parsed_answer
 
 
