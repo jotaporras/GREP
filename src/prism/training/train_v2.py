@@ -192,6 +192,9 @@ class TrainConfig:
     data: str
     bit4: bool = False
     eval_data: str = "data/eval/eval_1_multi_step.json"
+    # Optional pre-split validation file (same schema as `data`). When set,
+    # `val_frac` is ignored and this file is loaded as the eval dataset.
+    val_data: Optional[str] = None
     r: int = 16
     base_model: str = "meta-llama/Llama-3.2-3B-Instruct"
     wandb_project: str = "SLM-distill"
@@ -369,8 +372,19 @@ def train_model(config: TrainConfig, config_file: str = None):
         text_edge_list=config.text_edge_list,
     )
 
-    # Train/val split
-    if config.val_frac and config.val_frac > 0.0:
+    # Train/val split: prefer an explicit pre-split val file when provided.
+    if config.val_data:
+        train_dataset = full_dataset
+        eval_dataset = datasets.load_dataset("json", data_files=[config.val_data], split="train")
+        if config.debug:
+            eval_dataset = eval_dataset.select(range(round(len(eval_dataset) * config.dataset_proportion)))
+        eval_dataset = data.preprocess_dataset(
+            eval_dataset, tokenizer,
+            architecture=config.architecture,
+            text_edge_list=config.text_edge_list,
+        )
+        print(f"Using pre-split val file: {len(train_dataset)} train / {len(eval_dataset)} eval")
+    elif config.val_frac and config.val_frac > 0.0:
         dataset_size = len(full_dataset)
         val_size = int(dataset_size * config.val_frac)
         train_size = dataset_size - val_size
