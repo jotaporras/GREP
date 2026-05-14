@@ -47,14 +47,14 @@ if __name__ == "__main__":
         generated_data=generated_data, log_dir=plan_dir
     )
 
-    # for graph in graphs:
-    #     with open(graph) as f:
-    #         base_graph = json.load(f)
+    for graph in graphs:
+        with open(graph) as f:
+            base_graph = json.load(f)
 
-    #     data_generator.generate(
-    #         log_dir=log_dir,
-    #         base_graph=base_graph,
-    #         n_samples=args.n_samples,
-    #         n_tasks=args.n_tasks,
-    #         description=args.description,
-    #     )
+        data_generator.generate(
+            log_dir=log_dir,
+            base_graph=base_graph,
+            n_samples=args.n_samples,
+            n_tasks=args.n_tasks,
+         description=args.description,
+        )
