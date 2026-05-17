@@ -9,7 +9,6 @@
 
 set -euo pipefail
 
-SCRIPT="scripts/generate_eval_graphs.py"
 OUTDIR="data/training/training_v1"
 
 INTRA_PROB=0.6
@@ -35,7 +34,7 @@ for cfg in "${configs[@]}"; do
   OUT="${OUTDIR}/eval_graph_unique_${N}.json"
   echo ""
   echo "--- N=${N}  (${NC} communities × ${NPC} nodes/community) ---"
-  python "$SCRIPT" \
+  python scripts/generate_eval_graphs.py \
     --n-communities "$NC" \
     --nodes-per-community "$NPC" \
     --intra-community-prob "$INTRA_PROB" \

@@ -1,3 +1,37 @@
+"""Generate SPINE-style training data from skeleton scene graphs.
+
+This script runs a two-phase data generation pipeline:
+
+Phase 1 — Populate graphs and tasks (LLM-driven)
+    Reads every ``*graph*json`` file from ``--data-dir``. Each file is expected
+    to be a *skeleton* scene graph produced by ``scripts/generate_eval_graphs.py``:
+    nodes have generic names (e.g. ``region_1``, ``object_3``), empty or
+    ``"__FILL__"`` descriptions, an empty ``tasks: []`` list, and a ``_metadata``
+    block. The LLM (GPT-5.1) renames nodes with realistic semantics, fills
+    descriptions, and generates tasks. Outputs land in:
+
+        <name>/populated_graphs/data_gen_XXX.json   # graph + tasks + description
+        <name>/populated_graphs/graph_gen_XXX.json  # graph dict only
+
+Phase 2 — Generate example plans (SPINE planner)
+    For every populated ``data_gen_*.json``, iterates over its tasks and runs
+    the SPINE planner to produce a step-by-step plan trace. Partial-observability
+    is simulated by randomly hiding a fraction of nodes per task. Outputs:
+
+        <name>/generated_plans/sample_GGG_TTT.json         # successful rollout
+        <name>/generated_plans/sample_GGG_TTT_failed.json  # planner did not answer
+        <name>/generated_plans/formatted.json              # aggregated rollouts
+
+Side effects:
+    - Creates ``<name>/`` and writes ``<name>/data_gen_params.json`` recording
+      the CLI args used for this run.
+    - Requires ``OPENAI_API_KEY`` in the environment (GPT-5.1 calls).
+
+Note: ``--data-dir`` must contain *skeleton* graphs, not already-populated ones.
+If you point it at populated graphs, Phase 1 will re-process them through the
+LLM, which is not the intended flow.
+"""
+
 import argparse
 import json
 from pathlib import Path
@@ -5,10 +39,46 @@ from pathlib import Path
 from prism.data.data_gen import DataGenerator
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description=(
+            "Generate SPINE training data by populating skeleton scene graphs (generated from a random graph model) "
+            "with LLM-generated semantics and tasks, then running the SPINE "
+            "planner on each task to produce plan-trace rollouts."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
 
-    parser.add_argument("--name", type=str, default="non-iterative-data")
-    parser.add_argument("--data-dir", type=str, help="path to base graphs")
+    parser.add_argument(
+        "--name",
+        type=str,
+        default="non-iterative-data",
+        help=(
+            "Output run directory. Populated graphs are written to "
+            "<name>/populated_graphs/ and generated plans to "
+            "<name>/generated_plans/. The directory is created if missing."
+        ),
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        help=(
+            "Directory containing skeleton scene graph JSON files. All files "
+            "matching the glob '*graph*json' are loaded. Each file must be a "
+            "skeleton produced by scripts/generate_eval_graphs.py (empty tasks, "
+            "'__FILL__' or empty descriptions, with a _metadata block). "
+            "When --skip-populate is set, this directory is instead expected "
+            "to contain already-populated 'data_gen_*.json' files."
+        ),
+    )
+    parser.add_argument(
+        "--skip-populate",
+        action="store_true",
+        help=(
+            "Skip Phase 1 (LLM populate). Use --data-dir as a source of "
+            "already-populated 'data_gen_*.json' files and run only Phase 2 "
+            "(SPINE planner rollouts) on them."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -16,16 +86,10 @@ if __name__ == "__main__":
     with open(f"{args.name}/data_gen_params.json", "w") as f:
         json.dump(vars(args), f)
 
-    graph_paths = sorted(Path(args.data_dir).glob("*graph*json"))
+    output_dir = args.name
 
-    graphs = []
-    for graph_path in graph_paths:
-        print(graph_path)
-        with open(graph_path) as f:
-            graphs.append(str(json.load(f)))
-
-    log_dir = args.name
-
+    ## `unknown_pcts` is the percentage of nodes (integer percentage) to remove for each task.
+    # Currently it's hardcoded to 0 for all tasks.
     unknown_pcts = [0] * 10
     # unknown_pcts = [0, 5, 10, 15] * 10
 
@@ -37,16 +101,32 @@ if __name__ == "__main__":
         graph_unknown=unknown_pcts,
     )
 
-    graph_dir = Path(log_dir) / "populated_graphs"
-    graph_dir.mkdir(exist_ok=True)
+    if args.skip_populate:
+        # Phase 1 skipped: use --data-dir directly as the source of populated
+        # data_gen_*.json files for Phase 2.
+        populated_graphs_dir = Path(args.data_dir)
+    else:
+        graph_paths = sorted(Path(args.data_dir).glob("*graph*json"))
+        print(f"Populating graphs and tasks")
+        graphs = []
+        for graph_path in graph_paths:
+            print(graph_path)
+            with open(graph_path) as f:
+                graphs.append(str(json.load(f)))
 
-    data_generator.populate_graphs_and_tasks(graphs, log_dir=graph_dir)
+        populated_graphs_dir = Path(output_dir) / "populated_graphs"
+        populated_graphs_dir.mkdir(exist_ok=True)
 
-    plan_dir = Path(log_dir) / "generated_plans"
-    generated_data = sorted(graph_dir.glob("*data_gen*json"))
-    print(f"generated_data path: {generated_data}")
+        data_generator.populate_graphs_and_tasks(graphs, log_dir=populated_graphs_dir)
+
+    output_generated_plans_dir = Path(output_dir) / "generated_plans"
+    generated_graphs_dirs = sorted(populated_graphs_dir.glob("*data_gen*json"))
+    print(f"List of generated graph directories: {generated_graphs_dirs}")
+
+
+    print("Generating plans for each graph and task.")
     data_generator.generate_example_plans(
-        generated_data=generated_data, log_dir=plan_dir
+        generated_data=generated_graphs_dirs, log_dir=output_generated_plans_dir
     )
 
     # for graph in graphs:

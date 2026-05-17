@@ -21,15 +21,35 @@
       ]
     },
     {
+      "name": "Generate Training Data (SPINE, single rollout)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/training_data_generation/generate_data_spine.py",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false,
+      "envFile": "${workspaceFolder}/.env",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src:${workspaceFolder}/SPINE/src"
+      },
+      "args": [
+        // Full pipeline on ONE small skeleton graph (8 regions, 2 objects, 3 tasks).
+        // Phase 1: gpt-5.1 with reasoning=high populates names/descriptions/tasks.
+        // Phase 2: SPINE planner runs on each generated task.
+        // Expected cost: ~$0.20-$0.40 for Phase 1 + Phase 2 planner calls.
+        "--data-dir", "data/single_rollout_input",
+        "--name", "data/gen/spine_single_rollout"
+      ]
+    },
+    {
       "name": "Generate Training Data (SPINE)",
       "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/scripts/training_data_generation/generate_data_spine.py",
       "cwd": "${workspaceFolder}",
       "justMyCode": false,
+      "envFile": "${workspaceFolder}/.env",
       "env": {
-        "PYTHONPATH": "${workspaceFolder}/src:${workspaceFolder}/SPINE/src",
-        "OPENAI_API_KEY": "${env:OPENAI_API_KEY}"
+        "PYTHONPATH": "${workspaceFolder}/src:${workspaceFolder}/SPINE/src"
       },
       "args": [
         "--data-dir", "data/base_graphs",

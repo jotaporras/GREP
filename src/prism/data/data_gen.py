@@ -96,7 +96,15 @@ class DataGenerator:
                 with open(data_path) as f:
                     data = json.load(f)
 
+                # INVARIANT: the planner MUST only see the natural-language task text.
+                # Never pass `answer`, `acceptance_criterion`, `init_node`, or any
+                # other task-dict field to SPINE or to run_planning — that would
+                # leak ground truth into the rollout traces and contaminate
+                # training data.
                 tasks = [entry["task"] for entry in data["tasks"]]
+                assert all(
+                    isinstance(t, str) for t in tasks
+                ), "task field must be a plain string"
 
                 print(f"Generating example data for tasks: {tasks}")
 
@@ -129,7 +137,8 @@ class DataGenerator:
 
                     data_counter += 1
             except Exception as ex:
-                print(f"data generation produced exception: {ex}")
+                print(f"data generation produced exception:")
+                raise ex
 
         utils.aggregate(
             root_dir=log_dir,

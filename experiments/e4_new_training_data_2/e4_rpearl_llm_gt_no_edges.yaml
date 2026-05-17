@@ -1,12 +1,12 @@
 name: e4
 architecture: rpearl_gt_llm
 wandb_project: GREP-PRISM
-wandb_run_name: e4_rpearl_newdata2_gt_no_edges
+wandb_run_name: e4_rpearl_newdata2_gt_no_edges_fixed
 wandb_tag: e4_new_training_data_2
 checkpoint_dir: outputs/e4_new_training_data_2
-data: data/training_data_20260428/aggregate_20260428/split_20260428/formatted_all_new_2turn__train.json
-val_data: data/training_data_20260428/aggregate_20260428/split_20260428/formatted_all_new_2turn__val.json
-eval_data: data/training_data_20260428/aggregate_20260428/split_20260428/test_graphs/data_gen_003.json
+data: data/gen/e4_training_data_v4/split/formatted_all_new__train.json
+val_data: data/gen/e4_training_data_v4/split/formatted_all_new__val.json
+eval_data: data/gen/e4_training_data_v4/split/test_graphs/data_gen_004.json
 base_model: meta-llama/Llama-3.1-8B-Instruct
 bit4: true
 per_device_train_batch_size: 1

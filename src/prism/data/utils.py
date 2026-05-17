@@ -194,12 +194,12 @@ class GPTQueryClient:
     ) -> str:
 
         response = self.client.responses.create(
-            model="gpt-5.1",
+            model="gpt-5.5",
             input=[
                 {"role": "user", "content": [{"type": "input_text", "text": query}]}
             ],
             text={"format": {"type": "text"}, "verbosity": "low"},
-            reasoning={"effort": "none", "summary": "auto"},
+            reasoning={"effort": "xhigh", "summary": "auto"},
         )
 
         return response.output_text

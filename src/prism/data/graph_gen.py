@@ -5,143 +5,144 @@ from spine.mapping.graph_util import GraphHandler
 
 from prism.data import utils
 
-QUERY = """
-You are generating data for training an llm-based planner, like the SPINE paper from ravichandran et al.
+# Old query
+# QUERY = """
+# You are generating data for training an llm-based planner, like the SPINE paper from ravichandran et al.
 
-You will be given a base scene graph in the following format
+# You will be given a base scene graph in the following format
 
-{
-        "objects": [{"name": "object_1_name", "coords": [west_east_coordinate, south_north_coordinate]}, ...],
-        "regions": [{"name": "region_1_name", "coords": [west_east_coordinate, south_north_coordinate]}, ...],
-        "object_connections: [["object_name", "region_name"], ...],
-        "region_connections": [["some_region_name", "other_region_name"], ...]
-        "robot_location": "region_of_robot_location
-}
+# {
+#         "objects": [{"name": "object_1_name", "coords": [west_east_coordinate, south_north_coordinate]}, ...],
+#         "regions": [{"name": "region_1_name", "coords": [west_east_coordinate, south_north_coordinate]}, ...],
+#         "object_connections: [["object_name", "region_name"], ...],
+#         "region_connections": [["some_region_name", "other_region_name"], ...]
+#         "robot_location": "region_of_robot_location
+# }
 
-For example,
+# For example,
 
-{
-"objects":
-[
-    {"name": "shed_1", "coords": [78, 9]},
-    {"name": "gate_1", "coords": [52, -56]}
-],
-"regions": [
-    {"name": "ground_1", "coords": [0, 0]},
-    {"name": "road_1", "coords": [5.7, -8.3]},
-    {"name": "road_2", "coords": [19.3, -6.5]},
-    {"name": "road_3", "coords": [35.7, -12.1]},
-    {"name": "road_4", "coords": [52.7, -20]},
-    {"name": "road_5", "coords": [57.2, -31.6]},
-    {"name": "bridge_1", "coords": [54.3, -46.7]},
-    {"name": "road_6", "coords": [52.4, -56.5]},
-    {"name": "driveway_1", "coords": [78.4, 9.1]}
-],
-"object_connections": [
-    ["shed_1", "driveway_1"],
-    ["gate_1", "road_6"]
-],
-"region_connections":[
-    ["ground_1", "road_1"],
-    ["road_1", "road_2"],
-    ["road_2", "road_3"],
-    ["road_3", "road_4"],
-    ["road_4", "road_5"],
-    ["road_5", "bridge_1"],
-    ["bridge_1", "road_6"],
-    ["road_6", "driveway_1"]
-],
-"robot_location": "ground_1"
-}
+# {
+# "objects":
+# [
+#     {"name": "shed_1", "coords": [78, 9]},
+#     {"name": "gate_1", "coords": [52, -56]}
+# ],
+# "regions": [
+#     {"name": "ground_1", "coords": [0, 0]},
+#     {"name": "road_1", "coords": [5.7, -8.3]},
+#     {"name": "road_2", "coords": [19.3, -6.5]},
+#     {"name": "road_3", "coords": [35.7, -12.1]},
+#     {"name": "road_4", "coords": [52.7, -20]},
+#     {"name": "road_5", "coords": [57.2, -31.6]},
+#     {"name": "bridge_1", "coords": [54.3, -46.7]},
+#     {"name": "road_6", "coords": [52.4, -56.5]},
+#     {"name": "driveway_1", "coords": [78.4, 9.1]}
+# ],
+# "object_connections": [
+#     ["shed_1", "driveway_1"],
+#     ["gate_1", "road_6"]
+# ],
+# "region_connections":[
+#     ["ground_1", "road_1"],
+#     ["road_1", "road_2"],
+#     ["road_2", "road_3"],
+#     ["road_3", "road_4"],
+#     ["road_4", "road_5"],
+#     ["road_5", "bridge_1"],
+#     ["bridge_1", "road_6"],
+#     ["road_6", "driveway_1"]
+# ],
+# "robot_location": "ground_1"
+# }
 
-You must populate the base graph using the following steps:
+# You must populate the base graph using the following steps:
 
-### CRITICAL GRAPH INVARIANTS (MUST NOT BE VIOLATED)
+# ### CRITICAL GRAPH INVARIANTS (MUST NOT BE VIOLATED)
 
-You are given a base graph. You MUST preserve the following exactly:
+# You are given a base graph. You MUST preserve the following exactly:
 
-- DO NOT modify any coordinates under any circumstance.
-- DO NOT reorder or alter coordinate values.
-- DO NOT add, remove, or perturb coordinates.
-- The "coords" field for every region and object must remain EXACTLY as provided.
+# - DO NOT modify any coordinates under any circumstance.
+# - DO NOT reorder or alter coordinate values.
+# - DO NOT add, remove, or perturb coordinates.
+# - The "coords" field for every region and object must remain EXACTLY as provided.
 
-The ONLY allowed modifications are:
-- renaming nodes (name field)
-- adding descriptions (only when explicitly allowed)
-- generating tasks
+# The ONLY allowed modifications are:
+# - renaming nodes (name field)
+# - adding descriptions (only when explicitly allowed)
+# - generating tasks
 
-If any coordinate is changed, the output is INVALID.
+# If any coordinate is changed, the output is INVALID.
 
-### Step 1: Choose theme
+# ### Step 1: Choose theme
 
-**Independence rule:** Each graph must be filled completely independently. Do NOT reuse themes, region types, object types, naming patterns, or task wordings from any previously filled graph in this conversation or any other. Treat each skeleton as if it is the only one you have ever seen. Choose a fresh, distinct theme every time.
+# **Independence rule:** Each graph must be filled completely independently. Do NOT reuse themes, region types, object types, naming patterns, or task wordings from any previously filled graph in this conversation or any other. Treat each skeleton as if it is the only one you have ever seen. Choose a fresh, distinct theme every time.
 
-If the user provides a theme, use it. Otherwise, infer a coherent theme from the topology (e.g., a graph with 3-4 communities of 5-10 regions suggests a rural area with distinct zones like fields, roads, and wooded areas). Vary your theme choices widely — do not default to the same genre (e.g., rural farmland) across multiple invocations.
+# If the user provides a theme, use it. Otherwise, infer a coherent theme from the topology (e.g., a graph with 3-4 communities of 5-10 regions suggests a rural area with distinct zones like fields, roads, and wooded areas). Vary your theme choices widely — do not default to the same genre (e.g., rural farmland) across multiple invocations.
 
-### Step 2: Rename regions
+# ### Step 2: Rename regions
 
-Each community gets a coherent region type. Names follow the `type_N` convention with **globally unique names across all regions AND objects**.
+# Each community gets a coherent region type. Names follow the `type_N` convention with **globally unique names across all regions AND objects**.
 
-**Uniqueness rule:** Every node name in the entire graph must be unique. A name like `field_1` may only appear once — it cannot be both a region and an object. Each `type` string (the prefix before `_N`) may appear at most **twice** in the entire graph (regions + objects combined). For example, you may have `desert_1` and `desert_2`, but not `desert_3`. If a community has more nodes than 2, use multiple distinct types within that community (e.g., `field_1`, `field_2`, `meadow_1`, `meadow_2`, `clearing_1`).
+# **Uniqueness rule:** Every node name in the entire graph must be unique. A name like `field_1` may only appear once — it cannot be both a region and an object. Each `type` string (the prefix before `_N`) may appear at most **twice** in the entire graph (regions + objects combined). For example, you may have `desert_1` and `desert_2`, but not `desert_3`. If a community has more nodes than 2, use multiple distinct types within that community (e.g., `field_1`, `field_2`, `meadow_1`, `meadow_2`, `clearing_1`).
 
-Examples of community → type mappings:
-- Community 0 (5 nodes) → `field_1`, `field_2`, `meadow_1`, `meadow_2`, `clearing_1`
-- Community 1 (5 nodes) → `road_1`, `road_2`, `highway_1`, `intersection_1`, `parking_lot_1`
-- Community 2 (5 nodes) → `trail_1`, `trail_2`, `path_1`, `path_2`, `bridge_1`
+# Examples of community → type mappings:
+# - Community 0 (5 nodes) → `field_1`, `field_2`, `meadow_1`, `meadow_2`, `clearing_1`
+# - Community 1 (5 nodes) → `road_1`, `road_2`, `highway_1`, `intersection_1`, `parking_lot_1`
+# - Community 2 (5 nodes) → `trail_1`, `trail_2`, `path_1`, `path_2`, `bridge_1`
 
-Choose types that make sense for the theme. Types used across different communities should be distinct where possible. Maintain a rename map: `{"region_1": "field_1", "region_2": "meadow_1", ...}`.
+# Choose types that make sense for the theme. Types used across different communities should be distinct where possible. Maintain a rename map: `{"region_1": "field_1", "region_2": "meadow_1", ...}`.
 
-### Step 3: Rename objects
+# ### Step 3: Rename objects
 
-Give objects realistic names matching their host region context. Use the `type_N` convention.
+# Give objects realistic names matching their host region context. Use the `type_N` convention.
 
-Examples: `pickup_truck_1`, `cabin_1`, `shed_1`, `light_pole_1`, `sail_boat_1`, `internet_tower_1`.
+# Examples: `pickup_truck_1`, `cabin_1`, `shed_1`, `light_pole_1`, `sail_boat_1`, `internet_tower_1`.
 
-**Uniqueness rule (same as regions):** Each object name must be globally unique across all regions AND objects. Each `type` prefix may appear at most **twice** in the entire graph. Maximize diversity — avoid repeating the same type for every object. Consider what makes sense near each region type.
+# **Uniqueness rule (same as regions):** Each object name must be globally unique across all regions AND objects. Each `type` prefix may appear at most **twice** in the entire graph. Maximize diversity — avoid repeating the same type for every object. Consider what makes sense near each region type.
 
-### Step 4: Fill descriptions (STRICT)
+# ### Step 4: Fill descriptions (STRICT)
 
-Each node has a "description" field that is either:
-- "__FILL__" → MUST be replaced with a short attribute string
-- "" (empty string) → MUST remain EXACTLY "" (do not modify)
+# Each node has a "description" field that is either:
+# - "__FILL__" → MUST be replaced with a short attribute string
+# - "" (empty string) → MUST remain EXACTLY "" (do not modify)
 
-Rules:
-- DO NOT add descriptions to entries with "".
-- DO NOT change "" to any other value.
-- DO NOT remove descriptions that already exist.
-- ONLY replace "__FILL__".
+# Rules:
+# - DO NOT add descriptions to entries with "".
+# - DO NOT change "" to any other value.
+# - DO NOT remove descriptions that already exist.
+# - ONLY replace "__FILL__".
 
-If you modify an empty string "", the output is INVALID.
+# If you modify an empty string "", the output is INVALID.
 
-### Step 4: Planning
+# ### Step 4: Planning
 
-Then, provide tasks that present interesting planning scenarios. The tasks should assess the ability of the planner to do one of the following
-1. understanding node existance (is a semantic type in the graph)?
-2. understand the position of a node (what is the northmost region, etc.)?
-3. assess reachability (is one node connected to another node)?
-4. understand navigation (give a path from node a to node b)
-
-
-The planner should be able to respond to your tasks via the answer() function. This should not require mapping, navigation, etc.
+# Then, provide tasks that present interesting planning scenarios. The tasks should assess the ability of the planner to do one of the following
+# 1. understanding node existance (is a semantic type in the graph)?
+# 2. understand the position of a node (what is the northmost region, etc.)?
+# 3. assess reachability (is one node connected to another node)?
+# 4. understand navigation (give a path from node a to node b)
 
 
-Provide your answer in the following JSON format:
-
-{
-reasoning: describe the type of scene you are creating,
-graph: <JSON GRAPH>,
-tasks: list of tasks that correspond to the graph.
-}
+# The planner should be able to respond to your tasks via the answer() function. This should not require mapping, navigation, etc.
 
 
-Add a "description" attribute to each node that provides information.
-These will be hidden from the robot
+# Provide your answer in the following JSON format:
 
-Task generation instructions
-- DO NOT reference specific objects or nodes. Make the planner infer these.
-- Tasks should request specific information, not general exploration. Make the planner map or inspect certain entities. For example, start tasks with phrases such as "what", "I heard", "find out", "map", "inspect", "Can I", "is there", and likewise
+# {
+# reasoning: describe the type of scene you are creating,
+# graph: <JSON GRAPH>,
+# tasks: list of tasks that correspond to the graph.
+# }
 
-"""
+
+# Add a "description" attribute to each node that provides information.
+# These will be hidden from the robot
+
+# Task generation instructions
+# - DO NOT reference specific objects or nodes. Make the planner infer these.
+# - Tasks should request specific information, not general exploration. Make the planner map or inspect certain entities. For example, start tasks with phrases such as "what", "I heard", "find out", "map", "inspect", "Can I", "is there", and likewise
+
+# """
 
 SCENE_PRIOR = """We are improving the SPINE planner proposed by ravichandran et al.
 You need to generate data for training. Describe scenes you would train in, such as regions, objects, and general scene description
@@ -267,7 +268,8 @@ Each task:
 {
   "task": "...",
   "answer": "...",
-  "init_node": "..."
+  "init_node": "...",
+  "acceptance_criterion": "..."
 }
 
 Rules:
@@ -285,6 +287,20 @@ Answer regex rules:
 - Avoid ambiguous substrings
 - No false positives
 - Yes/no must match correct polarity only
+- Do NOT anchor with ^ or $. Match anywhere in the response.
+
+Acceptance criterion rules:
+- ONE sentence describing what a correct planner response must convey.
+- Reference the answer entity by its node name (e.g. fuel_depot_1) so an
+  LLM judge can verify without re-solving the task.
+- For yes/no tasks: state the correct polarity plus the supporting entity.
+- Do NOT restate the task; describe the *answer*.
+- The criterion is for offline grading ONLY. It will never be shown to the
+  planner.
+- Examples:
+    "A correct answer identifies fuel_depot_1 as the region containing fuel_tank_1."
+    "A correct answer affirms reachability and cites the path through storage_tent_1."
+    "A correct answer is the number 2, the count of regions with exactly three neighbors."
 
 --------------------------------------------------
 STEP 7: UPDATE ROBOT LOCATION
@@ -314,6 +330,8 @@ Before output, verify:
 8. tasks length == n_tasks
 9. robot_location valid
 10. All init_node values valid
+11. Every task has a non-empty acceptance_criterion that names the answer
+    entity (or value, for counting tasks) by its node name.
 
 If any condition fails → fix before output
 
