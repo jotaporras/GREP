@@ -1,16 +1,27 @@
 #!/usr/bin/env bash
-# Generate eval graph skeletons at various sizes, then print fill-graph
-# instructions for the Claude skill (Stage 2).
+# Generate the e4 transferability eval suite:
+#   1. Skeleton scene graphs at 7 sizes via generate_eval_graphs.py.
+#   2. GPT-5.5 populate (reasoning=xhigh) via scripts/populate_eval_graph.py.
+#
+# Runs locally on the workstation (needs OPENAI_API_KEY from .env). After it
+# finishes, rsync data/eval/e4_transferability/ to the cluster repo and submit
+# scripts/e4_transferability.sbatch.
 #
 # Usage: bash scripts/generate_eval_suite.sh
-#
-# Parameters from docs/plan.md; n_communities and nodes_per_community are
-# chosen so that n_regions ≈ N / 1.3 (objects add ~30% via Poisson rate 0.3).
 
 set -euo pipefail
 
-SCRIPT="scripts/generate_eval_graphs.py"
-OUTDIR="data/eval"
+# Auto-load .env so OPENAI_API_KEY is present in a plain bash shell.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [ -f "${REPO_ROOT}/.env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "${REPO_ROOT}/.env"
+  set +a
+fi
+
+SKEL_DIR="data/eval/e4_transferability_skeletons"
+OUT_DIR="data/eval/e4_transferability"
 
 INTRA_PROB=0.6
 INTER_PROB=0.05
@@ -20,6 +31,7 @@ N_TASKS=10
 SEED=42
 
 # Target N    n_communities  nodes_per_community
+# (n_communities * nodes_per_community + Poisson(object_rate) ≈ N)
 configs=(
   "10    2   4"
   "30    3   8"
@@ -30,14 +42,13 @@ configs=(
   "1000  8  96"
 )
 
-echo "=== Stage 1: Generating skeletons ==="
+mkdir -p "$SKEL_DIR" "$OUT_DIR"
 
+echo "=== Stage 1: Generate skeletons ==="
 for cfg in "${configs[@]}"; do
   read -r N NC NPC <<< "$cfg"
-  OUT="${OUTDIR}/eval_graph_unique_${N}.json"
-  echo ""
   echo "--- N=${N}  (${NC} communities × ${NPC} nodes/community) ---"
-  python "$SCRIPT" \
+  python scripts/generate_eval_graphs.py \
     --n-communities "$NC" \
     --nodes-per-community "$NPC" \
     --intra-community-prob "$INTRA_PROB" \
@@ -46,16 +57,21 @@ for cfg in "${configs[@]}"; do
     --description-prob "$DESC_PROB" \
     --n-tasks "$N_TASKS" \
     --seed "$SEED" \
-    --output "$OUT"
+    --output "${SKEL_DIR}/eval_graph_unique_${N}.json"
 done
 
 echo ""
-echo "=== Stage 2: Fill skeletons with Claude skill ==="
-echo "Run the following commands in Cursor/Claude to semantically fill each skeleton:"
-echo ""
+echo "=== Stage 2: Populate (gpt-5.5 reasoning=xhigh) ==="
 for cfg in "${configs[@]}"; do
   read -r N _ _ <<< "$cfg"
-  echo "  /fill-graph ${OUTDIR}/eval_graph_unique_${N}.json"
+  echo "--- N=${N} ---"
+  python scripts/populate_eval_graph.py \
+    --skeleton "${SKEL_DIR}/eval_graph_unique_${N}.json" \
+    --output   "${OUT_DIR}/eval_graph_unique_${N}.json"
 done
+
 echo ""
-echo "Done."
+echo "=== Done. Next steps ==="
+echo "  /verify-tasks ${OUT_DIR} --sample-size ${#configs[@]}"
+echo "  rsync -av --delete ${OUT_DIR}/ <cluster>:/vast/projects/aribeiro/alelab/jporras/GREP-PRISM/${OUT_DIR}/"
+echo "  sbatch scripts/e4_transferability.sbatch    # on the cluster"
