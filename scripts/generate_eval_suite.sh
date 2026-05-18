@@ -32,14 +32,14 @@ SEED=42
 
 # Target N    n_communities  nodes_per_community
 # (n_communities * nodes_per_community + Poisson(object_rate) ≈ N)
+# N=500 and N=1000 dropped: GPT-5.5 silently truncates the graph at those
+# sizes (drops most regions, leaves dangling edges, breaks every task).
 configs=(
   "10    2   4"
   "30    3   8"
   "50    4  10"
   "100   5  15"
   "250   6  32"
-  "500   7  55"
-  "1000  8  96"
 )
 
 mkdir -p "$SKEL_DIR" "$OUT_DIR"
