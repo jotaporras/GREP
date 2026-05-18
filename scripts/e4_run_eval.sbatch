@@ -31,7 +31,9 @@ if [[ -z "$CHECKPOINT" ]]; then
 fi
 
 mkdir -p "${OUTPUT_BASE}"
-cd "$(dirname "$0")/.."
+# Stable CWD. Under SLURM, $0 is the spooled script path — use SLURM_SUBMIT_DIR
+# (the directory sbatch was invoked from). Local fallback uses script location.
+cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/..}"
 
 module load anaconda3
 source "$(conda info --base)/etc/profile.d/conda.sh"

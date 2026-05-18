@@ -19,8 +19,11 @@ CHECKPOINT_DIR=${CHECKPOINT_DIR:-outputs/e4_new_training_data_2_iclfix}
 
 mkdir -p "${OUTPUT_BASE}"
 
-# Stable CWD so relative paths in the configs work regardless of submission dir.
-cd "$(dirname "$0")/.."
+# Stable CWD. Under SLURM, $0 is the spooled script path — don't use it.
+# SLURM_SUBMIT_DIR is the directory sbatch was invoked from (the repo root if
+# you submit with `sbatch scripts/e4_run_sweep.sbatch`). Local fallback uses
+# the script's location.
+cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/..}"
 
 module load anaconda3
 source "$(conda info --base)/etc/profile.d/conda.sh"
