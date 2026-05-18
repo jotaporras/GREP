@@ -49,6 +49,11 @@ module load anaconda3
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "$ENV_NAME"
 
+# SLURM 22.05+ stopped propagating --cpus-per-task from sbatch to srun, which
+# causes "CPU binding outside of job step allocation" on dgx-b200 nodes whose
+# topology doesn't include cpu 0. Pass it explicitly.
+export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-14}"
+
 log() {
     echo "[$(date --iso-8601=seconds)] $*"
 }
