@@ -13,7 +13,7 @@ set -euo pipefail
 PROJECT=${PROJECT:-GREP-PRISM}
 ENTITY=${ENTITY:-alelab}
 EXPERIMENT_TAG=${EXPERIMENT_TAG:-e4_new_training_data_2_iclfix}
-ENV_NAME=${ENV_NAME:-/vast/projects/aribeiro/alelab/jporras/envs/GREP-PRISM}
+ENV_NAME=${ENV_NAME:-/vast/projects/aribeiro/alelab/jporras/envs/GREP-PRISM-v2}
 OUTPUT_BASE=${OUTPUT_BASE:-/vast/home/j/jporras/sourcecode/GREP}
 CHECKPOINT_DIR=${CHECKPOINT_DIR:-outputs/e4_new_training_data_2_iclfix}
 
