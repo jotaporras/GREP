@@ -167,7 +167,7 @@ def eval_model(
             else:
                 client = inference.InMemoryLLM(model=model, tokenizer=tokenizer, strip_edges=strip_edges)
             llm_planner = SPINE(graph=graph_sim_inst.partial_graph, client=client,
-                                use_icl=use_icl if use_icl is not None else not is_gnn)
+                                use_icl=use_icl if use_icl is not None else True)
         else:
             llm_planner = SPINE(
                 graph=graph_sim_inst.partial_graph,

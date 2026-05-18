@@ -15,7 +15,7 @@ epochs: 2
 r: 16
 debug: true
 dataset_proportion: 1.0
-max_seq_length: 2048
+max_seq_length: 8192
 text_edge_list: none
 # R-PEARL GNN params
 d_model: 1024

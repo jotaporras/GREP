@@ -527,8 +527,28 @@ def train_model(config: TrainConfig, config_file: str = None):
 # ----------------------------
 if __name__ == "__main__":
     parser = HfArgumentParser(TrainConfig)
-    if len(sys.argv) == 2 and sys.argv[1].endswith((".yaml", ".yml")):
-        (cfg,) = parser.parse_yaml_file(sys.argv[1])
+    if len(sys.argv) >= 2 and sys.argv[1].endswith((".yaml", ".yml")):
+        import yaml as _yaml
+        with open(sys.argv[1]) as f:
+            cfg_dict = _yaml.safe_load(f) or {}
+        # Overlay --key value pairs from sys.argv[2:] onto the yaml dict so
+        # callers can override individual fields without writing a new yaml.
+        i = 2
+        while i < len(sys.argv):
+            arg = sys.argv[i]
+            if not arg.startswith("--"):
+                raise SystemExit(f"Expected --key value after yaml path, got: {arg!r}")
+            key = arg[2:]
+            if "=" in key:
+                k, v = key.split("=", 1)
+                cfg_dict[k] = _yaml.safe_load(v)
+                i += 1
+            else:
+                if i + 1 >= len(sys.argv):
+                    raise SystemExit(f"Missing value for override --{key}")
+                cfg_dict[key] = _yaml.safe_load(sys.argv[i + 1])
+                i += 2
+        (cfg,) = parser.parse_dict(cfg_dict)
         config_file = sys.argv[1]
     else:
         (cfg,) = parser.parse_args_into_dataclasses()

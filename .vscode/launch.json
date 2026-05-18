@@ -356,6 +356,57 @@
       ]
     },
     {
+      // Debug variant: same RPEARL config but with text edges kept in the prompt.
+      // Isolates whether the format-collapse at step 197 is driven by edge stripping
+      // vs. encoder noise. See plan: floofy-sprouting-waterfall.md (verification step 1).
+      "name": "PRISM: e4 RPEARL (newdata2, DEBUG with edges)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "prism.training.train_v2",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false,
+      "env": {
+        "UNSLOTH_RETURN_LOGITS": "1",
+        "CUDA_VISIBLE_DEVICES": "0"
+      },
+      "args": [
+        "experiments/e4_new_training_data_2/e4_rpearl_llm_no_edges.yaml",
+        "--text_edge_list", "present",
+        "--wandb_run_name", "e4_rpearl_newdata2_with_edges_debug"
+      ]
+    },
+    {
+      // Fast-debug training run for the failing no_edges config.
+      // dataset_proportion=0.01 makes one epoch finish in seconds so the eval
+      // callback fires quickly and you can hit breakpoints in both train and eval.
+      // Wandb disabled to skip auth/logging during debug.
+      // Breakpoint suggestions:
+      //   - src/prism/training/train_v2.py:152  → inspect `inputs` to see training-time tokens
+      //   - src/prism/data/data.py:76          → inspect message content after remove_edge_list
+      //   - src/prism/models/inference.py:114  → inspect `llm_msg` at eval (post-strip)
+      //   - src/prism/models/inference.py:117  → tokenizer.decode(input_ids[0]) for literal prompt
+      "name": "PRISM: e4 RPEARL (newdata2, DEBUG TRAIN no_edges)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "prism.training.train_v2",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false,
+      "env": {
+        "WANDB_MODE": "disabled",
+        "UNSLOTH_RETURN_LOGITS": "1",
+        "CUDA_VISIBLE_DEVICES": "0"
+      },
+      "args": [
+        "experiments/e4_new_training_data_2/e4_rpearl_llm_no_edges.yaml",
+        "--dataset_proportion", "0.01",
+        "--epochs", "1",
+        "--report_to", "none",
+        "--checkpoint_dir", "outputs/dev",
+        "--save_name", "debug_no_edges",
+        "--wandb_run_name", "debug_no_edges"
+      ]
+    },
+    {
       "name": "PRISM: e4 RPEARL+GT (newdata2, no_edges)",
       "type": "debugpy",
       "request": "launch",

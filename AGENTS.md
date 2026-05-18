@@ -1,6 +1,19 @@
 # Repository Guidelines
 You're a research scientist, writing code like one. You care about the result of the experiments, not  the modularity or extensibility of the code. The code should be easy to understand and follow, even if it comes at the expense of modularity or being error-prone in unfamiliar execution paths.
 
+## Cluster (SLURM) config for this project
+
+Used to fill in placeholders in `~/.claude/skills/cluster-slurm/template.sbatch`:
+
+- `PROJECT`: `GREP-PRISM`
+- `ENTITY`: `alelab` (wandb)
+- `ENV_NAME`: `/vast/projects/aribeiro/alelab/jporras/envs/GREP-PRISM`
+- `OUTPUT_BASE`: `/vast/projects/aribeiro/alelab/jporras/GREP-PRISM`
+- SLURM output dir: `/vast/projects/aribeiro/alelab/jporras/GREP-PRISM/slurm-%A_%a.out`
+- Repo path on cluster: `/vast/projects/aribeiro/alelab/jporras/GREP-PRISM`
+- Default partition: `dgx-b200`
+- Entry: `python -m prism.training.train_v2 <yaml> [--key value ...]` (yaml + CLI overrides supported since the e4 sweep)
+
 
 ## Project Structure & Module Organization
 - `src/prism/` houses the installable package; subfolders map to simulation assets, evaluation logic, planners, and LoRA tooling.
