@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=e4-eval
-#SBATCH --output=/vast/projects/aribeiro/alelab/jporras/GREP-PRISM/slurm-%A.out
+#SBATCH --output=/vast/home/j/jporras/sourcecode/GREP/slurm-%A.out
 #SBATCH --time=6:00:00
 #SBATCH --partition=dgx-b200
 #SBATCH --gpus=1
@@ -21,7 +21,7 @@ set -euo pipefail
 
 PROJECT=${PROJECT:-GREP-PRISM}
 ENV_NAME=${ENV_NAME:-/vast/projects/aribeiro/alelab/jporras/envs/GREP-PRISM}
-OUTPUT_BASE=${OUTPUT_BASE:-/vast/projects/aribeiro/alelab/jporras/GREP-PRISM}
+OUTPUT_BASE=${OUTPUT_BASE:-/vast/home/j/jporras/sourcecode/GREP}
 GRAPHS=${GRAPHS:-data/gen/e4_training_data_v4/split/test_graphs}
 
 CHECKPOINT=${CHECKPOINT:-${1:-}}

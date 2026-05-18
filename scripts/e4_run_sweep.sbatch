@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=e4-sweep
-#SBATCH --output=/vast/projects/aribeiro/alelab/jporras/GREP-PRISM/slurm-%A_%a.out
+#SBATCH --output=/vast/home/j/jporras/sourcecode/GREP/slurm-%A_%a.out
 #SBATCH --time=7:00:00
 #SBATCH --partition=dgx-b200
 #SBATCH --gpus=1
@@ -14,7 +14,7 @@ PROJECT=${PROJECT:-GREP-PRISM}
 ENTITY=${ENTITY:-alelab}
 EXPERIMENT_TAG=${EXPERIMENT_TAG:-e4_new_training_data_2_iclfix}
 ENV_NAME=${ENV_NAME:-/vast/projects/aribeiro/alelab/jporras/envs/GREP-PRISM}
-OUTPUT_BASE=${OUTPUT_BASE:-/vast/projects/aribeiro/alelab/jporras/GREP-PRISM}
+OUTPUT_BASE=${OUTPUT_BASE:-/vast/home/j/jporras/sourcecode/GREP}
 CHECKPOINT_DIR=${CHECKPOINT_DIR:-outputs/e4_new_training_data_2_iclfix}
 
 mkdir -p "${OUTPUT_BASE}"
