@@ -20,7 +20,7 @@
 set -euo pipefail
 
 PROJECT=${PROJECT:-GREP-PRISM}
-ENV_NAME=${ENV_NAME:-/vast/projects/aribeiro/alelab/jporras/envs/GREP-PRISM}
+ENV_NAME=${ENV_NAME:-/vast/projects/aribeiro/alelab/jporras/envs/GREP-PRISM-v2}
 OUTPUT_BASE=${OUTPUT_BASE:-/vast/home/j/jporras/sourcecode/GREP}
 GRAPHS=${GRAPHS:-data/gen/e4_training_data_v4/split/test_graphs}
 
