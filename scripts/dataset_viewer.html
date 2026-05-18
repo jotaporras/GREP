@@ -104,15 +104,17 @@
 <body>
 <header>
   <h1>PRISM Dataset Viewer</h1>
-  <input type="file" id="file" accept=".json" />
+  <input type="file" id="file" accept=".json" multiple />
   <span class="stats" id="stats">No dataset loaded</span>
 </header>
 <div class="layout">
   <div class="sidebar" id="sidebar"></div>
   <div class="main" id="main">
     <div class="empty">Load a dataset JSON file to begin.<br/><br/>
-      Supports the <code>[{conversations: [{role, content}]}]</code> format
-      (e3 / e4 training data).</div>
+      Supports:<br/>
+      &bull; <code>[{conversations: [{role, content}]}]</code> (e3 / e4 training data)<br/>
+      &bull; <code>{graph, tasks, _metadata?, description?}</code> (skeleton or populated graph)<br/>
+      &bull; multi-select a directory of per-file populated/skeleton graphs.</div>
   </div>
 </div>
 <script>
@@ -122,44 +124,77 @@ let DUP_USER = new Set(); // indices whose user[0] content is duplicated
 
 const $ = id => document.getElementById(id);
 
-$('file').addEventListener('change', e => {
-  const f = e.target.files[0];
-  if (!f) return;
-  const r = new FileReader();
-  r.onload = () => {
-    try {
-      const parsed = JSON.parse(r.result);
-      loadData(parsed, f.name);
-    } catch (err) {
-      alert('Failed to parse JSON: ' + err.message);
-    }
-  };
-  r.readAsText(f);
+$('file').addEventListener('change', async e => {
+  const files = [...e.target.files];
+  if (!files.length) return;
+  files.sort((a, b) => a.name.localeCompare(b.name));
+  try {
+    const parsedFiles = await Promise.all(files.map(f => readJson(f).then(p => ({ name: f.name, parsed: p }))));
+    loadData(parsedFiles);
+  } catch (err) {
+    alert('Failed to parse JSON: ' + err.message);
+  }
 });
 
-function loadData(parsed, name) {
-  DATA = Array.isArray(parsed) ? parsed : (parsed.samples || Object.values(parsed));
-  // role-sequence stats
+function readJson(f) {
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => { try { res(JSON.parse(r.result)); } catch (e) { rej(e); } };
+    r.onerror = () => rej(r.error);
+    r.readAsText(f);
+  });
+}
+
+function classify(entry) {
+  if (entry && Array.isArray(entry.conversations)) return 'conv';
+  if (entry && entry.graph && typeof entry.graph === 'object') return 'graph';
+  return 'unknown';
+}
+
+function loadData(parsedFiles) {
+  // Normalize each file into a flat list of entries tagged with kind + source.
+  DATA = [];
+  parsedFiles.forEach(({ name, parsed }) => {
+    let entries;
+    if (Array.isArray(parsed)) entries = parsed;
+    else if (parsed && Array.isArray(parsed.samples)) entries = parsed.samples;
+    else entries = [parsed];
+    entries.forEach(ex => {
+      const kind = classify(ex);
+      DATA.push({ __src: name, __kind: kind, data: ex });
+    });
+  });
+
+  // Stats: per-kind counts and (for conv) role sequences + dup detection.
   const seqCount = {};
   const userFirst = {};
-  DATA.forEach((ex, i) => {
-    const conv = ex.conversations || [];
-    const seq = conv.map(m => m.role).join('-');
-    seqCount[seq] = (seqCount[seq] || 0) + 1;
-    const u = conv.find(m => m.role === 'user');
-    if (u) (userFirst[u.content] = userFirst[u.content] || []).push(i);
+  const kindCount = {};
+  DATA.forEach((ent, i) => {
+    kindCount[ent.__kind] = (kindCount[ent.__kind] || 0) + 1;
+    if (ent.__kind === 'conv') {
+      const conv = ent.data.conversations || [];
+      const seq = conv.map(m => m.role).join('-');
+      seqCount[seq] = (seqCount[seq] || 0) + 1;
+      const u = conv.find(m => m.role === 'user');
+      if (u) (userFirst[u.content] = userFirst[u.content] || []).push(i);
+    }
   });
   DUP_USER = new Set();
   Object.values(userFirst).forEach(arr => {
     if (arr.length > 1) arr.forEach(i => DUP_USER.add(i));
   });
+
+  const srcLabel = parsedFiles.length === 1
+    ? parsedFiles[0].name
+    : `${parsedFiles.length} files`;
+  const kindStr = Object.entries(kindCount).map(([k, v]) => `${k}: ${v}`).join(' &nbsp;|&nbsp; ');
   const seqStr = Object.entries(seqCount)
     .sort((a, b) => b[1] - a[1])
     .map(([k, v]) => `${k}: ${v}`).join(' &nbsp;|&nbsp; ');
   $('stats').innerHTML =
-    `<b>${name}</b> &nbsp; ${DATA.length} examples &nbsp; ` +
-    `<span style="color:var(--warn)">${DUP_USER.size} dup-user-prompt</span> &nbsp; ` +
-    `[ ${seqStr} ]`;
+    `<b>${escapeHtml(srcLabel)}</b> &nbsp; ${DATA.length} entries &nbsp; [ ${kindStr} ]` +
+    (DUP_USER.size ? ` &nbsp; <span style="color:var(--warn)">${DUP_USER.size} dup-user-prompt</span>` : '') +
+    (seqStr ? ` &nbsp; [ ${seqStr} ]` : '');
   renderSidebar();
   show(0);
 }
@@ -167,17 +202,30 @@ function loadData(parsed, name) {
 function renderSidebar() {
   const sb = $('sidebar');
   sb.innerHTML = '';
-  DATA.forEach((ex, i) => {
-    const conv = ex.conversations || [];
-    const turns = conv.length;
-    const u = conv.find(m => m.role === 'user');
-    let title = u ? u.content.replace(/^task:\s*/, '').split(/Scene graph|\n/)[0] : '(no user turn)';
+  DATA.forEach((ent, i) => {
+    let title = '';
+    let badges = '';
+    if (ent.__kind === 'conv') {
+      const conv = ent.data.conversations || [];
+      const turns = conv.length;
+      const u = conv.find(m => m.role === 'user');
+      title = u ? u.content.replace(/^task:\s*/, '').split(/Scene graph|\n/)[0] : '(no user turn)';
+      if (turns > 2) badges += `<span class="badge multi">${turns}-turn</span>`;
+      if (DUP_USER.has(i)) badges += `<span class="badge dup">dup</span>`;
+    } else if (ent.__kind === 'graph') {
+      const g = ent.data.graph || {};
+      const tasks = ent.data.tasks || [];
+      const nObj = (g.objects || []).length;
+      const nReg = (g.regions || []).length;
+      title = ent.__src.replace(/\.json$/, '');
+      badges += `<span class="badge">${nReg}r/${nObj}o</span>`;
+      badges += `<span class="badge ${tasks.length ? 'multi' : ''}">${tasks.length} task${tasks.length === 1 ? '' : 's'}</span>`;
+    } else {
+      title = `(unknown format) ${ent.__src}`;
+    }
     const div = document.createElement('div');
     div.className = 'ex-item';
     div.dataset.idx = i;
-    let badges = '';
-    if (turns > 2) badges += `<span class="badge multi">${turns}-turn</span>`;
-    if (DUP_USER.has(i)) badges += `<span class="badge dup">dup</span>`;
     div.innerHTML = `<span class="idx">${i}</span>${escapeHtml(title.slice(0, 60))}${badges}`;
     div.onclick = () => show(i);
     sb.appendChild(div);
@@ -192,28 +240,76 @@ function show(i) {
   const active = $('sidebar').querySelector('.ex-item.active');
   if (active) active.scrollIntoView({ block: 'nearest' });
 
-  const ex = DATA[i];
-  const conv = ex.conversations || [];
+  const ent = DATA[i];
   let html = `<div class="controls">
     <button onclick="show(${i - 1})" ${i === 0 ? 'disabled' : ''}>&larr; Prev</button>
     <button onclick="show(${i + 1})" ${i === DATA.length - 1 ? 'disabled' : ''}>Next &rarr;</button>
     <input type="number" id="jump" value="${i}" min="0" max="${DATA.length - 1}" style="width:70px"
       onchange="show(+this.value)" />
-    <span class="stats">example ${i} / ${DATA.length - 1}</span>
+    <span class="stats">entry ${i} / ${DATA.length - 1} &nbsp;·&nbsp; ${escapeHtml(ent.__src)} &nbsp;·&nbsp; <code>${ent.__kind}</code></span>
   </div>`;
 
-  if (DUP_USER.has(i)) {
-    html += `<div class="warn-box">⚠ This example's user prompt is identical to other example(s) —
-      likely a data-formatting bug (input not populated).</div>`;
+  if (ent.__kind === 'conv') {
+    if (DUP_USER.has(i)) {
+      html += `<div class="warn-box">⚠ This example's user prompt is identical to other example(s) —
+        likely a data-formatting bug (input not populated).</div>`;
+    }
+    const conv = ent.data.conversations || [];
+    conv.forEach((m, ti) => {
+      html += `<div class="turn ${m.role}">
+        <div class="turn-head">${m.role} &nbsp;·&nbsp; turn ${ti}</div>
+        <div class="turn-body">${renderTurn(m)}</div>
+      </div>`;
+    });
+  } else if (ent.__kind === 'graph') {
+    html += renderGraphEntry(ent.data);
+  } else {
+    html += `<pre>${escapeHtml(JSON.stringify(ent.data, null, 2))}</pre>`;
   }
-
-  conv.forEach((m, ti) => {
-    html += `<div class="turn ${m.role}">
-      <div class="turn-head">${m.role} &nbsp;·&nbsp; turn ${ti}</div>
-      <div class="turn-body">${renderTurn(m)}</div>
-    </div>`;
-  });
   $('main').innerHTML = html;
+}
+
+function renderGraphEntry(ex) {
+  let html = '';
+  const desc = ex.description;
+  if (desc && String(desc).trim()) {
+    html += `<div class="turn user"><div class="turn-head">description</div>
+      <div class="turn-body"><div class="field-val">${escapeHtml(String(desc))}</div></div></div>`;
+  }
+  html += `<div class="turn user"><div class="turn-head">scene graph</div>
+    <div class="turn-body">${renderGraph(ex.graph || {})}</div></div>`;
+
+  const tasks = ex.tasks || [];
+  html += `<div class="turn assistant"><div class="turn-head">tasks &nbsp;·&nbsp; ${tasks.length}</div>
+    <div class="turn-body">${tasks.length ? tasks.map(renderTask).join('') : '<div class="field-val" style="color:var(--muted)">(no tasks — likely a skeleton)</div>'}</div></div>`;
+
+  const meta = ex._metadata;
+  if (meta) {
+    html += `<div class="turn"><div class="turn-head" style="background:var(--panel2);color:var(--muted)">_metadata</div>
+      <div class="turn-body"><details open><summary>metadata</summary><pre>${escapeHtml(JSON.stringify(meta, null, 2))}</pre></details></div></div>`;
+  }
+  return html;
+}
+
+function renderTask(t, i) {
+  const fields = ['task', 'answer', 'init_node', 'acceptance_criterion'];
+  let out = `<div class="field" style="border:1px solid var(--border);border-radius:4px;padding:8px;margin-bottom:8px">
+    <div class="field-label">task #${i}</div>`;
+  fields.forEach(k => {
+    if (t[k] != null) {
+      out += `<div class="field"><div class="field-label">${k}</div>
+        <div class="field-val">${escapeHtml(String(t[k]))}</div></div>`;
+    }
+  });
+  const known = new Set(fields);
+  const extra = Object.keys(t).filter(k => !known.has(k));
+  if (extra.length) {
+    out += `<details><summary>other keys (${extra.length})</summary><pre>${
+      escapeHtml(JSON.stringify(Object.fromEntries(extra.map(k => [k, t[k]])), null, 2))
+    }</pre></details>`;
+  }
+  out += '</div>';
+  return out;
 }
 
 function renderTurn(m) {

@@ -67,6 +67,30 @@ class DataGenerator:
                 json_str = json.dumps(rnd_data["graph"], indent=2)
                 f.write(json_str)
 
+    def populate_graphs_and_tasks_batch(
+        self,
+        base_graphs: List[str],
+        log_dir: str,
+        model: str = "gpt-5.5",
+        reasoning_effort: str = "xhigh",
+        poll_interval: int = 60,
+    ) -> None:
+        """Like populate_graphs_and_tasks but uses the OpenAI Batch API (~50% cheaper)."""
+        prompts = [self.context_gen.build_prompt(base_graph=g) for g in base_graphs]
+        responses = self.context_gen.client.batch_query_gpt_5(
+            prompts,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            poll_interval=poll_interval,
+        )
+
+        for idx, response in enumerate(responses):
+            rnd_data = self.context_gen.parse_response(response)
+            with open(f"{log_dir}/data_gen_{idx:03d}.json", "w") as f:
+                f.write(json.dumps(rnd_data, indent=2))
+            with open(f"{log_dir}/graph_gen_{idx:03d}.json", "w") as f:
+                f.write(json.dumps(rnd_data["graph"], indent=2))
+
     def generate_example_plans(
         self,
         generated_data: List[str],

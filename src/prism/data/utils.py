@@ -1,7 +1,9 @@
+import io
 import json
+import time
 from copy import deepcopy
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import networkx as nx
 import numpy as np
@@ -203,6 +205,56 @@ class GPTQueryClient:
         )
 
         return response.output_text
+
+    def batch_query_gpt_5(
+        self,
+        queries: List[str],
+        model: str = "gpt-5.5",
+        reasoning_effort: str = "xhigh",
+        poll_interval: int = 60,
+    ) -> List[str]:
+        """Submit queries via the Batch API and return responses in order (~50% cheaper)."""
+        requests_jsonl = "\n".join(
+            json.dumps({
+                "custom_id": str(i),
+                "method": "POST",
+                "url": "/v1/responses",
+                "body": {
+                    "model": model,
+                    "input": [{"role": "user", "content": [{"type": "input_text", "text": q}]}],
+                    "text": {"format": {"type": "text"}, "verbosity": "low"},
+                    "reasoning": {"effort": reasoning_effort, "summary": "auto"},
+                },
+            })
+            for i, q in enumerate(queries)
+        )
+
+        file_obj = self.client.files.create(
+            file=("batch.jsonl", io.BytesIO(requests_jsonl.encode()), "application/jsonl"),
+            purpose="batch",
+        )
+        batch = self.client.batches.create(
+            input_file_id=file_obj.id,
+            endpoint="/v1/responses",
+            completion_window="24h",
+        )
+        print(f"Batch submitted: {batch.id}")
+
+        while batch.status not in ("completed", "failed", "expired", "cancelled"):
+            time.sleep(poll_interval)
+            batch = self.client.batches.retrieve(batch.id)
+            c = batch.request_counts
+            print(f"Batch {batch.id}: {batch.status} ({c.completed}/{c.total})")
+
+        if batch.status != "completed":
+            raise RuntimeError(f"Batch {batch.id} ended with status: {batch.status}")
+
+        result_lines = self.client.files.content(batch.output_file_id).text.splitlines()
+        responses = {}
+        for line in filter(None, result_lines):
+            record = json.loads(line)
+            responses[int(record["custom_id"])] = record["response"]["body"]["output_text"]
+        return [responses[i] for i in range(len(queries))]
 
     def query_gpt_4(
         self,

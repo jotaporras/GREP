@@ -360,7 +360,7 @@ class TaskGraphGen:
     def __init__(self):
         self.client = utils.GPTQueryClient()  # OpenAI()
 
-    def _build_prompt(
+    def build_prompt(
         self,
         base_graph: str,
         n_tasks: Optional[int] = 2,
@@ -406,7 +406,7 @@ class TaskGraphGen:
             list of tasks
         """
         response = self.client.query_gpt(
-            query=self._build_prompt(
+            query=self.build_prompt(
                 n_tasks=n_tasks,
                 prior=description,
                 base_graph=base_graph,
@@ -414,7 +414,10 @@ class TaskGraphGen:
             )
         )
 
-        # try to load the graph for error handling
+        return self.parse_response(response, description=description)
+
+    def parse_response(self, response: str, description: str = "") -> dict:
+        """Validate and parse a raw GPT response string into a task dict."""
         print(response)
         json_content = json.loads(response)
         json_content["description"] = description

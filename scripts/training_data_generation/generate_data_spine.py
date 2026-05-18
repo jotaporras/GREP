@@ -79,6 +79,23 @@ if __name__ == "__main__":
             "(SPINE planner rollouts) on them."
         ),
     )
+    parser.add_argument(
+        "--batch",
+        action="store_true",
+        help="Use the OpenAI Batch API for Phase 1 (~50% cheaper, up to 24h turnaround).",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="gpt-5.5",
+        help="OpenAI model for Phase 1 populate calls (batch or sync).",
+    )
+    parser.add_argument(
+        "--reasoning-effort",
+        type=str,
+        default="xhigh",
+        help="Reasoning effort for Phase 1 calls (e.g. minimal, low, medium, high, xhigh).",
+    )
 
     args = parser.parse_args()
 
@@ -117,7 +134,15 @@ if __name__ == "__main__":
         populated_graphs_dir = Path(output_dir) / "populated_graphs"
         populated_graphs_dir.mkdir(exist_ok=True)
 
-        data_generator.populate_graphs_and_tasks(graphs, log_dir=populated_graphs_dir)
+        if args.batch:
+            data_generator.populate_graphs_and_tasks_batch(
+                graphs,
+                log_dir=populated_graphs_dir,
+                model=args.model,
+                reasoning_effort=args.reasoning_effort,
+            )
+        else:
+            data_generator.populate_graphs_and_tasks(graphs, log_dir=populated_graphs_dir)
 
     output_generated_plans_dir = Path(output_dir) / "generated_plans"
     generated_graphs_dirs = sorted(populated_graphs_dir.glob("*data_gen*json"))
