@@ -6,7 +6,7 @@
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=14
 #SBATCH --mem=256G
-#SBATCH --array=0-6%7
+#SBATCH --array=0-7%8
 
 # e5 PE / architecture sweep — train + cross-eval, one config per array task.
 #
@@ -21,6 +21,7 @@
 #   4    cfg4-gt       gt      256        4096     2                 2        2     2
 #   5    e4ref-rpearl  rpearl  256        1024     5                 3        -     -
 #   6    e4ref-gt      gt      256        1024     5                 3        2     3
+#   7    llm           llm     -          -        -                 -        -     -
 #
 # configs 1-3 raise both pe_hidden_channels and d_model to 4096; config 4 keeps
 # pe_hidden_channels at the yaml default (256) and only raises d_model.
@@ -86,10 +87,11 @@ fi
 
 RPEARL_YAML=experiments/e4_new_training_data_2/e4_rpearl_llm_no_edges.yaml
 GT_YAML=experiments/e4_new_training_data_2/e4_rpearl_llm_gt_no_edges.yaml
+LLM_YAML=experiments/e4_new_training_data_2/e4_llm.yaml
 
-# ---- Per-task config arrays (7 tasks). GT-only keys are 0 for RPEARL tasks. ----
-#                       0              1              2           3              4              5               6
-BASE_YAMLS=(  "$RPEARL_YAML"  "$RPEARL_YAML"  "$GT_YAML"  "$RPEARL_YAML"  "$GT_YAML"  "$RPEARL_YAML"  "$GT_YAML" )
+# ---- Per-task config arrays (8 tasks). GT-only keys are 0 for RPEARL tasks. ----
+#                       0              1              2           3              4              5               6             7
+BASE_YAMLS=(  "$RPEARL_YAML"  "$RPEARL_YAML"  "$GT_YAML"  "$RPEARL_YAML"  "$GT_YAML"  "$RPEARL_YAML"  "$GT_YAML"  "$LLM_YAML" )
 SAVE_NAMES=(
     e5_cfg1_rpearl_pe4096_dm4096_L5
     e5_cfg2_rpearl_pe4096_dm4096_L2
@@ -98,13 +100,15 @@ SAVE_NAMES=(
     e5_cfg4_gt_pe256_dm4096_L2
     e5_e4ref_rpearl_pe256_dm1024_L5
     e5_e4ref_gt_pe256_dm1024_L5
+    e5_llm
 )
-PE_HIDDEN=(   4096   4096   4096   256    256    256    256  )
-D_MODELS=(    4096   4096   4096   4096   4096   1024   1024 )
-PE_LAYERS=(   5      2      2      2      2      5      5    )
-K_PE=(        3      3      2      3      2      3      3    )
-K_GT=(        0      0      2      0      2      0      2    )   # 0 = not a GT task
-GT_LAYERS=(   0      0      2      0      2      0      3    )
+ARCHS=(       rpearl  rpearl  gt     rpearl  gt     rpearl  gt     llm  )
+PE_HIDDEN=(   4096    4096    4096   256     256    256     256    0    )
+D_MODELS=(    4096    4096    4096   4096    4096   1024    1024   0    )
+PE_LAYERS=(   5       2       2      2       2      5       5      0    )
+K_PE=(        3       3       2      3       2      3       3      0    )
+K_GT=(        0       0       2      0       2      0       2      0    )   # 0 = not a GT task
+GT_LAYERS=(   0       0       2      0       2      0       3      0    )
 
 TASK_ID=${SLURM_ARRAY_TASK_ID:-${1:-0}}
 TOTAL_TASKS=${#BASE_YAMLS[@]}
@@ -116,10 +120,13 @@ fi
 
 BASE_YAML=${BASE_YAMLS[TASK_ID]}
 SAVE_NAME=${SAVE_NAMES[TASK_ID]}
+ARCH=${ARCHS[TASK_ID]}
 TASK_NUMBER=$((TASK_ID + 1))
 
-log "Task ${TASK_NUMBER}/${TOTAL_TASKS}: ${SAVE_NAME}"
-log "  yaml=${BASE_YAML} pe_hidden=${PE_HIDDEN[TASK_ID]} d_model=${D_MODELS[TASK_ID]} pe_num_layers=${PE_LAYERS[TASK_ID]} k_pe=${K_PE[TASK_ID]} k_gt=${K_GT[TASK_ID]} gt_num_layers=${GT_LAYERS[TASK_ID]}"
+log "Task ${TASK_NUMBER}/${TOTAL_TASKS}: ${SAVE_NAME} (arch=${ARCH})"
+if [[ "$ARCH" != "llm" ]]; then
+    log "  yaml=${BASE_YAML} pe_hidden=${PE_HIDDEN[TASK_ID]} d_model=${D_MODELS[TASK_ID]} pe_num_layers=${PE_LAYERS[TASK_ID]} k_pe=${K_PE[TASK_ID]} k_gt=${K_GT[TASK_ID]} gt_num_layers=${GT_LAYERS[TASK_ID]}"
+fi
 
 # ---- Stage 1: training ----
 TRAIN_CMD=(
@@ -135,13 +142,17 @@ TRAIN_CMD=(
     --wandb_project "$PROJECT"
     --wandb_run_name "$SAVE_NAME"
     --wandb_tag "$EXPERIMENT_TAG"
-    --pe_hidden_channels "${PE_HIDDEN[TASK_ID]}"
-    --d_model "${D_MODELS[TASK_ID]}"
-    --pe_num_layers "${PE_LAYERS[TASK_ID]}"
-    --k_pe "${K_PE[TASK_ID]}"
 )
-if (( GT_LAYERS[TASK_ID] > 0 )); then
-    TRAIN_CMD+=(--k_gt "${K_GT[TASK_ID]}" --gt_num_layers "${GT_LAYERS[TASK_ID]}")
+if [[ "$ARCH" != "llm" ]]; then
+    TRAIN_CMD+=(
+        --pe_hidden_channels "${PE_HIDDEN[TASK_ID]}"
+        --d_model "${D_MODELS[TASK_ID]}"
+        --pe_num_layers "${PE_LAYERS[TASK_ID]}"
+        --k_pe "${K_PE[TASK_ID]}"
+    )
+    if (( GT_LAYERS[TASK_ID] > 0 )); then
+        TRAIN_CMD+=(--k_gt "${K_GT[TASK_ID]}" --gt_num_layers "${GT_LAYERS[TASK_ID]}")
+    fi
 fi
 
 log "TRAIN: ${TRAIN_CMD[*]}"

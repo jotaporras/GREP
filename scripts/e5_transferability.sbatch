@@ -59,19 +59,15 @@ log() {
     echo "[$(date --iso-8601=seconds)] $*"
 }
 
-# Best run per architecture from the e5 PE sweep — SAVE_NAME prefixes (the
-# wandb-id suffix is glob-resolved below). EDIT after the e5 cross-eval finishes:
-# inspect $ALELAB_DRIVE/GREP-PRISM/outputs/e5_pe_sweep/*/eval_logs/cross_eval/ (or notebooks/e5_pe_sweep.ipynb)
-# and set the best RPEARL, best GT, and an e4ref baseline.
-# The 7 e5 SAVE_NAMEs (see scripts/e5_train_and_eval.sbatch):
-#   e5_cfg1_rpearl_pe4096_dm4096_L5   e5_cfg2_rpearl_pe4096_dm4096_L2
-#   e5_cfg3_gt_pe4096_dm4096_L2       e5_cfg4_rpearl_pe256_dm4096_L2
-#   e5_cfg4_gt_pe256_dm4096_L2        e5_e4ref_rpearl_pe256_dm1024_L5
-#   e5_e4ref_gt_pe256_dm1024_L5
+# Best run per architecture from the e5 PE sweep, selected by cross-eval
+# accuracy on the held-out test graphs:
+#   GT     — cfg4-gt        50% (10/20)
+#   RPEARL — cfg2 / cfg4    tied at 45% (9/20); both included so transferability
+#            can break the tie.
 CHECKPOINTS=(
-    e5_cfg1_rpearl_pe4096_dm4096_L5   # best RPEARL  (edit after cross-eval)
-    e5_cfg3_gt_pe4096_dm4096_L2       # best GT      (edit after cross-eval)
-    e5_e4ref_rpearl_pe256_dm1024_L5   # e4 baseline  (edit after cross-eval)
+    e5_cfg2_rpearl_pe4096_dm4096_L2_8yikr0fk   # RPEARL, 45% cross-eval
+    e5_cfg4_rpearl_pe256_dm4096_L2_rbg6w5c4    # RPEARL, 45% cross-eval
+    e5_cfg4_gt_pe256_dm4096_L2_nuohivct        # GT,     50% cross-eval
 )
 SIZES=(10 30 50 100 250)
 PERM_SEEDS=(32 42 58)
@@ -89,15 +85,12 @@ fi
 CKPT_IDX=$(( TASK_ID / N_SIZE ))
 SIZE_IDX=$(( TASK_ID % N_SIZE ))
 
-CKPT_PREFIX=${CHECKPOINTS[CKPT_IDX]}
+CKPT_NAME=${CHECKPOINTS[CKPT_IDX]}
 SIZE=${SIZES[SIZE_IDX]}
 
-# Resolve the SAVE_NAME prefix to a checkpoint dir (newest mtime), as in
-# scripts/e5_train_and_eval.sbatch — the wandb-id suffix is unknown ahead of time.
-CHECKPOINT=$(ls -dt "${CHECKPOINT_BASE}/${CKPT_PREFIX}"_*/ 2>/dev/null | head -1 || true)
-CHECKPOINT="${CHECKPOINT%/}"
-if [[ -z "$CHECKPOINT" || ! -d "$CHECKPOINT" ]]; then
-    log "No checkpoint found matching ${CHECKPOINT_BASE}/${CKPT_PREFIX}_*"
+CHECKPOINT="${CHECKPOINT_BASE}/${CKPT_NAME}"
+if [[ ! -d "$CHECKPOINT" ]]; then
+    log "Checkpoint dir does not exist: $CHECKPOINT"
     exit 1
 fi
 
@@ -109,8 +102,7 @@ if (( N_GRAPHS == 0 )); then
     exit 1
 fi
 
-log "Task ${TASK_ID}/$((TOTAL_TASKS - 1)): ckpt=${CKPT_PREFIX}  size=${SIZE}  graphs=${N_GRAPHS}  perm_seeds=${PERM_SEEDS[*]}"
-log "Resolved checkpoint: ${CHECKPOINT}"
+log "Task ${TASK_ID}/$((TOTAL_TASKS - 1)): ckpt=${CKPT_NAME}  size=${SIZE}  graphs=${N_GRAPHS}  perm_seeds=${PERM_SEEDS[*]}"
 
 CMD=(
     srun
@@ -125,4 +117,4 @@ CMD=(
 log "CMD: ${CMD[*]}"
 "${CMD[@]}"
 
-log "Done: ${CKPT_PREFIX} on N=${SIZE} (${N_GRAPHS} graphs)"
+log "Done: ${CKPT_NAME} on N=${SIZE} (${N_GRAPHS} graphs)"
