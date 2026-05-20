@@ -89,5 +89,5 @@ done
 echo ""
 echo "=== Done. Next steps ==="
 echo "  /verify-tasks ${OUT_DIR} --sample-size 5"
-echo "  rsync -av --delete ${OUT_DIR}/ betty:/vast/projects/aribeiro/alelab/jporras/GREP-PRISM/${OUT_DIR}/"
+echo "  rsync -av ${OUT_DIR}/ betty:/vast/projects/aribeiro/alelab/jporras/GREP-PRISM/${OUT_DIR}/"
 echo "  sbatch scripts/e5_transferability.sbatch    # on the cluster"
