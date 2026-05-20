@@ -230,6 +230,31 @@ class DataGenerator:
             with open(f"{log_dir}/graph_gen_{idx:03d}.json", "w") as f:
                 f.write(json.dumps(rnd_data["graph"], indent=2))
 
+    @staticmethod
+    def _has_valid_rollout(path: str) -> bool:
+        """True if ``path`` is a rollout ``split_train_val`` would accept: a
+        parseable JSON list of role/content dicts with a strippable ICL prefix.
+
+        Lets a recovery rerun of :meth:`generate_example_plans` skip tasks whose
+        rollout is already good and regenerate only failed/corrupt/missing ones.
+        """
+        try:
+            with open(path) as f:
+                obj = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return False
+        if not (isinstance(obj, list) and obj):
+            return False
+        if not all(
+            isinstance(m, dict) and "role" in m and "content" in m for m in obj
+        ):
+            return False
+        try:
+            utils.strip_icl(obj)
+        except Exception:
+            return False
+        return True
+
     def generate_example_plans(
         self,
         generated_data: List[str],
@@ -279,11 +304,20 @@ class DataGenerator:
                 for task_idx, task_entry in enumerate(task_entries):
                     task = task_entry["task"]
                     init_location = task_entry["init_node"]
+                    log_name = f"{log_dir}/sample_{idx:03d}_{task_idx:03d}.json"
+                    # Recovery rerun: skip tasks whose rollout is already valid
+                    # so only failed/corrupt/missing ones are regenerated.
+                    if self._has_valid_rollout(log_name):
+                        print(
+                            f"Skipping sample_{idx:03d}_{task_idx:03d}: "
+                            "valid rollout already exists"
+                        )
+                        data_counter += 1
+                        continue
                     graph_handle = GraphHandler(graph=graph, init_node=init_location)
                     graph_data_gen = graph_sim.GraphSim(graph_handle)
                     unknown_pct = self.unknown_pcts[task_idx % len(self.unknown_pcts)]
                     graph_data_gen.randomly_remove_nodes(pct=unknown_pct)
-                    log_name = f"{log_dir}/sample_{idx:03d}_{task_idx:03d}.json"
                     planner = SPINE(
                         graph=graph_data_gen.partial_graph, log_name=log_name
                     )
