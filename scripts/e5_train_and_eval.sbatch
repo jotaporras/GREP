@@ -6,22 +6,29 @@
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=14
 #SBATCH --mem=256G
-#SBATCH --array=0-4%5
+#SBATCH --array=0-6%7
 
 # e5 PE / architecture sweep — train + cross-eval, one config per array task.
 #
-# Five configs (RPEARL and Graph-Transformer) varying pe_hidden_channels and
+# Seven configs (RPEARL and Graph-Transformer) varying pe_hidden_channels and
 # d_model against Llama-3.1-8B's hidden size (4096):
 #
-#   idx  cfg          arch    pe_hidden  d_model  pe_num_layers(L)  k_pe(K)  k_gt  gt_num_layers
-#   0    cfg1         rpearl  4096       4096     5                 3        -     -
-#   1    cfg2         rpearl  4096       4096     2                 3        -     -
-#   2    cfg3         gt      4096       4096     2                 2        2     2
-#   3    cfg4-rpearl  rpearl  256        4096     2                 3        -     -
-#   4    cfg4-gt      gt      256        4096     2                 2        2     2
+#   idx  cfg           arch    pe_hidden  d_model  pe_num_layers(L)  k_pe(K)  k_gt  gt_num_layers
+#   0    cfg1          rpearl  4096       4096     5                 3        -     -
+#   1    cfg2          rpearl  4096       4096     2                 3        -     -
+#   2    cfg3          gt      4096       4096     2                 2        2     2
+#   3    cfg4-rpearl   rpearl  256        4096     2                 3        -     -
+#   4    cfg4-gt       gt      256        4096     2                 2        2     2
+#   5    e4ref-rpearl  rpearl  256        1024     5                 3        -     -
+#   6    e4ref-gt      gt      256        1024     5                 3        2     3
 #
 # configs 1-3 raise both pe_hidden_channels and d_model to 4096; config 4 keeps
 # pe_hidden_channels at the yaml default (256) and only raises d_model.
+#
+# configs 5-6 are the e4 baseline reference: the unmodified e4 yaml
+# hyperparameters (d_model=1024, pe_hidden=256, L=5, k_pe=3; GT adds k_gt=2,
+# gt_num_layers=3, gt_heads=8). Trained on the same e5 dataset so the e5 sweep
+# can be compared against the old e4 parameter point.
 #
 # Each array task trains one config on the e5 graph-oriented dataset, then runs
 # cross-eval on that dataset's held-out test graphs — both in the same task.
@@ -80,22 +87,24 @@ fi
 RPEARL_YAML=experiments/e4_new_training_data_2/e4_rpearl_llm_no_edges.yaml
 GT_YAML=experiments/e4_new_training_data_2/e4_rpearl_llm_gt_no_edges.yaml
 
-# ---- Per-task config arrays (5 tasks). GT-only keys are 0 for RPEARL tasks. ----
-#                       0              1              2           3              4
-BASE_YAMLS=(  "$RPEARL_YAML"  "$RPEARL_YAML"  "$GT_YAML"  "$RPEARL_YAML"  "$GT_YAML" )
+# ---- Per-task config arrays (7 tasks). GT-only keys are 0 for RPEARL tasks. ----
+#                       0              1              2           3              4              5               6
+BASE_YAMLS=(  "$RPEARL_YAML"  "$RPEARL_YAML"  "$GT_YAML"  "$RPEARL_YAML"  "$GT_YAML"  "$RPEARL_YAML"  "$GT_YAML" )
 SAVE_NAMES=(
     e5_cfg1_rpearl_pe4096_dm4096_L5
     e5_cfg2_rpearl_pe4096_dm4096_L2
     e5_cfg3_gt_pe4096_dm4096_L2
     e5_cfg4_rpearl_pe256_dm4096_L2
     e5_cfg4_gt_pe256_dm4096_L2
+    e5_e4ref_rpearl_pe256_dm1024_L5
+    e5_e4ref_gt_pe256_dm1024_L5
 )
-PE_HIDDEN=(   4096   4096   4096   256    256  )
-D_MODELS=(    4096   4096   4096   4096   4096 )
-PE_LAYERS=(   5      2      2      2      2    )
-K_PE=(        3      3      2      3      2    )
-K_GT=(        0      0      2      0      2    )   # 0 = not a GT task
-GT_LAYERS=(   0      0      2      0      2    )
+PE_HIDDEN=(   4096   4096   4096   256    256    256    256  )
+D_MODELS=(    4096   4096   4096   4096   4096   1024   1024 )
+PE_LAYERS=(   5      2      2      2      2      5      5    )
+K_PE=(        3      3      2      3      2      3      3    )
+K_GT=(        0      0      2      0      2      0      2    )   # 0 = not a GT task
+GT_LAYERS=(   0      0      2      0      2      0      3    )
 
 TASK_ID=${SLURM_ARRAY_TASK_ID:-${1:-0}}
 TOTAL_TASKS=${#BASE_YAMLS[@]}
