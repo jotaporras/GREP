@@ -1,12 +1,55 @@
 import json
 import os
 from pathlib import Path
-from typing import List, Union
+from typing import List, Optional, Union
 
+import numpy as np
 from spine.mapping.graph_util import GraphHandler
 from spine.spine import SPINE
 
 from prism.data import graph_gen, graph_sim, planning_sim, utils
+
+TASK_TAXONOMY = {
+    0: "Existence",
+    1: "Positionality",
+    2: "Reachability",
+    3: "Navigability",
+}
+N_TASK_TYPES = len(TASK_TAXONOMY)
+
+
+def sample_task_types(
+    n_tasks: int,
+    proportions: List[float],
+    rng: Optional[np.random.Generator] = None,
+) -> List[int]:
+    """Sample a list of task-type labels from a multinomial distribution.
+
+    Parameters
+    ----------
+    n_tasks : int
+        How many tasks to generate.
+    proportions : List[float]
+        Weights for each task type (0-Existence, 1-Positionality,
+        2-Reachability, 3-Navigability). Automatically normalised.
+    rng : np.random.Generator, optional
+        Random generator for reproducibility.
+
+    Returns
+    -------
+    List[int]
+        e.g. [0, 1, 3, 2, 3, 3, 0, ...]
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    p = np.asarray(proportions, dtype=float)
+    p = p / p.sum()
+    counts = rng.multinomial(n_tasks, p)
+    labels: List[int] = []
+    for type_id, count in enumerate(counts):
+        labels.extend([type_id] * count)
+    rng.shuffle(labels)
+    return labels
 
 
 class DataGenerator:
@@ -15,8 +58,12 @@ class DataGenerator:
     def __init__(
         self,
         graph_unknown: Union[int, List[int]],
+        task_proportions: Optional[List[float]] = None,
+        seed: Optional[int] = None,
     ):
         self.unknown_pcts = graph_unknown
+        self.task_proportions = task_proportions
+        self.rng = np.random.default_rng(seed)
         self.context_gen = graph_gen.TaskGraphGen()
         self.planning_sim = planning_sim.PlanningSim()
 
@@ -24,6 +71,7 @@ class DataGenerator:
         self,
         base_graphs: List[str],
         log_dir: str,
+        n_tasks: int = 10,
     ) -> None:
         """Populate graphs with semantics and tasks.
 
@@ -43,8 +91,19 @@ class DataGenerator:
             for _ in range(self.n_graph_gen_attempts):
                 try:
                     # error handling in case data generation fails
+                    task_types = None
+                    if self.task_proportions is not None:
+                        task_types = sample_task_types(
+                            n_tasks=n_tasks,
+                            proportions=self.task_proportions,
+                            rng=self.rng,
+                        )
+
                     rnd_data = self.context_gen.get_tasks(
-                        base_graph=base_graph, previous_tasks=previous_tasks
+                        base_graph=base_graph,
+                        n_tasks=n_tasks,
+                        previous_tasks=previous_tasks,
+                        task_types=task_types,
                     )
 
                     break
@@ -71,12 +130,26 @@ class DataGenerator:
         self,
         base_graphs: List[str],
         log_dir: str,
+        n_tasks: int = 10,
         model: str = "gpt-5.5",
         reasoning_effort: str = "xhigh",
         poll_interval: int = 60,
     ) -> None:
         """Like populate_graphs_and_tasks but uses the OpenAI Batch API (~50% cheaper)."""
-        prompts = [self.context_gen.build_prompt(base_graph=g) for g in base_graphs]
+        prompts = []
+        for g in base_graphs:
+            task_types = None
+            if self.task_proportions is not None:
+                task_types = sample_task_types(
+                    n_tasks=n_tasks,
+                    proportions=self.task_proportions,
+                    rng=self.rng,
+                )
+            prompts.append(
+                self.context_gen.build_prompt(
+                    base_graph=g, n_tasks=n_tasks, task_types=task_types
+                )
+            )
         responses = self.context_gen.client.batch_query_gpt_5(
             prompts,
             model=model,

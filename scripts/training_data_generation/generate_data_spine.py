@@ -96,6 +96,25 @@ if __name__ == "__main__":
         default="xhigh",
         help="Reasoning effort for Phase 1 calls (e.g. minimal, low, medium, high, xhigh).",
     )
+    parser.add_argument(
+        "--task-proportions",
+        type=float,
+        nargs=4,
+        default=None,
+        metavar=("EXIST", "POS", "REACH", "NAV"),
+        help=(
+            "Multinomial weights for the four task types: "
+            "Existence, Positionality, Reachability, Navigability. "
+            "Values are normalised to sum to 1. "
+            "E.g. --task-proportions 1 1 1 1 for uniform."
+        ),
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for task-type sampling reproducibility.",
+    )
 
     args = parser.parse_args()
 
@@ -116,6 +135,8 @@ if __name__ == "__main__":
 
     data_generator = DataGenerator(
         graph_unknown=unknown_pcts,
+        task_proportions=args.task_proportions,
+        seed=args.seed,
     )
 
     if args.skip_populate:

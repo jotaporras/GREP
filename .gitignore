@@ -31,4 +31,4 @@ SPINE/
 data_backup/
 *.png
 trainer_output/
-results/
+shared/
