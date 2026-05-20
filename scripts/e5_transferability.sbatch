@@ -6,14 +6,14 @@
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=14
 #SBATCH --mem=256G
-#SBATCH --array=0-14%4
+#SBATCH --array=0-19%4
 
 # Transferability + permutation-equivariance eval for the best E5 checkpoints.
 #
 # Each array task evaluates ONE (checkpoint, graph_size) cell — all 10 graphs of
-# that size — across all three permutation seeds (model loaded once). The 15
+# that size — across all three permutation seeds (model loaded once). The 20
 # tasks cover:
-#     3 checkpoints × 5 graph sizes  (10 graphs + 3 perm seeds run inside each)
+#     4 checkpoints × 5 graph sizes  (10 graphs + 3 perm seeds run inside each)
 #
 # Sizes 500 and 1000 dropped: the populate model silently truncates the graph at
 # those sizes (drops most regions, leaves dangling edges).
@@ -60,14 +60,16 @@ log() {
 }
 
 # Best run per architecture from the e5 PE sweep, selected by cross-eval
-# accuracy on the held-out test graphs:
+# accuracy on the held-out test graphs, plus the text-only LLM baseline:
 #   GT     — cfg4-gt        50% (10/20)
 #   RPEARL — cfg2 / cfg4    tied at 45% (9/20); both included so transferability
 #            can break the tie.
+#   LLM    — text-only baseline (graph serialized into the prompt).
 CHECKPOINTS=(
     e5_cfg2_rpearl_pe4096_dm4096_L2_8yikr0fk   # RPEARL, 45% cross-eval
     e5_cfg4_rpearl_pe256_dm4096_L2_rbg6w5c4    # RPEARL, 45% cross-eval
     e5_cfg4_gt_pe256_dm4096_L2_nuohivct        # GT,     50% cross-eval
+    e5_llm_r5pbg901                            # LLM     text-only baseline
 )
 SIZES=(10 30 50 100 250)
 PERM_SEEDS=(32 42 58)
