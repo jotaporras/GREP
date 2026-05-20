@@ -107,7 +107,7 @@ class AlfredDataGen:
             self.log_dir,
             glob_str="sample*json",
             out_file=str(self.log_dir / "formatted.json"),
-            cutbefore=0,
+            strip_icl_prefix=False,
         )
 
 

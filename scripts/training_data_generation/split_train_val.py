@@ -30,6 +30,8 @@ import shutil
 from collections import defaultdict
 from pathlib import Path
 
+from prism.data.utils import strip_icl
+
 
 SAMPLE_RE = re.compile(r"^sample_(\d+)_(\d+)\.json$")
 
@@ -54,12 +56,20 @@ def validate_samples(plans_dir: Path) -> tuple[dict[str, list[Path]], list[tuple
         if not all(isinstance(msg, dict) and "role" in msg and "content" in msg for msg in obj):
             errors.append((p, "list entries missing role/content fields"))
             continue
+        try:
+            strip_icl(obj)
+        except ValueError as e:
+            errors.append((p, f"ICL strip failed: {e}"))
+            continue
         groups[name_match.group(1)].append(p)
     return groups, errors
 
 
 def write_split(out_path: Path, sample_paths: list[Path]) -> int:
-    entries = [{"conversations": json.loads(sp.read_text())} for sp in sample_paths]
+    entries = [
+        {"conversations": strip_icl(json.loads(sp.read_text()))}
+        for sp in sample_paths
+    ]
     with out_path.open("w") as f:
         json.dump(entries, f, indent=2)
     return len(entries)
@@ -71,7 +81,7 @@ def write_split_2turn(out_path: Path, sample_paths: list[Path]) -> int:
     Drops the system turn and every intermediate observation/action."""
     entries = []
     for sp in sample_paths:
-        msgs = json.loads(sp.read_text())
+        msgs = strip_icl(json.loads(sp.read_text()))
         first_user = next((m for m in msgs if m["role"] == "user"), None)
         last_assistant = next((m for m in reversed(msgs) if m["role"] == "assistant"), None)
         if first_user is None or last_assistant is None:

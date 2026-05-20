@@ -86,8 +86,8 @@ class TestBatchQueryGpt5:
         assert record["custom_id"] == "0"
         assert record["method"] == "POST"
         assert record["url"] == "/v1/responses"
-        assert record["body"]["model"] == "gpt-5.5"
-        assert record["body"]["reasoning"] == {"effort": "xhigh", "summary": "auto"}
+        assert record["body"]["model"] == "gpt-5.1"
+        assert record["body"]["reasoning"] == {"effort": "low", "summary": "auto"}
         assert record["body"]["input"][0]["content"][0]["text"] == "hello"
 
         gpt_client.client.batches.create.assert_called_once_with(

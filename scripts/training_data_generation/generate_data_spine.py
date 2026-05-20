@@ -7,7 +7,7 @@ Phase 1 — Populate graphs and tasks (LLM-driven)
     to be a *skeleton* scene graph produced by ``scripts/generate_eval_graphs.py``:
     nodes have generic names (e.g. ``region_1``, ``object_3``), empty or
     ``"__FILL__"`` descriptions, an empty ``tasks: []`` list, and a ``_metadata``
-    block. The LLM (GPT-5.1) renames nodes with realistic semantics, fills
+    block. The LLM (gpt-5.1) renames nodes with realistic semantics, fills
     descriptions, and generates tasks. Outputs land in:
 
         <name>/populated_graphs/data_gen_XXX.json   # graph + tasks + description
@@ -82,18 +82,18 @@ if __name__ == "__main__":
     parser.add_argument(
         "--batch",
         action="store_true",
-        help="Use the OpenAI Batch API for Phase 1 (~50% cheaper, up to 24h turnaround).",
+        help="Use the OpenAI Batch API for Phase 1 (~50%% cheaper, up to 24h turnaround).",
     )
     parser.add_argument(
         "--model",
         type=str,
-        default="gpt-5.5",
+        default="gpt-5.1",
         help="OpenAI model for Phase 1 populate calls (batch or sync).",
     )
     parser.add_argument(
         "--reasoning-effort",
         type=str,
-        default="xhigh",
+        default="low",
         help="Reasoning effort for Phase 1 calls (e.g. minimal, low, medium, high, xhigh).",
     )
     parser.add_argument(
@@ -110,10 +110,28 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--complexity-proportions",
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=("SIMPLE", "COMPLEX"),
+        help=(
+            "Multinomial weights for task difficulty: simple vs complex. "
+            "Values are normalised to sum to 1. "
+            "Default when omitted: 1 1 (50%% simple, 50%% complex)."
+        ),
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=None,
         help="Random seed for task-type sampling reproducibility.",
+    )
+    parser.add_argument(
+        "--n-tasks",
+        type=int,
+        default=10,
+        help="Number of tasks to generate per graph in Phase 1.",
     )
 
     args = parser.parse_args()
@@ -136,6 +154,7 @@ if __name__ == "__main__":
     data_generator = DataGenerator(
         graph_unknown=unknown_pcts,
         task_proportions=args.task_proportions,
+        complexity_proportions=args.complexity_proportions,
         seed=args.seed,
     )
 
@@ -159,11 +178,17 @@ if __name__ == "__main__":
             data_generator.populate_graphs_and_tasks_batch(
                 graphs,
                 log_dir=populated_graphs_dir,
+                n_tasks=args.n_tasks,
                 model=args.model,
                 reasoning_effort=args.reasoning_effort,
             )
         else:
-            data_generator.populate_graphs_and_tasks(graphs, log_dir=populated_graphs_dir)
+            data_generator.populate_graphs_and_tasks(
+                graphs,
+                log_dir=populated_graphs_dir,
+                n_tasks=args.n_tasks,
+                reasoning_effort=args.reasoning_effort,
+            )
 
     output_generated_plans_dir = Path(output_dir) / "generated_plans"
     generated_graphs_dirs = sorted(populated_graphs_dir.glob("*data_gen*json"))

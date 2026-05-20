@@ -156,21 +156,55 @@ def try_load_json(file):
         return json.loads("".join(content.split("\n")[:-4]))
 
 
+def strip_icl(msgs: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Strip the few-shot ICL prefix from a logged SPINE rollout.
+
+    A logged rollout is ``[system] + ICL example turns + real task turns``.
+    Every ICL example *and* the real task start with a ``user`` message whose
+    content begins with ``task:``; the real task is the *last* such message.
+    Returns ``[system] + msgs[real_task_idx:]``, keeping the system turn.
+
+    Replaces the old hardcoded ``cutbefore=36`` slice, which silently corrupted
+    training data whenever the ICL example set changed length.
+    """
+    if not (isinstance(msgs, list) and msgs):
+        raise ValueError("rollout must be a non-empty list of messages")
+    task_idx = next(
+        (
+            i
+            for i in range(len(msgs) - 1, -1, -1)
+            if msgs[i].get("role") == "user"
+            and msgs[i].get("content", "").lstrip().lower().startswith("task:")
+        ),
+        None,
+    )
+    if task_idx is None:
+        raise ValueError("no `task:` user message found in rollout")
+    if not any(m.get("role") == "assistant" for m in msgs[task_idx + 1 :]):
+        raise ValueError("no assistant turn after the real task")
+    head = [msgs[0]] if msgs[0].get("role") == "system" else []
+    return head + msgs[task_idx:]
+
+
 def aggregate(
-    root_dir: str, glob_str: str, out_file: str, cutbefore: Optional[int] = 36
+    root_dir: str, glob_str: str, out_file: str, strip_icl_prefix: bool = True
 ) -> None:
+    """Concatenate rollout JSON files under ``root_dir`` into one training file.
+
+    With ``strip_icl_prefix`` (default), each rollout has its few-shot ICL
+    prefix removed via :func:`strip_icl`. Pass ``strip_icl_prefix=False`` for
+    non-SPINE rollouts that have no ``task:``-prefixed ICL turns.
+    """
     json_files = Path(root_dir).glob(glob_str)
 
     all_data = []
     for json_file in json_files:
         try:
             data = try_load_json(json_file)
-
-            train_data = data[cutbefore:]
-
-            all_data.append({"conversations": train_data})
+            conversations = strip_icl(data) if strip_icl_prefix else data
+            all_data.append({"conversations": conversations})
         except Exception as ex:
-            print(json_file)
+            print(f"{json_file}: {ex}")
 
     with open(out_file, "w") as f:
         json.dump(all_data, f)
@@ -185,23 +219,25 @@ class GPTQueryClient:
         query: str,
         temperature: Optional[float] = 0.31,
         max_tokens: Optional[int] = 10240,
+        reasoning_effort: str = "low",
     ):
-        return self.query_gpt_5(query, temperature, max_tokens)
+        return self.query_gpt_5(query, temperature, max_tokens, reasoning_effort)
 
     def query_gpt_5(
         self,
         query: str,
         temperature: Optional[float] = 0.31,
         max_tokens: Optional[int] = 10240,
+        reasoning_effort: str = "low",
     ) -> str:
 
         response = self.client.responses.create(
-            model="gpt-5.5",
+            model="gpt-5.1",
             input=[
                 {"role": "user", "content": [{"type": "input_text", "text": query}]}
             ],
             text={"format": {"type": "text"}, "verbosity": "low"},
-            reasoning={"effort": "xhigh", "summary": "auto"},
+            reasoning={"effort": reasoning_effort, "summary": "auto"},
         )
 
         return response.output_text
@@ -209,8 +245,8 @@ class GPTQueryClient:
     def batch_query_gpt_5(
         self,
         queries: List[str],
-        model: str = "gpt-5.5",
-        reasoning_effort: str = "xhigh",
+        model: str = "gpt-5.1",
+        reasoning_effort: str = "low",
         poll_interval: int = 60,
     ) -> List[str]:
         """Submit queries via the Batch API and return responses in order (~50% cheaper)."""

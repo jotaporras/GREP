@@ -17,6 +17,14 @@ TASK_TAXONOMY = {
 }
 N_TASK_TYPES = len(TASK_TAXONOMY)
 
+TASK_COMPLEXITY = {
+    0: "Simple",
+    1: "Complex",
+}
+N_TASK_COMPLEXITIES = len(TASK_COMPLEXITY)
+
+DEFAULT_COMPLEXITY_PROPORTIONS = [1.0, 1.0]
+
 
 def sample_task_types(
     n_tasks: int,
@@ -52,6 +60,24 @@ def sample_task_types(
     return labels
 
 
+def sample_task_complexities(
+    n_tasks: int,
+    proportions: List[float],
+    rng: Optional[np.random.Generator] = None,
+) -> List[int]:
+    """Sample simple (0) vs complex (1) labels from a multinomial distribution."""
+    if rng is None:
+        rng = np.random.default_rng()
+    p = np.asarray(proportions, dtype=float)
+    p = p / p.sum()
+    counts = rng.multinomial(n_tasks, p)
+    labels: List[int] = []
+    for complexity_id, count in enumerate(counts):
+        labels.extend([complexity_id] * count)
+    rng.shuffle(labels)
+    return labels
+
+
 class DataGenerator:
     n_graph_gen_attempts = 10
 
@@ -59,10 +85,12 @@ class DataGenerator:
         self,
         graph_unknown: Union[int, List[int]],
         task_proportions: Optional[List[float]] = None,
+        complexity_proportions: Optional[List[float]] = None,
         seed: Optional[int] = None,
     ):
         self.unknown_pcts = graph_unknown
         self.task_proportions = task_proportions
+        self.complexity_proportions = complexity_proportions
         self.rng = np.random.default_rng(seed)
         self.context_gen = graph_gen.TaskGraphGen()
         self.planning_sim = planning_sim.PlanningSim()
@@ -72,6 +100,7 @@ class DataGenerator:
         base_graphs: List[str],
         log_dir: str,
         n_tasks: int = 10,
+        reasoning_effort: str = "low",
     ) -> None:
         """Populate graphs with semantics and tasks.
 
@@ -88,6 +117,7 @@ class DataGenerator:
         previous_tasks = ""
 
         for idx, base_graph in enumerate(base_graphs):
+            rnd_data = None
             for _ in range(self.n_graph_gen_attempts):
                 try:
                     # error handling in case data generation fails
@@ -99,17 +129,39 @@ class DataGenerator:
                             rng=self.rng,
                         )
 
+                    complexity_props = (
+                        self.complexity_proportions
+                        if self.complexity_proportions is not None
+                        else DEFAULT_COMPLEXITY_PROPORTIONS
+                    )
+                    task_complexities = sample_task_complexities(
+                        n_tasks=n_tasks,
+                        proportions=complexity_props,
+                        rng=self.rng,
+                    )
+
                     rnd_data = self.context_gen.get_tasks(
                         base_graph=base_graph,
                         n_tasks=n_tasks,
                         previous_tasks=previous_tasks,
                         task_types=task_types,
+                        task_complexities=task_complexities,
+                        reasoning_effort=reasoning_effort,
                     )
 
                     break
 
                 except Exception as ex:
                     print(f"graph generator invalid: {ex}")
+
+            # Fail loud instead of silently writing the previous graph's data:
+            # if `rnd_data` were left unset, a graph that fails all attempts
+            # would inherit the last successful `rnd_data` and be written twice.
+            if rnd_data is None:
+                raise RuntimeError(
+                    f"graph {idx} failed all {self.n_graph_gen_attempts} "
+                    f"populate attempts"
+                )
 
             tasks = [entry["task"] for entry in rnd_data["tasks"]]
 
@@ -131,8 +183,8 @@ class DataGenerator:
         base_graphs: List[str],
         log_dir: str,
         n_tasks: int = 10,
-        model: str = "gpt-5.5",
-        reasoning_effort: str = "xhigh",
+        model: str = "gpt-5.1",
+        reasoning_effort: str = "low",
         poll_interval: int = 60,
     ) -> None:
         """Like populate_graphs_and_tasks but uses the OpenAI Batch API (~50% cheaper)."""
@@ -145,9 +197,23 @@ class DataGenerator:
                     proportions=self.task_proportions,
                     rng=self.rng,
                 )
+
+            complexity_props = (
+                self.complexity_proportions
+                if self.complexity_proportions is not None
+                else DEFAULT_COMPLEXITY_PROPORTIONS
+            )
+            task_complexities = sample_task_complexities(
+                n_tasks=n_tasks,
+                proportions=complexity_props,
+                rng=self.rng,
+            )
             prompts.append(
                 self.context_gen.build_prompt(
-                    base_graph=g, n_tasks=n_tasks, task_types=task_types
+                    base_graph=g,
+                    n_tasks=n_tasks,
+                    task_types=task_types,
+                    task_complexities=task_complexities,
                 )
             )
         responses = self.context_gen.client.batch_query_gpt_5(
@@ -193,12 +259,14 @@ class DataGenerator:
                 with open(data_path) as f:
                     data = json.load(f)
 
-                # INVARIANT: the planner MUST only see the natural-language task text.
-                # Never pass `answer`, `acceptance_criterion`, `init_node`, or any
-                # other task-dict field to SPINE or to run_planning — that would
-                # leak ground truth into the rollout traces and contaminate
-                # training data.
-                tasks = [entry["task"] for entry in data["tasks"]]
+                # INVARIANT: the planner only ever sees the natural-language task
+                # text. `init_node` sets the robot's start region in the simulator
+                # (matching run_eval.py) and is NOT passed to the planner as task
+                # content. `answer` and `acceptance_criterion` must NEVER reach
+                # SPINE or run_planning — that would leak ground truth into the
+                # rollout traces and contaminate training data.
+                task_entries = data["tasks"]
+                tasks = [entry["task"] for entry in task_entries]
                 assert all(
                     isinstance(t, str) for t in tasks
                 ), "task field must be a plain string"
@@ -206,10 +274,11 @@ class DataGenerator:
                 print(f"Generating example data for tasks: {tasks}")
 
                 graph = data["graph"]
-                init_location = graph["robot_location"]
                 assert isinstance(graph, dict)
 
-                for task_idx, task in enumerate(tasks):
+                for task_idx, task_entry in enumerate(task_entries):
+                    task = task_entry["task"]
+                    init_location = task_entry["init_node"]
                     graph_handle = GraphHandler(graph=graph, init_node=init_location)
                     graph_data_gen = graph_sim.GraphSim(graph_handle)
                     unknown_pct = self.unknown_pcts[task_idx % len(self.unknown_pcts)]
@@ -221,20 +290,17 @@ class DataGenerator:
                     out = self.planning_sim.run_planning(
                         llm_planner=planner, task=task, graph_data_gen=graph_data_gen
                     )
-                    # some simple verification. Mark plans that don't come up with an answer
-                    try:
-                        if not out.response["plan"][-1][0].startswith("answer"):
-                            os.rename(
-                                log_name, log_name.replace(".json", "_failed") + ".json"
-                            )
-                    except:
+                    # Mark rollouts that never reached an answer so downstream
+                    # split/aggregate can skip them (split_train_val ignores
+                    # *_failed.json).
+                    if out.terminated_by != "answer":
                         os.rename(
-                            log_name, log_name.replace(".json", "failed") + ".json"
+                            log_name, log_name.replace(".json", "_failed.json")
                         )
 
                     data_counter += 1
             except Exception as ex:
-                print(f"data generation produced exception:")
+                print("data generation produced exception:")
                 raise ex
 
         utils.aggregate(
