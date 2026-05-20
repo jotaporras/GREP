@@ -44,7 +44,7 @@ ENTITY=${ENTITY:-alelab}
 EXPERIMENT_TAG=${EXPERIMENT_TAG:-e5_pe_sweep}
 ENV_NAME=${ENV_NAME:-/vast/projects/aribeiro/alelab/jporras/envs/GREP-PRISM-v2}
 OUTPUT_BASE=${OUTPUT_BASE:-/vast/home/j/jporras/sourcecode/GREP}
-CHECKPOINT_DIR=${CHECKPOINT_DIR:-outputs/e5_pe_sweep}
+CHECKPOINT_DIR=${CHECKPOINT_DIR:-/vast/projects/aribeiro/alelab/jporras/GREP-PRISM/outputs/e5_pe_sweep}
 
 # e5 dataset produced by scripts/e5_generate_training_data.sh
 DATA_SPLIT=${DATA_SPLIT:-data/gen/e5_graph_oriented_data/split}
