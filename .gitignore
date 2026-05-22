@@ -23,6 +23,7 @@ results/
 docs/
 .idea/
 .cursor/
+.vscode/
 .DS_Store
 
 *.bak
@@ -31,4 +32,6 @@ SPINE/
 data_backup/
 *.png
 trainer_output/
+results_old/
 shared/
+eval/
