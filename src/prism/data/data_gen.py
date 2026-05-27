@@ -280,7 +280,6 @@ class DataGenerator:
 
         for idx, data_path in enumerate(generated_data):
             try:
-
                 with open(data_path) as f:
                     data = json.load(f)
 
@@ -296,24 +295,31 @@ class DataGenerator:
                     isinstance(t, str) for t in tasks
                 ), "task field must be a plain string"
 
-                print(f"Generating example data for tasks: {tasks}")
-
                 graph = data["graph"]
                 assert isinstance(graph, dict)
+            except Exception as ex:
+                # A malformed data_gen_*.json (unparseable JSON, missing keys)
+                # must not abort the whole run — skip this graph so the
+                # remaining graphs still produce rollouts.
+                print(f"Skipping graph {idx} ({data_path}): unreadable — {ex}")
+                continue
 
-                for task_idx, task_entry in enumerate(task_entries):
+            print(f"Generating example data for tasks: {tasks}")
+
+            for task_idx, task_entry in enumerate(task_entries):
+                log_name = f"{log_dir}/sample_{idx:03d}_{task_idx:03d}.json"
+                # Recovery rerun: skip tasks whose rollout is already valid
+                # so only failed/corrupt/missing ones are regenerated.
+                if self._has_valid_rollout(log_name):
+                    print(
+                        f"Skipping sample_{idx:03d}_{task_idx:03d}: "
+                        "valid rollout already exists"
+                    )
+                    data_counter += 1
+                    continue
+                try:
                     task = task_entry["task"]
                     init_location = task_entry["init_node"]
-                    log_name = f"{log_dir}/sample_{idx:03d}_{task_idx:03d}.json"
-                    # Recovery rerun: skip tasks whose rollout is already valid
-                    # so only failed/corrupt/missing ones are regenerated.
-                    if self._has_valid_rollout(log_name):
-                        print(
-                            f"Skipping sample_{idx:03d}_{task_idx:03d}: "
-                            "valid rollout already exists"
-                        )
-                        data_counter += 1
-                        continue
                     graph_handle = GraphHandler(graph=graph, init_node=init_location)
                     graph_data_gen = graph_sim.GraphSim(graph_handle)
                     unknown_pct = self.unknown_pcts[task_idx % len(self.unknown_pcts)]
@@ -331,11 +337,20 @@ class DataGenerator:
                         os.rename(
                             log_name, log_name.replace(".json", "_failed.json")
                         )
-
                     data_counter += 1
-            except Exception as ex:
-                print("data generation produced exception:")
-                raise ex
+                except Exception as ex:
+                    # A malformed graph (e.g. a connection edge whose endpoint
+                    # is not a declared node) or any single-task failure must
+                    # not abort the run. Quarantine any partial log as
+                    # *_failed.json and move on to the next task.
+                    print(
+                        f"Skipping sample_{idx:03d}_{task_idx:03d}: "
+                        f"rollout failed — {type(ex).__name__}: {ex}"
+                    )
+                    if os.path.exists(log_name):
+                        os.rename(
+                            log_name, log_name.replace(".json", "_failed.json")
+                        )
 
         utils.aggregate(
             root_dir=log_dir,

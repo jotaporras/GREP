@@ -21,10 +21,10 @@
 #   - OPENAI_API_KEY must have available quota. The SPINE planner is OpenAI-
 #     backed; if the account is out of budget the rerun will not crash — it
 #     will just write *_failed.json files again. Top up billing first.
-#   - The LLMDataLogger r+ bug is NOT fixed here, so a fraction of the
-#     regenerated rollouts will again come out corrupt. This script is safe to
-#     re-run: each pass keeps the now-valid rollouts (trashing the rest) and
-#     retries only what is still missing, so repeated runs converge.
+#   - The LLMDataLogger r+ corruption bug is now fixed (mode "w" truncates),
+#     so freshly regenerated rollouts no longer come out corrupt mid-write.
+#     This script is still safe to re-run: each pass keeps the now-valid
+#     rollouts (trashing the rest) and retries only what is still missing.
 
 set -euo pipefail
 
