@@ -2,19 +2,6 @@ import os
 import re
 import sys
 
-# Isolate the target GPU BEFORE any torch/CUDA imports.  Without this, PyTorch
-# initializes a CUDA context on every visible GPU, blocking parallel runs.
-# Each process sets its own CUDA_VISIBLE_DEVICES from the YAML config's
-# `device:` field, so concurrent training/eval sessions coexist safely.
-if __name__ == "__main__":
-    for _arg in sys.argv[1:]:
-        if _arg.endswith(('.yaml', '.yml')) and os.path.exists(_arg):
-            with open(_arg) as _f:
-                _m = re.search(r'^device:\s*(\d+)', _f.read(), re.MULTILINE)
-            if _m:
-                os.environ["CUDA_VISIBLE_DEVICES"] = _m.group(1)
-            break
-
 from prism.data import data
 from prism.eval import callbacks
 from prism.eval import run_eval
@@ -205,12 +192,16 @@ class TrainConfig:
     data: str
     bit4: bool = False
     eval_data: str = "data/eval/eval_1_multi_step.json"
+    # Optional pre-split validation file (same schema as `data`). When set,
+    # `val_frac` is ignored and this file is loaded as the eval dataset.
+    val_data: Optional[str] = None
     r: int = 16
     base_model: str = "meta-llama/Llama-3.2-3B-Instruct"
     wandb_project: str = "SLM-distill"
     wandb_run_name: str = "spine_lora"
     wandb_tag: str = "spine"
     epochs: int = 2
+    max_steps: int = -1  # If > 0, overrides epochs and switches eval/save to step-based (dev use)
     val_frac: float = 0.1
     # LoRA
     lora_alpha: int = 16
@@ -381,8 +372,19 @@ def train_model(config: TrainConfig, config_file: str = None):
         text_edge_list=config.text_edge_list,
     )
 
-    # Train/val split
-    if config.val_frac and config.val_frac > 0.0:
+    # Train/val split: prefer an explicit pre-split val file when provided.
+    if config.val_data:
+        train_dataset = full_dataset
+        eval_dataset = datasets.load_dataset("json", data_files=[config.val_data], split="train")
+        if config.debug:
+            eval_dataset = eval_dataset.select(range(round(len(eval_dataset) * config.dataset_proportion)))
+        eval_dataset = data.preprocess_dataset(
+            eval_dataset, tokenizer,
+            architecture=config.architecture,
+            text_edge_list=config.text_edge_list,
+        )
+        print(f"Using pre-split val file: {len(train_dataset)} train / {len(eval_dataset)} eval")
+    elif config.val_frac and config.val_frac > 0.0:
         dataset_size = len(full_dataset)
         val_size = int(dataset_size * config.val_frac)
         train_size = dataset_size - val_size
@@ -433,6 +435,7 @@ def train_model(config: TrainConfig, config_file: str = None):
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         warmup_steps=config.warmup_steps,
         num_train_epochs=config.epochs,
+        max_steps=config.max_steps,
         learning_rate=config.learning_rate,
         weight_decay=config.weight_decay,
         lr_scheduler_type="linear",
@@ -450,12 +453,12 @@ def train_model(config: TrainConfig, config_file: str = None):
         # Temporarily disabled because qwen doesn't support it.
         #assistant_only_loss=True,  # train only on assistant tokens
         remove_unused_columns=False,
-        # Checkpointing
-        save_strategy="epoch",
+        # Checkpointing / Validation: step-based when max_steps is set (dev), else epoch-based.
+        save_strategy="steps" if config.max_steps > 0 else "epoch",
+        save_steps=max(1, config.max_steps // 2) if config.max_steps > 0 else 500,
         save_total_limit=3,
-        # Validation
-        eval_strategy="epoch",
-        eval_steps=0.5,
+        eval_strategy="steps" if config.max_steps > 0 else "epoch",
+        eval_steps=max(1, config.max_steps // 2) if config.max_steps > 0 else 0.5,
         do_eval=True,
     )
 
@@ -524,8 +527,28 @@ def train_model(config: TrainConfig, config_file: str = None):
 # ----------------------------
 if __name__ == "__main__":
     parser = HfArgumentParser(TrainConfig)
-    if len(sys.argv) == 2 and sys.argv[1].endswith((".yaml", ".yml")):
-        (cfg,) = parser.parse_yaml_file(sys.argv[1])
+    if len(sys.argv) >= 2 and sys.argv[1].endswith((".yaml", ".yml")):
+        import yaml as _yaml
+        with open(sys.argv[1]) as f:
+            cfg_dict = _yaml.safe_load(f) or {}
+        # Overlay --key value pairs from sys.argv[2:] onto the yaml dict so
+        # callers can override individual fields without writing a new yaml.
+        i = 2
+        while i < len(sys.argv):
+            arg = sys.argv[i]
+            if not arg.startswith("--"):
+                raise SystemExit(f"Expected --key value after yaml path, got: {arg!r}")
+            key = arg[2:]
+            if "=" in key:
+                k, v = key.split("=", 1)
+                cfg_dict[k] = _yaml.safe_load(v)
+                i += 1
+            else:
+                if i + 1 >= len(sys.argv):
+                    raise SystemExit(f"Missing value for override --{key}")
+                cfg_dict[key] = _yaml.safe_load(sys.argv[i + 1])
+                i += 2
+        (cfg,) = parser.parse_dict(cfg_dict)
         config_file = sys.argv[1]
     else:
         (cfg,) = parser.parse_args_into_dataclasses()

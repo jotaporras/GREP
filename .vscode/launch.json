@@ -2,6 +2,64 @@
   "version": "0.2.0",
   "configurations": [
     {
+      "name": "PRISM: Debug eval — e3 RPEARL on single e4 graph",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/eval_checkpoint_on_graphs.py",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src:${workspaceFolder}/SPINE/src",
+        "CUDA_VISIBLE_DEVICES": "1"
+      },
+      "args": [
+        // will output to outputs/e3_new_training_data/e3_rpearl_llm_llama-3.1-8b_r16_4bit_qmu8x2qu/eval_logs/cross_eval/debug_graph.json
+        //ie checkpoint/cross_eval/debug_graph.json
+        "--checkpoint", "outputs/e3_new_training_data/e3_rpearl_llm_llama-3.1-8b_r16_4bit_qmu8x2qu",
+        "--graphs", "data/debug_graph.json",
+        "--text-edge-list", "none"
+      ]
+    },
+    {
+      "name": "Generate Training Data (SPINE, single rollout)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/training_data_generation/generate_data_spine.py",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false,
+      "envFile": "${workspaceFolder}/.env",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src:${workspaceFolder}/SPINE/src"
+      },
+      "args": [
+        // Full pipeline on ONE small skeleton graph (8 regions, 2 objects, 3 tasks).
+        // Phase 1: gpt-5.1 with reasoning=high populates names/descriptions/tasks.
+        // Phase 2: SPINE planner runs on each generated task.
+        // Expected cost: ~$0.20-$0.40 for Phase 1 + Phase 2 planner calls.
+        "--data-dir", "data/single_rollout_input",
+        "--name", "data/gen/spine_single_rollout"
+      ]
+    },
+    {
+      "name": "Generate Training Data (SPINE)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/training_data_generation/generate_data_spine.py",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false,
+      "envFile": "${workspaceFolder}/.env",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src:${workspaceFolder}/SPINE/src"
+      },
+      "args": [
+        "--data-dir", "data/base_graphs",
+        "--name", "data/gen/spine_dev",
+        "--n-samples", "1",
+        "--n-tasks", "5",
+        "--temperature", "0.31"
+      ]
+    },
+    {
       "name": "PRISM: DEV: Fast Run (1% data, no wandb, ETA )",
       "type": "debugpy",
       "request": "launch",
@@ -23,19 +81,26 @@
         "--checkpoint_dir",
         "outputs/dev",
         "--data",
-        "data/gen/spine_exp1/formatted.json",
+        //"data/gen/spine_exp1/formatted.json",
+        //"data/2026_04_10_new_training/zac_20260402_training_v1.json",
+        "data/training_data_graphs_20260422/aggregate/training_data_20260422.json",
+        "--eval_data",
+        //"data/eval/eval_1_multi_step.json",
+        "data/training_data_graphs_20260422/aggregate/graphs/data_gen_000.json",
         "--base_model",
         // "meta-llama/Llama-3.2-3B-Instruct",
-        "meta-llama/Llama-3.1-8B-Instruct",
-        //"Qwen/Qwen2.5-0.5B-Instruct",
-        // "HuggingFaceTB/SmolLM2-135M-Instruct",
+        //"meta-llama/Llama-3.1-8B-Instruct",
+        // "Qwen/Qwen2.5-0.5B-Instruct",
+        "HuggingFaceTB/SmolLM2-135M-Instruct",
         "--per_device_train_batch_size",
         // "8",
         "1",
         "--bit4",
-        "true",
+        "false",
         "--epochs",
-        "2",
+        "1",
+        "--max_steps",
+        "3",
         "--debug",
         "false",
         "--dataset_proportion",
@@ -64,7 +129,7 @@
         "40",
         "--dropout",
         "0.05",
-        "--k",
+        "--k_pe",
         "3",
         "--use_layer_norm",
         "true",
@@ -72,6 +137,7 @@
         "false",
         "--wandb_project",
         "GREP-PRISM",
+        
         "--wandb_run_name",
         "fast_run",
         "--wandb_tag",
@@ -81,151 +147,6 @@
         "1",
         "--dataloader_num_workers",
         "1"
-      ]
-    },
-    {
-      "name": "PRISM: Train RPEARL + edges + EvalCallback",
-      "type": "debugpy",
-      "request": "launch",
-      "module": "prism.training.train_v2",
-      "cwd": "${workspaceFolder}/src",
-      "justMyCode": false,
-      "env": {
-        "WANDB_ENTITY": "alelab",
-        "UNSLOTH_RETURN_LOGITS": "1"
-      },
-      "args": [
-        "--name",
-        "dev_e2_eval",
-        "--architecture",
-        "rpearl_llm",
-        "--text_edge_list",
-        "present",
-        "--checkpoint_dir",
-        "../outputs/dev",
-        "--data",
-        "../data/gen/spine_exp1/formatted.json",
-        "--eval_data",
-        "../data/eval/eval_1_multi_step.json",
-        "--base_model",
-        //"meta-llama/Llama-3.1-8B-Instruct",
-        "meta-llama/Llama-3.2-3B-Instruct",
-        "--bit4",
-        "false",
-        "--epochs",
-        "2",
-        "--debug",
-        "true",
-        "--warmup_steps",
-        "5",
-        "--per_device_train_batch_size",
-        "2",
-        "--gradient_accumulation_steps",
-        "2",
-        "--learning_rate",
-        "2e-4",
-        "--weight_decay",
-        "1e-3",
-        "--r",
-        "16",
-        "--lora_alpha",
-        "16",
-        "--lora_dropout",
-        "0.2",
-        "--d_model",
-        "3072",
-        "--pe_hidden_channels",
-        "256",
-        "--pe_num_layers",
-        "5",
-        "--num_samples",
-        "40",
-        "--dropout",
-        "0.05",
-        "--k",
-        "3",
-        "--use_layer_norm",
-        "true",
-        "--freeze_llm",
-        "false",
-        "--wandb_run_name",
-        "dev_e1_rpearl_edges_eval",
-        "--wandb_tag",
-        "dev_e1_rpearl_eval",
-        "--wandb_project",
-        "GREP-PRISM"
-      ]
-    },
-    {
-      "name": "PRISM: Train LLM + edges + EvalCallback",
-      "type": "debugpy",
-      "request": "launch",
-      "module": "prism.training.train_v2",
-      "cwd": "${workspaceFolder}/src",
-      "justMyCode": false,
-      "env": {
-        "WANDB_ENTITY": "alelab",
-        "UNSLOTH_RETURN_LOGITS": "1"
-      },
-      "args": [
-        "--name",
-        "dev_e2_eval",
-        "--architecture",
-        "llm",
-        "--text_edge_list",
-        "present",
-        "--checkpoint_dir",
-        "../outputs/dev",
-        "--data",
-        "../data/gen/spine_exp1/formatted.json",
-        "--eval_data",
-        "../data/eval/eval_1_multi_step.json",
-        "--base_model",
-        "meta-llama/Llama-3.2-3B-Instruct",
-        "--bit4",
-        "false",
-        "--epochs",
-        "2",
-        "--debug",
-        "false",
-        "--warmup_steps",
-        "5",
-        "--per_device_train_batch_size",
-        "2",
-        "--gradient_accumulation_steps",
-        "2",
-        "--learning_rate",
-        "2e-4",
-        "--weight_decay",
-        "1e-3",
-        "--r",
-        "16",
-        "--lora_alpha",
-        "16",
-        "--lora_dropout",
-        "0.2",
-        "--d_model",
-        "3072",
-        "--pe_hidden_channels",
-        "256",
-        "--pe_num_layers",
-        "5",
-        "--num_samples",
-        "40",
-        "--dropout",
-        "0.05",
-        "--k",
-        "3",
-        "--use_layer_norm",
-        "true",
-        "--freeze_llm",
-        "false",
-        "--wandb_run_name",
-        "dev_e1_rpearl_edges_eval",
-        "--wandb_tag",
-        "dev_e1_rpearl_eval",
-        "--wandb_project",
-        "GREP-PRISM"
       ]
     },
     {
@@ -420,73 +341,101 @@
       ]
     },
     {
-      "name": "PRISM: Debug Eval Chain",
+      "name": "PRISM: e4 RPEARL (newdata2, no_edges)",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/scripts/debug_eval.py",
+      "module": "prism.training.train_v2",
       "cwd": "${workspaceFolder}",
       "justMyCode": false,
       "env": {
-        "PYTHONPATH": "${workspaceFolder}/src"
+        "UNSLOTH_RETURN_LOGITS": "1",
+        "CUDA_VISIBLE_DEVICES": "0"
       },
       "args": [
-        "--checkpoint_dir",
-        "../checkpoints/dev_e1_rpearl_edges_eval/dev_e1_rpearl_edges_eval_rpearl_llm_r16",
-        "--eval_data",
-        "../data/eval/eval_1_multi_step.json",
-        "--sample_idx",
-        "0"
+        "experiments/e4_new_training_data_2/e4_rpearl_llm_no_edges.yaml"
       ]
     },
     {
-      "name": "PRISM: Train LoRA (LLM Planner)",
+      // Debug variant: same RPEARL config but with text edges kept in the prompt.
+      // Isolates whether the format-collapse at step 197 is driven by edge stripping
+      // vs. encoder noise. See plan: floofy-sprouting-waterfall.md (verification step 1).
+      "name": "PRISM: e4 RPEARL (newdata2, DEBUG with edges)",
       "type": "debugpy",
       "request": "launch",
-      "module": "prism.training.train",
+      "module": "prism.training.train_v2",
       "cwd": "${workspaceFolder}",
       "justMyCode": false,
       "env": {
-        "WANDB_ENTITY": "alelab",
-        "UNSLOTH_RETURN_LOGITS": "1"
+        "UNSLOTH_RETURN_LOGITS": "1",
+        "CUDA_VISIBLE_DEVICES": "0"
       },
       "args": [
-        "--name",
-        "sft_llm_planner",
-        "--checkpoint_dir",
-        "outputs/dev",
-        "--data",
-        "data/gen/llm_planner/formatted.json",
-        "--eval_data",
-        "data/eval/eval_1_multi_step.json",
-        "--base_model",
-        "unsloth/Llama-3.2-1B-bnb-4bit",
-        "--bit4",
-        "true",
-        "--epochs",
-        "5",
-        "--warmup_steps",
-        "5",
-        "--per_device_train_batch_size",
-        "4",
-        "--gradient_accumulation_steps",
-        "2",
-        "--learning_rate",
-        "2e-4",
-        "--weight_decay",
-        "5e-2",
-        "--r",
-        "16",
-        "--lora_alpha",
-        "16",
-        "--lora_dropout",
-        "0.2",
-        "--wandb_run_name",
-        "llm_planner_lora",
-        "--wandb_tag",
-        "llm_planner",
-        "--wandb_project",
-        "GREP-PRISM"
+        "experiments/e4_new_training_data_2/e4_rpearl_llm_no_edges.yaml",
+        "--text_edge_list", "present",
+        "--wandb_run_name", "e4_rpearl_newdata2_with_edges_debug"
       ]
-    }
+    },
+    {
+      // Fast-debug training run for the failing no_edges config.
+      // dataset_proportion=0.01 makes one epoch finish in seconds so the eval
+      // callback fires quickly and you can hit breakpoints in both train and eval.
+      // Wandb disabled to skip auth/logging during debug.
+      // Breakpoint suggestions:
+      //   - src/prism/training/train_v2.py:152  → inspect `inputs` to see training-time tokens
+      //   - src/prism/data/data.py:76          → inspect message content after remove_edge_list
+      //   - src/prism/models/inference.py:114  → inspect `llm_msg` at eval (post-strip)
+      //   - src/prism/models/inference.py:117  → tokenizer.decode(input_ids[0]) for literal prompt
+      "name": "PRISM: e4 RPEARL (newdata2, DEBUG TRAIN no_edges)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "prism.training.train_v2",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false,
+      "env": {
+        "WANDB_MODE": "disabled",
+        "UNSLOTH_RETURN_LOGITS": "1",
+        "CUDA_VISIBLE_DEVICES": "0"
+      },
+      "args": [
+        "experiments/e4_new_training_data_2/e4_rpearl_llm_no_edges.yaml",
+        "--dataset_proportion", "0.01",
+        "--epochs", "1",
+        "--report_to", "none",
+        "--checkpoint_dir", "outputs/dev",
+        "--save_name", "debug_no_edges",
+        "--wandb_run_name", "debug_no_edges"
+      ]
+    },
+    {
+      "name": "PRISM: e4 RPEARL+GT (newdata2, no_edges)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "prism.training.train_v2",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false,
+      "env": {
+        "UNSLOTH_RETURN_LOGITS": "1",
+        "CUDA_VISIBLE_DEVICES": "0"
+      },
+      "args": [
+        "experiments/e4_new_training_data_2/e4_rpearl_llm_gt_no_edges.yaml"
+      ]
+    },
+    {
+      "name": "PRISM: e4 LLM text baseline (newdata2)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "prism.training.train_v2",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false,
+      "env": {
+        "UNSLOTH_RETURN_LOGITS": "1",
+        "CUDA_VISIBLE_DEVICES": "0"
+      },
+      "args": [
+        "experiments/e4_new_training_data_2/e4_llm.yaml"
+      ]
+    },
+    
   ]
 }

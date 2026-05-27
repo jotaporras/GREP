@@ -19,6 +19,12 @@ output/
 outputs/
 outputs_dev/
 extra/
+results/
+docs/
+.idea/
+.cursor/
+.vscode/
+.DS_Store
 
 *.bak
 SPINE/
@@ -26,3 +32,6 @@ SPINE/
 data_backup/
 *.png
 trainer_output/
+results_old/
+shared/
+eval/

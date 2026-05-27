@@ -18,7 +18,7 @@ def _fixed_get_base_prompt(request, scene_graph, use_icl=True):
         return _orig_get_base_prompt(request, scene_graph, use_icl=True)
     header = [_spine_prompts.SYS_PROMPT] + EXAMPLE_1 + [
         {"role": "user",
-         "content": f"{request}\nAdvice: \n- Recall the scene may be incomplete. \n- Carefully explain your reasoning in a step-by-step manner.\n- Reason over   connections, coordinates, and semantic relationships between objects and regions in the scene.\n\n"
+         "content": f"{request}\nAdvice: \n- Recall the scene may be incomplete. \n- Carefully explain your reasoning in a step-by-step manner.\n- Reason over connections, coordinates, and semantic relationships between objects and regions in the scene.\n\n"
                     f"Scene graph:{scene_graph}"}
     ]
     return header
@@ -71,7 +71,12 @@ def eval_answer(parsed_answer: Dict[str, str], answer_key: str):
 
         return EvalResult(formatted=formatted, plan_keyword=keyphrase), parsed_answer
     except Exception as e:
-        print(f"[eval] eval_answer exception: {e}")
+        import traceback as _tb
+        if not parsed_answer:
+            print(f"[eval] eval_answer received empty response — SPINE likely exhausted retries "
+                  f"(all attempts produced unparseable JSON). exception: {e}")
+        else:
+            print(f"[eval] eval_answer exception: {e}\n{_tb.format_exc()}")
         return EvalResult(False, False), parsed_answer
 
 
@@ -162,7 +167,7 @@ def eval_model(
             else:
                 client = inference.InMemoryLLM(model=model, tokenizer=tokenizer, strip_edges=strip_edges)
             llm_planner = SPINE(graph=graph_sim_inst.partial_graph, client=client,
-                                use_icl=use_icl if use_icl is not None else not is_gnn)
+                                use_icl=use_icl if use_icl is not None else True)
         else:
             llm_planner = SPINE(
                 graph=graph_sim_inst.partial_graph,

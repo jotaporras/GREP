@@ -13,7 +13,7 @@ The user provides a path to an eval log file (e.g. `eval_logs/step_001782_epoch_
 
 **MANDATORY: Always read files using the Read tool with `offset` and `limit` parameters in multiple passes.** Never use the Agent tool to read files. Start with a small chunk (e.g., `limit: 5`) to understand line structure, then use Grep to find key fields (`correct answer`, `plan`, `reasoning`, `=====`), then use targeted Read calls with `offset`/`limit` to read specific sections around each sample. Files may be very large (>25k tokens) and contain multiple concatenated runs — identify the final/canonical run by finding the last occurrence of `Running eval on N samples...`.
 
-You do NOT need to re-read the answer sheet or the graph — both are embedded below as reference.
+The answer sheet and scene graphs are **not** embedded — read them from the run being judged (see **Reference: answer sheet & graphs** below).
 
 ## Eval log format
 
@@ -40,6 +40,7 @@ For each sample:
    - Is the reasoning sound?
    - Would this plan actually work in the simulated environment?
 4. Compare the model's behavior against the **Acceptance Criterion** for each task (see answer sheet below).
+5. **For navigation / path tasks** (any task whose correct answer must give a route), do NOT eyeball the graph — verify the planner's stated route programmatically with the Python check in **Path Verification** below.
 
 ## Output format
 
@@ -90,80 +91,76 @@ Review the `interaction_trace` for each sample and flag any of the following as 
 
 These are planning inefficiencies that waste interaction turns. They do not make a correct answer incorrect, but should be flagged.
 
+## Path Verification (navigation tasks)
+
+For any task whose correct answer must contain a route, do not judge the path by
+eye — large scene graphs make eyeballing unreliable. Verify it with a short
+read-only Python REPL. The planner's reported route is correct only if every
+consecutive pair of regions is a real edge in the graph.
+
+Steps:
+
+1. Locate the scene graph for the sample — the `graph` block of the populated
+   `data_gen_*.json` (or `graph_gen_*.json`) the sample came from, or the scene
+   graph embedded in the sample's `interaction_trace`.
+2. Transcribe, in order, the list of regions the planner names as its route.
+3. Run this check in Bash via `python3`:
+
+   ```python
+   import json
+   g = json.load(open("<path to the graph JSON>"))
+   g = g.get("graph", g)   # data_gen_*.json nests the graph under "graph"
+   adj = {}
+   for a, b in g["region_connections"] + g["object_connections"]:
+       adj.setdefault(a, set()).add(b)
+       adj.setdefault(b, set()).add(a)
+
+   path = ["region_a", "region_b", "region_c"]   # the planner's stated route
+
+   broken = [(path[i], path[i + 1]) for i in range(len(path) - 1)
+             if path[i + 1] not in adj.get(path[i], set())]
+   print("all hops are real edges :", not broken)
+   print("broken hops             :", broken)
+   print("no repeated regions     :", len(path) == len(set(path)))
+   print("start -> end            :", path[0], "->", path[-1])
+   ```
+
+4. Judge the path from the output:
+   - **FAIL** — any hop is not a real edge (`broken` non-empty), or the route
+     does not start at the task's `init_node` / end at the intended destination.
+   - **PASS\*** — all hops are real edges and endpoints are correct, but a region
+     repeats (the planner padded or looped the route).
+   - **PASS** — all hops are real edges, endpoints correct, no region repeats.
+
+This is informal verification: it confirms the *output* route is a genuine path.
+It does not prove the task is optimally solvable — rigorous solvability checking
+is handled separately.
+
 ## IMPORTANT RESTRICTIONS
 
-When using this skill, you are NOT ALLOWED to: make changes to any code or files (except writing the output if requested), or run any scripts. This is a read-only analysis task.
+When using this skill, you are NOT ALLOWED to make changes to any code or files (except writing the output if requested). You MAY run a read-only Python REPL (via `python3` in Bash) for the single purpose of parsing scene graphs and verifying planner-reported paths, as described in **Path Verification**. Do not run any other scripts, and do not modify anything. This is a read-only analysis task.
 
 ---
 
-## Reference: Answer Sheet (`data/eval/eval_1_multi_step.json`)
+## Reference: answer sheet & graphs
 
-All tasks start at `init_node: field_1` (robot start location).
+The answer sheet and scene graphs are **not embedded** — they are specific to
+whichever eval run you are judging. Read them from that run.
 
-| # | Task | Answer regex | Acceptance Criterion |
-|---|------|-------------|----------------------|
-| 0 | is there a boat in the scene? | `yes\|boat\|sailboat` | The planner should call `inspect(sail_boat_1)` or `goto(field_7)` because the boat is at field_7; then answer confirming the boat exists. |
-| 1 | Find me something I can drive in | `truck` | The planner should call `inspect(pickup_truck_1)` or `goto(field_6)` because the truck is at field_6; then answer mentioning the truck. |
-| 2 | I lost my keys. I last saw them when I parked my truck. | `truck` | The planner should call `inspect(pickup_truck_1)` because the truck "has keys"; then answer directing the user to the truck. |
-| 3 | communications are down. Why? | `internet\|damaged` | The planner should call `inspect(internet_tower_2)` or `goto(field_9)` because the internet tower is damaged at field_9; then answer identifying the damaged tower. |
-| 4 | Is the light poles damaged? | `no\|i did not find\|not\|unable` | The planner should call `inspect(light_pole_1)` or `goto(field_9)` because the light pole is at field_9; then answer that it is not damaged (ground truth: no damage attribute). |
-| 5 | Is the truck damaged? | `no\|i did not find\|not\|unable` | The planner should call `inspect(pickup_truck_1)` because the truck is at field_6; then answer that no damage was found (ground truth: "has keys", no damage attribute). |
-| 6 | Is the boat damaged? | `no` | The planner should call `inspect(sail_boat_1)` because the boat is at field_7; then answer "no" (ground truth: "not damaged"). |
-| 7 | Find me a place to stay for the night? | `cabin` | The planner should call `inspect(cabin_1)` or `goto(field_6)` because cabin_1 is at field_6 (cabin_2 at field_8); then answer recommending a cabin. |
-| 8 | Where are tools likely to be? | `shed` | The planner should call `inspect(shed_1)` or `goto(field_13)` because the shed is at field_13; then answer pointing to the shed. |
-| 9 | Can I cross the bridge? | `yes\|i did not find\|not` | The planner should call `map_region(bridge_1)` or `goto(bridge_1)` because the bridge must be checked for damage; then answer that it is traversable (ground truth: "not damaged"). |
+Every eval-log sample was generated from a task in a populated `data_gen_*.json`
+file, under the run's `populated_graphs/` directory — e.g.
+`data/gen/<run>/populated_graphs/data_gen_GGG.json`. Each task in that file
+carries everything you need:
 
----
+- `task` — the natural-language task (matches the sample's `task`)
+- `answer` — the answer regex (matches the sample's `answer_key`)
+- `init_node` — the region the robot starts in
+- `acceptance_criterion` — the rubric to judge against (Step 4)
+- the file's `graph` block — the scene graph for **Path Verification** (Step 5)
 
-## Reference: Ground Truth Graph
+To build the answer sheet for a run: match each eval-log sample to its source
+task by `task` text (or by `idx` order), then read that task's
+`acceptance_criterion` and `graph`.
 
-### Topology
-
-```
-         [field_2]
-        /    |    \
-  [field_1]  |  [field_3]
-   🤖        |    /
-        \    |   /
-         [field_5]──[field_4]
-              │
-          [field_6] ← 🚛 pickup_truck_1 (has keys), 🏠 cabin_1
-              │
-          [field_7] ← ⛵ sail_boat_1 (not damaged)
-              │
-          [field_8] ← 🏠 cabin_2
-              │
-          [field_9] ← 📡 internet_tower_2 (damaged), 💡 light_pole_1
-              │
-         [field_10]
-              │
-         [field_11]
-              │
-         [field_12]
-              │
-          [bridge_1] (not damaged)
-              │
-         [field_13] ← 🏚️ shed_1
-              │
-         [field_14]
-              │
-         [field_15]
-              │
-          [road_1]
-           /     \
-     [field_17]  [road_2]
-```
-
-### Objects
-
-| Object | Location | Description |
-|--------|----------|-------------|
-| pickup_truck_1 | field_6 | has keys |
-| cabin_1 | field_6 | — |
-| sail_boat_1 | field_7 | not damaged |
-| cabin_2 | field_8 | — |
-| internet_tower_2 | field_9 | **damaged** |
-| light_pole_1 | field_9 | — |
-| shed_1 | field_13 | — |
-
-Key structure: fields 1–5 form a loop with shortcut (field_2↔field_5); beyond field_6 is a strict linear chain ending in a fork at road_1.
+If the user has not said which run the eval log came from, ask for the run
+directory (or its `populated_graphs/` path) before judging.

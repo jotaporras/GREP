@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>PRISM Dataset Viewer</title>
+<style>
+  :root {
+    --bg: #1e1e1e; --panel: #252526; --panel2: #2d2d30; --border: #3e3e42;
+    --fg: #d4d4d4; --muted: #858585; --accent: #4ec9b0; --user: #569cd6;
+    --asst: #ce9178; --warn: #f48771; --ok: #6a9955;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--fg); font-size: 13px;
+  }
+  header {
+    padding: 10px 16px; background: var(--panel2); border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  }
+  header h1 { font-size: 15px; margin: 0; color: var(--accent); }
+  .stats { color: var(--muted); font-size: 12px; }
+  .stats b { color: var(--fg); }
+  input[type=file] { color: var(--muted); font-size: 12px; }
+  .layout { display: flex; height: calc(100vh - 49px); }
+  .sidebar {
+    width: 280px; border-right: 1px solid var(--border); overflow-y: auto;
+    background: var(--panel); flex-shrink: 0;
+  }
+  .ex-item {
+    padding: 7px 12px; border-bottom: 1px solid var(--border); cursor: pointer;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .ex-item:hover { background: var(--panel2); }
+  .ex-item.active { background: #094771; }
+  .ex-item .idx { color: var(--muted); margin-right: 6px; }
+  .ex-item .badge {
+    font-size: 10px; padding: 1px 5px; border-radius: 3px; margin-left: 6px;
+    background: var(--border); color: var(--fg);
+  }
+  .ex-item .badge.multi { background: var(--ok); color: #fff; }
+  .ex-item .badge.dup { background: var(--warn); color: #fff; }
+  .main { flex: 1; overflow-y: auto; padding: 16px 24px; }
+  .controls { display: flex; gap: 8px; align-items: center; margin-bottom: 14px; }
+  button {
+    background: var(--panel2); color: var(--fg); border: 1px solid var(--border);
+    padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 12px;
+  }
+  button:hover { background: var(--border); }
+  button:disabled { opacity: .4; cursor: default; }
+  input[type=text], input[type=number] {
+    background: var(--panel); color: var(--fg); border: 1px solid var(--border);
+    padding: 4px 8px; border-radius: 4px; font-size: 12px;
+  }
+  .turn {
+    margin-bottom: 14px; border: 1px solid var(--border); border-radius: 6px;
+    overflow: hidden;
+  }
+  .turn-head {
+    padding: 5px 12px; font-weight: 600; font-size: 11px; text-transform: uppercase;
+    letter-spacing: .5px;
+  }
+  .turn.user .turn-head { background: #1c3a5e; color: var(--user); }
+  .turn.assistant .turn-head { background: #4a2f25; color: var(--asst); }
+  .turn-body { padding: 12px; }
+  .field { margin-bottom: 10px; }
+  .field-label {
+    color: var(--accent); font-size: 11px; text-transform: uppercase;
+    letter-spacing: .5px; margin-bottom: 3px;
+  }
+  .field-val { white-space: pre-wrap; word-break: break-word; }
+  pre {
+    background: var(--panel); padding: 8px 10px; border-radius: 4px; margin: 0;
+    white-space: pre-wrap; word-break: break-word; font-size: 12px;
+    border: 1px solid var(--border);
+  }
+  table { border-collapse: collapse; font-size: 12px; }
+  th, td { border: 1px solid var(--border); padding: 2px 8px; text-align: left; }
+  th { background: var(--panel2); color: var(--muted); }
+  .grid2 { display: flex; gap: 16px; flex-wrap: wrap; }
+  .plan-step {
+    font-family: ui-monospace, monospace; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px;
+    margin-bottom: 4px;
+  }
+  .plan-step .act { color: var(--accent); }
+  .plan-step.answer .act { color: var(--asst); }
+  svg { background: var(--panel); border: 1px solid var(--border); border-radius: 4px; }
+  .node-region { fill: #1c3a5e; stroke: var(--user); }
+  .node-object { fill: #4a2f25; stroke: var(--asst); }
+  .node-robot { fill: #2e4a2e; stroke: var(--ok); stroke-width: 2px; }
+  .edge-region { stroke: var(--user); stroke-opacity: .5; }
+  .edge-object { stroke: var(--asst); stroke-opacity: .5; stroke-dasharray: 3 2; }
+  .node-label { fill: var(--fg); font-size: 9px; pointer-events: none; }
+  .empty { color: var(--muted); padding: 40px; text-align: center; }
+  .warn-box {
+    background: #4a2f25; border: 1px solid var(--warn); color: var(--warn);
+    padding: 6px 10px; border-radius: 4px; margin-bottom: 12px; font-size: 12px;
+  }
+  details summary { cursor: pointer; color: var(--muted); margin-bottom: 6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>PRISM Dataset Viewer</h1>
+  <input type="file" id="file" accept=".json" multiple />
+  <span class="stats" id="stats">No dataset loaded</span>
+</header>
+<div class="layout">
+  <div class="sidebar" id="sidebar"></div>
+  <div class="main" id="main">
+    <div class="empty">Load a dataset JSON file to begin.<br/><br/>
+      Supports:<br/>
+      &bull; <code>[{conversations: [{role, content}]}]</code> (e3 / e4 training data)<br/>
+      &bull; <code>{graph, tasks, _metadata?, description?}</code> (skeleton or populated graph)<br/>
+      &bull; multi-select a directory of per-file populated/skeleton graphs.</div>
+  </div>
+</div>
+<script>
+let DATA = [];
+let CUR = -1;
+let DUP_USER = new Set(); // indices whose user[0] content is duplicated
+
+const $ = id => document.getElementById(id);
+
+$('file').addEventListener('change', async e => {
+  const files = [...e.target.files];
+  if (!files.length) return;
+  files.sort((a, b) => a.name.localeCompare(b.name));
+  try {
+    const parsedFiles = await Promise.all(files.map(f => readJson(f).then(p => ({ name: f.name, parsed: p }))));
+    loadData(parsedFiles);
+  } catch (err) {
+    alert('Failed to parse JSON: ' + err.message);
+  }
+});
+
+function readJson(f) {
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => { try { res(JSON.parse(r.result)); } catch (e) { rej(e); } };
+    r.onerror = () => rej(r.error);
+    r.readAsText(f);
+  });
+}
+
+function classify(entry) {
+  if (entry && Array.isArray(entry.conversations)) return 'conv';
+  if (entry && entry.graph && typeof entry.graph === 'object') return 'graph';
+  return 'unknown';
+}
+
+function loadData(parsedFiles) {
+  // Normalize each file into a flat list of entries tagged with kind + source.
+  DATA = [];
+  parsedFiles.forEach(({ name, parsed }) => {
+    let entries;
+    if (Array.isArray(parsed)) entries = parsed;
+    else if (parsed && Array.isArray(parsed.samples)) entries = parsed.samples;
+    else entries = [parsed];
+    entries.forEach(ex => {
+      const kind = classify(ex);
+      DATA.push({ __src: name, __kind: kind, data: ex });
+    });
+  });
+
+  // Stats: per-kind counts and (for conv) role sequences + dup detection.
+  const seqCount = {};
+  const userFirst = {};
+  const kindCount = {};
+  DATA.forEach((ent, i) => {
+    kindCount[ent.__kind] = (kindCount[ent.__kind] || 0) + 1;
+    if (ent.__kind === 'conv') {
+      const conv = ent.data.conversations || [];
+      const seq = conv.map(m => m.role).join('-');
+      seqCount[seq] = (seqCount[seq] || 0) + 1;
+      const u = conv.find(m => m.role === 'user');
+      if (u) (userFirst[u.content] = userFirst[u.content] || []).push(i);
+    }
+  });
+  DUP_USER = new Set();
+  Object.values(userFirst).forEach(arr => {
+    if (arr.length > 1) arr.forEach(i => DUP_USER.add(i));
+  });
+
+  const srcLabel = parsedFiles.length === 1
+    ? parsedFiles[0].name
+    : `${parsedFiles.length} files`;
+  const kindStr = Object.entries(kindCount).map(([k, v]) => `${k}: ${v}`).join(' &nbsp;|&nbsp; ');
+  const seqStr = Object.entries(seqCount)
+    .sort((a, b) => b[1] - a[1])
+    .map(([k, v]) => `${k}: ${v}`).join(' &nbsp;|&nbsp; ');
+  $('stats').innerHTML =
+    `<b>${escapeHtml(srcLabel)}</b> &nbsp; ${DATA.length} entries &nbsp; [ ${kindStr} ]` +
+    (DUP_USER.size ? ` &nbsp; <span style="color:var(--warn)">${DUP_USER.size} dup-user-prompt</span>` : '') +
+    (seqStr ? ` &nbsp; [ ${seqStr} ]` : '');
+  renderSidebar();
+  show(0);
+}
+
+function renderSidebar() {
+  const sb = $('sidebar');
+  sb.innerHTML = '';
+  DATA.forEach((ent, i) => {
+    let title = '';
+    let badges = '';
+    if (ent.__kind === 'conv') {
+      const conv = ent.data.conversations || [];
+      const turns = conv.length;
+      const u = conv.find(m => m.role === 'user');
+      title = u ? u.content.replace(/^task:\s*/, '').split(/Scene graph|\n/)[0] : '(no user turn)';
+      if (turns > 2) badges += `<span class="badge multi">${turns}-turn</span>`;
+      if (DUP_USER.has(i)) badges += `<span class="badge dup">dup</span>`;
+    } else if (ent.__kind === 'graph') {
+      const g = ent.data.graph || {};
+      const tasks = ent.data.tasks || [];
+      const nObj = (g.objects || []).length;
+      const nReg = (g.regions || []).length;
+      title = ent.__src.replace(/\.json$/, '');
+      badges += `<span class="badge">${nReg}r/${nObj}o</span>`;
+      badges += `<span class="badge ${tasks.length ? 'multi' : ''}">${tasks.length} task${tasks.length === 1 ? '' : 's'}</span>`;
+    } else {
+      title = `(unknown format) ${ent.__src}`;
+    }
+    const div = document.createElement('div');
+    div.className = 'ex-item';
+    div.dataset.idx = i;
+    div.innerHTML = `<span class="idx">${i}</span>${escapeHtml(title.slice(0, 60))}${badges}`;
+    div.onclick = () => show(i);
+    sb.appendChild(div);
+  });
+}
+
+function show(i) {
+  if (i < 0 || i >= DATA.length) return;
+  CUR = i;
+  [...$('sidebar').children].forEach(c =>
+    c.classList.toggle('active', +c.dataset.idx === i));
+  const active = $('sidebar').querySelector('.ex-item.active');
+  if (active) active.scrollIntoView({ block: 'nearest' });
+
+  const ent = DATA[i];
+  let html = `<div class="controls">
+    <button onclick="show(${i - 1})" ${i === 0 ? 'disabled' : ''}>&larr; Prev</button>
+    <button onclick="show(${i + 1})" ${i === DATA.length - 1 ? 'disabled' : ''}>Next &rarr;</button>
+    <input type="number" id="jump" value="${i}" min="0" max="${DATA.length - 1}" style="width:70px"
+      onchange="show(+this.value)" />
+    <span class="stats">entry ${i} / ${DATA.length - 1} &nbsp;·&nbsp; ${escapeHtml(ent.__src)} &nbsp;·&nbsp; <code>${ent.__kind}</code></span>
+  </div>`;
+
+  if (ent.__kind === 'conv') {
+    if (DUP_USER.has(i)) {
+      html += `<div class="warn-box">⚠ This example's user prompt is identical to other example(s) —
+        likely a data-formatting bug (input not populated).</div>`;
+    }
+    const conv = ent.data.conversations || [];
+    conv.forEach((m, ti) => {
+      html += `<div class="turn ${m.role}">
+        <div class="turn-head">${m.role} &nbsp;·&nbsp; turn ${ti}</div>
+        <div class="turn-body">${renderTurn(m)}</div>
+      </div>`;
+    });
+  } else if (ent.__kind === 'graph') {
+    html += renderGraphEntry(ent.data);
+  } else {
+    html += `<pre>${escapeHtml(JSON.stringify(ent.data, null, 2))}</pre>`;
+  }
+  $('main').innerHTML = html;
+}
+
+function renderGraphEntry(ex) {
+  let html = '';
+  const desc = ex.description;
+  if (desc && String(desc).trim()) {
+    html += `<div class="turn user"><div class="turn-head">description</div>
+      <div class="turn-body"><div class="field-val">${escapeHtml(String(desc))}</div></div></div>`;
+  }
+  html += `<div class="turn user"><div class="turn-head">scene graph</div>
+    <div class="turn-body">${renderGraph(ex.graph || {})}</div></div>`;
+
+  const tasks = ex.tasks || [];
+  html += `<div class="turn assistant"><div class="turn-head">tasks &nbsp;·&nbsp; ${tasks.length}</div>
+    <div class="turn-body">${tasks.length ? tasks.map(renderTask).join('') : '<div class="field-val" style="color:var(--muted)">(no tasks — likely a skeleton)</div>'}</div></div>`;
+
+  const meta = ex._metadata;
+  if (meta) {
+    html += `<div class="turn"><div class="turn-head" style="background:var(--panel2);color:var(--muted)">_metadata</div>
+      <div class="turn-body"><details open><summary>metadata</summary><pre>${escapeHtml(JSON.stringify(meta, null, 2))}</pre></details></div></div>`;
+  }
+  return html;
+}
+
+function renderTask(t, i) {
+  const fields = ['task', 'answer', 'init_node', 'acceptance_criterion'];
+  let out = `<div class="field" style="border:1px solid var(--border);border-radius:4px;padding:8px;margin-bottom:8px">
+    <div class="field-label">task #${i}</div>`;
+  fields.forEach(k => {
+    if (t[k] != null) {
+      out += `<div class="field"><div class="field-label">${k}</div>
+        <div class="field-val">${escapeHtml(String(t[k]))}</div></div>`;
+    }
+  });
+  const known = new Set(fields);
+  const extra = Object.keys(t).filter(k => !known.has(k));
+  if (extra.length) {
+    out += `<details><summary>other keys (${extra.length})</summary><pre>${
+      escapeHtml(JSON.stringify(Object.fromEntries(extra.map(k => [k, t[k]])), null, 2))
+    }</pre></details>`;
+  }
+  out += '</div>';
+  return out;
+}
+
+function renderTurn(m) {
+  if (m.role === 'user') return renderUser(m.content);
+  if (m.role === 'assistant') return renderAssistant(m.content);
+  return `<pre>${escapeHtml(m.content)}</pre>`;
+}
+
+function renderUser(content) {
+  // Split into pre-graph text and scene graph JSON
+  let out = '';
+  const gi = content.search(/Scene graph\s*:/i);
+  let head = gi >= 0 ? content.slice(0, gi) : content;
+  let graphStr = gi >= 0 ? content.slice(gi).replace(/^Scene graph\s*:/i, '').trim() : null;
+
+  out += `<div class="field"><div class="field-label">task / advice</div>
+    <div class="field-val">${escapeHtml(head.trim())}</div></div>`;
+
+  if (graphStr) {
+    const g = tryParseGraph(graphStr);
+    if (g) {
+      out += renderGraph(g);
+    } else {
+      out += `<div class="field"><div class="field-label">scene graph (unparsed)</div>
+        <pre>${escapeHtml(graphStr)}</pre></div>`;
+    }
+  }
+  return out;
+}
+
+function tryParseGraph(s) {
+  try { return JSON.parse(s); } catch (e) {}
+  // try single-quote -> double-quote
+  try { return JSON.parse(s.replace(/'/g, '"')); } catch (e) {}
+  return null;
+}
+
+function renderGraph(g) {
+  const objects = g.objects || [];
+  const regions = g.regions || [];
+  const oc = g.object_connections || [];
+  const rc = g.region_connections || [];
+  const robot = g.robot_location || null;
+
+  let out = '<div class="grid2">';
+  out += `<div><div class="field-label">regions (${regions.length})</div>${tbl(regions)}</div>`;
+  out += `<div><div class="field-label">objects (${objects.length})</div>${tbl(objects)}</div>`;
+  out += '</div>';
+
+  out += '<div class="grid2" style="margin-top:10px">';
+  out += `<div><div class="field-label">region_connections (${rc.length})</div>
+    <pre>${rc.map(e => JSON.stringify(e)).join('\n') || '(none)'}</pre></div>`;
+  out += `<div><div class="field-label">object_connections (${oc.length})</div>
+    <pre>${oc.map(e => JSON.stringify(e)).join('\n') || '(none)'}</pre></div>`;
+  out += '</div>';
+
+  if (robot) out += `<div class="field" style="margin-top:8px"><div class="field-label">robot_location</div>
+    <div class="field-val">${escapeHtml(String(robot))}</div></div>`;
+
+  out += `<details style="margin-top:10px"><summary>graph diagram</summary>
+    ${renderSvg(regions, objects, rc, oc, robot)}</details>`;
+  return out;
+}
+
+function tbl(rows) {
+  if (!rows.length) return '<pre>(none)</pre>';
+  return '<table><tr><th>name</th><th>coords</th></tr>' +
+    rows.map(r => `<tr><td>${escapeHtml(String(r.name))}</td>
+      <td>${escapeHtml(JSON.stringify(r.coords))}</td></tr>`).join('') +
+    '</table>';
+}
+
+function renderSvg(regions, objects, rc, oc, robot) {
+  const W = 760, H = 420, pad = 30;
+  const nodes = {};
+  [...regions, ...objects].forEach(n => {
+    let c = n.coords;
+    if (typeof c === 'string') { try { c = JSON.parse(c); } catch (e) { c = [0, 0]; } }
+    if (!Array.isArray(c)) c = [0, 0];
+    nodes[n.name] = { x: c[0], y: c[1], name: n.name };
+  });
+  const names = Object.keys(nodes);
+  if (!names.length) return '<pre>(no nodes)</pre>';
+  const xs = names.map(n => nodes[n].x), ys = names.map(n => nodes[n].y);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  const sx = v => pad + (maxX === minX ? W / 2 - pad : (v - minX) / (maxX - minX) * (W - 2 * pad));
+  const sy = v => pad + (maxY === minY ? H / 2 - pad : (maxY - v) / (maxY - minY) * (H - 2 * pad));
+  const regionSet = new Set(regions.map(r => r.name));
+
+  let s = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">`;
+  const edge = (e, cls) => {
+    const a = nodes[e[0]], b = nodes[e[1]];
+    if (!a || !b) return '';
+    return `<line class="${cls}" x1="${sx(a.x)}" y1="${sy(a.y)}"
+      x2="${sx(b.x)}" y2="${sy(b.y)}" />`;
+  };
+  rc.forEach(e => s += edge(e, 'edge-region'));
+  oc.forEach(e => s += edge(e, 'edge-object'));
+  names.forEach(n => {
+    const nd = nodes[n];
+    const isRegion = regionSet.has(n);
+    const cls = n === robot ? 'node-robot' : (isRegion ? 'node-region' : 'node-object');
+    s += `<circle class="${cls}" cx="${sx(nd.x)}" cy="${sy(nd.y)}" r="${isRegion ? 7 : 5}" />`;
+    s += `<text class="node-label" x="${sx(nd.x) + 8}" y="${sy(nd.y) + 3}">${escapeHtml(n)}</text>`;
+  });
+  s += '</svg>';
+  return s;
+}
+
+function renderAssistant(content) {
+  let obj = null;
+  try { obj = JSON.parse(content); } catch (e) {}
+  if (!obj) {
+    try { obj = JSON.parse(content.replace(/'/g, '"')); } catch (e) {}
+  }
+  if (!obj) return `<pre>${escapeHtml(content)}</pre>`;
+
+  let out = '';
+  const fieldOrder = ['primary_goal', 'relevant_graph', 'reasoning'];
+  fieldOrder.forEach(k => {
+    if (obj[k] != null) {
+      out += `<div class="field"><div class="field-label">${k}</div>
+        <div class="field-val">${escapeHtml(String(obj[k]))}</div></div>`;
+    }
+  });
+  if (Array.isArray(obj.plan)) {
+    out += `<div class="field"><div class="field-label">plan (${obj.plan.length} steps)</div>`;
+    obj.plan.forEach(step => {
+      const act = Array.isArray(step) ? step[0] : step.action;
+      const arg = Array.isArray(step) ? step[1] : step.arg;
+      out += `<div class="plan-step ${act === 'answer' ? 'answer' : ''}">
+        <span class="act">${escapeHtml(String(act))}</span>( ${escapeHtml(String(arg))} )</div>`;
+    });
+    out += '</div>';
+  }
+  // any leftover keys
+  const known = new Set([...fieldOrder, 'plan']);
+  const extra = Object.keys(obj).filter(k => !known.has(k));
+  if (extra.length) {
+    out += `<details><summary>other keys (${extra.length})</summary><pre>${
+      escapeHtml(JSON.stringify(Object.fromEntries(extra.map(k => [k, obj[k]])), null, 2))
+    }</pre></details>`;
+  }
+  return out;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"]/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return;
+  if (e.key === 'ArrowLeft' || e.key === 'j') show(CUR - 1);
+  if (e.key === 'ArrowRight' || e.key === 'k') show(CUR + 1);
+});
+</script>
+</body>
+</html>

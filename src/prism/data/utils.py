@@ -1,17 +1,19 @@
+import io
 import json
+import time
 from copy import deepcopy
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import networkx as nx
 import numpy as np
 import torch
 import torch_geometric.utils as pyg_utils
-from torch_geometric.data import Data
 from openai import OpenAI
 from openai.types.chat import ChatCompletion
 from scipy.spatial.transform import Rotation
 from spine.mapping.graph_util import parse_graph_coord
+from torch_geometric.data import Data
 
 
 def safe_parse_graph(
@@ -154,21 +156,55 @@ def try_load_json(file):
         return json.loads("".join(content.split("\n")[:-4]))
 
 
+def strip_icl(msgs: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Strip the few-shot ICL prefix from a logged SPINE rollout.
+
+    A logged rollout is ``[system] + ICL example turns + real task turns``.
+    Every ICL example *and* the real task start with a ``user`` message whose
+    content begins with ``task:``; the real task is the *last* such message.
+    Returns ``[system] + msgs[real_task_idx:]``, keeping the system turn.
+
+    Replaces the old hardcoded ``cutbefore=36`` slice, which silently corrupted
+    training data whenever the ICL example set changed length.
+    """
+    if not (isinstance(msgs, list) and msgs):
+        raise ValueError("rollout must be a non-empty list of messages")
+    task_idx = next(
+        (
+            i
+            for i in range(len(msgs) - 1, -1, -1)
+            if msgs[i].get("role") == "user"
+            and msgs[i].get("content", "").lstrip().lower().startswith("task:")
+        ),
+        None,
+    )
+    if task_idx is None:
+        raise ValueError("no `task:` user message found in rollout")
+    if not any(m.get("role") == "assistant" for m in msgs[task_idx + 1 :]):
+        raise ValueError("no assistant turn after the real task")
+    head = [msgs[0]] if msgs[0].get("role") == "system" else []
+    return head + msgs[task_idx:]
+
+
 def aggregate(
-    root_dir: str, glob_str: str, out_file: str, cutbefore: Optional[int] = 36
+    root_dir: str, glob_str: str, out_file: str, strip_icl_prefix: bool = True
 ) -> None:
+    """Concatenate rollout JSON files under ``root_dir`` into one training file.
+
+    With ``strip_icl_prefix`` (default), each rollout has its few-shot ICL
+    prefix removed via :func:`strip_icl`. Pass ``strip_icl_prefix=False`` for
+    non-SPINE rollouts that have no ``task:``-prefixed ICL turns.
+    """
     json_files = Path(root_dir).glob(glob_str)
 
     all_data = []
     for json_file in json_files:
         try:
             data = try_load_json(json_file)
-
-            train_data = data[cutbefore:]
-
-            all_data.append({"conversations": train_data})
+            conversations = strip_icl(data) if strip_icl_prefix else data
+            all_data.append({"conversations": conversations})
         except Exception as ex:
-            print(json_file)
+            print(f"{json_file}: {ex}")
 
     with open(out_file, "w") as f:
         json.dump(all_data, f)
@@ -182,10 +218,88 @@ class GPTQueryClient:
         self,
         query: str,
         temperature: Optional[float] = 0.31,
-        max_tokens: Optional[int] = 2048,
-    ) -> ChatCompletion:
+        max_tokens: Optional[int] = 10240,
+        reasoning_effort: str = "low",
+    ):
+        return self.query_gpt_5(query, temperature, max_tokens, reasoning_effort)
+
+    def query_gpt_5(
+        self,
+        query: str,
+        temperature: Optional[float] = 0.31,
+        max_tokens: Optional[int] = 10240,
+        reasoning_effort: str = "low",
+    ) -> str:
+
+        response = self.client.responses.create(
+            model="gpt-5.1",
+            input=[
+                {"role": "user", "content": [{"type": "input_text", "text": query}]}
+            ],
+            text={"format": {"type": "text"}, "verbosity": "low"},
+            reasoning={"effort": reasoning_effort, "summary": "auto"},
+        )
+
+        return response.output_text
+
+    def batch_query_gpt_5(
+        self,
+        queries: List[str],
+        model: str = "gpt-5.1",
+        reasoning_effort: str = "low",
+        poll_interval: int = 60,
+    ) -> List[str]:
+        """Submit queries via the Batch API and return responses in order (~50% cheaper)."""
+        requests_jsonl = "\n".join(
+            json.dumps({
+                "custom_id": str(i),
+                "method": "POST",
+                "url": "/v1/responses",
+                "body": {
+                    "model": model,
+                    "input": [{"role": "user", "content": [{"type": "input_text", "text": q}]}],
+                    "text": {"format": {"type": "text"}, "verbosity": "low"},
+                    "reasoning": {"effort": reasoning_effort, "summary": "auto"},
+                },
+            })
+            for i, q in enumerate(queries)
+        )
+
+        file_obj = self.client.files.create(
+            file=("batch.jsonl", io.BytesIO(requests_jsonl.encode()), "application/jsonl"),
+            purpose="batch",
+        )
+        batch = self.client.batches.create(
+            input_file_id=file_obj.id,
+            endpoint="/v1/responses",
+            completion_window="24h",
+        )
+        print(f"Batch submitted: {batch.id}")
+
+        while batch.status not in ("completed", "failed", "expired", "cancelled"):
+            time.sleep(poll_interval)
+            batch = self.client.batches.retrieve(batch.id)
+            c = batch.request_counts
+            print(f"Batch {batch.id}: {batch.status} ({c.completed}/{c.total})")
+
+        if batch.status != "completed":
+            raise RuntimeError(f"Batch {batch.id} ended with status: {batch.status}")
+
+        result_lines = self.client.files.content(batch.output_file_id).text.splitlines()
+        responses = {}
+        for line in filter(None, result_lines):
+            record = json.loads(line)
+            responses[int(record["custom_id"])] = record["response"]["body"]["output_text"]
+        return [responses[i] for i in range(len(queries))]
+
+    def query_gpt_4(
+        self,
+        query: str,
+        temperature: Optional[float] = 0.31,
+        max_tokens: Optional[int] = 10240,
+    ) -> str:
         response = self.client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4.1",
             messages=[
                 {
                     "role": "user",
@@ -200,4 +314,4 @@ class GPTQueryClient:
             presence_penalty=0,
         )
 
-        return response
+        return response.choices[0].message.content

@@ -1,5 +1,6 @@
+import ast
+import json
 import re
-from ast import literal_eval
 from typing import Optional, no_type_check
 
 import datasets
@@ -37,9 +38,26 @@ def preprocess_dataset(
 
     def _parse_scene_graph(example):
         full_text = tokenizer.apply_chat_template(example["messages"], tokenize=False)
-        pattern = r"[Ss]cene graph:"
-        scene_graph_text = re.findall(pattern + r" ?(.*})", full_text)[0]
-        sg = literal_eval(scene_graph_text)
+        m = re.search(r"[Ss]cene graph:", full_text)
+        start = full_text.index("{", m.end())
+        tail = full_text[start:]
+        try:
+            sg, _ = json.JSONDecoder().raw_decode(tail)
+        except json.JSONDecodeError:
+            # Some rollouts serialize the scene graph as a Python repr
+            # (single-quoted dict). Fall back to a safe literal parse over
+            # the balanced-braces slice.
+            depth, end = 0, None
+            for i, ch in enumerate(tail):
+                if ch == "{": depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+            if end is None:
+                raise
+            sg = ast.literal_eval(tail[:end])
         all_names = [n["name"] for n in sg["objects"] + sg["regions"]]
         seen, duplicates = set(), set()
         for name in all_names:

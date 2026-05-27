@@ -6,7 +6,6 @@ from torch.nn.utils.parametrizations import spectral_norm
 from torch.utils.checkpoint import checkpoint
 from torch_geometric.data import Data
 from torch_geometric.utils import add_self_loops, coalesce, softmax
-from torch_sparse import SparseTensor
 
 from prism.models.r_pearl import RandomGNNPositionalEncodings
 from prism.models.utils import LipschitzNorm, SparseCSRDropout
@@ -333,20 +332,23 @@ class GraphTransformer(nn.Module):
         # captures all nodes within k hops, not just nodes reachable in exactly k steps.
         edge_idx_self, _ = add_self_loops(edge_index, num_nodes=num_nodes)
 
-        # Use Sparse Tensor adjacency for reachability.
-        adj = SparseTensor.from_edge_index(
-            edge_idx_self, sparse_sizes=(num_nodes, num_nodes)
-        )
+        # Build binary sparse adjacency (A + I) for reachability via repeated
+        # sparse matmul. Binarize after each step so entries stay 0/1.
+        values = torch.ones(edge_idx_self.shape[1], device=edge_idx_self.device)
+        adj = torch.sparse_coo_tensor(
+            edge_idx_self, values, (num_nodes, num_nodes)
+        ).coalesce()
 
-        # Precompute k-hop reachable Sparse Tensor graph.
         reachable = adj
         for _ in range(k - 1):
-            reachable = reachable @ adj
+            reachable = torch.sparse.mm(reachable, adj).coalesce()
+            reachable = torch.sparse_coo_tensor(
+                reachable.indices(),
+                torch.ones(reachable._nnz(), device=reachable.device),
+                reachable.shape,
+            ).coalesce()
 
-        # Extract edge indices from SparseTensor. torch_sparse's SparseTensor
-        # uses .coo() -> (row, col, val), not .coalesce().indices().
-        row, col, _ = reachable.coo()
-        expanded_edge_index = torch.stack([row, col], dim=0)
+        expanded_edge_index = reachable.indices()
 
         # Return the coalesced edge index.
         return coalesce(expanded_edge_index, num_nodes=num_nodes)
