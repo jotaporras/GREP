@@ -40,16 +40,43 @@ MODEL_LABELS = {
 }
 
 
-def parse_source_file(src: str) -> dict:
+GRAPH_SIZE_CACHE: dict[str, int | None] = {}
+
+
+def _graph_size_from_file(src: str) -> int | None:
+    """Extract graph size (region count) by finding the corresponding graph file for a data_gen source."""
+    dg_match = re.search(r"(data_gen_\d+)", src)
+    if not dg_match:
+        return None
+    slug = dg_match.group(1)
+    if slug in GRAPH_SIZE_CACHE:
+        return GRAPH_SIZE_CACHE[slug]
+    graph_file = PROJECT_ROOT / "data" / "grep_training_data" / "graphs" / f"{slug}.json"
+    if not graph_file.exists():
+        GRAPH_SIZE_CACHE[slug] = None
+        return None
+    with open(graph_file) as f:
+        graph_data = json.load(f)
+    size = len(graph_data.get("graph", {}).get("regions", []))
+    GRAPH_SIZE_CACHE[slug] = size or None
+    return GRAPH_SIZE_CACHE[slug]
+
+
+def parse_source_file(src: str, result: dict | None = None) -> dict:
     """Extract experiment suite, model variant, permutation, and graph size from source path."""
     basename = os.path.basename(src)
     dirname = os.path.dirname(src)
 
     perm_match = re.search(r"perm_(\d+)", dirname)
     perm = f"perm_{perm_match.group(1)}" if perm_match else None
+    if perm is None and result and result.get("permutation") is not None:
+        perm = f"perm_{result['permutation']}"
 
-    size_match = re.search(r"graph_unique_(\d+?)(?:_\d+)?\.json$", basename)
+    size_match = re.search(r"graph_unique_(\d+)", basename)
     graph_size = int(size_match.group(1)) if size_match else None
+
+    if graph_size is None:
+        graph_size = _graph_size_from_file(src)
 
     if "multi_step" in basename:
         graph_size = None
@@ -74,9 +101,9 @@ def parse_source_file(src: str) -> dict:
         suite = f"{exp_prefix}_transferability_n100"
     elif "transferability" in dirname:
         suite = f"{exp_prefix}_transferability"
-    elif dirname.startswith("results/"):
+    elif "/results/" in dirname or dirname.startswith("results/"):
         suite = f"{exp_prefix}_baseline"
-    elif dirname.startswith("shared/results/perm"):
+    elif "shared/results/perm" in dirname:
         suite = f"{exp_prefix}_shared"
     else:
         suite = exp_prefix
@@ -93,7 +120,7 @@ def group_results(results: list[dict]) -> dict:
     """Group results by (suite, perm) -> model -> graph_size -> metrics."""
     grouped = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     for r in results:
-        meta = parse_source_file(r["source_file"])
+        meta = parse_source_file(r["source_file"], r)
         if meta["graph_size"] is None:
             continue
         key = (meta["suite"], meta["perm"] or "none")
@@ -145,7 +172,6 @@ def make_figure(suite: str, perm: str, model_data: dict, output_dir: Path):
     if not sizes:
         return
 
-    n_types = len(TASK_LABELS)
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
     fig.suptitle(
         f"Task Classification Analysis: {suite} / {perm}",
@@ -203,10 +229,12 @@ def make_figure(suite: str, perm: str, model_data: dict, output_dir: Path):
             fontweight="bold",
             color=TASK_COLORS[task_label],
         )
-        ax.set_xlabel("Graph Size (nodes)")
+        is_file_index = max(sizes) <= 20 and min(sizes) <= 1
+        ax.set_xlabel("File Index" if is_file_index else "Graph Size (nodes)")
         ax.set_ylabel("Rate")
         ax.set_ylim(-0.05, 1.05)
-        ax.set_xscale("log")
+        if not is_file_index:
+            ax.set_xscale("log")
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=7, loc="lower left")
 
@@ -283,7 +311,8 @@ def make_distribution_figure(suite: str, perm: str, model_data: dict, output_dir
         ax.set_title(MODEL_LABELS.get(model, model), fontsize=11)
         ax.set_xticks(range(len(sizes)))
         ax.set_xticklabels([str(s) for s in sizes], fontsize=8)
-        ax.set_xlabel("Graph Size")
+        is_file_index = max(sizes) <= 20 and min(sizes) <= 1
+        ax.set_xlabel("File Index" if is_file_index else "Graph Size")
         ax.set_ylabel("Avg Task Count")
         ax.legend(fontsize=7, loc="upper left")
 
@@ -296,12 +325,15 @@ def make_distribution_figure(suite: str, perm: str, model_data: dict, output_dir
 
 
 def main():
-    input_path = PROJECT_ROOT / "eval" / "task_classification.json"
+    if len(sys.argv) > 1:
+        input_path = Path(sys.argv[1]).resolve()
+    else:
+        input_path = PROJECT_ROOT / "eval" / "task_classification.json"
     if not input_path.exists():
         print(f"ERROR: {input_path} not found. Run bert_task_classifier.py first.")
         sys.exit(1)
 
-    output_dir = PROJECT_ROOT / "eval"
+    output_dir = input_path.parent
     output_dir.mkdir(parents=True, exist_ok=True)
 
     with open(input_path) as f:
