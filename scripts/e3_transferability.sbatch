@@ -14,8 +14,9 @@
 # results/perm_*/ is preserved for direct A/B comparison.
 #
 # April pattern (from the user's notes):
-#   uv run scripts/evaluate_suite.py <ckpt> \
-#       --pattern "data/eval/transferability_data_v1/eval_graph_unique_*.json" \
+#   uv run python -m prism.eval.scalability_evaluation \
+#       --checkpoint <ckpt> \
+#       --graphs "data/eval/transferability_data_v1/eval_graph_unique_*.json" \
 #       --four-bit --device -1 --use-icl true \
 #       --output results \
 #       --permutation-seed 42 58 32
@@ -83,9 +84,9 @@ log "Output:    ${RESULTS_DIR}/perm_{32,42,58}/"
 
 CMD=(
     srun
-    python scripts/evaluate_suite.py
-    "$CHECKPOINT"
-    --pattern "${EVAL_DIR}/eval_graph_unique_*.json"
+    python -m prism.eval.scalability_evaluation
+    --checkpoint "$CHECKPOINT"
+    --graphs "${EVAL_DIR}/eval_graph_unique_*.json"
     --four-bit
     --device -1
     --use-icl true

@@ -14,7 +14,7 @@
 #   CHECKPOINT=<dir> sbatch scripts/e4_run_eval.sbatch
 #
 # Architecture (LLM vs graph-augmented) is auto-detected from the checkpoint
-# contents by scripts/eval_checkpoint_on_graphs.py:_load_checkpoint.
+# contents by prism.eval.scalability_evaluation:_load_checkpoint.
 # Results land in <checkpoint>/eval_logs/cross_eval/<graph>.json.
 
 set -euo pipefail
@@ -53,9 +53,10 @@ log "Graphs: $GRAPHS"
 
 CMD=(
     srun
-    python scripts/eval_checkpoint_on_graphs.py
+    python -m prism.eval.scalability_evaluation
     --checkpoint "$CHECKPOINT"
     --graphs "$GRAPHS"
+    --four-bit
 )
 
 log "CMD: ${CMD[*]}"

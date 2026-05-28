@@ -1,4 +1,4 @@
-"""Post-hoc log an evaluate.py results JSON to an existing wandb run.
+"""Post-hoc log a scalability_evaluation results JSON to an existing wandb run.
 
 Usage:
     python scripts/log_eval_to_wandb.py \
@@ -15,9 +15,9 @@ import wandb
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Log an evaluate.py results JSON to an existing wandb run.")
+    parser = argparse.ArgumentParser(description="Log a scalability_evaluation results JSON to an existing wandb run.")
     parser.add_argument("--run-id", required=True, help="Wandb run ID to resume (e.g. qmu8x2qu).")
-    parser.add_argument("--results", required=True, help="Path to JSON file written by evaluate.py.")
+    parser.add_argument("--results", required=True, help="Path to JSON file written by prism.eval.scalability_evaluation.")
     parser.add_argument("--project", default="GREP-PRISM", help="Wandb project (default: GREP-PRISM).")
     parser.add_argument("--epoch", type=float, default=None, help="Epoch tag to include with the log (optional).")
     args = parser.parse_args()

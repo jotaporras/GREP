@@ -31,8 +31,10 @@
 # gt_num_layers=3, gt_heads=8). Trained on the same e5 dataset so the e5 sweep
 # can be compared against the old e4 parameter point.
 #
-# Each array task trains one config on the e5 graph-oriented dataset, then runs
-# cross-eval on that dataset's held-out test graphs — both in the same task.
+# Each array task trains one config on the e5 graph-oriented dataset; the
+# trainer now performs the inline post-train cross-eval on the held-out test
+# graphs at the end of training (via --post_train_eval_graphs). No separate
+# Stage 3 eval step.
 #
 # Submit AFTER scripts/e5_generate_training_data.sh has produced
 # data/gen/e5_graph_oriented_data/split/. Local single-task run:
@@ -137,6 +139,7 @@ TRAIN_CMD=(
     --data "$TRAIN_DATA"
     --val_data "$VAL_DATA"
     --eval_data "$EVAL_DATA"
+    --post_train_eval_graphs "$TEST_GRAPHS"
     --checkpoint_dir "$CHECKPOINT_DIR"
     --save_name "$SAVE_NAME"
     --wandb_project "$PROJECT"
@@ -158,28 +161,9 @@ fi
 log "TRAIN: ${TRAIN_CMD[*]}"
 "${TRAIN_CMD[@]}"
 
-# ---- Stage 2: locate the trained checkpoint ----
-# train_v2 writes to {checkpoint_dir}/{save_name}_{wandb_run_id}; save_name is
-# unique per task, so glob + newest mtime resolves it unambiguously.
+# train_v2's --post_train_eval_graphs flag runs the cross-eval inline at end
+# of training and writes per-graph results to <checkpoint>/eval_logs/cross_eval/.
+# Resolve the checkpoint dir for logging purposes only.
 CHECKPOINT=$(ls -dt "${CHECKPOINT_DIR}/${SAVE_NAME}"_*/ 2>/dev/null | head -1 || true)
 CHECKPOINT="${CHECKPOINT%/}"
-if [[ -z "$CHECKPOINT" || ! -d "$CHECKPOINT" ]]; then
-    log "ERROR: no checkpoint found matching ${CHECKPOINT_DIR}/${SAVE_NAME}_*"
-    exit 1
-fi
-log "Checkpoint: ${CHECKPOINT}"
-
-# ---- Stage 3: cross-eval on the e5 held-out test graphs ----
-# eval_checkpoint_on_graphs.py auto-detects architecture (rpearl vs gt vs llm)
-# from the checkpoint and writes per-graph results to
-# {checkpoint}/eval_logs/cross_eval/.
-EVAL_CMD=(
-    srun
-    python scripts/eval_checkpoint_on_graphs.py
-    --checkpoint "$CHECKPOINT"
-    --graphs "$TEST_GRAPHS"
-)
-log "EVAL: ${EVAL_CMD[*]}"
-"${EVAL_CMD[@]}"
-
 log "Completed task ${TASK_NUMBER}/${TOTAL_TASKS}: ${SAVE_NAME} -> ${CHECKPOINT}/eval_logs/cross_eval/"

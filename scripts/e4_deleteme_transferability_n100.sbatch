@@ -63,9 +63,9 @@ log "Task ${TASK_ID}: ckpt=${CKPT_NAME}  graphs=${N_GRAPHS}  perm_seeds=${PERM_S
 
 CMD=(
     srun
-    python scripts/evaluate_suite.py
-    "$CHECKPOINT"
-    --pattern "$PATTERN"
+    python -m prism.eval.scalability_evaluation
+    --checkpoint "$CHECKPOINT"
+    --graphs "$PATTERN"
     --four-bit
     --permutation-seed "${PERM_SEEDS[@]}"
     --output "$RESULTS_DIR"

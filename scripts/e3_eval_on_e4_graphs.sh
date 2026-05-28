@@ -16,7 +16,8 @@ GT_CKPT="outputs/e3_new_training_data/e3_rpearl_gt_llm_llama-3.1-8b_r16_4bit_bzq
 
 run_llm() {
     echo "=== e3 LLM (CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-auto}) ==="
-    python scripts/eval_checkpoint_on_graphs.py \
+    python -m prism.eval.scalability_evaluation \
+        --four-bit \
         --checkpoint "$LLM_CKPT" \
         --graphs "$E4_GRAPHS" \
         --text-edge-list present
@@ -24,7 +25,8 @@ run_llm() {
 
 run_rpearl() {
     echo "=== e3 RPEARL (CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-auto}) ==="
-    python scripts/eval_checkpoint_on_graphs.py \
+    python -m prism.eval.scalability_evaluation \
+        --four-bit \
         --checkpoint "$RPEARL_CKPT" \
         --graphs "$E4_GRAPHS" \
         --text-edge-list none
@@ -32,7 +34,8 @@ run_rpearl() {
 
 run_gt() {
     echo "=== e3 RPEARL-GT (CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-auto}) ==="
-    python scripts/eval_checkpoint_on_graphs.py \
+    python -m prism.eval.scalability_evaluation \
+        --four-bit \
         --checkpoint "$GT_CKPT" \
         --graphs "$E4_GRAPHS" \
         --text-edge-list none

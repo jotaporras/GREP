@@ -4,7 +4,8 @@ import sys
 
 from prism.data import data
 from prism.eval import callbacks
-from prism.eval import run_eval
+from prism.eval import evaluate
+from prism.eval import loading
 from prism.models import gnn_llm
 from prism.models import r_pearl as r_pearl_module
 from prism.models import gt as gt_module
@@ -250,22 +251,102 @@ class TrainConfig:
     # Default (None): auto-generated as "{name}_{architecture}_{model_slug}_r{r}[_4bit]_{wandb_run_id}"
     # Override: "{save_name}_{wandb_run_id}" — the run ID is always appended.
     save_name: str = None
+    # Optional path (file or directory of {graph, tasks} JSONs) to run a
+    # post-training cross-eval on. When set, after training finishes the
+    # in-memory model is evaluated over the resolved files and per-graph
+    # results are written to <output_dir>/eval_logs/cross_eval/<graph>.json.
+    # Replaces the previous Stage 3 sbatch step that invoked
+    # scripts/eval_checkpoint_on_graphs.py against the same checkpoint.
+    post_train_eval_graphs: Optional[str] = None
+    # Whether to enable SPINE in-context-learning examples during both the
+    # train-time eval callback and the optional post-train cross-eval.
+    # Argparse-layer default; library functions never default this on the
+    # caller's behalf. Historical behavior: True (None used to cascade to
+    # SPINE's default of True).
+    eval_use_icl: bool = True
 
 
 def _load_eval_samples(eval_data_path: str) -> list:
+    """Load a single-graph eval file as a list of `EvalSample`s.
+
+    Used by the train-time periodic `EvalCallback`. For multi-graph
+    post-train eval see `_run_post_train_cross_eval`.
+    """
     with open(eval_data_path) as f:
-        data = json.load(f)
-    tasks = data["tasks"]
-    graph_data = data["graph"]
-    return [
-        run_eval.EvalSample(
-            task=entry["task"],
-            answer=entry["answer"],
-            graph=graph_data,
-            init_node=entry["init_node"],
+        payload = json.load(f)
+    graph_name = os.path.splitext(os.path.basename(eval_data_path))[0]
+    return evaluate.eval_samples_from_dict(
+        payload["graph"], payload["tasks"], graph_name=graph_name,
+    )
+
+
+def _run_post_train_cross_eval(model, tokenizer, config: "TrainConfig", output_dir: str) -> None:
+    """Run cross-eval on the in-memory model after training and write per-graph JSONs.
+
+    Disk I/O happens in `loading.load_samples_by_graph`; this function is
+    pure orchestration: load → eval → write. Output shape matches the old
+    `eval_checkpoint_on_graphs.py` (consumed by eval_viewer.html and the
+    judge-eval skill).
+    """
+    target = config.post_train_eval_graphs
+    if target is None:
+        return
+
+    samples_by_graph, graph_file_by_name = loading.load_samples_by_graph(target)
+
+    is_gnn = config.architecture in ("rpearl_llm", "rpearl_gt_llm")
+    architecture = "graph-augmented" if is_gnn else "llm"
+    out_dir = os.path.join(output_dir, "eval_logs", "cross_eval")
+    os.makedirs(out_dir, exist_ok=True)
+
+    model.eval()
+    print(f"\n[post-train eval] {len(samples_by_graph)} graph file(s) -> {out_dir}")
+    results = evaluate.run_on_graphs(
+        model,
+        tokenizer,
+        samples_by_graph,
+        include_edge_list=(config.text_edge_list == "present"),
+        use_icl=config.eval_use_icl,
+        permutation=None,
+        on_graph_done=None,
+    )
+
+    for name, result in results.items():
+        _write_cross_eval_json(
+            out_dir, name, result,
+            checkpoint=output_dir,
+            graph_file=graph_file_by_name[name],
+            architecture=architecture,
+            text_edge_list=config.text_edge_list,
         )
-        for entry in tasks
-    ]
+
+    evaluate.print_summary_table(list(results.values()))
+
+
+def _write_cross_eval_json(
+    out_dir: str,
+    name: str,
+    result: evaluate.GraphEvalResults,
+    *,
+    checkpoint: str,
+    graph_file: str,
+    architecture: str,
+    text_edge_list: str,
+) -> None:
+    log_data = {
+        "checkpoint": checkpoint,
+        "graph_file": graph_file,
+        "architecture": architecture,
+        "text_edge_list": text_edge_list,
+        "accuracy": result.accuracy,
+        "num_samples": result.num_total,
+        "num_correct": result.num_correct,
+        "samples": result.samples,
+    }
+    out_file = os.path.join(out_dir, f"{name}.json")
+    with open(out_file, "w") as f:
+        json.dump(log_data, f, indent=2, default=str)
+    print(f"  {name}: {result.num_correct}/{result.num_total} ({result.accuracy:.1%}) -> {out_file}")
 
 
 # ----------------------------
@@ -507,7 +588,13 @@ def train_model(config: TrainConfig, config_file: str = None):
                 wandb.config.update({"_config_yaml": f.read()}, allow_val_change=True)
 
     eval_samples = _load_eval_samples(config.eval_data)
-    trainer.add_callback(callbacks.EvalCallback(eval_samples, tokenizer=tokenizer, eval_epoch_interval=1.0, text_edge_list=config.text_edge_list))
+    trainer.add_callback(callbacks.EvalCallback(
+        eval_samples,
+        tokenizer=tokenizer,
+        use_icl=config.eval_use_icl,
+        include_edge_list=(config.text_edge_list == "present"),
+        eval_epoch_interval=1.0,
+    ))
 
     if config.architecture in ("rpearl_llm", "rpearl_gt_llm"):
         trainer.add_callback(callbacks.GradientDebugCallback())
@@ -518,6 +605,13 @@ def train_model(config: TrainConfig, config_file: str = None):
     # Save model artifacts
     trainer.save_model()
     tokenizer.save_pretrained(sft_args.output_dir)
+
+    # Optional inline post-training cross-eval (replaces the old Stage 3
+    # sbatch invocation of scripts/eval_checkpoint_on_graphs.py).
+    if config.post_train_eval_graphs:
+        _run_post_train_cross_eval(
+            trainer.model, tokenizer, config, sft_args.output_dir,
+        )
 
     return trainer
 
