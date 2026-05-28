@@ -35,7 +35,7 @@ class EvalCallback(TrainerCallback):
     def _run_eval(self, args, state, **kwargs):
         model = kwargs["model"]
         model.eval()
-        accuracy, sample_results = evaluate.eval_model(
+        accuracy, sample_results = evaluate.eval_model_single_graph(
             model,
             self.tokenizer,
             self.eval_samples,

@@ -275,7 +275,7 @@ def _load_eval_samples(eval_data_path: str) -> list:
     with open(eval_data_path) as f:
         payload = json.load(f)
     graph_name = os.path.splitext(os.path.basename(eval_data_path))[0]
-    return evaluate.eval_samples_from_dict(
+    return evaluate.construct_eval_samples_from_dict(
         payload["graph"], payload["tasks"], graph_name=graph_name,
     )
 
@@ -301,7 +301,7 @@ def _run_post_train_cross_eval(model, tokenizer, config: "TrainConfig", output_d
 
     model.eval()
     print(f"\n[post-train eval] {len(samples_by_graph)} graph file(s) -> {out_dir}")
-    results = evaluate.run_on_graphs(
+    results = evaluate.eval_model_multiple_graphs(
         model,
         tokenizer,
         samples_by_graph,
@@ -326,7 +326,7 @@ def _run_post_train_cross_eval(model, tokenizer, config: "TrainConfig", output_d
 def _write_cross_eval_json(
     out_dir: str,
     name: str,
-    result: evaluate.GraphEvalResults,
+    result: evaluate.GraphEvalResultSummary,
     *,
     checkpoint: str,
     graph_file: str,

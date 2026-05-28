@@ -192,7 +192,7 @@ def main():
     else:
         planner_response = {"response": {}}
 
-    result, formatted_answer = evaluate.eval_answer(planner_response, sample.answer)
+    result, formatted_answer = evaluate._construct_eval_result(planner_response, sample.answer)
     print(f"  Formatted: {result.formatted}")
     print(f"  Keyword match: {result.plan_keyword}")
     print(f"  Correct: {result.is_correct()}")
