@@ -167,6 +167,7 @@ class GradientDebugCallback(TrainerCallback):
         """
         self._captured_grad_norms["gnn"] = self._grad_norm(model.pe_model.parameters())
         self._captured_grad_norms["pe_proj"] = self._grad_norm(model.pe_proj.parameters())
+        self._captured_grad_norms["pe_gain"] = self._grad_norm([model.pe_gain])
         lora_params = [p for n, p in model.llm.named_parameters() if p.requires_grad]
         self._captured_grad_norms["lora"] = self._grad_norm(lora_params)
 
@@ -193,6 +194,8 @@ class GradientDebugCallback(TrainerCallback):
             "debug/embedding_norm": self._emb_norm,
             "debug/num_injections": self._num_injections,
             "debug/lr": lr,
+            "debug/pe_gain": model.pe_gain.item(),
+            "debug/grad_norm_pe_gain": self._captured_grad_norms.get("pe_gain", 0.0),
         }
 
         # rpearl_gt_llm: split gradient norms by GT sub-component.

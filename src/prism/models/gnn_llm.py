@@ -3,8 +3,7 @@ from collections import defaultdict
 
 import torch
 from torch import nn
-from torch.nn import functional as F
-from torch.nn.utils import spectral_norm
+from torch.nn.utils.parametrizations import spectral_norm
 from torch_geometric.data import Batch
 from transformers import PreTrainedModel
 
@@ -51,6 +50,12 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             spectral_norm(nn.Linear(d_model, llm.config.hidden_size, device=device)),
             LipschitzNorm(llm.config.hidden_size, eps=eps, device=device),
         )
+        
+        # Learnable scalar gain for PE injection magnitude (Audit Rec 3).
+        # Replaces the F.normalize + target_norm heuristic which discarded
+        # structurally meaningful norm differences between nodes.
+        # Initialized small so PE doesn't overwhelm embeddings at the start.
+        self.pe_gain = nn.Parameter(torch.tensor(0.00, device=device))
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         self.llm.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
@@ -89,11 +94,7 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
 
         for b in range(input_ids.shape[0]):
             pe = self.pe_proj(self.pe_model(graphs[b]))  # [n, hidden_size]
-            # Rescale PE to match embedding norm. pe_proj ends with LipschitzNorm
-            # which forces output to norm ≈ sqrt(d_model), while LLM embeddings
-            # (pre-RMSNorm) are much smaller. Without rescaling, PE overwhelms.
-            target_norm = embeddings[b].norm(dim=-1).mean().detach()
-            pe = F.normalize(pe, dim=-1) * target_norm
+            pe = pe * torch.tanh(self.pe_gain)
             for node_idx, spans in injection_maps[b].items():
                 for start, end in spans:
                     end = min(end, input_ids.shape[1])

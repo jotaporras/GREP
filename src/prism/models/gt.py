@@ -314,7 +314,7 @@ class GraphTransformer(nn.Module):
         self.output_norm = LipschitzNorm(d_model, eps=eps)
 
     @torch.no_grad()
-    def _expand_edge_index(self, edge_index: Tensor, num_nodes: int, k_hops: int = None) -> Tensor:
+    def _expand_edge_index(self, edge_index: Tensor, num_nodes: int, k_hops: int = 1) -> Tensor:
         """
         Expands the edge index to the ≤k-hop neighborhood via sparse (A+I)^k.
 

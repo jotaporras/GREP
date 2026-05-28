@@ -41,6 +41,11 @@ class RandomGNNPositionalEncodings(nn.Module):
         )
         # Add a final projection to ensure output is d_model dimensions
         self.output_projection = spectral_norm(nn.Linear(pe_hidden_channels, d_model))
+        
+        # 1/√F scaling to satisfy PEARL Assumption 4.2 (β = 1/F) after spectral norm.
+        # Spectral norm constrains ‖W‖_op ≤ 1; this additional scaling brings the
+        # effective operator norm closer to 1/F as required by Theorem 4.3.
+        self.register_buffer('_dim_scale', torch.tensor(d_model ** -0.5))
         self.dropout = nn.Dropout(dropout)
         self.use_layer_norm = use_layer_norm
         if self.use_layer_norm:
@@ -78,7 +83,7 @@ class RandomGNNPositionalEncodings(nn.Module):
         # Single batched GCN forward pass over all M copies.
         pe_all = self.pe_gcn(batch_data)
         pe_all = self.dropout(pe_all)
-        pe_all = self.output_projection(pe_all)
+        pe_all = self.output_projection(pe_all) * self._dim_scale
 
         # Reshape [M*N, d_model] -> [M, N, d_model] and mean-pool over samples.
         pe_all = pe_all.view(self.M, num_nodes, -1)
@@ -99,8 +104,10 @@ class RandomGNNPositionalEncodings(nn.Module):
         if permutation is not None:
             edge_index = permutation.apply(edge_index, num_nodes, device=device)
 
-        # Generate random node embeddings for positional encoding
-        Q = torch.randn((num_nodes, self.M), device=device)
+        # Rademacher random signals: i.i.d. ±1 with equal probability.
+        # Satisfies PEARL §4 requirements E[q]=0 and E[q^p]=1 for all even p,
+        # unlike Gaussian which only satisfies p=2.
+        Q = torch.randint(0, 2, (num_nodes, self.M), device=device, dtype=torch.float) * 2 - 1
 
         # Gradient checkpoint: recompute the batched GCN on backward to save memory.
         # The dummy tensor ensures at least one input requires grad (needed by checkpoint).
