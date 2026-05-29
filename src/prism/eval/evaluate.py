@@ -48,15 +48,25 @@ import spine.prompts.prompts as spine_prompts
 _orig_get_base_prompt = spine_prompts.get_base_prompt_update_graph
 
 
+# R10: ICL is a 2/5 switch, and the e7/augmented-graph model is trained with
+# TWO in-context examples. SPINE's stock get_base_prompt uses five
+# (EXAMPLE_1..EXAMPLE_5), which roughly triples the prompt length — and hence
+# the augmented-graph cycle length (one node per token) — versus training. With
+# RoPE disabled (M8) the model is acutely sensitive to that distribution shift
+# and degenerates into repeated-token output. Pin eval to the same two examples
+# the model trained on so train and eval ICL counts match.
+_ICL_EXAMPLES_2 = examples.EXAMPLE_1 + examples.EXAMPLE_2
+
+
 def _fixed_get_base_prompt(request, scene_graph, use_icl=True):
-    if use_icl:
-        return _orig_get_base_prompt(request, scene_graph, use_icl=True)
-    header = [spine_prompts.SYS_PROMPT] + examples.EXAMPLE_1 + [
+    # use_icl=True -> exactly the 2 training ICL examples; use_icl=False -> 1
+    # (EXAMPLE_1), preserving the prior minimal-prompt behavior for that flag.
+    header = [spine_prompts.SYS_PROMPT] + (_ICL_EXAMPLES_2 if use_icl else examples.EXAMPLE_1)
+    return header + [
         {"role": "user",
          "content": f"{request}\nAdvice: \n- Recall the scene may be incomplete. \n- Carefully explain your reasoning in a step-by-step manner.\n- Reason over connections, coordinates, and semantic relationships between objects and regions in the scene.\n\n"
                     f"Scene graph:{scene_graph}"}
     ]
-    return header
 
 
 spine_prompts.get_base_prompt_update_graph = _fixed_get_base_prompt

@@ -8,7 +8,7 @@ from torch_geometric.data import Batch
 from transformers.data.data_collator import DataCollatorForLanguageModeling
 
 from prism.data import utils
-from prism.models.gnn_llm import build_injection_map
+from prism.models.gnn_llm import build_injection_map, find_last_graph_scope
 
 
 def preprocess_dataset(
@@ -137,7 +137,16 @@ class SpineDataCollator(DataCollatorForLanguageModeling):
             self.tokenizer.encode(name, add_special_tokens=False)
             for name in pyg_graph.node_names
         ]
-        injection_map = build_injection_map(example["input_ids"], node_token_seqs)
+        # Scope injection to the last (query) graph block, matching eval
+        # (GraphAugmentedInMemoryLLM) and R10. Without this, training cross-links
+        # the query graph's labels to their mentions across the *whole* prompt —
+        # including the ICL examples — so the augmented-graph structure the model
+        # learns diverges from the scoped structure it sees at inference (and the
+        # gap widens with more ICL examples).
+        scope_start = find_last_graph_scope(example["input_ids"], self.tokenizer)
+        injection_map = build_injection_map(
+            example["input_ids"], node_token_seqs, scope_start=scope_start
+        )
         return pyg_graph, injection_map
 
     _NON_TENSOR_KEYS = {"conversations", "scene_graph", "scene_graph_dict", "messages", "text", "full_text"}

@@ -22,7 +22,7 @@ d_model: 4096
 gt_num_layers: 3
 gt_heads: 8
 pe_hidden_channels: 256
-pe_num_layers: 3
+pe_num_layers: 5
 num_samples: 40
 dropout: 0.1
 k_pe: 5
@@ -47,7 +47,7 @@ fixed_seed_mode: false  # Switch
 fixed_seed_value: 0
 # Gated injection
 injection_mode: interpolate
-gate_init: 0.0
+gate_init: 0.1          # warm-start >0 so the structural path gets gradient (R6); was 0.0 and stuck
 gate_per_dim: false
 # LLM
 disable_rope: true

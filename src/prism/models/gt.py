@@ -1,3 +1,4 @@
+import contextlib
 import warnings
 
 import torch
@@ -116,83 +117,79 @@ class SparseGraphAttention(nn.Module):
 
 
 class _SafeBatchedSparseAttn(torch.autograd.Function):
-    """Block-diagonal sampled_addmm forward, per-head backward.
+    """Per-head sparse attention (memory-bounded).
 
-    Forward batches all heads into one (H*N, H*N) sampled_addmm for speed.
-    Backward loops per-head to avoid unreliable sparse autograd on the
-    block-diagonal path.
+    Both the forward and backward loop over heads. The previous forward batched
+    all heads into one ``(H*N, H*N)`` block-diagonal ``sampled_addmm``; that
+    materialised H copies of the N×N sparsity pattern (and H times the score
+    nnz), an H-fold memory blow-up that OOMs on the augmented graph, where
+    N = token-cycle length ≈ thousands. Looping caps peak memory at a single
+    head's N×N pattern plus one ``[N, F_head]`` fp32 working copy.
+
+    The fp32 cast happens **per head and only for the sparse score op**
+    (``torch.sparse.sampled_addmm`` is fp32-only). The saved tensors keep their
+    original (e.g. bf16) dtype, so the backward stash is half the size of the
+    old fp32 copies, and the dense ``[H, N, F_head]`` features never exist in
+    fp32 all at once.
     """
 
     @staticmethod
+    def _head_attn(qi, ki, vi, A_csr_f, scale, attn_dropout, training):
+        """One head: sparse masked ``softmax(QKᵀ·scale) @ V`` over A's pattern.
+
+        ``qi/ki/vi`` are ``[N, F_head]`` (any float dtype). Returns ``[N, F_head]``
+        in fp32. ``A_csr_f`` is the fp32 CSR adjacency (shared across heads). The
+        fp32 score tensor is local and freed when the head finishes.
+        """
+        N = qi.shape[0]
+        # The sparse ops (sampled_addmm, sparse.mm) are fp32-only. .float() casts
+        # the operands, but a surrounding bf16 autocast (the M6 eval path) would
+        # still recast them to bf16 and raise "not implemented for BFloat16", so
+        # autocast is explicitly disabled for this fp32-only region.
+        with torch.autocast(device_type=qi.device.type, enabled=False):
+            unnormalized = torch.sparse.sampled_addmm(
+                input=A_csr_f, mat1=qi.float(), mat2=ki.float().T, beta=0.0
+            )
+            if training and attn_dropout is not None:
+                unnormalized = attn_dropout(unnormalized)
+            crow = unnormalized.crow_indices()
+            col = unnormalized.col_indices()
+            row_counts = crow[1:] - crow[:-1]
+            row_index = torch.arange(N, device=qi.device).repeat_interleave(row_counts)
+            # Scaled dot-product scores with per-neighborhood (per-row) softmax.
+            attn_alpha = softmax(src=unnormalized.values() * scale, index=row_index,
+                                 dim=0, num_nodes=N)
+            B = torch.sparse_csr_tensor(crow, col, attn_alpha, size=(N, N))
+            return torch.sparse.mm(B, vi.float())  # [N, F_head], fp32
+
+    @staticmethod
     def forward(ctx, QX, KX, VX, A_csr, scale, attn_dropout, training):
-        # Initialize variables.
         H, N, F_head = QX.shape
         orig_dtype = QX.dtype
+        A_csr_f = A_csr.float()  # cast the (binary) adjacency once, shared by heads
 
-        # sampled_addmm only supports float32 — cast up front.
-        QX = QX.float()
-        KX = KX.float()
-        VX = VX.float()
+        # Accumulate per-head outputs; only one head's fp32 working set is live.
+        outs = [
+            _SafeBatchedSparseAttn._head_attn(
+                QX[i], KX[i], VX[i], A_csr_f, scale, attn_dropout, training)
+            for i in range(H)
+        ]
+        attn_out = (torch.stack(outs, dim=0)        # [H, N, F_head]
+                    .permute(1, 0, 2)               # [N, H, F_head]
+                    .reshape(N, H * F_head)
+                    .to(orig_dtype))
 
-        # Flatten heads into the node dimension.
-        QX_flat = QX.reshape(H * N, F_head)
-        KX_flat = KX.reshape(H * N, F_head)
-        VX_flat = VX.reshape(H * N, F_head)
-
-        # Build block-diagonal CSR: H copies of A_csr along the diagonal.
-        crow = A_csr.crow_indices()
-        col = A_csr.col_indices()
-        block_crow = torch.cat([
-            crow[:1],
-            *(crow[1:] + i * col.shape[0] for i in range(H))
-        ])
-        block_col = torch.cat([col + i * N for i in range(H)])
-        block_vals = torch.ones(H * col.shape[0], device=QX.device, dtype=QX.dtype)
-
-        A_block = torch.sparse_csr_tensor(
-            block_crow, block_col, block_vals, size=(H * N, H * N)
-        )
-
-        # Compute the batched sampled_addmm multi-head attention.
-        unnormalized = torch.sparse.sampled_addmm(
-            input=A_block, mat1=QX_flat, mat2=KX_flat.T, beta=0.0
-        )
-
-        # Apply sparse dropout and clean up the tensor dimensions.
-        if training and attn_dropout is not None:
-            unnormalized = attn_dropout(unnormalized)
-        crow_b = unnormalized.crow_indices()
-        col_b = unnormalized.col_indices()
-        row_counts = crow_b[1:] - crow_b[:-1]
-        row_index = torch.arange(H * N, device=QX.device).repeat_interleave(row_counts)
-
-        # Scaled dot-product attention scores with neighborhood softmax.
-        attn_scores = unnormalized.values() * scale
-        attn_alpha = softmax(src=attn_scores, index=row_index, dim=0, num_nodes=H * N)
-
-        # Construct the sparse CSR attention tensor.
-        B = torch.sparse_csr_tensor(
-            crow_indices=crow_b, col_indices=col_b, values=attn_alpha, size=(H * N, H * N)
-        )
-
-        # Multiply by the value tensor.
-        out_flat = torch.sparse.mm(B, VX_flat)
-
-        # Reshape the output.
-        attn_out = out_flat.reshape(H, N, F_head).permute(1, 0, 2).reshape(N, H * F_head)
-        attn_out = attn_out.to(orig_dtype)
-
-        # Save for backward (keep float32 copies for backward sampled_addmm).
-        ctx.save_for_backward(QX, KX, VX, A_csr.float(), scale)
+        # Save the original-dtype tensors (half the size of fp32 copies); the
+        # backward recasts per head, mirroring the forward.
+        ctx.save_for_backward(QX, KX, VX, A_csr_f, scale)
         ctx.orig_dtype = orig_dtype
         ctx.attn_dropout = attn_dropout
         ctx.is_training = training
-
         return attn_out
 
     @staticmethod
     def backward(ctx, grad_output):
-        QX, KX, VX, A_csr, scale = ctx.saved_tensors
+        QX, KX, VX, A_csr_f, scale = ctx.saved_tensors
         H, N, F_head = QX.shape
 
         # Reshape grad to (H, N, F_head).
@@ -202,48 +199,23 @@ class _SafeBatchedSparseAttn(torch.autograd.Function):
         grad_KX = torch.zeros_like(KX)
         grad_VX = torch.zeros_like(VX)
 
-        # Per-head backward for reliable gradients.
+        # Per-head backward: recompute the same head attention with grad enabled.
+        # (Sparse autograd on the block-diagonal path is unreliable, so we drive
+        # the gradient through the per-head primitive that the forward also uses.)
         for i in range(H):
             with torch.enable_grad():
-                qi = QX[i].detach().requires_grad_(True)
-                ki = KX[i].detach().requires_grad_(True)
-                vi = VX[i].detach().requires_grad_(True)
-
-                # Compute sparse dot-product scores for head i.
-                unnormalized = torch.sparse.sampled_addmm(
-                    input=A_csr, mat1=qi, mat2=ki.T, beta=0.0
-                )
-
-                # Apply sparse attention-score dropout.
-                if ctx.is_training and ctx.attn_dropout is not None:
-                    unnormalized = ctx.attn_dropout(unnormalized)
-
-                # Extract CSR structure for neighborhood softmax.
-                crow_b = unnormalized.crow_indices()
-                col_b = unnormalized.col_indices()
-                row_counts = crow_b[1:] - crow_b[:-1]
-                row_index = torch.arange(N, device=qi.device).repeat_interleave(row_counts)
-
-                # Scaled dot-product attention scores with neighborhood softmax.
-                attn_scores = unnormalized.values() * scale
-                attn_alpha = softmax(src=attn_scores, index=row_index, dim=0, num_nodes=N)
-
-                # Construct the sparse CSR attention tensor.
-                B_h = torch.sparse_csr_tensor(
-                    crow_indices=crow_b, col_indices=col_b, values=attn_alpha, size=(N, N)
-                )
-
-                # Multiply by the value tensor.
-                out_h = torch.sparse.mm(B_h, vi)
-
+                qi = QX[i].detach().float().requires_grad_(True)
+                ki = KX[i].detach().float().requires_grad_(True)
+                vi = VX[i].detach().float().requires_grad_(True)
+                out_h = _SafeBatchedSparseAttn._head_attn(
+                    qi, ki, vi, A_csr_f, scale, ctx.attn_dropout, ctx.is_training)
             out_h.backward(grad_out[i])
-            grad_QX[i] = qi.grad
-            grad_KX[i] = ki.grad
-            grad_VX[i] = vi.grad
+            grad_QX[i] = qi.grad.to(QX.dtype)
+            grad_KX[i] = ki.grad.to(KX.dtype)
+            grad_VX[i] = vi.grad.to(VX.dtype)
 
         # 7 inputs to forward: QX, KX, VX, A_csr, scale, attn_dropout, training.
-        orig_dtype = ctx.orig_dtype
-        return grad_QX.to(orig_dtype), grad_KX.to(orig_dtype), grad_VX.to(orig_dtype), None, None, None, None
+        return grad_QX, grad_KX, grad_VX, None, None, None, None
 
 
 class SparseTransformerBlock(nn.Module):
@@ -437,10 +409,31 @@ class GraphTransformer(nn.Module):
                 data._khop_edge_index = self._expand_edge_index(edge_index, x.size(0))
             khop_edge_index = data._khop_edge_index
 
-        # Run signal through all Transformer Blocks.
-        for block in self.blocks:
-            x = block(x, khop_edge_index)
+        # Run the transformer blocks in the LLM's low-precision dtype when token
+        # embeddings are supplied (the M6 fusion path). Training already runs the
+        # GT under a bf16 autocast, but eval/generate has no autocast, so the GT
+        # would otherwise hold the dense [N, 4096] attention/FFN activations in
+        # fp32 — on the augmented graph (N = token-cycle length ≈ thousands) that
+        # OOMs. The fp32-only sparse score op casts locally (see
+        # _SafeBatchedSparseAttn._head_attn), so only the dense projections/FFN
+        # drop to bf16. The legacy PE-generator path (token_embeddings is None)
+        # keeps full fp32, unchanged.
+        amp_dtype = None
+        if token_embeddings is not None and token_embeddings.dtype in (torch.float16, torch.bfloat16):
+            amp_dtype = token_embeddings.dtype
+            # CPU autocast supports bf16 only; never request fp16 autocast on CPU.
+            if amp_dtype == torch.float16 and device.type == "cpu":
+                amp_dtype = None
+        if amp_dtype is not None:
+            x = x.to(amp_dtype)
+            amp_ctx = torch.autocast(device_type=device.type, dtype=amp_dtype)
+        else:
+            amp_ctx = contextlib.nullcontext()
 
-        # Apply Output Lipschitz Normalizer.
-        x = self.output_norm(x)
+        with amp_ctx:
+            # Run signal through all Transformer Blocks.
+            for block in self.blocks:
+                x = block(x, khop_edge_index)
+            # Apply Output Lipschitz Normalizer.
+            x = self.output_norm(x)
         return x

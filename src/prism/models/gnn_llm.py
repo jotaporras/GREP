@@ -289,7 +289,12 @@ class AugmentedGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             Y = self.gt_model(aug_data, token_embeddings=X[b], is_token=aug.is_token)
             # M7: blend X with the token-node outputs Y[V_Tx] through the gate.
             fused.append(self.injection(X[b], Y[aug.is_token]))
-        return torch.stack(fused, dim=0)
+        # The GT runs in float32 (sparse sampled_addmm is fp32-only) and the gate
+        # promotes the bf16 X to fp32, so cast inputs_embeds back to the LLM's dtype.
+        # Training tolerated the fp32 mismatch under autocast; generate() has no
+        # autocast, so the fp32 hidden state would hit the bf16 lm_head and raise
+        # "expected scalar type Float but found BFloat16".
+        return torch.stack(fused, dim=0).to(X.dtype)
 
     def forward(
         self,
@@ -309,6 +314,34 @@ class AugmentedGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             labels=labels,
             **kwargs,
         )
+
+
+def find_last_graph_scope(input_ids_b, tokenizer) -> int:
+    """Token index where the last scene-graph block begins (injection scope).
+
+    Only mentions at/after this index belong to the last (query) graph; earlier
+    matches live inside ICL-example graphs and must be ignored so the query
+    graph's labels don't cross-link into ICL regions. Spec R10 locks this:
+    "infra inputs only the last (query) graph and scopes injection after it
+    completes."
+
+    Used by BOTH the training collator (``SpineDataCollator``) and eval
+    (``GraphAugmentedInMemoryLLM``) so the augmented graph is assembled with the
+    same scope in train and eval — otherwise the cross-link structure the model
+    trains on differs from what it sees at inference (the divergence grows with
+    ``n_icl_examples``). Returns 0 when no marker is found (whole sequence
+    eligible), matching the previous default.
+    """
+    seq = list(map(int, input_ids_b))
+    scope_start = 0
+    for surface in ("scene graph:", " scene graph:", "Scene graph:", " Scene graph:"):
+        marker = tokenizer.encode(surface, add_special_tokens=False)
+        if not marker:
+            continue
+        for pos in range(len(seq) - len(marker) + 1):
+            if seq[pos:pos + len(marker)] == marker:
+                scope_start = max(scope_start, pos)
+    return scope_start
 
 
 def has_match(input_ids_b: list[int], to_match:list[int],start_pos:int):

@@ -6,7 +6,7 @@ import torch
 
 from prism.data import utils
 from prism.data.data import remove_edge_list
-from prism.models.gnn_llm import AugmentedGraphLLM, build_injection_map
+from prism.models.gnn_llm import AugmentedGraphLLM, build_injection_map, find_last_graph_scope
 
 
 class InMemoryLLM:
@@ -25,7 +25,13 @@ class InMemoryLLM:
         return [{"role": "user", "content": f"task: {base_request}. scene graph {graph_as_json}"}]
 
     def _decode(self, outputs) -> str:
-        return self.tokenizer.batch_decode(outputs, skip_special_tokens=True)[0].strip()
+        # clean_up_tokenization_spaces=False: the cleanup step is a WordPiece
+        # post-process that is destructive for BPE (Llama) — it strips spaces
+        # before punctuation and corrupts the generated plan text. Off here also
+        # silences the transformers warning.
+        return self.tokenizer.batch_decode(
+            outputs, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )[0].strip()
 
     def _generate_tokens(self, input_ids, attention_mask, msg, max_new_tokens):
         """Abstracts token generation. In the base case, it's just calling `model.generate`"""
@@ -157,14 +163,7 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
         # at/after the final "scene graph:" marker are eligible. Otherwise the
         # query graph's node labels would also match identical strings inside
         # earlier ICL-example graphs and inject PE into the wrong regions.
-        scope_start = 0
-        for surface in ("scene graph:", " scene graph:", "Scene graph:", " Scene graph:"):
-            marker = self.tokenizer.encode(surface, add_special_tokens=False)
-            if not marker:
-                continue
-            for pos in range(len(input_ids_list) - len(marker) + 1):
-                if input_ids_list[pos:pos + len(marker)] == marker:
-                    scope_start = max(scope_start, pos)
+        scope_start = find_last_graph_scope(input_ids_list, self.tokenizer)
         print(f"[spine-llm] injection scope_start={scope_start} / {len(input_ids_list)} tokens")
 
         injection_map = build_injection_map(input_ids_list, node_token_seqs, scope_start=scope_start)

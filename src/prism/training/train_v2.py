@@ -695,6 +695,9 @@ def train_model(config: TrainConfig, config_file: str = None):
     if config.architecture in ("rpearl_llm", "rpearl_gt_llm"):
         trainer.add_callback(callbacks.GradientDebugCallback())
     elif config.architecture == "augmented_graph_gt":
+        # Gradient / magnitude view: per-component grad norms (R-PEARL, GT blocks,
+        # GT output norm, gate, LoRA), GT output magnitude, gate value, injection count.
+        trainer.add_callback(callbacks.GradientDebugCallback())
         # M11: augmented-graph diagnostics (Fiedler, scene-mass, gate, contrib-ratio).
         # M12: when enable_visualizer is set, this callback also renders the
         # augmented-graph + spectral-clustering artifacts once (first eval-time log).

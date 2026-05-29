@@ -181,7 +181,10 @@ def _load_judge():
             input_len = inputs["input_ids"].shape[-1]
             with torch.no_grad():
                 out = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
-            return tokenizer.decode(out[0][input_len:], skip_special_tokens=True)
+            return tokenizer.decode(
+                out[0][input_len:], skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,  # destructive for BPE (see inference._decode)
+            )
 
         _JUDGE["gen"] = _generate
     except Exception as e:  # gated/missing model, offline, OOM, etc.

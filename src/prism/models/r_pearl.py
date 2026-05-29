@@ -46,6 +46,7 @@ class RandomGNNPositionalEncodings(nn.Module):
         m_test: int = None,
         fixed_seed_mode: bool = False,
         fixed_seed_value: int = 0,
+        max_probe_rows: int = 65536,
     ):
         super().__init__()
         if probe_distribution not in ("gaussian", "rademacher"):
@@ -83,6 +84,14 @@ class RandomGNNPositionalEncodings(nn.Module):
         self.probe_distribution = probe_distribution
         self.fixed_seed_mode = fixed_seed_mode
         self.fixed_seed_value = fixed_seed_value
+        # Cap on the number of [rows, d_model] entries materialised in one GCN
+        # batch. The batched forward stacks `m` probe copies of the N-node graph
+        # into a single [m*N, d_model] pass; at eval (m_test large) over the
+        # augmented graph (N = context_len + scene nodes) that tensor OOMs, so the
+        # probes are split into chunks of `floor(max_probe_rows / N)` and the
+        # per-chunk means are accumulated (the MC estimate is mean-over-probes, so
+        # this is identical to a single pass — only the peak memory differs).
+        self.max_probe_rows = max_probe_rows
         self.eps = eps
 
     def _sample_probes(self, num_nodes: int, m: int, device,
@@ -167,18 +176,40 @@ class RandomGNNPositionalEncodings(nn.Module):
         if self.fixed_seed_mode:
             generator = torch.Generator(device=device)
             generator.manual_seed(self.fixed_seed_value)
+
+        # Sample all m probes up front (Q is [N, m], 1 feature dim ⇒ tiny). The
+        # memory blowup is the batched GCN activation [chunk*N, d_model], not Q,
+        # so we chunk only the GCN pass over column slices of the *same* Q. The
+        # probe set is therefore identical regardless of chunk size, so chunking
+        # is bit-transparent (and R7 reproducibility is unaffected).
         Q = self._sample_probes(num_nodes, m, device, generator)
 
-        # Gradient checkpoint: recompute the batched GCN on backward to save memory.
-        # Q is sampled here (outside the checkpoint), so determinism is unaffected.
-        # The dummy tensor ensures at least one input requires grad (needed by checkpoint).
-        dummy = Q.new_ones(1, requires_grad=True)
-        pooled_pe = checkpoint(
-            lambda q, ei, d, dev: self._batched_gcn_forward(
-                q, ei, num_nodes, m, edge_weight=edge_weight, device=dev),
-            Q, edge_index, dummy, device,
-            use_reentrant=False,
-        )
+        # chunk = how many probes fit under max_probe_rows; train (small N, small
+        # m_train) keeps chunk == m (single pass, unchanged), eval (large N, large
+        # m_test) splits so [chunk*N, d_model] stays bounded.
+        chunk = max(1, min(m, self.max_probe_rows // max(1, num_nodes)))
+        pooled_sum = None
+        for start in range(0, m, chunk):
+            Qc = Q[:, start:start + chunk]
+            mc = Qc.shape[1]
+            # Gradient checkpoint (train only): recompute the batched GCN on
+            # backward to save memory. The dummy gives checkpoint a grad input.
+            if torch.is_grad_enabled():
+                dummy = Qc.new_ones(1, requires_grad=True)
+                pooled = checkpoint(
+                    lambda q, ei, d, dev, _mc=mc: self._batched_gcn_forward(
+                        q, ei, num_nodes, _mc, edge_weight=edge_weight, device=dev),
+                    Qc, edge_index, dummy, device,
+                    use_reentrant=False,
+                )
+            else:
+                pooled = self._batched_gcn_forward(
+                    Qc, edge_index, num_nodes, mc, edge_weight=edge_weight, device=device)
+            # _batched_gcn_forward returns the mean over its mc probes; weight by
+            # mc and divide by m at the end to recover the global mean exactly.
+            contrib = pooled * mc
+            pooled_sum = contrib if pooled_sum is None else pooled_sum + contrib
+        pooled_pe = pooled_sum / m
 
         pooled_pe = self.norm(pooled_pe)
         return pooled_pe
