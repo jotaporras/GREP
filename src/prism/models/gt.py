@@ -431,9 +431,18 @@ class GraphTransformer(nn.Module):
             amp_ctx = contextlib.nullcontext()
 
         with amp_ctx:
-            # Run signal through all Transformer Blocks.
+            # Run signal through all Transformer Blocks. During training, activation-
+            # checkpoint each block so its dense [N, d_model] attention/FFN activations
+            # are recomputed in the backward pass instead of all being retained at once
+            # — the GT's dominant training-memory term (spec M9). use_reentrant=False
+            # preserves RNG state (dropout masks match on recompute) and carries the
+            # autocast dtype into the recomputed forward. At eval (no grad) this is
+            # skipped: checkpoint would only add a recompute with nothing to save.
             for block in self.blocks:
-                x = block(x, khop_edge_index)
+                if self.training and torch.is_grad_enabled():
+                    x = checkpoint(block, x, khop_edge_index, use_reentrant=False)
+                else:
+                    x = block(x, khop_edge_index)
             # Apply Output Lipschitz Normalizer.
             x = self.output_norm(x)
         return x
