@@ -21,6 +21,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+GRAPH_DIRS = [
+    PROJECT_ROOT / "data" / "grep_training_data" / "graphs",
+    PROJECT_ROOT / "data" / "graphs",
+]
 TASK_LABELS = ["node_existence", "position_in_map", "reachability", "navigability"]
 TASK_COLORS = {
     "node_existence": "#2196F3",
@@ -40,6 +44,36 @@ MODEL_LABELS = {
 }
 
 
+_graph_size_cache: dict[str, int | None] = {}
+
+
+def _resolve_graph_size(basename: str) -> int | None:
+    """Look up the region count for a data_gen_NNN graph file."""
+    if basename in _graph_size_cache:
+        return _graph_size_cache[basename]
+
+    idx_match = re.search(r"data_gen_(\d+)", basename)
+    if not idx_match:
+        _graph_size_cache[basename] = None
+        return None
+
+    graph_filename = f"data_gen_{idx_match.group(1)}.json"
+    for graph_dir in GRAPH_DIRS:
+        graph_path = graph_dir / graph_filename
+        if graph_path.exists():
+            try:
+                with open(graph_path) as f:
+                    g = json.load(f)
+                size = len(g.get("graph", {}).get("regions", []))
+                _graph_size_cache[basename] = size if size > 0 else None
+                return _graph_size_cache[basename]
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+    _graph_size_cache[basename] = None
+    return None
+
+
 def parse_source_file(src: str) -> dict:
     """Extract experiment suite, model variant, permutation, and graph size from source path."""
     basename = os.path.basename(src)
@@ -49,7 +83,10 @@ def parse_source_file(src: str) -> dict:
     perm = f"perm_{perm_match.group(1)}" if perm_match else None
 
     size_match = re.search(r"graph_unique_(\d+?)(?:_\d+)?\.json$", basename)
-    graph_size = int(size_match.group(1)) if size_match else None
+    if size_match:
+        graph_size = int(size_match.group(1))
+    else:
+        graph_size = _resolve_graph_size(basename)
 
     if "multi_step" in basename:
         graph_size = None
@@ -68,15 +105,18 @@ def parse_source_file(src: str) -> dict:
     exp_match = re.match(r"(e\d+)", basename)
     exp_prefix = exp_match.group(1) if exp_match else "unknown"
 
-    if "transferability_betty" in dirname:
+    norm_dir = re.sub(r"^(\.\./)*", "", dirname)
+    norm_dir = re.sub(r"^.*/GREP-PRISM/", "", norm_dir)
+
+    if "transferability_betty" in norm_dir:
         suite = f"{exp_prefix}_transferability_betty"
-    elif "transferability_n100" in dirname:
+    elif "transferability_n100" in norm_dir:
         suite = f"{exp_prefix}_transferability_n100"
-    elif "transferability" in dirname:
+    elif "transferability" in norm_dir:
         suite = f"{exp_prefix}_transferability"
-    elif dirname.startswith("results/"):
+    elif norm_dir.startswith("results/"):
         suite = f"{exp_prefix}_baseline"
-    elif dirname.startswith("shared/results/perm"):
+    elif norm_dir.startswith("shared/results/perm"):
         suite = f"{exp_prefix}_shared"
     else:
         suite = exp_prefix
@@ -90,14 +130,17 @@ def parse_source_file(src: str) -> dict:
 
 
 def group_results(results: list[dict]) -> dict:
-    """Group results by (suite, perm) -> model -> graph_size -> metrics."""
+    """Group results by (suite, perm) -> model -> graph_size -> metrics.
+
+    When graph_size is None (no size in filename), results are grouped
+    under the sentinel key "aggregate" so they can still be visualized.
+    """
     grouped = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     for r in results:
         meta = parse_source_file(r["source_file"])
-        if meta["graph_size"] is None:
-            continue
+        size_key = meta["graph_size"] if meta["graph_size"] is not None else "aggregate"
         key = (meta["suite"], meta["perm"] or "none")
-        grouped[key][meta["model"]][meta["graph_size"]].append(r)
+        grouped[key][meta["model"]][size_key].append(r)
     return grouped
 
 
@@ -132,20 +175,35 @@ def aggregate_metrics(result_list: list[dict]) -> dict:
     return agg
 
 
+def _has_numeric_sizes(model_data: dict) -> bool:
+    """Check whether any model has numeric graph-size keys (not just 'aggregate')."""
+    for size_map in model_data.values():
+        for k in size_map:
+            if isinstance(k, int):
+                return True
+    return False
+
+
 def make_figure(suite: str, perm: str, model_data: dict, output_dir: Path):
-    """Create a single figure for one (suite, perm) combination."""
+    """Create a single figure for one (suite, perm) combination.
+
+    When graph-size data is available, plots accuracy/formatting lines vs size.
+    When only aggregate data exists, produces grouped bar charts per task type.
+    """
     models = sorted(model_data.keys())
     if not models:
         return
 
+    if not _has_numeric_sizes(model_data):
+        return _make_aggregate_figure(suite, perm, model_data, output_dir)
+
     all_sizes = set()
     for model in models:
-        all_sizes.update(model_data[model].keys())
+        all_sizes.update(k for k in model_data[model] if isinstance(k, int))
     sizes = sorted(all_sizes)
     if not sizes:
         return
 
-    n_types = len(TASK_LABELS)
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
     fig.suptitle(
         f"Task Classification Analysis: {suite} / {perm}",
@@ -236,15 +294,82 @@ def make_figure(suite: str, perm: str, model_data: dict, output_dir: Path):
     print(f"  Saved: {out_path.name}")
 
 
+def _make_aggregate_figure(suite: str, perm: str, model_data: dict, output_dir: Path):
+    """Bar-chart figure when there is no graph-size dimension to plot against."""
+    models = sorted(model_data.keys())
+
+    all_runs = []
+    for model in models:
+        for runs in model_data[model].values():
+            all_runs.extend(runs)
+    agg = aggregate_metrics(all_runs)
+    if not agg:
+        return
+
+    fig, (ax_acc, ax_dist) = plt.subplots(1, 2, figsize=(14, 6))
+    fig.suptitle(
+        f"Task Classification Analysis (aggregate): {suite} / {perm}",
+        fontsize=14,
+        fontweight="bold",
+    )
+
+    x = np.arange(len(TASK_LABELS))
+    width = 0.35
+    acc_vals = [agg["accuracy_by_type"].get(t, 0) for t in TASK_LABELS]
+    fmt_vals = [agg["formatted_by_type"].get(t, 0) for t in TASK_LABELS]
+    colors = [TASK_COLORS[t] for t in TASK_LABELS]
+
+    ax_acc.bar(x - width / 2, acc_vals, width, label="Accuracy", color=colors, alpha=0.9)
+    ax_acc.bar(x + width / 2, fmt_vals, width, label="Formatting", color=colors, alpha=0.4)
+    ax_acc.set_xticks(x)
+    ax_acc.set_xticklabels([t.replace("_", " ").title() for t in TASK_LABELS], fontsize=9, rotation=15)
+    ax_acc.set_ylabel("Rate")
+    ax_acc.set_ylim(0, 1.1)
+    ax_acc.legend()
+    ax_acc.set_title("Accuracy & Formatting by Task Type")
+    ax_acc.grid(axis="y", alpha=0.3)
+
+    for i, (a, f_) in enumerate(zip(acc_vals, fmt_vals)):
+        ax_acc.text(i - width / 2, a + 0.02, f"{a:.2f}", ha="center", fontsize=8)
+        ax_acc.text(i + width / 2, f_ + 0.02, f"{f_:.2f}", ha="center", fontsize=8)
+
+    dist_vals = [agg["type_distribution"].get(t, 0) for t in TASK_LABELS]
+    ax_dist.bar(x, dist_vals, color=colors, alpha=0.85)
+    ax_dist.set_xticks(x)
+    ax_dist.set_xticklabels([t.replace("_", " ").title() for t in TASK_LABELS], fontsize=9, rotation=15)
+    ax_dist.set_ylabel("Avg Count")
+    ax_dist.set_title("Task Type Distribution")
+    ax_dist.grid(axis="y", alpha=0.3)
+
+    total_samples = sum(r["total_samples"] for r in all_runs)
+    fig.text(
+        0.5, 0.01,
+        f"Total samples: {total_samples} | Files: {len(all_runs)} | "
+        f"Overall accuracy: {agg['overall_accuracy']:.3f} | Overall formatted: {agg['overall_formatted']:.3f}",
+        ha="center", fontsize=9, style="italic",
+    )
+
+    plt.tight_layout(rect=[0, 0.04, 1, 0.95])
+
+    safe_name = f"{suite}_{perm}".replace("/", "_")
+    out_path = output_dir / f"task_classification_{safe_name}.png"
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {out_path.name}")
+
+
 def make_distribution_figure(suite: str, perm: str, model_data: dict, output_dir: Path):
     """Create a stacked bar chart showing task type distribution across graph sizes."""
     models = sorted(model_data.keys())
     if not models:
         return
 
+    if not _has_numeric_sizes(model_data):
+        return
+
     all_sizes = set()
     for model in models:
-        all_sizes.update(model_data[model].keys())
+        all_sizes.update(k for k in model_data[model] if isinstance(k, int))
     sizes = sorted(all_sizes)
     if not sizes:
         return
