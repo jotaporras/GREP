@@ -128,6 +128,10 @@ def scene_graph_dict_to_pyg(scene_graph_dict: dict) -> Data:
         [nx_graph.nodes[n]["coords"] for n in node_names], dtype=torch.float32
     )
     pyg_graph = pyg_utils.from_networkx(nx_graph)
+    # safe_parse_graph stores the raw Euclidean edge distance (meters) under the
+    # networkx "weight" attribute, which from_networkx copies to pyg_graph.weight
+    # (one entry per directed edge). Grab it before the cleanup below.
+    raw_distance = getattr(pyg_graph, "weight", None)
     # Drop all networkx node/edge attributes that are not explicitly set below.
     # from_networkx copies every attr (type, weight, …); graphs with no edges/nodes
     # won't have the edge attrs, causing Batch.from_data_list to fail when mixing
@@ -135,6 +139,19 @@ def scene_graph_dict_to_pyg(scene_graph_dict: dict) -> Data:
     for attr in ("edge_type", "edge_weight", "weight", "type"):
         if hasattr(pyg_graph, attr):
             delattr(pyg_graph, attr)
+    # Convert raw distance to the E1 Gaussian heat-kernel affinity
+    # exp(-d^2 / 2σ^2), σ = per-graph median distance, and keep it as
+    # `edge_weight` so TAGConv couples closer nodes more strongly. Raw meters are
+    # retained under `distance_m` for the path validator (M10). Edgeless graphs
+    # get no edge_weight, so downstream forwards stay unweighted (and Batch
+    # mixing keeps working).
+    if raw_distance is not None and raw_distance.numel() > 0:
+        d = raw_distance.float()
+        sigma = d.median()
+        pyg_graph.edge_weight = (
+            torch.exp(-(d ** 2) / (2.0 * sigma ** 2)) if sigma > 0 else torch.ones_like(d)
+        )
+        pyg_graph.distance_m = d
     pyg_graph.coords = coords
     pyg_graph.x = torch.zeros((coords.size(0), 1), dtype=torch.float32)
     pyg_graph.node_names = node_names

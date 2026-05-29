@@ -135,6 +135,42 @@ def graph_augmented_llm_from_pretrained(
         model.pe_proj.load_state_dict(gnn_weights["pe_proj"])
         if "pe_gain" in gnn_weights:
             model.pe_gain.data.copy_(gnn_weights["pe_gain"])
+    elif architecture == "augmented_graph_gt":
+        # M9 augmented-graph assembly: Graph Transformer (R-PEARL inside) + M7 gate
+        # over a RoPE-disabled LLM. Rebuild from gnn_config and load the saved weights.
+        gt_model = gt_module.GraphTransformer(
+            num_layers=gnn_cfg["gt_num_layers"],
+            pe_hidden_channels=gnn_cfg["pe_hidden_channels"],
+            pe_num_layers=gnn_cfg["pe_num_layers"],
+            d_model=gnn_cfg["d_model"],
+            heads=gnn_cfg["gt_heads"],
+            num_samples=gnn_cfg["num_samples"],
+            dropout=gnn_cfg["dropout"],
+            k_pe=gnn_cfg["k_pe"],
+            k_gt=gnn_cfg["k_gt"],
+            eps=gnn_cfg["eps"],
+            use_layer_norm=gnn_cfg["use_layer_norm"],
+            probe_distribution=gnn_cfg.get("probe_distribution", "gaussian"),
+            m_test=gnn_cfg.get("m_test"),
+            fixed_seed_mode=gnn_cfg.get("fixed_seed_mode", False),
+            fixed_seed_value=gnn_cfg.get("fixed_seed_value", 0),
+            spectral_norm_linears=False,  # M6 fusion path (token embeddings fused)
+        )
+        model = gnn_llm.AugmentedGraphLLM(
+            llm, gt_model, d_model=gnn_cfg["d_model"],
+            gate_init=gnn_cfg.get("gate_init", 0.0),
+            gate_per_dim=gnn_cfg.get("gate_per_dim", False),
+            injection_mode=gnn_cfg.get("injection_mode", "interpolate"),
+            disable_llm_rope=gnn_cfg.get("disable_rope", True),
+            cycle_weight=gnn_cfg.get("cycle_weight", 1.0),
+            cycle_directed=gnn_cfg.get("cycle_directed", True),
+            crosslink_weight=gnn_cfg.get("crosslink_weight", 1.0),
+            crosslink_mention_to_node=gnn_cfg.get("crosslink_mention_to_node", True),
+            crosslink_mention_clique=gnn_cfg.get("crosslink_mention_clique", True),
+        )
+        gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
+        model.gt_model.load_state_dict(gnn_weights["gt_model"], strict=False)
+        model.injection.load_state_dict(gnn_weights["injection"])
     else:
         pe_model = r_pearl.RandomGNNPositionalEncodings(
             pe_hidden_channels=gnn_cfg["pe_hidden_channels"],

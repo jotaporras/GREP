@@ -76,11 +76,14 @@ class GCN(nn.Module):
             device = data.x.device
         data.x = data.x.to(device)
         data.edge_index = data.edge_index.to(device)
+        edge_weight = getattr(data, "edge_weight", None)
+        if edge_weight is not None:
+            edge_weight = edge_weight.to(device)
         x0, edge_index = data.x, data.edge_index
         x_prev = x0
         x = x0.clone()
         for i, conv in enumerate(self.convs[:-1]):
-            x = conv(x_prev, edge_index) * self._dim_scale
+            x = conv(x_prev, edge_index, edge_weight) * self._dim_scale
             if i < len(self.norms):
                 x = self.norms[i](x)
             x = self.relu(x)
@@ -88,5 +91,5 @@ class GCN(nn.Module):
             if self.skip_connection and i > 0:
                 x = x + x_prev
             x_prev = x
-        x = self.convs[-1](x, edge_index) * self._dim_scale
+        x = self.convs[-1](x, edge_index, edge_weight) * self._dim_scale
         return x

@@ -1,0 +1,58 @@
+name: e7
+architecture: augmented_graph_gt
+wandb_project: GREP-PRISM
+wandb_run_name: e7_augmented_graph_gt_no_edges
+wandb_tag: e7_architecture_experiments
+checkpoint_dir: outputs/e7_architecture_improvements
+data: /home/shared/GREP-PRISM/data/gen/e5_graph_oriented_data/split/formatted_all_new__train.json
+val_data: /home/shared/GREP-PRISM/data/gen/e5_graph_oriented_data/split/formatted_all_new__val.json
+eval_data: /home/shared/GREP-PRISM/data/gen/e5_graph_oriented_data/split/test_graphs/data_gen_004.json
+base_model: meta-llama/Llama-3.1-8B-Instruct
+bit4: true
+per_device_train_batch_size: 1
+learning_rate: 0.0002
+epochs: 2
+r: 16
+debug: true
+dataset_proportion: 1.0
+max_seq_length: 8192
+text_edge_list: none
+# Graph Transformer + R-PEARL params
+d_model: 4096
+gt_num_layers: 3
+gt_heads: 8
+pe_hidden_channels: 256
+pe_num_layers: 3
+num_samples: 40
+dropout: 0.1
+k_pe: 5
+k_gt: 2
+eps: 1e-6
+use_layer_norm: true
+freeze_llm: false
+device: -1
+# Augmented graph params
+cycle_directed: true
+cycle_weight: 1.0
+affinity_kernel: gaussian
+sigma_mode: median
+keep_raw_distance_feature: true
+crosslink_weight: 1.0
+crosslink_mention_to_node: true
+crosslink_mention_clique: true
+# R-PEARL sampling
+probe_distribution: gaussian
+m_test: 128
+fixed_seed_mode: false  # Switch
+fixed_seed_value: 0
+# Gated injection
+injection_mode: interpolate
+gate_init: 0.0
+gate_per_dim: false
+# LLM
+disable_rope: true
+n_icl_examples: 2       # Switch
+# Debug / viz
+log_fiedler: true
+log_scene_mass: true
+enable_visualizer: true

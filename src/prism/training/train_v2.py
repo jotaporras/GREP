@@ -143,12 +143,18 @@ class GraphSFTTrainer(SFTTrainer):
         super().__init__(*args, **kwargs)
         self.gnn_config = gnn_config
         # PEFT freezes all non-LoRA parameters. Re-enable gradients for the
-        # graph encoder and projection head so they actually train.
-        for p in self.model.pe_model.parameters():
-            p.requires_grad = True
-        for p in self.model.pe_proj.parameters():
-            p.requires_grad = True
-        self.model.pe_gain.requires_grad = True
+        # graph encoder and gate/projection so they actually train.
+        if gnn_config.get("architecture") == "augmented_graph_gt":
+            for p in self.model.gt_model.parameters():
+                p.requires_grad = True
+            for p in self.model.injection.parameters():
+                p.requires_grad = True
+        else:
+            for p in self.model.pe_model.parameters():
+                p.requires_grad = True
+            for p in self.model.pe_proj.parameters():
+                p.requires_grad = True
+            self.model.pe_gain.requires_grad = True
 
     def training_step(self, model, inputs, num_items_in_batch=None, **kwargs):
         loss = super().training_step(model, inputs, num_items_in_batch=num_items_in_batch, **kwargs)
@@ -165,7 +171,16 @@ class GraphSFTTrainer(SFTTrainer):
         os.makedirs(output_dir, exist_ok=True)
         with open(os.path.join(output_dir, "gnn_config.json"), "w") as f:
             json.dump(self.gnn_config, f, indent=2)
-        if self.gnn_config.get("architecture") == "rpearl_gt_llm":
+        if self.gnn_config.get("architecture") == "augmented_graph_gt":
+            # M9: save the Graph Transformer (R-PEARL inside) and the M7 gate.
+            torch.save({
+                'gt_model': self.model.gt_model.state_dict(),
+                'injection': self.model.injection.state_dict(),
+            }, os.path.join(output_dir, "gnn_weights.pt"))
+            torch.save({
+                'rpearl': self.model.gt_model.pe_model.state_dict(),
+            }, os.path.join(output_dir, "rpearl_weights.pt"))
+        elif self.gnn_config.get("architecture") == "rpearl_gt_llm":
             # Full GT: save the whole GraphTransformer (includes R-PEARL inside) + projection head.
             torch.save({
                 'gt_model': self.model.pe_model.state_dict(),
@@ -238,8 +253,8 @@ class TrainConfig:
     k_pe: int = 3
     use_layer_norm: bool = True
     freeze_llm: bool = False
-    architecture: str = "rpearl_llm"  # "rpearl_llm", "rpearl_gt_llm", or "llm"
-    # GT-specific params (used when architecture == "rpearl_gt_llm")
+    architecture: str = "rpearl_llm"  # "rpearl_llm", "rpearl_gt_llm", "augmented_graph_gt", or "llm"
+    # GT-specific params (used when architecture == "rpearl_gt_llm" / "augmented_graph_gt")
     gt_num_layers: int = 3
     gt_heads: int = 8
     eps: float = 1e-8
@@ -248,6 +263,30 @@ class TrainConfig:
         self.eps = float(self.eps)
     k_gt: int = 3
     text_edge_list: str = "present"   # "present" or "none"
+    # Augmented-graph params (used when architecture == "augmented_graph_gt")
+    cycle_directed: bool = True
+    cycle_weight: float = 1.0
+    affinity_kernel: str = "gaussian"
+    sigma_mode: str = "median"
+    keep_raw_distance_feature: bool = True
+    crosslink_weight: float = 1.0
+    crosslink_mention_to_node: bool = True
+    crosslink_mention_clique: bool = True
+    # R-PEARL sampling
+    probe_distribution: str = "gaussian"
+    m_test: int = 128
+    fixed_seed_mode: bool = False
+    fixed_seed_value: int = 0
+    # Gated injection
+    injection_mode: str = "interpolate"
+    gate_init: float = 0.0
+    gate_per_dim: bool = False
+    disable_rope: bool = True
+    # Prompt / debug-viz switches (carried for config fidelity)
+    n_icl_examples: int = 2
+    log_fiedler: bool = True
+    log_scene_mass: bool = True
+    enable_visualizer: bool = False
     device: int = 0                   # GPU index to pin the model to; -1 = let device_map="auto" decide
     overwrite_ok: bool = False
     # Optional override for the checkpoint subdirectory name.
@@ -297,7 +336,7 @@ def _run_post_train_cross_eval(model, tokenizer, config: "TrainConfig", output_d
 
     samples_by_graph, graph_file_by_name = loading.load_samples_by_graph(target)
 
-    is_gnn = config.architecture in ("rpearl_llm", "rpearl_gt_llm")
+    is_gnn = config.architecture in ("rpearl_llm", "rpearl_gt_llm", "augmented_graph_gt")
     architecture = "graph-augmented" if is_gnn else "llm"
     out_dir = os.path.join(output_dir, "eval_logs", "cross_eval")
     os.makedirs(out_dir, exist_ok=True)
@@ -344,6 +383,7 @@ def _write_cross_eval_json(
         "accuracy": result.accuracy,
         "num_samples": result.num_total,
         "num_correct": result.num_correct,
+        "path_metrics": result.path_metrics,
         "samples": result.samples,
     }
     out_file = os.path.join(out_dir, f"{name}.json")
@@ -436,6 +476,47 @@ def train_model(config: TrainConfig, config_file: str = None):
 
         if config.freeze_llm:
             model.llm.requires_grad_(False)
+    elif config.architecture == "augmented_graph_gt":
+        # Augmented-graph pipeline (M4-M8): one graph (cycle + scene + cross-links)
+        # per sequence; R-PEARL + GT refine it; the gate injects Y[V_Tx] into the
+        # RoPE-disabled LLM. Reuses SpineDataCollator (scene graphs + injection maps);
+        # the augmented graph is assembled inside the model forward.
+        gt_model = gt_module.GraphTransformer(
+            num_layers=config.gt_num_layers,
+            pe_hidden_channels=config.pe_hidden_channels,
+            pe_num_layers=config.pe_num_layers,
+            d_model=config.d_model,
+            heads=config.gt_heads,
+            num_samples=config.num_samples,
+            dropout=config.dropout,
+            k_pe=config.k_pe,
+            k_gt=config.k_gt,
+            eps=config.eps,
+            use_layer_norm=config.use_layer_norm,
+            probe_distribution=config.probe_distribution,
+            m_test=config.m_test,
+            fixed_seed_mode=config.fixed_seed_mode,
+            fixed_seed_value=config.fixed_seed_value,
+            # Token embeddings are fused (M6) -> the X-carrying GT path is not
+            # spectrally normalized (only the PE-side R-PEARL projection is).
+            spectral_norm_linears=False,
+        )
+        model = gnn_llm.AugmentedGraphLLM(
+            llm, gt_model, d_model=config.d_model,
+            gate_init=config.gate_init,
+            gate_per_dim=config.gate_per_dim,
+            injection_mode=config.injection_mode,
+            disable_llm_rope=config.disable_rope,
+            cycle_weight=config.cycle_weight,
+            cycle_directed=config.cycle_directed,
+            crosslink_weight=config.crosslink_weight,
+            crosslink_mention_to_node=config.crosslink_mention_to_node,
+            crosslink_mention_clique=config.crosslink_mention_clique,
+        )
+        collator = data.SpineDataCollator(tokenizer, mlm=False)
+
+        if config.freeze_llm:
+            model.llm.requires_grad_(False)
     elif config.architecture == "llm":
         # Pure LLM baseline — scene graph text stays in the prompt as-is.
         # No custom collator: SFTTrainer's built-in collator handles
@@ -443,7 +524,7 @@ def train_model(config: TrainConfig, config_file: str = None):
         model = llm
         collator = None
     else:
-        raise ValueError(f"Unknown architecture: {config.architecture!r}. Choose 'rpearl_llm', 'rpearl_gt_llm', or 'llm'.")
+        raise ValueError(f"Unknown architecture: {config.architecture!r}. Choose 'rpearl_llm', 'rpearl_gt_llm', 'augmented_graph_gt', or 'llm'.")
 
     # Load & optionally downsample data
     full_dataset = datasets.load_dataset("json", data_files=[config.data], split="train")
@@ -546,7 +627,7 @@ def train_model(config: TrainConfig, config_file: str = None):
         do_eval=True,
     )
 
-    if config.architecture in ("rpearl_llm", "rpearl_gt_llm"):
+    if config.architecture in ("rpearl_llm", "rpearl_gt_llm", "augmented_graph_gt"):
         gnn_config = {
             "architecture": config.architecture,
             "base_model": config.base_model,
@@ -561,7 +642,19 @@ def train_model(config: TrainConfig, config_file: str = None):
             "eps": config.eps,
             **({"k_gt": config.k_gt, "gt_num_layers": config.gt_num_layers,
                 "gt_heads": config.gt_heads}
-               if config.architecture == "rpearl_gt_llm" else {}),
+               if config.architecture in ("rpearl_gt_llm", "augmented_graph_gt") else {}),
+            # Augmented-graph rebuild params (read back by loaders for eval).
+            **({"k_gt": config.k_gt, "gt_num_layers": config.gt_num_layers,
+                "gt_heads": config.gt_heads,
+                "probe_distribution": config.probe_distribution, "m_test": config.m_test,
+                "fixed_seed_mode": config.fixed_seed_mode, "fixed_seed_value": config.fixed_seed_value,
+                "injection_mode": config.injection_mode, "gate_init": config.gate_init,
+                "gate_per_dim": config.gate_per_dim, "disable_rope": config.disable_rope,
+                "cycle_weight": config.cycle_weight, "cycle_directed": config.cycle_directed,
+                "crosslink_weight": config.crosslink_weight,
+                "crosslink_mention_to_node": config.crosslink_mention_to_node,
+                "crosslink_mention_clique": config.crosslink_mention_clique}
+               if config.architecture == "augmented_graph_gt" else {}),
         }
         trainer = GraphSFTTrainer(
             model=model,
@@ -601,6 +694,14 @@ def train_model(config: TrainConfig, config_file: str = None):
 
     if config.architecture in ("rpearl_llm", "rpearl_gt_llm"):
         trainer.add_callback(callbacks.GradientDebugCallback())
+    elif config.architecture == "augmented_graph_gt":
+        # M11: augmented-graph diagnostics (Fiedler, scene-mass, gate, contrib-ratio).
+        # M12: when enable_visualizer is set, this callback also renders the
+        # augmented-graph + spectral-clustering artifacts once (first eval-time log).
+        trainer.add_callback(callbacks.AugGraphDebugCallback(
+            enable_visualizer=config.enable_visualizer,
+            visualizer_dir=os.path.join(output_dir, "visuals"),
+        ))
 
     # Start training
     trainer.train()

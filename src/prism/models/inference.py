@@ -6,7 +6,7 @@ import torch
 
 from prism.data import utils
 from prism.data.data import remove_edge_list
-from prism.models.gnn_llm import build_injection_map
+from prism.models.gnn_llm import AugmentedGraphLLM, build_injection_map
 
 
 class InMemoryLLM:
@@ -152,7 +152,35 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
             self.tokenizer.encode(name, add_special_tokens=False)
             for name in pyg_graph.node_names
         ]
-        injection_map = build_injection_map(input_ids_list, node_token_seqs)
+
+        # Scope injection to the last (query) graph block: only token positions
+        # at/after the final "scene graph:" marker are eligible. Otherwise the
+        # query graph's node labels would also match identical strings inside
+        # earlier ICL-example graphs and inject PE into the wrong regions.
+        scope_start = 0
+        for surface in ("scene graph:", " scene graph:", "Scene graph:", " Scene graph:"):
+            marker = self.tokenizer.encode(surface, add_special_tokens=False)
+            if not marker:
+                continue
+            for pos in range(len(input_ids_list) - len(marker) + 1):
+                if input_ids_list[pos:pos + len(marker)] == marker:
+                    scope_start = max(scope_start, pos)
+        print(f"[spine-llm] injection scope_start={scope_start} / {len(input_ids_list)} tokens")
+
+        injection_map = build_injection_map(input_ids_list, node_token_seqs, scope_start=scope_start)
+
+        if isinstance(self.model, AugmentedGraphLLM):
+            # M9: assemble the augmented graph (cycle + scene + cross-links) from the
+            # last graph's scene PyG + scoped injection map, run M4→M6→M7, and feed
+            # the fused token embeddings to the RoPE-disabled LLM.
+            inputs_embeds = self.model._fuse_embeddings(
+                input_ids, [pyg_graph], [injection_map], permutation=self.permutation)
+            return self.model.llm.generate(
+                inputs_embeds=inputs_embeds, attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens, use_cache=True, temperature=0.01, min_p=0.1,
+                pad_token_id=self.tokenizer.eos_token_id,
+            )
+
         pe = self.model.pe_proj(self.model.pe_model(pyg_graph, permutation=self.permutation))  # [n, hidden_size]
         pe = pe * self.model.pe_gain
 

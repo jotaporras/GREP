@@ -7,6 +7,18 @@ from torch.utils.checkpoint import checkpoint
 from torch_geometric.data import Data
 from torch_geometric.utils import add_self_loops, coalesce, softmax
 
+
+def _maybe_spectral_norm(linear: nn.Module, enabled: bool) -> nn.Module:
+    """Wrap ``linear`` in spectral norm when ``enabled``, else return it as-is.
+
+    In the M6 fusion path the GT node features carry the LLM token embeddings X
+    (semantic content). Per the spec, that path must NOT be spectrally normalized
+    — only PE-side operators are — so the Q/K/V/O and FFN linears are left bare
+    when token embeddings are fused. In the legacy PE-generator path (no token
+    embeddings) spectral norm stays on to preserve the transferability guarantees.
+    """
+    return spectral_norm(linear) if enabled else linear
+
 from prism.models.r_pearl import RandomGNNPositionalEncodings
 from prism.models.utils import LipschitzNorm, SparseCSRDropout
 
@@ -24,13 +36,19 @@ class SparseGraphAttention(nn.Module):
     avoid JIT-compiled propagate + autocast bf16 scatter kernel interactions
     that trigger CUDA device-side assertions on some GPU/driver combinations.
 
+    Q, K, V projections are spectrally normed (to enforce Assumption 2) only when
+    ``spectral_norm_linears`` is set; in the M6 fusion path it is disabled so the
+    X-carrying path is not distorted.
+
     Args:
         d_model (int): Input/output feature dimension
         heads (int): Number of attention heads
         dropout (float): Attention weight dropout
+        spectral_norm_linears (bool): Spectrally normalize Q/K/V/O (default True).
     """
 
-    def __init__(self, d_model: int, heads: int = 4, dropout: float = 0.1):
+    def __init__(self, d_model: int, heads: int = 4, dropout: float = 0.1,
+                 spectral_norm_linears: bool = True):
         super().__init__()
 
         # Store preliminary information.
@@ -44,9 +62,9 @@ class SparseGraphAttention(nn.Module):
         self.c_v = nn.Parameter(torch.tensor(1.0))
 
         # Instantiate this attention layer's query, key, and value matrices.
-        self.W_Q = spectral_norm(nn.Linear(d_model, d_model, bias=False))
-        self.W_K = spectral_norm(nn.Linear(d_model, d_model, bias=False))
-        self.W_V = spectral_norm(nn.Linear(d_model, d_model, bias=False))
+        self.W_Q = _maybe_spectral_norm(nn.Linear(d_model, d_model, bias=False), spectral_norm_linears)
+        self.W_K = _maybe_spectral_norm(nn.Linear(d_model, d_model, bias=False), spectral_norm_linears)
+        self.W_V = _maybe_spectral_norm(nn.Linear(d_model, d_model, bias=False), spectral_norm_linears)
 
         # Register a scale factor for the attention scores.
         self.register_buffer("scale", torch.tensor(self.head_dim, dtype=torch.float).rsqrt())
@@ -54,7 +72,7 @@ class SparseGraphAttention(nn.Module):
         # Register dropout and the output linear map.
         self.dropout: nn.Module = nn.Dropout(dropout)
         self.attn_dropout: nn.Module = SparseCSRDropout(dropout)
-        self.W_O = spectral_norm(nn.Linear(d_model, d_model, bias=False))
+        self.W_O = _maybe_spectral_norm(nn.Linear(d_model, d_model, bias=False), spectral_norm_linears)
 
     def forward(self, x: Tensor, edge_index: Tensor) -> Tensor:
         N = x.shape[0]
@@ -239,17 +257,19 @@ class SparseTransformerBlock(nn.Module):
         eps (float): Lipschitz normalization epsilon.
     """
 
-    def __init__(self, d_model: int, heads: int = 4, dropout: float = 0.1, use_layer_norm: bool = False, eps: float = 1e-8):
+    def __init__(self, d_model: int, heads: int = 4, dropout: float = 0.1, use_layer_norm: bool = False, eps: float = 1e-8,
+                 spectral_norm_linears: bool = True):
         super().__init__()
 
         # Set up Attention, Dropout, Feed-Forward Network, and
         # Lipschitz Normalizer layers of Transformer Block.
-        self.attn = SparseGraphAttention(d_model, heads=heads, dropout=dropout)
+        self.attn = SparseGraphAttention(d_model, heads=heads, dropout=dropout,
+                                         spectral_norm_linears=spectral_norm_linears)
         self.dropout: nn.Module = nn.Dropout(dropout)
         self.ffn = nn.Sequential(
-            spectral_norm(nn.Linear(d_model, d_model)),
+            _maybe_spectral_norm(nn.Linear(d_model, d_model), spectral_norm_linears),
             nn.LeakyReLU(),
-            spectral_norm(nn.Linear(d_model, d_model)),
+            _maybe_spectral_norm(nn.Linear(d_model, d_model), spectral_norm_linears),
         )
         self.norms = nn.ModuleList([])
         if use_layer_norm:
@@ -276,6 +296,18 @@ class GraphTransformer(nn.Module):
 
     Pipeline: R-PEARL(graph) -> PE ⊕ node_features -> stacked SparseTransformerBlocks -> output
 
+    M6 fusion (when token embeddings are supplied): node features are
+    ``H0 = X_full + Psi``, where ``X_full`` carries the token embeddings on the
+    directed-cycle (token) nodes and zeros on the scene nodes, and ``Psi`` is the
+    R-PEARL encoding (the transferability-paper form ``X + Psi_G``). No gate lives
+    here — the M7 cold-start gate is applied at the LLM input as
+    ``inputs_embeds = X + gate * Y[V_Tx]``. Only the token-node rows of the output
+    are used downstream.
+
+    When token embeddings are omitted the module keeps its legacy behavior — a
+    pure R-PEARL-fed PE generator — so existing ``rpearl_gt_llm`` callers are
+    unaffected.
+
     Args:
         num_layers (int): Number of transformer blocks.
         pe_hidden_channels (int): R-PEARL GCN hidden dimension.
@@ -293,22 +325,32 @@ class GraphTransformer(nn.Module):
     def __init__(self, num_layers: int, pe_hidden_channels: int,
                  pe_num_layers: int, d_model: int, heads: int = 4, num_samples: int = 30,
                  dropout: float = 0.1, k_pe: int = 3, k_gt: int = 3,
-                 eps: float = 1e-8, use_layer_norm: bool = True):
+                 eps: float = 1e-8, use_layer_norm: bool = True,
+                 probe_distribution: str = "gaussian", m_test: int = None,
+                 fixed_seed_mode: bool = False, fixed_seed_value: int = 0,
+                 spectral_norm_linears: bool = True):
         super().__init__()
 
         # Register preliminary information.
         self.k_hops = k_gt
         self.heads = heads
         self.num_layers = num_layers
+        self.d_model = d_model
 
         # Set up R-PEARL Positional Encoder, Transformer Blocks, and Output Lipschitz Normalizer.
+        # spectral_norm_linears is disabled by the M6 fusion path (token embeddings
+        # fused) so the X-carrying attention/FFN linears are not spectrally normalized;
+        # the PE-side R-PEARL projection keeps its own spectral norm regardless.
         self.pe_model = RandomGNNPositionalEncodings(
             pe_hidden_channels=pe_hidden_channels, pe_num_layers=pe_num_layers, d_model=d_model,
-            num_samples=num_samples, dropout=dropout, k=k_pe, eps=eps, use_layer_norm=use_layer_norm
+            num_samples=num_samples, dropout=dropout, k=k_pe, eps=eps, use_layer_norm=use_layer_norm,
+            probe_distribution=probe_distribution, m_test=m_test,
+            fixed_seed_mode=fixed_seed_mode, fixed_seed_value=fixed_seed_value,
         )
         self.blocks = nn.ModuleList([
             SparseTransformerBlock(
-                d_model, heads=heads, dropout=dropout, use_layer_norm=use_layer_norm, eps=eps
+                d_model, heads=heads, dropout=dropout, use_layer_norm=use_layer_norm, eps=eps,
+                spectral_norm_linears=spectral_norm_linears,
             ) for _ in range(num_layers)
         ])
         self.output_norm = LipschitzNorm(d_model, eps=eps)
@@ -353,7 +395,7 @@ class GraphTransformer(nn.Module):
         # Return the coalesced edge index.
         return coalesce(expanded_edge_index, num_nodes=num_nodes)
 
-    def forward(self, data, permutation=None) -> Tensor:
+    def forward(self, data, token_embeddings=None, is_token=None, permutation=None) -> Tensor:
         # Move input data to the Graph Transformer's device.
         try:
             device = next(self.parameters()).device
@@ -366,11 +408,26 @@ class GraphTransformer(nn.Module):
         if permutation is not None:
             edge_index = permutation.apply(edge_index, data.x.size(0), device=device)
             pe_data = Data(x=data.x, edge_index=edge_index)
+            if getattr(data, "edge_weight", None) is not None:
+                pe_data.edge_weight = data.edge_weight
         else:
             pe_data = data
 
-        # Gather positional encodings as input to the Graph Transformer.
-        x = self.pe_model(pe_data)
+        # R-PEARL positional encoding Ψ over the augmented graph.
+        psi = self.pe_model(pe_data)  # [N, d_model]
+
+        # M6 input fusion: H0 = X_full + Ψ, where X_full carries the token
+        # embeddings on the directed-cycle (token) nodes and zeros on the scene
+        # nodes. No gate here — the M7 gate sits at the LLM input (see
+        # gated_injection.GatedInjection). When no token embeddings are supplied
+        # the module behaves as a pure PE generator (legacy rpearl_gt_llm path).
+        if token_embeddings is None:
+            x = psi
+        else:
+            x_full = torch.zeros_like(psi)
+            rows = slice(0, token_embeddings.shape[0]) if is_token is None else is_token
+            x_full[rows] = token_embeddings.to(device=psi.device, dtype=psi.dtype)
+            x = x_full + psi
 
         # Precompute k-hop neighborhood diffusions.
         if permutation is not None:

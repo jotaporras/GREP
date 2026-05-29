@@ -66,13 +66,20 @@ from prism.models import inference
 from prism.models import utils as model_utils
 from prism.data import graph_sim
 from prism.data import planning_sim
+from prism.eval import path_validator
 
 
 # ----------------------------------------------------------------------------
 # Public data structures
 # ----------------------------------------------------------------------------
 
-EvalSample = namedtuple("EvalSample", ["task", "answer", "graph", "init_node", "graph_name"])
+EvalSample = namedtuple(
+    "EvalSample",
+    ["task", "answer", "graph", "init_node", "graph_name", "acceptance_criterion"],
+)
+# acceptance_criterion is optional: only e6-style datasets carry it. When present
+# it enables the M10 Gemma judge; otherwise M10 falls back to regex/NetworkX.
+EvalSample.__new__.__defaults__ = (None,)
 """
 
 Evaluation sample task specification: An eval task is given by a natural-languaget ask specification,
@@ -106,6 +113,9 @@ class GraphEvalResultSummary:
     use_icl: bool
     permutation: Optional[dict]
     samples: List[dict] = field(default_factory=list)
+    # M10 (R4) path-validity aggregates over this graph's samples. Empty when
+    # no sample produced a parseable route.
+    path_metrics: dict = field(default_factory=dict)
 
 
 # ----------------------------------------------------------------------------
@@ -214,6 +224,7 @@ def eval_model_single_graph(
 
             print(f"correct answer: {result.plan_keyword}")
 
+            pm = _sample_path_metrics(planner_response, eval_sample)
             sample_results.append({
                 "graph_name": eval_sample.graph_name,
                 "idx": i,
@@ -224,9 +235,15 @@ def eval_model_single_graph(
                 "terminated_by": planning_result.terminated_by if planning_result else None,
                 "formatted": result.formatted,
                 "plan_keyword": result.plan_keyword,
+                # `correct` is the authoritative RegEx/NetworkX verdict. The Gemma
+                # judge is advisory only (never the true judge): its per-sample
+                # verdict is surfaced separately as `llm_judge_pass` (None unless
+                # the answer is yes/no or an acceptance_criterion exists).
                 "correct": result.is_correct(),
+                "llm_judge_pass": (pm or {}).get("llm_judge_pass"),
                 "error": None,
                 "traceback": None,
+                "path_metrics": pm,
             })
 
         except Exception as e:
@@ -250,8 +267,10 @@ def eval_model_single_graph(
                 "formatted": False,
                 "plan_keyword": False,
                 "correct": False,
+                "llm_judge_pass": None,
                 "error": f"{type(e).__name__}: {e}",
                 "traceback": tb_str,
+                "path_metrics": None,
             })
 
         print("\n=====\n")
@@ -315,6 +334,7 @@ def eval_model_multiple_graphs(
             use_icl=use_icl,
             permutation=permutation.to_dict() if permutation is not None else None,
             samples=sample_results,
+            path_metrics=_aggregate_path_metrics(sample_results),
         )
         results[name] = result
 
@@ -387,6 +407,22 @@ def print_summary_table(results: List[GraphEvalResultSummary]) -> None:
     )
     print(sep)
 
+    # M10 (R4) path-validity block — only printed when some graph yielded routes.
+    pm_results = [r for r in results if r.path_metrics]
+    if pm_results:
+        def _fmt(v):
+            return f"{v:.2f}" if isinstance(v, (int, float)) else "  —"
+        print("\nPATH-VALIDITY (M10)")
+        print(f"{'Eval File':<{name_width}}  {'edge_val':>8}  {'nodes_ex':>8}  "
+              f"{'full_valid':>10}  {'start_goal':>10}  {'cost_opt':>8}  {'judge':>6}")
+        for r in pm_results:
+            p = r.path_metrics
+            print(f"{r.name:<{name_width}}  {_fmt(p.get('edge_validity_rate')):>8}  "
+                  f"{_fmt(p.get('nodes_exist_rate')):>8}  {_fmt(p.get('full_path_valid_rate')):>10}  "
+                  f"{_fmt(p.get('start_goal_ok_rate')):>10}  {_fmt(p.get('cost_optimality')):>8}  "
+                  f"{_fmt(p.get('llm_judge_accuracy')):>6}")
+        print(sep)
+
 
 # ----------------------------------------------------------------------------
 # Private helpers
@@ -412,6 +448,7 @@ def construct_eval_samples_from_dict(
             graph=graph_dict,
             init_node=t["init_node"],
             graph_name=graph_name,
+            acceptance_criterion=t.get("acceptance_criterion"),
         )
         for t in tasks_list
     ]
@@ -456,12 +493,68 @@ def _construct_eval_result(parsed_answer: Dict[str, str], answer_key: str) -> Tu
         return _EvalResult(False, False), parsed_answer
 
 
+def _sample_path_metrics(planner_response, eval_sample: EvalSample) -> Optional[dict]:
+    """M10 (R4) per-sample path validation; never raises (returns None on failure).
+
+    Pulls the route out of the planner's ``plan`` field, validates it against the
+    sample's graph (regex + NetworkX), and runs the Gemma judge only if the
+    sample carries an ``acceptance_criterion``.
+    """
+    try:
+        plan = planner_response.get("plan") if isinstance(planner_response, dict) else planner_response
+        return path_validator.evaluate_sample(
+            eval_sample.task,
+            "" if plan is None else str(plan),
+            eval_sample.graph,
+            init_node=eval_sample.init_node,
+            acceptance_criterion=eval_sample.acceptance_criterion,
+            answer=eval_sample.answer,
+            full_response="" if planner_response is None else str(planner_response),
+        )
+    except Exception as e:
+        print(f"[eval] path-metric computation failed: {type(e).__name__}: {e}")
+        return None
+
+
+def _aggregate_path_metrics(sample_results: List[dict]) -> dict:
+    """Mean M10 path metrics over samples that produced a parseable route."""
+    pms = [r.get("path_metrics") for r in sample_results]
+    pms = [p for p in pms if p and p.get("num_parsed", 0) > 0]
+    if not pms:
+        return {}
+
+    def _mean(key):
+        vals = [p[key] for p in pms if p.get(key) is not None]
+        return (sum(vals) / len(vals)) if vals else None
+
+    def _rate(key):
+        return sum(1 for p in pms if p.get(key)) / len(pms)
+
+    agg = {
+        "edge_validity_rate": _mean("edge_validity_rate"),
+        "nodes_exist_rate": _mean("nodes_exist_rate"),
+        "full_path_valid_rate": _rate("full_path_valid"),
+        "start_goal_ok_rate": _rate("start_goal_ok"),
+        "cost_optimality": _mean("cost_optimality"),
+        "num_with_path": len(pms),
+    }
+    judged = [p["llm_judge_pass"] for p in pms if p.get("llm_judge_pass") is not None]
+    if judged:
+        agg["llm_judge_accuracy"] = sum(judged) / len(judged)
+    return agg
+
+
 def _is_graph_augmented(model) -> bool:
-    """True if `model` is (or wraps) a `GraphAugmentedLLM`, including under PEFT."""
-    if isinstance(model, gnn_llm.GraphAugmentedLLM):
+    """True if `model` is (or wraps) a graph-augmented LLM, including under PEFT.
+
+    Covers both the legacy `GraphAugmentedLLM` (PE injection) and the M9
+    `AugmentedGraphLLM` (augmented-graph fusion).
+    """
+    graph_types = (gnn_llm.GraphAugmentedLLM, gnn_llm.AugmentedGraphLLM)
+    if isinstance(model, graph_types):
         return True
     inner = getattr(getattr(model, "base_model", None), "model", None)
-    return isinstance(inner, gnn_llm.GraphAugmentedLLM)
+    return isinstance(inner, graph_types)
 
 
 def _graph_node_count(graph: dict) -> int:

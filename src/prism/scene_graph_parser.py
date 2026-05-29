@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import re
 import ast
+import math
+from statistics import median
 from typing import Any, Dict, List, Mapping
 
+import networkx as nx
 from datasets import Dataset
 
 SCENE_GRAPH_PATTERN = re.compile(r"[Ss]cene graph:\s*(\{.*)", re.DOTALL)
@@ -86,6 +89,68 @@ def find_undefined_nodes(scene_graph_dict: Mapping[str, Any]) -> List[str]:
     return undefined_nodes
 
 
+def build_scene_affinity_graph(
+    scene_graph_dict: Mapping[str, Any],
+    sigma_mode: str = "median",
+    keep_raw_distance_feature: bool = True,
+) -> nx.Graph:
+    """Build the weighted scene graph G_Sc for the augmented-graph pipeline.
+
+    Topology comes from the same object/region connection lists the rest of the
+    parser uses; node labels stay the canonical underscore-joined names. Every
+    edge gets a Gaussian heat-kernel affinity (E1)
+
+        weight = exp(-d^2 / (2 * sigma^2)),   sigma = median edge distance,
+
+    with the raw Euclidean distance kept under ``distance_m``. The median
+    bandwidth makes affinities comparable across graph scales and keeps closer
+    edges strictly stronger. Degenerate graphs (no edges, or sigma == 0) fall
+    back to weight 1.
+
+    Args:
+        scene_graph_dict: Parsed scene graph with objects/regions (each with a
+            ``coords`` list) and object/region connection lists.
+        sigma_mode: Bandwidth rule for the kernel. Only ``"median"`` is used.
+        keep_raw_distance_feature: Keep the raw meters under ``distance_m``.
+
+    Returns:
+        Undirected ``nx.Graph`` (directedness matches the source connections).
+        ``distance_m`` and affinity ``weight`` are stored per edge; node
+        ``coords`` are preserved for the validator (M10).
+    """
+
+    coords = {
+        node["name"]: node["coords"]
+        for node in (*scene_graph_dict["objects"], *scene_graph_dict["regions"])
+    }
+
+    G = nx.Graph()
+    for name, c in coords.items():
+        G.add_node(name, coords=c)
+
+    distances: List[float] = []
+    for key, edge_type in (("object_connections", "object"), ("region_connections", "region")):
+        for source, target in scene_graph_dict[key]:
+            if source in coords and target in coords:
+                a = coords[source]
+                b = coords[target]
+                dist = math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
+                G.add_edge(source, target, type=edge_type, distance_m=dist)
+                distances.append(dist)
+
+    if sigma_mode != "median":
+        raise ValueError(f"Unsupported sigma_mode {sigma_mode!r}; only 'median' is locked (E1).")
+    sigma = median(distances) if distances else 0.0
+
+    for _, _, attrs in G.edges(data=True):
+        d = attrs["distance_m"]
+        attrs["weight"] = math.exp(-(d ** 2) / (2.0 * sigma ** 2)) if sigma > 0 else 1.0
+        if not keep_raw_distance_feature:
+            del attrs["distance_m"]
+
+    return G
+
+
 def add_scene_graph_feature(
     dataset: Dataset,
 ) -> Dataset:
@@ -120,6 +185,7 @@ def add_scene_graph_feature(
 
 __all__ = [
     "add_scene_graph_feature",
+    "build_scene_affinity_graph",
     "find_undefined_nodes",
     "_parse_scene_graph_dictionary_from_conversation",
 ]
