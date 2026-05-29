@@ -156,6 +156,57 @@ class GraphSFTTrainer(SFTTrainer):
                 p.requires_grad = True
             self.model.pe_gain.requires_grad = True
 
+    def create_optimizer(self):
+        """Two learning-rate groups: the structural path (GT + R-PEARL + gate)
+        trains at ``structural_lr_mult`` × the base LR, the LLM/LoRA at the base LR.
+
+        First-run diagnostics showed the structural gradients (R-PEARL ~1e-5)
+        were orders of magnitude below the LoRA gradient at a shared LR, so the
+        LLM content-fit the task before the gate could open and the structural
+        gradients collapsed (R6 failure). Giving the structural params a higher
+        LR lets them contribute before LoRA saturates the loss. Falls back to the
+        stock optimizer when the multiplier is 1.0 (no behavior change).
+        """
+        mult = float(self.gnn_config.get("structural_lr_mult", 1.0))
+        if self.optimizer is not None or mult == 1.0:
+            return super().create_optimizer()
+
+        opt_model = self.model
+        if self.gnn_config.get("architecture") == "augmented_graph_gt":
+            structural = list(self.model.gt_model.parameters()) + list(self.model.injection.parameters())
+        else:
+            structural = (list(self.model.pe_model.parameters())
+                          + list(self.model.pe_proj.parameters()) + [self.model.pe_gain])
+        structural_ids = {id(p) for p in structural}
+
+        decay_names = set(self.get_decay_parameter_names(opt_model))
+        base_lr = self.args.learning_rate
+        groups = []
+        # structural group at the boosted LR, LLM/LoRA group at the base LR; each
+        # split into decay / no-decay (norms, biases, the scalar gate) exactly as
+        # the stock optimizer would.
+        for is_struct, lr in ((True, base_lr * mult), (False, base_lr)):
+            named = [(n, p) for n, p in opt_model.named_parameters()
+                     if p.requires_grad and (id(p) in structural_ids) == is_struct]
+            decay = [p for n, p in named if n in decay_names]
+            no_decay = [p for n, p in named if n not in decay_names]
+            if decay:
+                groups.append({"params": decay, "lr": lr, "weight_decay": self.args.weight_decay})
+            if no_decay:
+                groups.append({"params": no_decay, "lr": lr, "weight_decay": 0.0})
+
+        try:
+            optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args, opt_model)
+        except TypeError:
+            optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args)
+        optimizer_kwargs.pop("params", None)
+        optimizer_kwargs.pop("lr", None)
+        self.optimizer = optimizer_cls(groups, lr=base_lr, **optimizer_kwargs)
+        n_struct = sum(p.numel() for p in structural if p.requires_grad)
+        print(f"[train] structural LR group: {mult}x base = {base_lr * mult:.2e} "
+              f"({n_struct / 1e6:.2f}M params); LLM/LoRA at base LR {base_lr:.2e}")
+        return self.optimizer
+
     def training_step(self, model, inputs, num_items_in_batch=None, **kwargs):
         loss = super().training_step(model, inputs, num_items_in_batch=num_items_in_batch, **kwargs)
         # Gradients exist now (backward already ran inside super().training_step).
@@ -282,6 +333,12 @@ class TrainConfig:
     gate_init: float = 0.0
     gate_per_dim: bool = False
     disable_rope: bool = True
+    # Structural-path optimization (R6): the GT + R-PEARL + gate train at
+    # structural_lr_mult × the base LR (they otherwise get gradients orders of
+    # magnitude below LoRA and never open the gate); lora_warmup_steps freezes the
+    # LLM/LoRA for the first N optimizer steps so the structural path learns first.
+    structural_lr_mult: float = 1.0
+    lora_warmup_steps: int = 0
     # Prompt / debug-viz switches (carried for config fidelity)
     n_icl_examples: int = 2
     log_fiedler: bool = True
@@ -650,6 +707,7 @@ def train_model(config: TrainConfig, config_file: str = None):
                 "fixed_seed_mode": config.fixed_seed_mode, "fixed_seed_value": config.fixed_seed_value,
                 "injection_mode": config.injection_mode, "gate_init": config.gate_init,
                 "gate_per_dim": config.gate_per_dim, "disable_rope": config.disable_rope,
+                "structural_lr_mult": config.structural_lr_mult,
                 "cycle_weight": config.cycle_weight, "cycle_directed": config.cycle_directed,
                 "crosslink_weight": config.crosslink_weight,
                 "crosslink_mention_to_node": config.crosslink_mention_to_node,
@@ -705,6 +763,10 @@ def train_model(config: TrainConfig, config_file: str = None):
             enable_visualizer=config.enable_visualizer,
             visualizer_dir=os.path.join(output_dir, "visuals"),
         ))
+        # R6: optionally freeze LoRA for the first N steps so the structural path
+        # (GT/R-PEARL/gate) learns before the LLM content-fits the task.
+        if config.lora_warmup_steps > 0:
+            trainer.add_callback(callbacks.LoraWarmupCallback(config.lora_warmup_steps))
 
     # Start training
     trainer.train()

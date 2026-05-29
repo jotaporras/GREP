@@ -419,6 +419,57 @@ class AugGraphDebugCallback(TrainerCallback):
                 print(f"[M12] visualizer failed: {type(e).__name__}: {e}")
 
 
+class LoraWarmupCallback(TrainerCallback):
+    """Freeze the LLM/LoRA parameters for the first ``warmup_steps`` optimizer
+    steps so the structural path (GT, R-PEARL, gate) learns first (R6).
+
+    With the LLM frozen, the loss gradient still flows to the structural params
+    through ``inputs_embeds`` (which require grad), so the GT/gate get an
+    isolated learning signal before LoRA starts competing for the objective.
+    This counters the observed failure where the LLM content-fits the task in
+    the first ~60 steps and the structural gradients then collapse to ~0. After
+    ``warmup_steps`` the LoRA params are re-enabled and resume training (the
+    optimizer already holds them, so updates simply resume).
+    """
+
+    def __init__(self, warmup_steps: int):
+        self.warmup_steps = int(warmup_steps)
+        self._frozen_params = []
+        self._restored = False
+
+    @staticmethod
+    def _unwrap_peft(model):
+        inner = model
+        if hasattr(inner, "base_model"):
+            inner = inner.base_model
+        if hasattr(inner, "model") and (
+            hasattr(inner.model, "injection") or hasattr(inner.model, "pe_proj")
+        ):
+            inner = inner.model
+        return inner
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        if self.warmup_steps <= 0 or model is None:
+            return
+        inner = self._unwrap_peft(model)
+        # Capture the currently-trainable LLM params (the LoRA adapters), then
+        # freeze them. Saved so we can re-enable exactly these after warmup.
+        self._frozen_params = [p for p in inner.llm.parameters() if p.requires_grad]
+        for p in self._frozen_params:
+            p.requires_grad_(False)
+        print(f"[train] LoRA warmup: froze {len(self._frozen_params)} LLM tensors "
+              f"for the first {self.warmup_steps} steps (structure learns first)")
+
+    def on_step_begin(self, args, state, control, model=None, **kwargs):
+        if (self._frozen_params and not self._restored
+                and state.global_step >= self.warmup_steps):
+            for p in self._frozen_params:
+                p.requires_grad_(True)
+            self._restored = True
+            print(f"[train] LoRA warmup complete at step {state.global_step}: "
+                  f"re-enabled {len(self._frozen_params)} LLM tensors")
+
+
 class MetricsTrackerCallback(TrainerCallback):
     """Custom callback that captures metrics for retrieval"""
 
