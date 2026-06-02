@@ -12,7 +12,7 @@
 #   scripts/e7_train_and_eval.sh <custom_eval_graphs> [options]
 #
 # Options (also settable as env vars):
-#   --config PATH        e7 yaml             (CONFIG,        default: experiments/e7_architecture_improvements/e7_augmented_graph_gt_no_edges.yaml)
+#   --config PATH        e7 yaml             (CONFIG,        default: experiments/e7_architecture_improvements/e7_composite_graph_gt_no_edges.yaml)
 #   --device N           GPU index, -1=auto  (DEVICE,        default: 0)
 #   --test-graphs PATH   training test set   (TEST_GRAPHS,   default: the config's eval_data)
 #   --custom-graphs PATH your eval graphs     (CUSTOM_GRAPHS, required)
@@ -35,7 +35,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 # --- defaults (env overridable) ---
-CONFIG="${CONFIG:-experiments/e7_architecture_improvements/e7_augmented_graph_gt_no_edges.yaml}"
+CONFIG="${CONFIG:-experiments/e7_architecture_improvements/e7_composite_graph_gt_no_edges.yaml}"
 DEVICE="${DEVICE:-0}"
 FOUR_BIT="${FOUR_BIT:-true}"
 USE_ICL="${USE_ICL:-true}"

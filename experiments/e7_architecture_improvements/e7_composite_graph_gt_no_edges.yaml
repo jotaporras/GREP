@@ -45,7 +45,7 @@ probe_distribution: gaussian
 m_test: 128
 fixed_seed_mode: false    # Switch
 fixed_seed_value: 0
-e_readout: second_moment  # Switch
+pe_readout: second_moment  # Switch
 # Gated injection
 injection_mode: none
 gate_init: 0.3
