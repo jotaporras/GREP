@@ -7,7 +7,7 @@ import torch
 from prism.data import utils
 from prism.data.data import remove_edge_list
 from prism.models.gnn_llm import (
-    AugmentedGraphLLM,
+    CompositeGraphLLM,
     GraphAugmentedLLM,
     build_injection_map,
     find_last_graph_scope,
@@ -15,10 +15,10 @@ from prism.models.gnn_llm import (
 
 
 def _core_graph_model(model):
-    """Peel PEFT wrappers to the AugmentedGraphLLM / GraphAugmentedLLM core.
+    """Peel PEFT wrappers to the CompositeGraphLLM / GraphAugmentedLLM core.
 
     The eval model is loaded PEFT-wrapped (PeftModel -> LoraModel -> graph model),
-    so ``isinstance(model, AugmentedGraphLLM)`` is False on the wrapper and the
+    so ``isinstance(model, CompositeGraphLLM)`` is False on the wrapper and the
     wrong injection branch runs (then fails on a missing ``pe_proj``). Unwrap to
     the underlying graph model first. The LoRA adapters live inside the graph
     model's ``.llm`` submodule (PEFT patches it in place), so calling the core's
@@ -26,7 +26,7 @@ def _core_graph_model(model):
     """
     inner = model
     for _ in range(5):
-        if isinstance(inner, (AugmentedGraphLLM, GraphAugmentedLLM)):
+        if isinstance(inner, (CompositeGraphLLM, GraphAugmentedLLM)):
             return inner
         nxt = getattr(inner, "base_model", None)
         if nxt is None or nxt is inner:
@@ -200,8 +200,8 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
 
         injection_map = build_injection_map(input_ids_list, node_token_seqs, scope_start=scope_start)
 
-        if isinstance(graph_model, AugmentedGraphLLM):
-            # M9: assemble the augmented graph (cycle + scene + cross-links) from the
+        if isinstance(graph_model, CompositeGraphLLM):
+            # M9: assemble the composite graph (cycle + scene + cross-links) from the
             # last graph's scene PyG + scoped injection map, run M4→M6→M7, and feed
             # the fused token embeddings to the RoPE-disabled LLM.
             inputs_embeds = graph_model._fuse_embeddings(

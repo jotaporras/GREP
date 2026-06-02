@@ -144,7 +144,7 @@ class GraphSFTTrainer(SFTTrainer):
         self.gnn_config = gnn_config
         # PEFT freezes all non-LoRA parameters. Re-enable gradients for the
         # graph encoder and gate/projection so they actually train.
-        if gnn_config.get("architecture") == "augmented_graph_gt":
+        if gnn_config.get("architecture") == "composite_graph_gt":
             for p in self.model.gt_model.parameters():
                 p.requires_grad = True
             for p in self.model.injection.parameters():
@@ -172,7 +172,7 @@ class GraphSFTTrainer(SFTTrainer):
             return super().create_optimizer()
 
         opt_model = self.model
-        if self.gnn_config.get("architecture") == "augmented_graph_gt":
+        if self.gnn_config.get("architecture") == "composite_graph_gt":
             structural = list(self.model.gt_model.parameters()) + list(self.model.injection.parameters())
         else:
             structural = (list(self.model.pe_model.parameters())
@@ -222,7 +222,7 @@ class GraphSFTTrainer(SFTTrainer):
         os.makedirs(output_dir, exist_ok=True)
         with open(os.path.join(output_dir, "gnn_config.json"), "w") as f:
             json.dump(self.gnn_config, f, indent=2)
-        if self.gnn_config.get("architecture") == "augmented_graph_gt":
+        if self.gnn_config.get("architecture") == "composite_graph_gt":
             # M9: save the Graph Transformer (R-PEARL inside) and the M7 gate.
             torch.save({
                 'gt_model': self.model.gt_model.state_dict(),
@@ -304,8 +304,8 @@ class TrainConfig:
     k_pe: int = 3
     use_layer_norm: bool = True
     freeze_llm: bool = False
-    architecture: str = "rpearl_llm"  # "rpearl_llm", "rpearl_gt_llm", "augmented_graph_gt", or "llm"
-    # GT-specific params (used when architecture == "rpearl_gt_llm" / "augmented_graph_gt")
+    architecture: str = "rpearl_llm"  # "rpearl_llm", "rpearl_gt_llm", "composite_graph_gt", or "llm"
+    # GT-specific params (used when architecture == "rpearl_gt_llm" / "composite_graph_gt")
     gt_num_layers: int = 3
     gt_heads: int = 8
     eps: float = 1e-8
@@ -314,7 +314,7 @@ class TrainConfig:
         self.eps = float(self.eps)
     k_gt: int = 3
     text_edge_list: str = "present"   # "present" or "none"
-    # Augmented-graph params (used when architecture == "augmented_graph_gt")
+    # Composite-graph params (used when architecture == "composite_graph_gt")
     cycle_directed: bool = True
     cycle_weight: float = 1.0
     affinity_kernel: str = "gaussian"
@@ -328,7 +328,7 @@ class TrainConfig:
     m_test: int = 128
     fixed_seed_mode: bool = False
     fixed_seed_value: int = 0
-    # R-PEARL readout fed to the GT (augmented_graph_gt only): "mean" = first
+    # R-PEARL readout fed to the GT (composite_graph_gt only): "mean" = first
     # moment E_q[Φ(q)] (default); "second_moment" = C @ X for C = E_q[Φ(q)Φ(q)ᵀ],
     # which carries the relative position the first moment collapses away.
     pe_readout: str = "mean"
@@ -397,7 +397,7 @@ def _run_post_train_cross_eval(model, tokenizer, config: "TrainConfig", output_d
 
     samples_by_graph, graph_file_by_name = loading.load_samples_by_graph(target)
 
-    is_gnn = config.architecture in ("rpearl_llm", "rpearl_gt_llm", "augmented_graph_gt")
+    is_gnn = config.architecture in ("rpearl_llm", "rpearl_gt_llm", "composite_graph_gt")
     architecture = "graph-augmented" if is_gnn else "llm"
     out_dir = os.path.join(output_dir, "eval_logs", "cross_eval")
     os.makedirs(out_dir, exist_ok=True)
@@ -537,11 +537,11 @@ def train_model(config: TrainConfig, config_file: str = None):
 
         if config.freeze_llm:
             model.llm.requires_grad_(False)
-    elif config.architecture == "augmented_graph_gt":
-        # Augmented-graph pipeline (M4-M8): one graph (cycle + scene + cross-links)
+    elif config.architecture == "composite_graph_gt":
+        # Composite-graph pipeline (M4-M8): one graph (cycle + scene + cross-links)
         # per sequence; R-PEARL + GT refine it; the gate injects Y[V_Tx] into the
         # RoPE-disabled LLM. Reuses SpineDataCollator (scene graphs + injection maps);
-        # the augmented graph is assembled inside the model forward.
+        # the composite graph is assembled inside the model forward.
         gt_model = gt_module.GraphTransformer(
             num_layers=config.gt_num_layers,
             pe_hidden_channels=config.pe_hidden_channels,
@@ -563,7 +563,7 @@ def train_model(config: TrainConfig, config_file: str = None):
             spectral_norm_linears=False,
             pe_readout=config.pe_readout,
         )
-        model = gnn_llm.AugmentedGraphLLM(
+        model = gnn_llm.CompositeGraphLLM(
             llm, gt_model, d_model=config.d_model,
             gate_init=config.gate_init,
             gate_per_dim=config.gate_per_dim,
@@ -586,7 +586,7 @@ def train_model(config: TrainConfig, config_file: str = None):
         model = llm
         collator = None
     else:
-        raise ValueError(f"Unknown architecture: {config.architecture!r}. Choose 'rpearl_llm', 'rpearl_gt_llm', 'augmented_graph_gt', or 'llm'.")
+        raise ValueError(f"Unknown architecture: {config.architecture!r}. Choose 'rpearl_llm', 'rpearl_gt_llm', 'composite_graph_gt', or 'llm'.")
 
     # Load & optionally downsample data
     full_dataset = datasets.load_dataset("json", data_files=[config.data], split="train")
@@ -689,7 +689,7 @@ def train_model(config: TrainConfig, config_file: str = None):
         do_eval=True,
     )
 
-    if config.architecture in ("rpearl_llm", "rpearl_gt_llm", "augmented_graph_gt"):
+    if config.architecture in ("rpearl_llm", "rpearl_gt_llm", "composite_graph_gt"):
         gnn_config = {
             "architecture": config.architecture,
             "base_model": config.base_model,
@@ -704,8 +704,8 @@ def train_model(config: TrainConfig, config_file: str = None):
             "eps": config.eps,
             **({"k_gt": config.k_gt, "gt_num_layers": config.gt_num_layers,
                 "gt_heads": config.gt_heads}
-               if config.architecture in ("rpearl_gt_llm", "augmented_graph_gt") else {}),
-            # Augmented-graph rebuild params (read back by loaders for eval).
+               if config.architecture in ("rpearl_gt_llm", "composite_graph_gt") else {}),
+            # Composite-graph rebuild params (read back by loaders for eval).
             **({"k_gt": config.k_gt, "gt_num_layers": config.gt_num_layers,
                 "gt_heads": config.gt_heads,
                 "probe_distribution": config.probe_distribution, "m_test": config.m_test,
@@ -717,7 +717,7 @@ def train_model(config: TrainConfig, config_file: str = None):
                 "crosslink_weight": config.crosslink_weight,
                 "crosslink_mention_to_node": config.crosslink_mention_to_node,
                 "crosslink_mention_clique": config.crosslink_mention_clique}
-               if config.architecture == "augmented_graph_gt" else {}),
+               if config.architecture == "composite_graph_gt" else {}),
         }
         trainer = GraphSFTTrainer(
             model=model,
@@ -757,13 +757,13 @@ def train_model(config: TrainConfig, config_file: str = None):
 
     if config.architecture in ("rpearl_llm", "rpearl_gt_llm"):
         trainer.add_callback(callbacks.GradientDebugCallback())
-    elif config.architecture == "augmented_graph_gt":
+    elif config.architecture == "composite_graph_gt":
         # Gradient / magnitude view: per-component grad norms (R-PEARL, GT blocks,
         # GT output norm, gate, LoRA), GT output magnitude, gate value, injection count.
         trainer.add_callback(callbacks.GradientDebugCallback())
-        # M11: augmented-graph diagnostics (Fiedler, scene-mass, gate, contrib-ratio).
+        # M11: composite-graph diagnostics (Fiedler, scene-mass, gate, contrib-ratio).
         # M12: when enable_visualizer is set, this callback also renders the
-        # augmented-graph + spectral-clustering artifacts once (first eval-time log).
+        # composite-graph + spectral-clustering artifacts once (first eval-time log).
         trainer.add_callback(callbacks.AugGraphDebugCallback(
             enable_visualizer=config.enable_visualizer,
             visualizer_dir=os.path.join(output_dir, "visuals"),

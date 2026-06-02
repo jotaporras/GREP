@@ -1,6 +1,6 @@
-"""M4 — assemble the augmented graph G and its graph shift operator S.
+"""M4 — assemble the composite graph G and its graph shift operator S.
 
-The augmented graph glues a directed-cycle "sequence layer" (one node per token,
+The composite graph glues a directed-cycle "sequence layer" (one node per token,
 nodes 0..c-1) to the scene graph (nodes c..c+|V_Sc|-1) with cross-links (E2):
 
   - sequence layer: directed cycle  i -> (i+1) mod c, weight cycle_weight;
@@ -30,8 +30,8 @@ from torch_geometric.utils import add_self_loops, coalesce
 
 
 @dataclass
-class AugmentedGraph:
-    """Assembled augmented graph G plus its sparse GSO S.
+class CompositeGraph:
+    """Assembled composite graph G plus its sparse GSO S.
 
     Attributes:
         edge_index: [2, E] directed edges of G (cycle is one-directional).
@@ -137,7 +137,7 @@ def _symmetrize(edge_index: Tensor, edge_weight: Tensor, num_nodes: int):
     return coalesce(sym_index, sym_weight, num_nodes=num_nodes, reduce="max")
 
 
-def build_augmented_graph(
+def build_composite_graph(
     num_token_nodes: int,
     scene_edge_index: Tensor,
     scene_edge_weight: Tensor,
@@ -148,8 +148,8 @@ def build_augmented_graph(
     crosslink_weight: float = 1.0,
     crosslink_mention_to_node: bool = True,
     crosslink_mention_clique: bool = True,
-) -> AugmentedGraph:
-    """Assemble the augmented graph G and its GSO S (M4).
+) -> CompositeGraph:
+    """Assemble the composite graph G and its GSO S (M4).
 
     Args:
         num_token_nodes: c, the sequence-layer length.
@@ -161,7 +161,7 @@ def build_augmented_graph(
         cycle_weight / cycle_directed / crosslink_*: see GREPConfig / E2.
 
     Returns:
-        AugmentedGraph with directed (edge_index, edge_weight), is_token mask, and
+        CompositeGraph with directed (edge_index, edge_weight), is_token mask, and
         the sparse two-sided degree-normalized GSO of the directed graph.
     """
     c = num_token_nodes
@@ -216,7 +216,7 @@ def build_augmented_graph(
 
     gso = _build_gso(edge_index, edge_weight, N)
 
-    return AugmentedGraph(
+    return CompositeGraph(
         edge_index=edge_index,
         edge_weight=edge_weight,
         is_token=is_token,

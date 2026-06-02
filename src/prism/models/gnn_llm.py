@@ -7,7 +7,7 @@ from torch.nn.utils.parametrizations import spectral_norm
 from torch_geometric.data import Batch, Data
 from transformers import PreTrainedModel
 
-from prism.models.augmented_graph import build_augmented_graph
+from prism.models.composite_graph import build_composite_graph
 from prism.models.llama import disable_rope
 from prism.models.utils import LipschitzNorm
 
@@ -200,8 +200,8 @@ class GatedInjection(nn.Module):
         return X + gate * Y_tx
 
 
-class AugmentedGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
-    """Augmented-graph assembly: M6 Graph Transformer → M7 gate → M8 RoPE-disabled Llama.
+class CompositeGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
+    """Composite-graph assembly: M6 Graph Transformer → M7 gate → M8 RoPE-disabled Llama.
 
     For each sequence: the token embeddings ``X`` become the directed-cycle node
     features, the Graph Transformer (``gt_model``) refines them over the augmented
@@ -212,7 +212,7 @@ class AugmentedGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
 
     Inputs match the existing ``SpineDataCollator`` contract — a PyG Batch of
     scene graphs (``graphs``) and per-sample ``injection_maps`` ({scene_node_idx →
-    token spans}). For each sequence the augmented graph G is assembled on the fly
+    token spans}). For each sequence the composite graph G is assembled on the fly
     (M4): a directed cycle over the ``c`` token positions, the scene graph, and the
     cross-links from the injection map. Token embeddings X seed the cycle nodes,
     R-PEARL + the GT refine over G, and ``Y[V_Tx]`` is gated back into X (M7).
@@ -224,7 +224,7 @@ class AugmentedGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         d_model (int): Embedding / GT width (must equal the LLM hidden size).
         gate_init, gate_per_dim, injection_mode: M7 gate settings (R6).
         disable_llm_rope (bool): Apply the M8 RoPE disable to ``llm`` (default True).
-        cycle_weight, cycle_directed, crosslink_*: M4 augmented-graph settings.
+        cycle_weight, cycle_directed, crosslink_*: M4 composite-graph settings.
     """
 
     def __init__(self, llm: nn.Module, gt_model: nn.Module, d_model: int,
@@ -266,8 +266,8 @@ class AugmentedGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         except AttributeError:
             return getattr(self.llm, name)
 
-    def _augmented_graph(self, scene, injection_map, c, device, permutation=None):
-        """Assemble the augmented graph G for one sequence (M4) on ``device``.
+    def _composite_graph(self, scene, injection_map, c, device, permutation=None):
+        """Assemble the composite graph G for one sequence (M4) on ``device``.
 
         With a ``permutation`` (transferability sweep), the scene nodes are
         relabeled — matching the legacy R-PEARL semantics of permuting over the
@@ -286,7 +286,7 @@ class AugmentedGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             scene_edge_index = permutation.apply(scene_edge_index, n_scene, device=device)
             perm = permutation.perm.to(device)
             injection_map = {int(perm[k]): v for k, v in injection_map.items()}
-        return build_augmented_graph(
+        return build_composite_graph(
             c, scene_edge_index, scene_edge_weight, n_scene, injection_map,
             cycle_weight=self.cycle_weight, cycle_directed=self.cycle_directed,
             crosslink_weight=self.crosslink_weight,
@@ -301,7 +301,7 @@ class AugmentedGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         c = input_ids.shape[1]
         fused = []
         for b in range(input_ids.shape[0]):
-            aug = self._augmented_graph(graphs[b], injection_maps[b], c, device, permutation=permutation)
+            aug = self._composite_graph(graphs[b], injection_maps[b], c, device, permutation=permutation)
             aug_data = Data(
                 x=torch.zeros(aug.num_nodes, 1, device=device),
                 edge_index=aug.edge_index,
@@ -348,7 +348,7 @@ def find_last_graph_scope(input_ids_b, tokenizer) -> int:
     completes."
 
     Used by BOTH the training collator (``SpineDataCollator``) and eval
-    (``GraphAugmentedInMemoryLLM``) so the augmented graph is assembled with the
+    (``GraphAugmentedInMemoryLLM``) so the composite graph is assembled with the
     same scope in train and eval — otherwise the cross-link structure the model
     trains on differs from what it sees at inference (the divergence grows with
     ``n_icl_examples``). Returns 0 when no marker is found (whole sequence

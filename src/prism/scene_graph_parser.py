@@ -94,7 +94,7 @@ def build_scene_affinity_graph(
     sigma_mode: str = "median",
     keep_raw_distance_feature: bool = True,
 ) -> nx.Graph:
-    """Build the weighted scene graph G_Sc for the augmented-graph pipeline.
+    """Build the weighted scene graph G_Sc for the composite-graph pipeline.
 
     Topology comes from the same object/region connection lists the rest of the
     parser uses; node labels stay the canonical underscore-joined names. Every

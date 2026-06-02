@@ -48,10 +48,10 @@ import spine.prompts.prompts as spine_prompts
 _orig_get_base_prompt = spine_prompts.get_base_prompt_update_graph
 
 
-# R10: ICL is a 2/5 switch, and the e7/augmented-graph model is trained with
+# R10: ICL is a 2/5 switch, and the e7/composite-graph model is trained with
 # TWO in-context examples. SPINE's stock get_base_prompt uses five
 # (EXAMPLE_1..EXAMPLE_5), which roughly triples the prompt length — and hence
-# the augmented-graph cycle length (one node per token) — versus training. With
+# the composite-graph cycle length (one node per token) — versus training. With
 # RoPE disabled (M8) the model is acutely sensitive to that distribution shift
 # and degenerates into repeated-token output. Pin eval to the same two examples
 # the model trained on so train and eval ICL counts match.
@@ -558,9 +558,9 @@ def _is_graph_augmented(model) -> bool:
     """True if `model` is (or wraps) a graph-augmented LLM, including under PEFT.
 
     Covers both the legacy `GraphAugmentedLLM` (PE injection) and the M9
-    `AugmentedGraphLLM` (augmented-graph fusion).
+    `CompositeGraphLLM` (composite-graph fusion).
     """
-    graph_types = (gnn_llm.GraphAugmentedLLM, gnn_llm.AugmentedGraphLLM)
+    graph_types = (gnn_llm.GraphAugmentedLLM, gnn_llm.CompositeGraphLLM)
     if isinstance(model, graph_types):
         return True
     inner = getattr(getattr(model, "base_model", None), "model", None)

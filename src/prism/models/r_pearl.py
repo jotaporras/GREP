@@ -87,7 +87,7 @@ class RandomGNNPositionalEncodings(nn.Module):
         # Cap on the number of [rows, d_model] entries materialised in one GCN
         # batch. The batched forward stacks `m` probe copies of the N-node graph
         # into a single [m*N, d_model] pass; at eval (m_test large) over the
-        # augmented graph (N = context_len + scene nodes) that tensor OOMs, so the
+        # composite graph (N = context_len + scene nodes) that tensor OOMs, so the
         # probes are split into chunks of `floor(max_probe_rows / N)` and the
         # per-chunk means are accumulated (the MC estimate is mean-over-probes, so
         # this is identical to a single pass — only the peak memory differs).
@@ -219,29 +219,33 @@ class RandomGNNPositionalEncodings(nn.Module):
         return pooled_pe
 
     def second_moment_apply(self, data, signal: torch.Tensor) -> torch.Tensor:
-        """Second-moment readout: return ``C @ signal`` for ``C = E_q[Φ(q) Φ(q)ᵀ]``.
+        """Apply the probe second moment ``C = E_q[Φ(q)Φ(q)ᵀ]`` to ``signal``.
 
-        This is the only quantity that differs from ``forward``. Where ``forward``
-        returns the first moment ``E_q[Φ(q)]`` (which is permutation-equivariant
-        and collapses to a node-constant on the vertex-transitive sequence cycle),
-        this returns the probe **second moment** applied to a signal — the object
-        that carries relative position (the bilinear ``q_nᵀ k_m``). The N×N matrix
-        ``C`` is never formed; associativity gives
+        Returns ``C·signal ∈ [N, d_model]`` WITHOUT ever forming the ``[N, N]``
+        matrix ``C``, via the associativity
 
-            C @ s = E_q[ Φ(q) ( Φ(q)ᵀ s ) ].
+            C·s = E_q[ Φ(q) ( Φ(q)ᵀ s ) ].
 
-        Probe sampling, chunking, fixed-seed determinism and gradient checkpointing
-        mirror ``forward`` exactly, so the two readouts share all R7 semantics; only
-        the pooled statistic changes. Activated by ``pe_readout="second_moment"``.
+        ``C`` is the AugR-PEARL second moment — the deterministic, time-invariant
+        circulant autocorrelation ``[C]_{nm} = c(n-m)`` over the token cycle
+        (page-10 proof: ``C = F* diag(ρ) F``, ``ρ_k = |h(ω^k)|²``) — a *relative*-
+        position operator that does NOT collapse on the vertex-transitive cycle the
+        way the first moment ``E_q[Φ]`` does. ``Φ(q)`` runs over the entire composite
+        graph, so ``C`` spans token+scene; when ``signal`` is non-zero on every node
+        (token rows = X, scene rows = first-moment Ψ) the full structure
+        (scene–scene, scene–token, token–token) propagates.
+
+        Used by the Graph Transformer as ``H0 = signal + C·signal`` (the second-
+        moment readout). Size-robust / transferable (no size-locked parameter, no
+        factoring). Probe sampling, chunking, fixed-seed determinism and gradient
+        checkpointing mirror ``forward``; only the pooled statistic differs.
 
         Args:
-            data: PyG Data carrying the (already-permuted, if any) augmented-graph
-                edges and edge weights, exactly as ``forward`` consumes.
-            signal: [N, d_model] node signal to apply ``C`` to (the GT's ``X_full``
-                — token embeddings on V_Tx rows, zeros on V_Sc).
+            data: PyG Data with the (already-permuted, if any) composite-graph edges.
+            signal: [N, d_model] signal to apply ``C`` to (the GT's ``seeded``).
 
         Returns:
-            ``C @ signal`` in [N, d_model], LipschitzNorm-normalized like ``forward``.
+            ``C·signal`` in [N, d_model], LipschitzNorm-normalized like ``forward``.
         """
         try:
             device = next(self.parameters()).device
@@ -254,7 +258,7 @@ class RandomGNNPositionalEncodings(nn.Module):
         if edge_weight is not None:
             edge_weight = edge_weight.to(device)
         num_nodes = data.x.shape[0]
-        # The GCN runs in fp32; operate the whole second moment in fp32.
+        # The GCN runs in fp32; apply the whole second moment in fp32.
         s = signal.to(device=device, dtype=torch.float32)
 
         m = self.m_train if self.training else self.m_test
@@ -269,7 +273,7 @@ class RandomGNNPositionalEncodings(nn.Module):
             mc = Qc.shape[1]
             # Per-probe responses P_s = Φ(q^(s)) ∈ [N, d] (pool=False keeps them
             # un-meaned); accumulate Σ_s P_s (P_sᵀ s) so the [d, d] inner product
-            # is the only dense intermediate — never an N×N matrix.
+            # is the only dense intermediate — the N×N matrix is never formed.
             P = self._batched_gcn_forward(
                 Qc, ei, num_nodes, mc, edge_weight=edge_weight, device=device, pool=False
             )  # [mc, N, d]

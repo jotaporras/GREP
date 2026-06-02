@@ -100,7 +100,7 @@ class GradientDebugCallback(TrainerCallback):
       norms for the GNN/PE, projection, gain, LoRA, and — for the GT variant —
       the inner R-PEARL, GT attention blocks, and GT output norm, plus the
       ``pe_proj`` output magnitude.
-    - ``AugmentedGraphLLM`` (``augmented_graph_gt``, M4–M9): a ``gt_model``
+    - ``CompositeGraphLLM`` (``composite_graph_gt``, M4–M9): a ``gt_model``
       (GraphTransformer holding R-PEARL), the M7 ``injection`` gate, and
       ``_fuse_embeddings`` for injection. Logs grad norms for the inner R-PEARL,
       GT blocks, GT output norm, the whole GT, the gate, and LoRA, plus the GT
@@ -110,9 +110,9 @@ class GradientDebugCallback(TrainerCallback):
     ``_capture_grad_norms`` (called from ``GraphSFTTrainer.training_step`` after
     backward, before zero_grad) so they reflect real gradients — HF Trainer
     zeroes grads before ``on_log`` fires, so reading ``.grad`` there returns 0.
-    The augmented-graph spectral diagnostics (Fiedler, scene-mass, contrib-ratio)
+    The composite-graph spectral diagnostics (Fiedler, scene-mass, contrib-ratio)
     live in ``AugGraphDebugCallback``; this callback is the gradient/magnitude
-    view and the two compose on the same ``augmented_graph_gt`` run.
+    view and the two compose on the same ``composite_graph_gt`` run.
     """
 
     def __init__(self):
@@ -125,7 +125,7 @@ class GradientDebugCallback(TrainerCallback):
 
     @staticmethod
     def _unwrap_peft(model):
-        """Navigate PeftModel → LoraModel → GraphAugmentedLLM / AugmentedGraphLLM."""
+        """Navigate PeftModel → LoraModel → GraphAugmentedLLM / CompositeGraphLLM."""
         inner = model
         if hasattr(inner, 'base_model'):
             inner = inner.base_model
@@ -137,7 +137,7 @@ class GradientDebugCallback(TrainerCallback):
 
     @staticmethod
     def _is_augmented(inner):
-        """True for the M4–M9 ``AugmentedGraphLLM`` (``gt_model`` + M7 ``injection``)."""
+        """True for the M4–M9 ``CompositeGraphLLM`` (``gt_model`` + M7 ``injection``)."""
         return hasattr(inner, "gt_model") and hasattr(inner, "injection")
 
     @staticmethod
@@ -187,7 +187,7 @@ class GradientDebugCallback(TrainerCallback):
         inner._augment_embeddings = _wrapped_augment
 
     def _install_augmented_hooks(self, inner):
-        """AugmentedGraphLLM: GT output (Y) norm + ``_fuse_embeddings`` wrap.
+        """CompositeGraphLLM: GT output (Y) norm + ``_fuse_embeddings`` wrap.
 
         The GT output ``Y`` is the structural signal the M7 gate scales into the
         LLM, so its magnitude (and any NaN) is the analogue of the legacy
@@ -237,7 +237,7 @@ class GradientDebugCallback(TrainerCallback):
         )
 
         if self._is_augmented(inner):
-            # AugmentedGraphLLM: GraphTransformer (R-PEARL + blocks) + M7 gate.
+            # CompositeGraphLLM: GraphTransformer (R-PEARL + blocks) + M7 gate.
             gt = inner.gt_model
             self._captured_grad_norms["gt"] = self._grad_norm(gt.parameters())
             self._captured_grad_norms["rpearl"] = self._grad_norm(gt.pe_model.parameters())
@@ -270,7 +270,7 @@ class GradientDebugCallback(TrainerCallback):
         g = self._captured_grad_norms
 
         if self._is_augmented(inner):
-            # AugmentedGraphLLM (augmented_graph_gt): R-PEARL + GT + M7 gate.
+            # CompositeGraphLLM (composite_graph_gt): R-PEARL + GT + M7 gate.
             metrics = {
                 "debug/grad_norm_lora": g.get("lora", 0.0),
                 "debug/grad_norm_gt": g.get("gt", 0.0),
@@ -310,7 +310,7 @@ class GradientDebugCallback(TrainerCallback):
 
 
 class AugGraphDebugCallback(TrainerCallback):
-    """M11 — log augmented-graph diagnostics for the ``augmented_graph_gt`` model.
+    """M11 — log composite-graph diagnostics for the ``composite_graph_gt`` model.
 
     Logs to W&B (E3/R6):
       - ``aug_graph/fiedler``     — λ₂ of the augmented Laplacian (sparse LOBPCG /
@@ -326,9 +326,9 @@ class AugGraphDebugCallback(TrainerCallback):
     Path metrics (M10) are logged separately by ``EvalCallback``.
 
     Styled after ``GradientDebugCallback``: lightweight hooks capture the last
-    augmented graph and the gated contribution during forward; ``on_log`` computes
+    composite graph and the gated contribution during forward; ``on_log`` computes
     the (sparse) spectral quantities and logs. Only active for a model exposing
-    the M7 ``injection`` gate (i.e. ``AugmentedGraphLLM``); a no-op otherwise.
+    the M7 ``injection`` gate (i.e. ``CompositeGraphLLM``); a no-op otherwise.
     """
 
     def __init__(self, enable_visualizer: bool = False, visualizer_dir: str | None = None):
@@ -341,7 +341,7 @@ class AugGraphDebugCallback(TrainerCallback):
 
     @staticmethod
     def _unwrap_peft(model):
-        """Navigate PeftModel → LoraModel → AugmentedGraphLLM (which owns ``injection``)."""
+        """Navigate PeftModel → LoraModel → CompositeGraphLLM (which owns ``injection``)."""
         inner = model
         if hasattr(inner, "base_model"):
             inner = inner.base_model
@@ -355,16 +355,16 @@ class AugGraphDebugCallback(TrainerCallback):
         callback = self
         inner = self._unwrap_peft(model)
 
-        # Hook 1: capture the last per-sample augmented graph so on_log can compute
+        # Hook 1: capture the last per-sample composite graph so on_log can compute
         # Fiedler / scene-mass without duplicating the M4 build.
-        orig_aug = inner._augmented_graph
+        orig_aug = inner._composite_graph
 
         def _wrapped_aug(scene, injection_map, c, device, permutation=None):
             aug = orig_aug(scene, injection_map, c, device, permutation=permutation)
             callback._last_aug = aug
             return aug
 
-        inner._augmented_graph = _wrapped_aug
+        inner._composite_graph = _wrapped_aug
 
         # Hook 2: contrib_ratio = ‖gate·Y[V_Tx]‖ / ‖X‖ from the gate's own inputs
         # (GatedInjection.forward(X, Y_tx)).
@@ -406,7 +406,7 @@ class AugGraphDebugCallback(TrainerCallback):
                     print(f"[M11] scene_mass computation failed: {type(e).__name__}: {e}")
             wandb.log(metrics, step=state.global_step)
 
-        # M12: one-shot augmented-graph + spectral-clustering render on the first
+        # M12: one-shot composite-graph + spectral-clustering render on the first
         # logging step after a graph is captured, when enabled.
         if self._enable_visualizer and not self._visualized and aug is not None:
             self._visualized = True

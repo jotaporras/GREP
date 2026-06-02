@@ -122,7 +122,7 @@ class _SafeBatchedSparseAttn(torch.autograd.Function):
     Both the forward and backward loop over heads. The previous forward batched
     all heads into one ``(H*N, H*N)`` block-diagonal ``sampled_addmm``; that
     materialised H copies of the N×N sparsity pattern (and H times the score
-    nnz), an H-fold memory blow-up that OOMs on the augmented graph, where
+    nnz), an H-fold memory blow-up that OOMs on the composite graph, where
     N = token-cycle length ≈ thousands. Looping caps peak memory at a single
     head's N×N pattern plus one ``[N, F_head]`` fp32 working copy.
 
@@ -312,9 +312,12 @@ class GraphTransformer(nn.Module):
         self.heads = heads
         self.num_layers = num_layers
         self.d_model = d_model
-        # R-PEARL readout fed into the M6 fusion: "mean" = first moment E_q[Φ(q)]
-        # (default), "second_moment" = C @ X for C = E_q[Φ(q)Φ(q)ᵀ]. See
-        # RandomGNNPositionalEncodings.second_moment_apply.
+        # R-PEARL readout fed into the M6 fusion:
+        #   "mean"          : H0 = X_full + Ψ,  Ψ = E_q[Φ(q)]   (first moment)
+        #   "second_moment" : H0 = seeded + C·seeded, seeded = [X on token ; Ψ on scene],
+        #                     C = E_q[Φ(q)Φ(q)ᵀ] applied over the full composite graph
+        #                     (the proof's circulant c(n-m)); see
+        #                     RandomGNNPositionalEncodings.second_moment_apply.
         self.pe_readout = pe_readout
 
         # Set up R-PEARL Positional Encoder, Transformer Blocks, and Output Lipschitz Normalizer.
@@ -393,16 +396,21 @@ class GraphTransformer(nn.Module):
         else:
             pe_data = data
 
-        # M6 input fusion. X_full carries the token embeddings on the directed-
-        # cycle (token) nodes and zeros on the scene nodes; no gate here — the M7
-        # gate sits at the LLM input (see gated_injection.GatedInjection).
-        #   pe_readout="mean"           : H0 = X_full + Ψ,  Ψ = E_q[Φ(q)]  (first moment)
-        #   pe_readout="second_moment"  : H0 = X_full + C·X_full,  C = E_q[Φ(q)Φ(q)ᵀ]
-        # The second moment carries relative position that the first moment (which
-        # collapses to a node-constant on the vertex-transitive cycle) cannot.
+        # M6 input fusion. No gate here — the M7 gate sits at the LLM input (see
+        # gated_injection.GatedInjection).
+        #   pe_readout="mean"          : H0 = X_full + Ψ, Ψ = E_q[Φ(q)] (first moment;
+        #                                X_full = token embeddings on cycle rows, 0 on scene).
+        #   pe_readout="second_moment" : H0 = seeded + C·seeded, where
+        #                                seeded = [X on token rows ; Ψ_scene on scene rows]
+        #                                and C = E_q[Φ(q)Φ(q)ᵀ] is the relative-position
+        #                                operator (proof's c(n-m)) applied over the entire
+        #                                composite graph (C·seeded = E_q[Φ(Φᵀ seeded)], C
+        #                                never formed). Tokens get the second moment (the
+        #                                first moment collapses on the vertex-transitive
+        #                                cycle); scene rows carry their first-moment PE so
+        #                                scene–scene structure propagates through C.
         if token_embeddings is None:
-            # Legacy pure-PE-generator path (rpearl_gt_llm): no token signal to
-            # apply C to, so always use the first moment here.
+            # Legacy pure-PE-generator path (rpearl_gt_llm): first moment is the PE.
             x = self.pe_model(pe_data)
         else:
             num_nodes = pe_data.x.size(0)
@@ -410,7 +418,13 @@ class GraphTransformer(nn.Module):
             rows = slice(0, token_embeddings.shape[0]) if is_token is None else is_token
             x_full[rows] = token_embeddings.to(device=device, dtype=torch.float32)
             if self.pe_readout == "second_moment":
-                x = x_full + self.pe_model.second_moment_apply(pe_data, x_full)
+                psi = self.pe_model(pe_data)              # first moment Ψ ∈ [N, d_model]
+                seeded = x_full.clone()
+                if is_token is not None:
+                    # scene rows ← first-moment Ψ; token rows stay the verbal embeddings X
+                    seeded[~is_token] = psi[~is_token]
+                cx = self.pe_model.second_moment_apply(pe_data, seeded)  # C·seeded
+                x = seeded + cx.to(seeded.dtype)          # H0 = seeded + C·seeded
             else:
                 x = x_full + self.pe_model(pe_data)
 
@@ -426,7 +440,7 @@ class GraphTransformer(nn.Module):
         # embeddings are supplied (the M6 fusion path). Training already runs the
         # GT under a bf16 autocast, but eval/generate has no autocast, so the GT
         # would otherwise hold the dense [N, 4096] attention/FFN activations in
-        # fp32 — on the augmented graph (N = token-cycle length ≈ thousands) that
+        # fp32 — on the composite graph (N = token-cycle length ≈ thousands) that
         # OOMs. The fp32-only sparse score op casts locally (see
         # _SafeBatchedSparseAttn._head_attn), so only the dense projections/FFN
         # drop to bf16. The legacy PE-generator path (token_embeddings is None)

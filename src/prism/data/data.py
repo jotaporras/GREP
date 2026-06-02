@@ -71,7 +71,7 @@ def preprocess_dataset(
     
     ds = ds.map(lambda e: {"messages": e["conversations"]})
 
-    if architecture in ("rpearl_llm", "rpearl_gt_llm", "augmented_graph_gt"):
+    if architecture in ("rpearl_llm", "rpearl_gt_llm", "composite_graph_gt"):
         ds = ds.map(_parse_scene_graph)
     if text_edge_list == "none":
         def _strip_edges(example):
@@ -140,7 +140,7 @@ class SpineDataCollator(DataCollatorForLanguageModeling):
         # Scope injection to the last (query) graph block, matching eval
         # (GraphAugmentedInMemoryLLM) and R10. Without this, training cross-links
         # the query graph's labels to their mentions across the *whole* prompt —
-        # including the ICL examples — so the augmented-graph structure the model
+        # including the ICL examples — so the composite-graph structure the model
         # learns diverges from the scoped structure it sees at inference (and the
         # gap widens with more ICL examples).
         scope_start = find_last_graph_scope(example["input_ids"], self.tokenizer)

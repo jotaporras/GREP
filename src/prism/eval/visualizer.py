@@ -1,6 +1,6 @@
-"""M12 — visualize the augmented graph and its spectral clustering (R10).
+"""M12 — visualize the composite graph and its spectral clustering (R10).
 
-Two artifacts for a single augmented graph (from M4):
+Two artifacts for a single composite graph (from M4):
   1. an interactive vis.js HTML laying out the two layers — token (directed
      cycle) nodes vs. scene nodes — with cross-links highlighted;
   2. a spectral-clustering PNG coloring nodes by the Fiedler vector of the
@@ -36,7 +36,7 @@ def _import_scripts():
 
 
 def _subsample(aug, max_cycle: int = 80):
-    """Reduce the augmented graph for legible rendering.
+    """Reduce the composite graph for legible rendering.
 
     Keeps every scene node and every cross-linked token node, plus a strided
     sample of the remaining cycle for context. Returns the kept global ids, a
@@ -112,8 +112,8 @@ def _subsample(aug, max_cycle: int = 80):
     return keep, remap, node_is_token, edges, pos, c
 
 
-def render_augmented_graph_html(aug, out_path: str, max_cycle: int = 80, source: str = None) -> str:
-    """Write the interactive augmented-graph HTML (reuses render_scene_graph's vis.js shell)."""
+def render_composite_graph_html(aug, out_path: str, max_cycle: int = 80, source: str = None) -> str:
+    """Write the interactive composite-graph HTML (reuses render_scene_graph's vis.js shell)."""
     import json
     rsg, _ = _import_scripts()
     keep, remap, node_is_token, edges, pos, c = _subsample(aug, max_cycle)
@@ -147,13 +147,13 @@ def render_augmented_graph_html(aug, out_path: str, max_cycle: int = 80, source:
     for a, b in edges["clique"]:      # same-label multi-mention clique (E2b) — purple
         vis_edges.append({"from": a, "to": b, "color": {"color": "#9b59b6", "highlight": "#6c3483"}, "width": 0.8})
 
-    source_label = f"augmented graph (M4) — source: {source}" if source else "augmented graph (M4)"
+    source_label = f"composite graph (M4) — source: {source}" if source else "composite graph (M4)"
     html = rsg.HTML_TEMPLATE.format(
-        title="Augmented Graph", source_file=source_label,
+        title="Composite Graph", source_file=source_label,
         n_nodes=len(keep), n_edges=len(vis_edges), robot_location="—",
         vis_nodes=json.dumps(vis_nodes), vis_edges=json.dumps(vis_edges),
     )
-    # Relabel the reused legend to the augmented-graph layers + edge classes.
+    # Relabel the reused legend to the composite-graph layers + edge classes.
     html = (html.replace("</div> Region", "</div> Token node (cycle)")
                 .replace("</div> Object", "</div> Scene node")
                 .replace("Robot start (",
@@ -221,7 +221,7 @@ def render_spectral_clustering(aug, out_path: str, max_cycle: int = 80, source: 
     ax.legend(handles=[Line2D([0], [0], color=col, lw=2, label=name)
                        for name, (col, _w, _a) in _EDGE_STYLE.items()],
               loc="upper left", fontsize=8, title="edge type")
-    ax.set_title("Augmented graph — spectral clustering (Fiedler) + colored edges", fontsize=11)
+    ax.set_title("Composite graph — spectral clustering (Fiedler) + colored edges", fontsize=11)
     ax.axis("off")
     if source:
         fig.text(0.5, 0.01, f"source: {source}", ha="center", fontsize=8, color="#555")
@@ -231,7 +231,7 @@ def render_spectral_clustering(aug, out_path: str, max_cycle: int = 80, source: 
 
 
 def visualize(aug, out_dir: str, config=None, source: str = None) -> Dict[str, str]:
-    """M12 entry point: write both artifacts for one augmented graph.
+    """M12 entry point: write both artifacts for one composite graph.
 
     ``source`` is an optional provenance label (e.g. the scene-graph file or
     checkpoint) stamped onto both artifacts. Returns paths {"html",
@@ -239,7 +239,7 @@ def visualize(aug, out_dir: str, config=None, source: str = None) -> Dict[str, s
     (see callbacks.AugGraphDebugCallback).
     """
     os.makedirs(out_dir, exist_ok=True)
-    html = render_augmented_graph_html(aug, os.path.join(out_dir, "augmented_graph.html"), source=source)
-    png = render_spectral_clustering(aug, os.path.join(out_dir, "augmented_graph_spectral.png"), source=source)
+    html = render_composite_graph_html(aug, os.path.join(out_dir, "composite_graph.html"), source=source)
+    png = render_spectral_clustering(aug, os.path.join(out_dir, "composite_graph_spectral.png"), source=source)
     print(f"[M12] visualizer wrote: {html} , {png}")
     return {"html": html, "spectral_png": png}

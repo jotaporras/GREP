@@ -135,8 +135,8 @@ def graph_augmented_llm_from_pretrained(
         model.pe_proj.load_state_dict(gnn_weights["pe_proj"])
         if "pe_gain" in gnn_weights:
             model.pe_gain.data.copy_(gnn_weights["pe_gain"])
-    elif architecture == "augmented_graph_gt":
-        # M9 augmented-graph assembly: Graph Transformer (R-PEARL inside) + M7 gate
+    elif architecture == "composite_graph_gt":
+        # M9 composite-graph assembly: Graph Transformer (R-PEARL inside) + M7 gate
         # over a RoPE-disabled LLM. Rebuild from gnn_config and load the saved weights.
         gt_model = gt_module.GraphTransformer(
             num_layers=gnn_cfg["gt_num_layers"],
@@ -157,7 +157,7 @@ def graph_augmented_llm_from_pretrained(
             spectral_norm_linears=False,  # M6 fusion path (token embeddings fused)
             pe_readout=gnn_cfg.get("pe_readout", "mean"),
         )
-        model = gnn_llm.AugmentedGraphLLM(
+        model = gnn_llm.CompositeGraphLLM(
             llm, gt_model, d_model=gnn_cfg["d_model"],
             gate_init=gnn_cfg.get("gate_init", 0.0),
             gate_per_dim=gnn_cfg.get("gate_per_dim", False),
