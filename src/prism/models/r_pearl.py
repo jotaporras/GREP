@@ -110,7 +110,7 @@ class RandomGNNPositionalEncodings(nn.Module):
 
     def _batched_gcn_forward(self, Q: torch.Tensor, edge_index: torch.Tensor,
                              num_nodes: int, m: int, edge_weight: torch.Tensor = None,
-                             device=None) -> torch.Tensor:
+                             device=None, pool: bool = True) -> torch.Tensor:
         """Process all m random samples through the GCN in a single batched call.
 
         Creates m copies of the graph, each with a different random feature column,
@@ -146,8 +146,12 @@ class RandomGNNPositionalEncodings(nn.Module):
         pe_all = self.dropout(pe_all)
         pe_all = self.output_projection(pe_all) * self._dim_scale
 
-        # Reshape [m*N, d_model] -> [m, N, d_model] and mean-pool over samples.
+        # Reshape [m*N, d_model] -> [m, N, d_model].
         pe_all = pe_all.view(m, num_nodes, -1)
+        if not pool:
+            # Per-probe responses Φ(q^(s)); the second-moment readout needs these
+            # un-pooled (the first-moment readout means over them, below).
+            return pe_all
         pooled_pe = pe_all.mean(dim=0)
         return pooled_pe
 
@@ -213,4 +217,78 @@ class RandomGNNPositionalEncodings(nn.Module):
 
         pooled_pe = self.norm(pooled_pe)
         return pooled_pe
+
+    def second_moment_apply(self, data, signal: torch.Tensor) -> torch.Tensor:
+        """Second-moment readout: return ``C @ signal`` for ``C = E_q[Φ(q) Φ(q)ᵀ]``.
+
+        This is the only quantity that differs from ``forward``. Where ``forward``
+        returns the first moment ``E_q[Φ(q)]`` (which is permutation-equivariant
+        and collapses to a node-constant on the vertex-transitive sequence cycle),
+        this returns the probe **second moment** applied to a signal — the object
+        that carries relative position (the bilinear ``q_nᵀ k_m``). The N×N matrix
+        ``C`` is never formed; associativity gives
+
+            C @ s = E_q[ Φ(q) ( Φ(q)ᵀ s ) ].
+
+        Probe sampling, chunking, fixed-seed determinism and gradient checkpointing
+        mirror ``forward`` exactly, so the two readouts share all R7 semantics; only
+        the pooled statistic changes. Activated by ``pe_readout="second_moment"``.
+
+        Args:
+            data: PyG Data carrying the (already-permuted, if any) augmented-graph
+                edges and edge weights, exactly as ``forward`` consumes.
+            signal: [N, d_model] node signal to apply ``C`` to (the GT's ``X_full``
+                — token embeddings on V_Tx rows, zeros on V_Sc).
+
+        Returns:
+            ``C @ signal`` in [N, d_model], LipschitzNorm-normalized like ``forward``.
+        """
+        try:
+            device = next(self.parameters()).device
+        except StopIteration:
+            device = data.x.device
+        data.x = data.x.to(device)
+        data.edge_index = data.edge_index.to(device)
+        edge_index = data.edge_index
+        edge_weight = getattr(data, "edge_weight", None)
+        if edge_weight is not None:
+            edge_weight = edge_weight.to(device)
+        num_nodes = data.x.shape[0]
+        # The GCN runs in fp32; operate the whole second moment in fp32.
+        s = signal.to(device=device, dtype=torch.float32)
+
+        m = self.m_train if self.training else self.m_test
+        generator = None
+        if self.fixed_seed_mode:
+            generator = torch.Generator(device=device)
+            generator.manual_seed(self.fixed_seed_value)
+        Q = self._sample_probes(num_nodes, m, device, generator)
+        chunk = max(1, min(m, self.max_probe_rows // max(1, num_nodes)))
+
+        def _chunk_apply(Qc, ei, _dummy=None):
+            mc = Qc.shape[1]
+            # Per-probe responses P_s = Φ(q^(s)) ∈ [N, d] (pool=False keeps them
+            # un-meaned); accumulate Σ_s P_s (P_sᵀ s) so the [d, d] inner product
+            # is the only dense intermediate — never an N×N matrix.
+            P = self._batched_gcn_forward(
+                Qc, ei, num_nodes, mc, edge_weight=edge_weight, device=device, pool=False
+            )  # [mc, N, d]
+            out = None
+            for si in range(P.shape[0]):
+                Ps = P[si]                                   # [N, d]
+                contrib = Ps @ (Ps.transpose(0, 1) @ s)      # [N, d] @ ([d, N] @ [N, d])
+                out = contrib if out is None else out + contrib
+            return out
+
+        acc = None
+        for start in range(0, m, chunk):
+            Qc = Q[:, start:start + chunk]
+            if torch.is_grad_enabled():
+                dummy = Qc.new_ones(1, requires_grad=True)
+                contrib = checkpoint(_chunk_apply, Qc, edge_index, dummy, use_reentrant=False)
+            else:
+                contrib = _chunk_apply(Qc, edge_index)
+            acc = contrib if acc is None else acc + contrib
+        result = acc / m
+        return self.norm(result)
 

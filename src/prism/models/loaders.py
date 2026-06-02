@@ -155,6 +155,7 @@ def graph_augmented_llm_from_pretrained(
             fixed_seed_mode=gnn_cfg.get("fixed_seed_mode", False),
             fixed_seed_value=gnn_cfg.get("fixed_seed_value", 0),
             spectral_norm_linears=False,  # M6 fusion path (token embeddings fused)
+            pe_readout=gnn_cfg.get("pe_readout", "mean"),
         )
         model = gnn_llm.AugmentedGraphLLM(
             llm, gt_model, d_model=gnn_cfg["d_model"],

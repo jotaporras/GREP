@@ -141,26 +141,45 @@ class GatedInjection(nn.Module):
         by the structural output — at ``gate=0`` the LLM sees clean Llama
         embeddings, and structure ramps in as the gate grows.
       - ``"additive"``: ``inputs_embeds = X + gate * Y``.
+      - ``"none"``: ``inputs_embeds = Y`` — the Graph Transformer output is fed
+        straight to the LLM with **no gate and no mixing of the token embeddings
+        X**. There is no learnable gate in this mode; the LLM must consume the
+        structural representation directly. Pairing it with a LoRA warmup (the
+        LLM frozen for the first N optimizer steps, see ``LoraWarmupCallback``)
+        lets the GT learn to emit an LLM-consumable representation before the
+        adapters start adapting to it. ``gate`` is registered as a fixed
+        non-trainable buffer of 1.0 so the M11 diagnostics
+        (``grep/structural_gate``, ``grep/contrib_ratio``) keep reading sensibly.
 
     No RoPE or positional transform is applied here (the LLM is RoPE-disabled, M8).
 
     Args:
         d_model (int): Embedding width (only used for ``gate_per_dim``).
-        gate_init (float): Initial gate value (≈0 cold-start, R6).
-        gate_per_dim (bool): Per-feature gate vector instead of a scalar.
-        injection_mode (str): "interpolate" (default) or "additive".
+        gate_init (float): Initial gate value (≈0 cold-start, R6). Ignored when
+            ``injection_mode == "none"``.
+        gate_per_dim (bool): Per-feature gate vector instead of a scalar. Ignored
+            when ``injection_mode == "none"``.
+        injection_mode (str): "interpolate" (default), "additive", or "none".
     """
 
     def __init__(self, d_model: int, gate_init: float = 0.0,
                  gate_per_dim: bool = False, injection_mode: str = "interpolate"):
         super().__init__()
-        if injection_mode not in ("interpolate", "additive"):
+        if injection_mode not in ("interpolate", "additive", "none"):
             raise ValueError(
-                f"injection_mode must be 'interpolate' or 'additive', got {injection_mode!r}"
+                "injection_mode must be 'interpolate', 'additive', or 'none', "
+                f"got {injection_mode!r}"
             )
         self.injection_mode = injection_mode
-        gate_shape = (d_model,) if gate_per_dim else ()
-        self.gate = nn.Parameter(torch.full(gate_shape, float(gate_init)))
+        if injection_mode == "none":
+            # No learnable gate: the GT output replaces X outright. Keep a fixed
+            # gate=1.0 buffer (not a Parameter) so callbacks/optimizer code that
+            # reads ``injection.gate`` still works and reports the true full-strength
+            # injection (contrib_ratio = ‖Y‖/‖X‖) without adding a trainable param.
+            self.register_buffer("gate", torch.tensor(1.0))
+        else:
+            gate_shape = (d_model,) if gate_per_dim else ()
+            self.gate = nn.Parameter(torch.full(gate_shape, float(gate_init)))
 
     def forward(self, X: torch.Tensor, Y_tx: torch.Tensor) -> torch.Tensor:
         """Combine token embeddings X with the gated GT token-node outputs Y[V_Tx].
@@ -172,6 +191,9 @@ class GatedInjection(nn.Module):
         Returns:
             inputs_embeds [c, d] for the LLM.
         """
+        if self.injection_mode == "none":
+            # Feed the GT output straight through: no gate, no mixing with X.
+            return Y_tx
         gate = self.gate
         if self.injection_mode == "interpolate":
             return (1 - gate) * X + gate * Y_tx

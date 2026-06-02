@@ -300,14 +300,22 @@ class GraphTransformer(nn.Module):
                  eps: float = 1e-8, use_layer_norm: bool = True,
                  probe_distribution: str = "gaussian", m_test: int = None,
                  fixed_seed_mode: bool = False, fixed_seed_value: int = 0,
-                 spectral_norm_linears: bool = True):
+                 spectral_norm_linears: bool = True, pe_readout: str = "mean"):
         super().__init__()
+        if pe_readout not in ("mean", "second_moment"):
+            raise ValueError(
+                f"pe_readout must be 'mean' or 'second_moment', got {pe_readout!r}"
+            )
 
         # Register preliminary information.
         self.k_hops = k_gt
         self.heads = heads
         self.num_layers = num_layers
         self.d_model = d_model
+        # R-PEARL readout fed into the M6 fusion: "mean" = first moment E_q[Φ(q)]
+        # (default), "second_moment" = C @ X for C = E_q[Φ(q)Φ(q)ᵀ]. See
+        # RandomGNNPositionalEncodings.second_moment_apply.
+        self.pe_readout = pe_readout
 
         # Set up R-PEARL Positional Encoder, Transformer Blocks, and Output Lipschitz Normalizer.
         # spectral_norm_linears is disabled by the M6 fusion path (token embeddings
@@ -385,21 +393,26 @@ class GraphTransformer(nn.Module):
         else:
             pe_data = data
 
-        # R-PEARL positional encoding Ψ over the augmented graph.
-        psi = self.pe_model(pe_data)  # [N, d_model]
-
-        # M6 input fusion: H0 = X_full + Ψ, where X_full carries the token
-        # embeddings on the directed-cycle (token) nodes and zeros on the scene
-        # nodes. No gate here — the M7 gate sits at the LLM input (see
-        # gated_injection.GatedInjection). When no token embeddings are supplied
-        # the module behaves as a pure PE generator (legacy rpearl_gt_llm path).
+        # M6 input fusion. X_full carries the token embeddings on the directed-
+        # cycle (token) nodes and zeros on the scene nodes; no gate here — the M7
+        # gate sits at the LLM input (see gated_injection.GatedInjection).
+        #   pe_readout="mean"           : H0 = X_full + Ψ,  Ψ = E_q[Φ(q)]  (first moment)
+        #   pe_readout="second_moment"  : H0 = X_full + C·X_full,  C = E_q[Φ(q)Φ(q)ᵀ]
+        # The second moment carries relative position that the first moment (which
+        # collapses to a node-constant on the vertex-transitive cycle) cannot.
         if token_embeddings is None:
-            x = psi
+            # Legacy pure-PE-generator path (rpearl_gt_llm): no token signal to
+            # apply C to, so always use the first moment here.
+            x = self.pe_model(pe_data)
         else:
-            x_full = torch.zeros_like(psi)
+            num_nodes = pe_data.x.size(0)
+            x_full = torch.zeros(num_nodes, self.d_model, device=device, dtype=torch.float32)
             rows = slice(0, token_embeddings.shape[0]) if is_token is None else is_token
-            x_full[rows] = token_embeddings.to(device=psi.device, dtype=psi.dtype)
-            x = x_full + psi
+            x_full[rows] = token_embeddings.to(device=device, dtype=torch.float32)
+            if self.pe_readout == "second_moment":
+                x = x_full + self.pe_model.second_moment_apply(pe_data, x_full)
+            else:
+                x = x_full + self.pe_model(pe_data)
 
         # Precompute k-hop neighborhood diffusions.
         if permutation is not None:

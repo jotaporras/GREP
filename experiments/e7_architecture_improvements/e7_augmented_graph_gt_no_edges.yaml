@@ -45,15 +45,22 @@ probe_distribution: gaussian
 m_test: 128
 fixed_seed_mode: false  # Switch
 fixed_seed_value: 0
+# R-PEARL readout fed to the GT: 'mean' = first moment E_q[Phi(q)] (collapses to a
+# node-constant on the vertex-transitive sequence cycle, so position is lost);
+# 'second_moment' = C @ X for C = E_q[Phi(q) Phi(q)^T], which carries the relative
+# position (the q_n^T k_m bilinear) the first moment averages away.
+pe_readout: second_moment  # Switch
 # Gated injection
-injection_mode: interpolate   # inputs_embeds = (1-gate)*X + gate*Y
-gate_init: 1.0                # 100% structural: the LLM sees the GT output Y (= X+Ψ, refined) only,
-                              # not the raw token embeddings X — forces full reliance on the PE
-gate_per_dim: false
-# Structural-path optimization (R6): boost the GT/R-PEARL/gate LR (their grads ran
-# ~1e-5 vs LoRA ~1-3 at a shared LR), and let structure learn first by freezing LoRA early.
+injection_mode: none       # inputs_embeds = Y: the Graph Transformer output is fed straight to the LLM
+                           # with NO gate and NO mixing of the token embeddings X. The LLM must consume
+                           # the structural representation directly; lora_warmup_steps keeps the LLM
+                           # frozen long enough for the GT to learn an LLM-consumable representation
+                           # first (X still seeds the GT cycle nodes, so token content is not lost).
+gate_init: 0.3             # unused in 'none' mode (no learnable gate); kept for reload compatibility
+gate_per_dim: false        # unused in 'none' mode
 structural_lr_mult: 20.0
-lora_warmup_steps: 40
+lora_warmup_steps: 200     # freeze the LLM/LoRA for the first 200 optimizer steps so the GT shapes its
+                           # output before the adapters adapt to it ('a good number of samples')
 # LLM
 disable_rope: true
 n_icl_examples: 2       # Switch

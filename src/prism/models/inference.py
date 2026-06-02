@@ -6,7 +6,35 @@ import torch
 
 from prism.data import utils
 from prism.data.data import remove_edge_list
-from prism.models.gnn_llm import AugmentedGraphLLM, build_injection_map, find_last_graph_scope
+from prism.models.gnn_llm import (
+    AugmentedGraphLLM,
+    GraphAugmentedLLM,
+    build_injection_map,
+    find_last_graph_scope,
+)
+
+
+def _core_graph_model(model):
+    """Peel PEFT wrappers to the AugmentedGraphLLM / GraphAugmentedLLM core.
+
+    The eval model is loaded PEFT-wrapped (PeftModel -> LoraModel -> graph model),
+    so ``isinstance(model, AugmentedGraphLLM)`` is False on the wrapper and the
+    wrong injection branch runs (then fails on a missing ``pe_proj``). Unwrap to
+    the underlying graph model first. The LoRA adapters live inside the graph
+    model's ``.llm`` submodule (PEFT patches it in place), so calling the core's
+    methods/``.llm`` still runs the adapted LLM.
+    """
+    inner = model
+    for _ in range(5):
+        if isinstance(inner, (AugmentedGraphLLM, GraphAugmentedLLM)):
+            return inner
+        nxt = getattr(inner, "base_model", None)
+        if nxt is None or nxt is inner:
+            nxt = getattr(inner, "model", None)
+        if nxt is None or nxt is inner:
+            break
+        inner = nxt
+    return inner
 
 
 class InMemoryLLM:
@@ -137,8 +165,12 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
         robot_loc = pyg_graphs[-1].robot_location if pyg_graphs else None
         print(f"[spine-llm] graph_found={bool(pyg_graphs)}, n_graphs={len(pyg_graphs)}, robot_location={robot_loc}")
 
+        # Unwrap any PEFT wrapper to the graph model so attribute access and the
+        # architecture branch below hit the real model, not the PeftModel shell.
+        graph_model = _core_graph_model(self.model)
+
         if not pyg_graphs:
-            outputs = self.model.llm.generate(
+            outputs = graph_model.llm.generate(
                 input_ids=input_ids, attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens, use_cache=True, temperature=0.01, min_p=0.1,
                 pad_token_id=self.tokenizer.eos_token_id,
@@ -147,7 +179,7 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
 
         # Compute base embeddings once
         embeddings = (
-            self.model.llm.get_input_embeddings()(input_ids)
+            graph_model.llm.get_input_embeddings()(input_ids)
             .clone()
             .to(input_ids.device)
         )
@@ -168,27 +200,27 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
 
         injection_map = build_injection_map(input_ids_list, node_token_seqs, scope_start=scope_start)
 
-        if isinstance(self.model, AugmentedGraphLLM):
+        if isinstance(graph_model, AugmentedGraphLLM):
             # M9: assemble the augmented graph (cycle + scene + cross-links) from the
             # last graph's scene PyG + scoped injection map, run M4→M6→M7, and feed
             # the fused token embeddings to the RoPE-disabled LLM.
-            inputs_embeds = self.model._fuse_embeddings(
+            inputs_embeds = graph_model._fuse_embeddings(
                 input_ids, [pyg_graph], [injection_map], permutation=self.permutation)
-            return self.model.llm.generate(
+            return graph_model.llm.generate(
                 inputs_embeds=inputs_embeds, attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens, use_cache=True, temperature=0.01, min_p=0.1,
                 pad_token_id=self.tokenizer.eos_token_id,
             )
 
-        pe = self.model.pe_proj(self.model.pe_model(pyg_graph, permutation=self.permutation))  # [n, hidden_size]
-        pe = pe * self.model.pe_gain
+        pe = graph_model.pe_proj(graph_model.pe_model(pyg_graph, permutation=self.permutation))  # [n, hidden_size]
+        pe = pe * graph_model.pe_gain
 
         for node_idx, spans in injection_map.items():
             for start, end in spans:
                 end = min(end, input_ids.shape[1])
                 embeddings[0, start:end] = embeddings[0, start:end] + pe[node_idx]
 
-        return self.model.llm.generate(
+        return graph_model.llm.generate(
             inputs_embeds=embeddings, attention_mask=attention_mask,
             max_new_tokens=max_new_tokens, use_cache=True, temperature=0.01, min_p=0.1,
             pad_token_id=self.tokenizer.eos_token_id,

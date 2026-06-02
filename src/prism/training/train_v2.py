@@ -328,6 +328,10 @@ class TrainConfig:
     m_test: int = 128
     fixed_seed_mode: bool = False
     fixed_seed_value: int = 0
+    # R-PEARL readout fed to the GT (augmented_graph_gt only): "mean" = first
+    # moment E_q[Φ(q)] (default); "second_moment" = C @ X for C = E_q[Φ(q)Φ(q)ᵀ],
+    # which carries the relative position the first moment collapses away.
+    pe_readout: str = "mean"
     # Gated injection
     injection_mode: str = "interpolate"
     gate_init: float = 0.0
@@ -557,6 +561,7 @@ def train_model(config: TrainConfig, config_file: str = None):
             # Token embeddings are fused (M6) -> the X-carrying GT path is not
             # spectrally normalized (only the PE-side R-PEARL projection is).
             spectral_norm_linears=False,
+            pe_readout=config.pe_readout,
         )
         model = gnn_llm.AugmentedGraphLLM(
             llm, gt_model, d_model=config.d_model,
@@ -707,7 +712,7 @@ def train_model(config: TrainConfig, config_file: str = None):
                 "fixed_seed_mode": config.fixed_seed_mode, "fixed_seed_value": config.fixed_seed_value,
                 "injection_mode": config.injection_mode, "gate_init": config.gate_init,
                 "gate_per_dim": config.gate_per_dim, "disable_rope": config.disable_rope,
-                "structural_lr_mult": config.structural_lr_mult,
+                "structural_lr_mult": config.structural_lr_mult, "pe_readout": config.pe_readout,
                 "cycle_weight": config.cycle_weight, "cycle_directed": config.cycle_directed,
                 "crosslink_weight": config.crosslink_weight,
                 "crosslink_mention_to_node": config.crosslink_mention_to_node,
