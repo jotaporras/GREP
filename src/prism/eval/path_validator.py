@@ -9,11 +9,21 @@ Two layers:
    ``start_goal_ok``, ``cost_optimality`` (emitted weighted cost ÷ shortest path
    by ``distance_m``). Malformed/empty input is invalid, never raises.
 
-2. **LLM judge (conditional).** When — and only when — a task carries an
-   ``acceptance_criterion`` in the dataset JSON, an LLM-as-judge (Gemma E2B,
-   ``GEMMA_JUDGE_MODEL``) grades the response against that rubric. If no
-   ``acceptance_criterion`` is present, the judge is skipped and the verdict
-   rests on the regex/NetworkX metrics above (per the project decision).
+2. **LLM judge (separate, subjective score).** When a task carries an
+   ``acceptance_criterion`` (or is a yes/no task), an LLM-as-judge (Gemma 4 E2B,
+   ``GEMMA_JUDGE_MODEL``, default ``google/gemma-4-E2B-it``) grades the response
+   against that rubric. For acceptance_criterion tasks the judge runs *every*
+   evaluation turn (validation and test). The judge score and the RegEx score are
+   kept **completely separate** — computed from disjoint inputs, neither reading the
+   other: the RegEx/NetworkX accuracy is judge-free, and the *subjective* accuracy is
+   the judge's verdict over judged samples only. Relative to the objective baseline
+   the judge moves the subjective column only — it LOWERS it on a false positive
+   (RegEx correct, judge wrong) and RAISES it on a false negative (RegEx wrong, judge
+   correct). ``combine_verdict`` computes both verdicts plus the
+   ``false_positive``/``false_negative`` diagnostics. If the judge cannot load (no
+   weights/auth) those samples are simply absent from the subjective score (and the
+   caller warns) — never copied from RegEx. With no ``acceptance_criterion`` and a
+   non-yes/no answer, the judge is skipped entirely.
 
 The graph is built with the same coords→Euclidean ``distance_m`` convention as
 ``scene_graph_parser`` / ``data.utils``; directedness follows the source
@@ -29,10 +39,10 @@ from typing import Dict, List, Optional
 
 import networkx as nx
 
-# Gemma 4 E2B judge. Defaults to the ungated "unsloth/gemma-4-E2B-it" mirror
-# (no HF auth needed); set GREP_JUDGE_MODEL to override (e.g. the gated Google
-# repo when an auth token is configured).
-GEMMA_JUDGE_MODEL = os.environ.get("GREP_JUDGE_MODEL", "unsloth/gemma-4-E2B-it")
+# Gemma 4 E2B judge. Defaults to the official gated "google/gemma-4-E2B-it" repo
+# (requires an HF auth token with access granted); set GREP_JUDGE_MODEL to override
+# (e.g. the ungated "unsloth/gemma-4-E2B-it" mirror when no auth is configured).
+GEMMA_JUDGE_MODEL = os.environ.get("GREP_JUDGE_MODEL", "google/gemma-4-E2B-it")
 
 # Route formats: "a -> b -> c" (spec form) or PRISM "goto(a), goto(b)" actions.
 _ARROW = re.compile(r"\s*->\s*")
@@ -284,3 +294,48 @@ def evaluate_sample(
         if should_judge else None
     )
     return metrics
+
+
+def combine_verdict(
+    *,
+    regex_correct: bool,
+    regex_keyword: bool,
+    judge_pass: Optional[bool],
+    acceptance_criterion_present: bool,
+) -> Dict:
+    """Produce the two *completely separate* per-sample verdicts.
+
+    The two scores are computed from **disjoint inputs** and never read each other:
+
+    * **objective** — a function of the RegEx/NetworkX args ONLY
+      (``regex_correct``/``regex_keyword``). The judge has zero effect on it.
+    * **subjective** — a function of ``judge_pass`` ONLY. It is the judge's boolean
+      where the judge ran (``acceptance_criterion`` present and a boolean returned),
+      else ``None`` (not judged — it does NOT borrow the RegEx value).
+
+    ``false_positive`` / ``false_negative`` are separate diagnostics that *compare*
+    the two verdicts (judge disagreeing with RegEx); they feed neither score.
+
+    Returns: ``objective_correct``/``objective_keyword`` (RegEx-only booleans),
+    ``subjective_correct``/``subjective_keyword`` (judge-only, ``None`` if unjudged),
+    ``false_positive``, ``false_negative``, ``judged``.
+    """
+    judged = acceptance_criterion_present and judge_pass is not None
+    # --- objective: RegEx/NetworkX inputs only -----------------------------------
+    objective_correct = bool(regex_correct)
+    objective_keyword = bool(regex_keyword)
+    # --- subjective: judge input only (None when not judged) ---------------------
+    subjective_correct = bool(judge_pass) if judged else None
+    subjective_keyword = bool(judge_pass) if judged else None
+    # --- diagnostics: compare the two, feed neither score ------------------------
+    false_positive = bool(judged and regex_keyword and not judge_pass)
+    false_negative = bool(judged and (not regex_keyword) and judge_pass)
+    return {
+        "objective_correct": objective_correct,
+        "objective_keyword": objective_keyword,
+        "subjective_correct": subjective_correct,
+        "subjective_keyword": subjective_keyword,
+        "false_positive": false_positive,
+        "false_negative": false_negative,
+        "judged": judged,
+    }

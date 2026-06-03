@@ -113,10 +113,14 @@ class GraphEvalResultSummary:
     """
     name: str
     num_total: int
-    num_correct: int
-    accuracy: float
+    num_correct: int                       # objective (RegEx/NetworkX) correct count
+    accuracy: float                        # objective accuracy (judge-free)
+    subjective_accuracy: Optional[float]   # separate Gemma-judge accuracy over judged samples (None if none judged)
+    num_judged: int                        # samples the judge actually scored
     num_formatted: int
     num_keyword: int
+    num_false_pos: int                     # RegEx correct, judge rejected (lowers subjective)
+    num_false_neg: int                     # RegEx wrong, judge accepted (raises subjective)
     num_errors: int
     elapsed_s: float
     n_nodes: int
@@ -168,9 +172,16 @@ def eval_model_single_graph(
                             ("no permutation"), not a delegated default.
 
     Returns:
-        `(accuracy, sample_results)` where `accuracy` is fraction with the
-        `plan_keyword` flag set, and `sample_results` is a list of dicts
-        with one entry per sample (see schema in source).   
+        `(accuracy, sample_results)` where `accuracy` is the OBJECTIVE
+        RegEx/NetworkX keyword accuracy — computed from RegEx fields only, never
+        from the judge. The separate Gemma judge score is carried per-sample
+        (`subjective_correct` — None when unjudged, `false_positive`,
+        `false_negative`) and aggregated into `subjective_accuracy` (over judged
+        samples only, judge verdict only) by `eval_model_multiple_graphs`. The two
+        scores share no inputs: `false_positive`/`false_negative` are diagnostics
+        comparing them and feed neither. A sample the judge cannot score is omitted
+        from the subjective accuracy (and warned about), never copied from RegEx.
+        `sample_results` is a list of dicts with one entry per sample.
     """
     graph_handler = graph_util.GraphHandler("")
     graph_simulation = graph_sim.GraphSim(graph_handler)
@@ -200,7 +211,8 @@ def eval_model_single_graph(
 
     planner = planning_sim.PlanningSim(debug=False)
 
-    total_correct = 0
+    total_correct = 0          # objective (RegEx/NetworkX) keyword marks -> headline accuracy
+    n_judge_fallback = 0       # AC-tasks not judged (judge couldn't run) -> subjective==objective
     sample_results: List[Dict] = []
 
     for i, eval_sample in enumerate(eval_samples):
@@ -235,6 +247,22 @@ def eval_model_single_graph(
             print(f"correct answer: {result.plan_keyword}")
 
             pm = _sample_path_metrics(planner_response, eval_sample)
+            judge_pass = (pm or {}).get("llm_judge_pass")
+            ac_present = bool(eval_sample.acceptance_criterion)
+            if ac_present and judge_pass is None:
+                n_judge_fallback += 1
+            # Two completely separate graders. `objective_*` is the pure
+            # RegEx/NetworkX score (the judge never touches it). `subjective_*` is
+            # the Gemma judge's score where it ran, else it mirrors the objective.
+            # The judge moves the subjective column only: down on a false positive
+            # (RegEx correct, judge wrong), up on a false negative (RegEx wrong,
+            # judge correct).
+            v = path_validator.combine_verdict(
+                regex_correct=result.is_correct(),
+                regex_keyword=result.plan_keyword,
+                judge_pass=judge_pass,
+                acceptance_criterion_present=ac_present,
+            )
             sample_results.append({
                 "graph_name": eval_sample.graph_name,
                 "idx": i,
@@ -245,16 +273,27 @@ def eval_model_single_graph(
                 "terminated_by": planning_result.terminated_by if planning_result else None,
                 "formatted": result.formatted,
                 "plan_keyword": result.plan_keyword,
-                # `correct` is the authoritative RegEx/NetworkX verdict. The Gemma
-                # judge is advisory only (never the true judge): its per-sample
-                # verdict is surfaced separately as `llm_judge_pass` (None unless
-                # the answer is yes/no or an acceptance_criterion exists).
-                "correct": result.is_correct(),
-                "llm_judge_pass": (pm or {}).get("llm_judge_pass"),
+                # `correct` is the OBJECTIVE RegEx/NetworkX verdict (judge-free).
+                # `subjective_correct` is the separate judge-based verdict.
+                # `false_positive`/`false_negative` flag where the judge disagreed
+                # with RegEx. `llm_judge_pass` is the raw judge verdict (None unless
+                # yes/no or an acceptance_criterion exists).
+                "correct": v["objective_correct"],
+                "subjective_correct": v["subjective_correct"],
+                "false_positive": v["false_positive"],
+                "false_negative": v["false_negative"],
+                "llm_judge_pass": judge_pass,
                 "error": None,
                 "traceback": None,
                 "path_metrics": pm,
             })
+            if v["false_positive"]:
+                print("⚑ FALSE POSITIVE: RegEx/NetworkX marked this correct but the Gemma judge "
+                      "rejected it — subjective score reduced (objective score unchanged).")
+            if v["false_negative"]:
+                print("⚑ FALSE NEGATIVE: RegEx/NetworkX marked this wrong but the Gemma judge "
+                      "accepted it — subjective score raised (objective score unchanged).")
+            total_correct += int(v["objective_keyword"])
 
         except Exception as e:
             tb_str = traceback_mod.format_exc()
@@ -276,7 +315,10 @@ def eval_model_single_graph(
                 "terminated_by": planning_result.terminated_by if planning_result else "exception",
                 "formatted": False,
                 "plan_keyword": False,
-                "correct": False,
+                "correct": False,           # objective (RegEx) — sample crashed
+                "subjective_correct": None,  # not judged
+                "false_positive": False,
+                "false_negative": False,
                 "llm_judge_pass": None,
                 "error": f"{type(e).__name__}: {e}",
                 "traceback": tb_str,
@@ -284,8 +326,12 @@ def eval_model_single_graph(
             })
 
         print("\n=====\n")
-        total_correct += result.plan_keyword
 
+    if n_judge_fallback:
+        print(f"[eval] WARNING: {n_judge_fallback}/{len(eval_samples)} acceptance_criterion "
+              f"task(s) could not be judged by Gemma ({path_validator.GEMMA_JUDGE_MODEL}) and were scored by "
+              f"RegEx/NetworkX only. Ensure the judge weights/HF auth are available so the "
+              f"acceptance criteria are enforced.")
     accuracy = total_correct / len(eval_samples) if eval_samples else 0.0
     return accuracy, sample_results
 
@@ -326,18 +372,32 @@ def eval_model_multiple_graphs(
         )
         elapsed = time.time() - t0
 
+        # Objective (RegEx/NetworkX) aggregates — read only RegEx fields.
         num_correct = sum(r["correct"] for r in sample_results)
         num_formatted = sum(r["formatted"] for r in sample_results)
         num_keyword = sum(r["plan_keyword"] for r in sample_results)
         num_errors = sum(1 for r in sample_results if r["error"] is not None)
+        # Subjective (Gemma judge) aggregates — read only the judge verdict, over
+        # the judged samples ONLY. No RegEx value is mixed in.
+        judged = [r for r in sample_results if r["llm_judge_pass"] is not None]
+        num_judged = len(judged)
+        subjective_accuracy = (
+            sum(1 for r in judged if r["llm_judge_pass"]) / num_judged if num_judged else None
+        )
+        num_false_pos = sum(1 for r in sample_results if r.get("false_positive"))
+        num_false_neg = sum(1 for r in sample_results if r.get("false_negative"))
 
         result = GraphEvalResultSummary(
             name=name,
             num_total=len(sample_results),
             num_correct=num_correct,
             accuracy=accuracy,
+            subjective_accuracy=subjective_accuracy,
+            num_judged=num_judged,
             num_formatted=num_formatted,
             num_keyword=num_keyword,
+            num_false_pos=num_false_pos,
+            num_false_neg=num_false_neg,
             num_errors=num_errors,
             elapsed_s=elapsed,
             n_nodes=n_nodes,
@@ -367,7 +427,10 @@ def print_summary_table(results: List[GraphEvalResultSummary]) -> None:
         f"{'Eval File':<{name_width}}  "
         f"{'Tasks':>5}  "
         f"{'Correct':>7}  "
-        f"{'Acc':>7}  "
+        f"{'Acc(obj)':>8}  "
+        f"{'SubjAcc':>8}  "
+        f"{'FP':>3}  "
+        f"{'FN':>3}  "
         f"{'Formatted':>9}  "
         f"{'Keyword':>7}  "
         f"{'Errors':>6}  "
@@ -376,19 +439,29 @@ def print_summary_table(results: List[GraphEvalResultSummary]) -> None:
     sep = "-" * len(header)
 
     print(f"\n{sep}")
-    print("EVALUATION SUITE SUMMARY")
+    print("EVALUATION SUITE SUMMARY  (Acc(obj)=RegEx/NetworkX; SubjAcc=Gemma judge; FP/FN=judge↔RegEx disagreements)")
     print(sep)
     print(header)
     print(sep)
 
     total_tasks = total_correct = total_formatted = total_keyword = total_errors = 0
+    total_false_pos = total_false_neg = total_judged = 0
+    total_subj_hits = 0.0
     total_time = 0.0
+
+    def _pct(v):
+        return f"{v:>8.1%}" if v is not None else f"{'n/a':>8}"
 
     for r in results:
         total_tasks += r.num_total
         total_correct += r.num_correct
         total_formatted += r.num_formatted
         total_keyword += r.num_keyword
+        total_false_pos += r.num_false_pos
+        total_false_neg += r.num_false_neg
+        total_judged += r.num_judged
+        if r.subjective_accuracy is not None:
+            total_subj_hits += r.subjective_accuracy * r.num_judged
         total_errors += r.num_errors
         total_time += r.elapsed_s
 
@@ -396,7 +469,10 @@ def print_summary_table(results: List[GraphEvalResultSummary]) -> None:
             f"{r.name:<{name_width}}  "
             f"{r.num_total:>5}  "
             f"{r.num_correct:>7}  "
-            f"{r.accuracy:>7.1%}  "
+            f"{r.accuracy:>8.1%}  "
+            f"{_pct(r.subjective_accuracy)}  "
+            f"{r.num_false_pos:>3}  "
+            f"{r.num_false_neg:>3}  "
             f"{r.num_formatted:>9}  "
             f"{r.num_keyword:>7}  "
             f"{r.num_errors:>6}  "
@@ -405,17 +481,26 @@ def print_summary_table(results: List[GraphEvalResultSummary]) -> None:
 
     print(sep)
     overall_acc = total_correct / total_tasks if total_tasks else 0.0
+    overall_subj = (total_subj_hits / total_judged) if total_judged else None
     print(
         f"{'TOTAL':<{name_width}}  "
         f"{total_tasks:>5}  "
         f"{total_correct:>7}  "
-        f"{overall_acc:>7.1%}  "
+        f"{overall_acc:>8.1%}  "
+        f"{_pct(overall_subj)}  "
+        f"{total_false_pos:>3}  "
+        f"{total_false_neg:>3}  "
         f"{total_formatted:>9}  "
         f"{total_keyword:>7}  "
         f"{total_errors:>6}  "
         f"{total_time:>8.1f}"
     )
     print(sep)
+    if total_false_pos or total_false_neg:
+        net = (overall_subj - overall_acc) if overall_subj is not None else 0.0
+        print(f"  ⚑ Subjective column (judge-only, over {total_judged} judged): {total_false_pos} false "
+              f"positive(s) (−) and {total_false_neg} false negative(s) (+); net {net:+.1%} vs the "
+              f"judge-free objective column.")
 
     # M10 (R4) path-validity block — only printed when some graph yielded routes.
     pm_results = [r for r in results if r.path_metrics]
