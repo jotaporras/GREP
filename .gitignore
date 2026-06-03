@@ -35,3 +35,4 @@ trainer_output/
 results_old/
 shared/
 eval/*
+data_store/*
