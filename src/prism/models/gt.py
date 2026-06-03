@@ -230,7 +230,7 @@ class SparseTransformerBlock(nn.Module):
     """
 
     def __init__(self, d_model: int, heads: int = 4, dropout: float = 0.1, use_layer_norm: bool = False, eps: float = 1e-8,
-                 spectral_norm_linears: bool = True):
+                 spectral_norm_linears: bool = True, normalize: bool = True):
         super().__init__()
 
         # Set up Attention, Dropout, Feed-Forward Network, and
@@ -243,22 +243,27 @@ class SparseTransformerBlock(nn.Module):
             nn.LeakyReLU(),
             _maybe_spectral_norm(nn.Linear(d_model, d_model), spectral_norm_linears),
         )
+        # normalize=False keeps the block magnitude-preserving: the two LipschitzNorms
+        # are skipped and the residual adds carry through. Used for the final block.
+        self.normalize = normalize
         self.norms = nn.ModuleList([])
-        if use_layer_norm:
-            self.norms.append(LipschitzNorm(d_model, eps=eps))
-            self.norms.append(LipschitzNorm(d_model, eps=eps))
-        else:
-            self.norms.append(nn.BatchNorm1d(d_model))
-            self.norms.append(nn.BatchNorm1d(d_model))
+        if normalize:
+            if use_layer_norm:
+                self.norms.append(LipschitzNorm(d_model, eps=eps))
+                self.norms.append(LipschitzNorm(d_model, eps=eps))
+            else:
+                self.norms.append(nn.BatchNorm1d(d_model))
+                self.norms.append(nn.BatchNorm1d(d_model))
 
 
     def forward(self, x: Tensor, edge_index: Tensor) -> Tensor:
-        # Compute attention, Lipschitz norm, FFN,
-        # and another independent Lipschitz norm.
+        # Compute attention, (optional) norm, FFN, and another (optional) norm.
+        # When self.normalize is False the residual adds carry through unnormalized
+        # so the block preserves magnitude.
         h = self.attn(x, edge_index)
-        x = self.norms[0](x + self.dropout(h))
+        x = self.norms[0](x + self.dropout(h)) if self.normalize else x + self.dropout(h)
         h = self.ffn(x)
-        x = self.norms[1](x + self.dropout(h))
+        x = self.norms[1](x + self.dropout(h)) if self.normalize else x + self.dropout(h)
         return x
 
 
@@ -312,6 +317,7 @@ class GraphTransformer(nn.Module):
         self.heads = heads
         self.num_layers = num_layers
         self.d_model = d_model
+        self.eps = eps
         # R-PEARL readout fed into the M6 fusion:
         #   "mean"          : H0 = X_full + Ψ,  Ψ = E_q[Φ(q)]   (first moment)
         #   "second_moment" : H0 = seeded + C·seeded, seeded = [X on token ; Ψ on scene],
@@ -330,12 +336,20 @@ class GraphTransformer(nn.Module):
             probe_distribution=probe_distribution, m_test=m_test,
             fixed_seed_mode=fixed_seed_mode, fixed_seed_value=fixed_seed_value,
         )
+        # Blocks 0..L-2 keep their LipschitzNorms (stability through depth); the final
+        # block is norm-free (normalize=False) so the output magnitude survives for the
+        # embedding-scale rescale in forward() — under injection_mode="none" the GT
+        # output is the LLM's inputs_embeds and must not be on the unit sphere.
         self.blocks = nn.ModuleList([
             SparseTransformerBlock(
                 d_model, heads=heads, dropout=dropout, use_layer_norm=use_layer_norm, eps=eps,
                 spectral_norm_linears=spectral_norm_linears,
-            ) for _ in range(num_layers)
+                normalize=(i < num_layers - 1),
+            ) for i in range(num_layers)
         ])
+        # Normalization utility, kept available: loads in old checkpoints and is the
+        # toggle point if a bounded unit-norm output is ever wanted again. Currently
+        # bypassed in forward() in favor of the embedding-scale rescale.
         self.output_norm = LipschitzNorm(d_model, eps=eps)
 
     @torch.no_grad()
@@ -421,8 +435,18 @@ class GraphTransformer(nn.Module):
                 psi = self.pe_model(pe_data)              # first moment Ψ ∈ [N, d_model]
                 seeded = x_full.clone()
                 if is_token is not None:
-                    # scene rows ← first-moment Ψ; token rows stay the verbal embeddings X
-                    seeded[~is_token] = psi[~is_token]
+                    # scene rows ← first-moment Ψ; token rows stay the verbal embeddings X.
+                    # Match Ψ_scene's magnitude to the token-embedding scale: Ψ exits
+                    # R-PEARL at ~unit norm (LipschitzNorm) while X is at ~‖X‖ (≈24 for
+                    # Llama). Un-scaled, the scene graph contributes only ~7% to the
+                    # token positional encoding through C·seeded (token content + the
+                    # cycle dominate ~14:1), so the graph-reasoning signal is nearly
+                    # lost; scaling Ψ_scene to the mean token norm restores it to full
+                    # strength (~89%). Transferable scalar, structure-preserving.
+                    psi_scene = psi[~is_token]
+                    tok_scale = token_embeddings.float().norm(dim=-1).mean()
+                    psi_scale = psi_scene.float().norm(dim=-1).mean().clamp(min=self.eps)
+                    seeded[~is_token] = (psi_scene * (tok_scale / psi_scale)).to(seeded.dtype)
                 cx = self.pe_model.second_moment_apply(pe_data, seeded)  # C·seeded
                 x = seeded + cx.to(seeded.dtype)          # H0 = seeded + C·seeded
             else:
@@ -470,6 +494,14 @@ class GraphTransformer(nn.Module):
                     x = checkpoint(block, x, khop_edge_index, use_reentrant=False)
                 else:
                     x = block(x, khop_edge_index)
-            # Apply Output Lipschitz Normalizer.
-            x = self.output_norm(x)
+            # Embedding-scale rescale: multiply Y by the single scalar (mean input-
+            # embedding row-norm)/(mean GT token-row norm). Pins the overall magnitude
+            # to the embedding manifold (Y is the LLM's inputs_embeds under "none")
+            # while preserving relative per-row magnitudes — a global scale, not a
+            # per-row normalization. Transferable; a no-op when token_embeddings is None.
+            if token_embeddings is not None:
+                tok = x if is_token is None else x[is_token]
+                cur = tok.float().norm(dim=-1).mean().clamp(min=self.eps)
+                target = token_embeddings.float().norm(dim=-1).mean()
+                x = x * (target / cur).to(x.dtype)
         return x

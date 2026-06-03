@@ -294,5 +294,15 @@ class RandomGNNPositionalEncodings(nn.Module):
                 contrib = _chunk_apply(Qc, edge_index)
             acc = contrib if acc is None else acc + contrib
         result = acc / m
-        return self.norm(result)
+        # Scale C·signal to the SIGNAL's magnitude rather than to unit norm. A unit
+        # LipschitzNorm here would leave C·signal at ~4% of H0 = signal + C·signal
+        # (token rows of `signal` are X at ~‖X‖), drowning out the relative-position
+        # operator that — with RoPE off — is the model's only source of token order.
+        # Matching the mean row-norm of C·signal to that of `signal` gives the two H0
+        # terms comparable strength via a single global scalar (per-row structure
+        # preserved, transferable). self.norm (LipschitzNorm) is kept as a utility:
+        # loads in old checkpoints and is the toggle point for unit-norm output.
+        cur = result.float().norm(dim=-1).mean().clamp(min=1e-6)
+        target = s.float().norm(dim=-1).mean()
+        return result * (target / cur).to(result.dtype)
 
