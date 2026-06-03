@@ -89,11 +89,13 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
 
         for b in range(input_ids.shape[0]):
             pe = self.pe_proj(self.pe_model(graphs[b]))  # [n, hidden_size]
-            # Rescale PE to match embedding norm. pe_proj ends with LipschitzNorm
-            # which forces output to norm ≈ sqrt(d_model), while LLM embeddings
-            # (pre-RMSNorm) are much smaller. Without rescaling, PE overwhelms.
-            target_norm = embeddings[b].norm(dim=-1).mean().detach()
-            pe = F.normalize(pe, dim=-1) * target_norm
+            # Scale Ψ to the token-embedding magnitude so RoPE(X + Ψ) is a genuine
+            # sum. pe_proj ends in a LipschitzNorm, so Ψ exits at ~unit norm — only
+            # ~4% of ‖X‖ (≈24 for Llama) — and would be drowned out. Matching it to
+            # the mean token-embedding norm lets the positional signal contribute at
+            # full strength before RoPE rotates X + Ψ. (self.pe_gain is retained as a
+            # utility/optional gate but no longer zeroes the signal at init.)
+            pe = pe * embeddings[b].norm(dim=-1).mean()
             for node_idx, spans in injection_maps[b].items():
                 for start, end in spans:
                     end = min(end, input_ids.shape[1])
