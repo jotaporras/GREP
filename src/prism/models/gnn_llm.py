@@ -105,7 +105,7 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             # token-embedding norm makes it a full-strength positional signal, and
             # g = tanh(pe_gain) ∈ (-1,1) (init ≈ 0.76) gates it: active from the start,
             # bounded by ‖X‖. Mirrored in inference.py so eval matches training.
-            pe = pe * embeddings[b].norm(dim=-1).mean() * torch.tanh(self.pe_gain)
+            pe = pe * embeddings[b].norm(dim=-1).mean().detach() * torch.tanh(self.pe_gain)
             for node_idx, spans in injection_maps[b].items():
                 for start, end in spans:
                     end = min(end, input_ids.shape[1])
