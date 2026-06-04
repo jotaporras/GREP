@@ -155,11 +155,12 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
         injection_map = build_injection_map(input_ids_list, node_token_seqs)
         pe = self.model.pe_proj(self.model.pe_model(pyg_graph, permutation=self.permutation))  # [n, hidden_size]
 
-        # Rescale PE to match embedding norm. pe_proj ends with LipschitzNorm which
-        # forces output to norm ≈ sqrt(d_model) ≈ 64, while LLM embeddings
-        # (pre-RMSNorm) sit at ~0.5. Without rescaling, PE overwhelms embeddings.
+        # Mirror _augment_embeddings exactly so eval matches training: scale Ψ to the
+        # mean token-embedding norm, then apply the learnable tanh gate. (pe_proj's
+        # LipschitzNorm leaves Ψ at ~unit norm; the raw product is used — not
+        # F.normalize — so the per-row magnitude structure matches the training path.)
         target_norm = embeddings.norm(dim=-1).mean()
-        pe = torch.nn.functional.normalize(pe, dim=-1) * target_norm
+        pe = pe * target_norm * torch.tanh(self.model.pe_gain)
 
         for node_idx, spans in injection_map.items():
             for start, end in spans:

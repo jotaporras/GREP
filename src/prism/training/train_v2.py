@@ -148,6 +148,9 @@ class GraphSFTTrainer(SFTTrainer):
             p.requires_grad = True
         for p in self.model.pe_proj.parameters():
             p.requires_grad = True
+        # The PE-injection gate (g = tanh(pe_gain)) must train too, else it stays at
+        # its init and the learned X + g·Ψ balance can't adapt.
+        self.model.pe_gain.requires_grad = True
 
     def training_step(self, model, inputs, num_items_in_batch=None, **kwargs):
         loss = super().training_step(model, inputs, num_items_in_batch=num_items_in_batch, **kwargs)
@@ -169,6 +172,7 @@ class GraphSFTTrainer(SFTTrainer):
             torch.save({
                 'gt_model': self.model.pe_model.state_dict(),
                 'pe_proj': self.model.pe_proj.state_dict(),
+                'pe_gain': self.model.pe_gain.data,
             }, os.path.join(output_dir, "gnn_weights.pt"))
             # Also save the inner R-PEARL separately for analysis / reuse.
             torch.save({
@@ -178,6 +182,7 @@ class GraphSFTTrainer(SFTTrainer):
             torch.save({
                 'pe_model': self.model.pe_model.state_dict(),
                 'pe_proj': self.model.pe_proj.state_dict(),
+                'pe_gain': self.model.pe_gain.data,
             }, os.path.join(output_dir, "gnn_weights.pt"))
         if any(p.requires_grad for p in self.model.llm.parameters()):
             super().save_model(output_dir, _internal_call)

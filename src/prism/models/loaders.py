@@ -133,6 +133,8 @@ def graph_augmented_llm_from_pretrained(
         gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
         model.pe_model.load_state_dict(gnn_weights["gt_model"], strict=False)
         model.pe_proj.load_state_dict(gnn_weights["pe_proj"])
+        if "pe_gain" in gnn_weights:
+            model.pe_gain.data.copy_(gnn_weights["pe_gain"])
     else:
         pe_model = r_pearl.RandomGNNPositionalEncodings(
             pe_hidden_channels=gnn_cfg["pe_hidden_channels"],
@@ -148,6 +150,8 @@ def graph_augmented_llm_from_pretrained(
         gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
         model.pe_model.load_state_dict(gnn_weights["pe_model"], strict=False)
         model.pe_proj.load_state_dict(gnn_weights["pe_proj"])
+        if "pe_gain" in gnn_weights:
+            model.pe_gain.data.copy_(gnn_weights["pe_gain"])
 
     model.eval()
     return model, tokenizer
