@@ -213,7 +213,11 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
             )
 
         pe = graph_model.pe_proj(graph_model.pe_model(pyg_graph, permutation=self.permutation))  # [n, hidden_size]
-        pe = pe * graph_model.pe_gain
+        # Mirror _augment_embeddings exactly so eval matches training: scale Ψ to the
+        # token-embedding magnitude, then apply the learnable tanh gate. (The old
+        # `pe * pe_gain` used the raw gain with no embedding-scale, which — with
+        # pe_gain≈0 — left the eval PE effectively off and disagreeing with training.)
+        pe = pe * embeddings[0].norm(dim=-1).mean() * torch.tanh(graph_model.pe_gain)
 
         for node_idx, spans in injection_map.items():
             for start, end in spans:

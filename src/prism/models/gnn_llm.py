@@ -53,11 +53,13 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             LipschitzNorm(llm.config.hidden_size, eps=eps, device=device),
         )
         
-        # Learnable scalar gain for PE injection magnitude (Audit Rec 3).
-        # Replaces the F.normalize + target_norm heuristic which discarded
-        # structurally meaningful norm differences between nodes.
-        # Initialized small so PE doesn't overwhelm embeddings at the start.
-        self.pe_gain = nn.Parameter(torch.tensor(0.00, device=device))
+        # Learnable gate on the PE injection: g = tanh(pe_gain) ∈ (-1,1). Lets the
+        # model regulate how strongly (and with which sign) Ψ enters the sum X + g·Ψ.
+        # Init pe_gain = 1.0 → g ≈ 0.76, so Ψ is active from the first step (near the
+        # token-embedding scale) and the optimizer can scale it down toward 0 or up
+        # toward ±‖X‖. The init is deliberately nonzero: pe_gain=0 would give
+        # tanh(0)=0 and switch the positional signal off entirely at the start.
+        self.pe_gain = nn.Parameter(torch.tensor(1.0, device=device))
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         self.llm.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
@@ -96,13 +98,14 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
 
         for b in range(input_ids.shape[0]):
             pe = self.pe_proj(self.pe_model(graphs[b]))  # [n, hidden_size]
-            # Scale Ψ to the token-embedding magnitude so RoPE(X + Ψ) is a genuine
-            # sum. pe_proj ends in a LipschitzNorm, so Ψ exits at ~unit norm — only
-            # ~4% of ‖X‖ (≈24 for Llama) — and would be drowned out. Matching it to
-            # the mean token-embedding norm lets the positional signal contribute at
-            # full strength before RoPE rotates X + Ψ. (self.pe_gain is retained as a
-            # utility/optional gate but no longer zeroes the signal at init.)
-            pe = pe * embeddings[b].norm(dim=-1).mean()
+            # Scale Ψ to the token-embedding magnitude, then apply the learnable gate,
+            # so the LLM sees RoPE(X + g·Ψ): a genuine sum the model can regulate.
+            # pe_proj ends in a LipschitzNorm, so Ψ exits at ~unit norm — only ~4% of
+            # ‖X‖ (≈24 for Llama) — and would be drowned out; matching it to the mean
+            # token-embedding norm makes it a full-strength positional signal, and
+            # g = tanh(pe_gain) ∈ (-1,1) (init ≈ 0.76) gates it: active from the start,
+            # bounded by ‖X‖. Mirrored in inference.py so eval matches training.
+            pe = pe * embeddings[b].norm(dim=-1).mean() * torch.tanh(self.pe_gain)
             for node_idx, spans in injection_maps[b].items():
                 for start, end in spans:
                     end = min(end, input_ids.shape[1])
