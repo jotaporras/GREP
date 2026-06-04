@@ -145,7 +145,7 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
             )
             return outputs[:, input_ids.shape[-1]:]
 
-        # Compute base embeddings once
+        # Compute base embeddings once (plain X — Ψ is injected inside attention).
         embeddings = (
             self.model.llm.get_input_embeddings()(input_ids)
             .clone()
@@ -159,22 +159,20 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
             for name in pyg_graph.node_names
         ]
         injection_map = build_injection_map(input_ids_list, node_token_seqs)
-        pe = self.model.pe_proj(self.model.pe_model(pyg_graph, permutation=self.permutation))  # [n, hidden_size]
 
-        # Mirror _augment_embeddings exactly so eval matches training: scale Ψ to the
-        # mean token-embedding norm, then apply the learnable tanh gate. (pe_proj's
-        # LipschitzNorm leaves Ψ at ~unit norm; the raw product is used — not
-        # F.normalize — so the per-row magnitude structure matches the training path.)
-        target_norm = embeddings.norm(dim=-1).mean()
-        pe = pe * target_norm * torch.tanh(self.model.pe_gain)
-
-        for node_idx, spans in injection_map.items():
-            for start, end in spans:
-                end = min(end, input_ids.shape[1])
-                embeddings[0, start:end] = embeddings[0, start:end] + pe[node_idx]
-
-        return self.model.llm.generate(
-            inputs_embeds=embeddings, attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens, use_cache=True, temperature=0.01, min_p=0.1,
-            pad_token_id=self.tokenizer.eos_token_id,
-        )
+        # Build Ψ exactly as training (build_pe_signal: scale to mean token-embedding
+        # norm, apply the learnable tanh gate, place at node-name spans) and arm it on
+        # the model so the patched attention layers add it post-RoPE → RoPE(X) + Ψ.
+        # Injection auto-skips cached single-token decode steps (seq mismatch), so only
+        # the prompt tokens carry Ψ.
+        psi = self.model.build_pe_signal(
+            embeddings, [pyg_graph], [injection_map], permutation=self.permutation)
+        self.model._pe_signal = psi
+        try:
+            return self.model.llm.generate(
+                inputs_embeds=embeddings, attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens, use_cache=True, temperature=0.01, min_p=0.1,
+                pad_token_id=self.tokenizer.eos_token_id,
+            )
+        finally:
+            self.model._pe_signal = None

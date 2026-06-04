@@ -81,30 +81,19 @@ class EvalCallback(TrainerCallback):
         return self.metrics
 
 class GradientDebugCallback(TrainerCallback):
-    """Logs per-component gradient norms, structural-signal magnitudes, and
-    injection counts to W&B.
+    """Logs per-component gradient norms, PE magnitude, and injection counts to W&B.
 
-    Architecture-aware — covers both graph-augmented LLM families:
-
-    - ``GraphAugmentedLLM`` (``rpearl_llm`` / ``rpearl_gt_llm``): a ``pe_model``
-      (R-PEARL, optionally inside a GraphTransformer), a ``pe_proj`` head, a
-      scalar ``pe_gain``, and ``_augment_embeddings`` for injection. Logs grad
-      norms for the GNN/PE, projection, gain, LoRA, and — for the GT variant —
-      the inner R-PEARL, GT attention blocks, and GT output norm, plus the
-      ``pe_proj`` output magnitude.
-    - ``CompositeGraphLLM`` (``composite_graph_gt``, M4–M9): a ``gt_model``
-      (GraphTransformer holding R-PEARL), the M7 ``injection`` gate, and
-      ``_fuse_embeddings`` for injection. Logs grad norms for the inner R-PEARL,
-      GT blocks, GT output norm, the whole GT, the gate, and LoRA, plus the GT
-      output ``Y`` magnitude and the gate value.
+    For ``GraphAugmentedLLM`` (``rpearl_llm`` / ``rpearl_gt_llm``): a ``pe_model``
+    (R-PEARL, optionally inside a GraphTransformer), a ``pe_proj`` head, a scalar
+    ``pe_gain``, and ``_augment_embeddings`` for injection. Logs grad norms for the
+    GNN/PE, projection, gain, and LoRA — and, for the ``rpearl_gt_llm`` variant,
+    the inner R-PEARL, GT attention blocks, and GT output norm — plus the
+    ``pe_proj`` output magnitude and the injection count.
 
     Hooks observe without duplicating logic. Gradient norms are captured by
     ``_capture_grad_norms`` (called from ``GraphSFTTrainer.training_step`` after
     backward, before zero_grad) so they reflect real gradients — HF Trainer
     zeroes grads before ``on_log`` fires, so reading ``.grad`` there returns 0.
-    The composite-graph spectral diagnostics (Fiedler, scene-mass, contrib-ratio)
-    live in ``AugGraphDebugCallback``; this callback is the gradient/magnitude
-    view and the two compose on the same ``composite_graph_gt`` run.
     """
 
     def __init__(self):
@@ -117,43 +106,28 @@ class GradientDebugCallback(TrainerCallback):
 
     @staticmethod
     def _unwrap_peft(model):
-        """Navigate PeftModel → LoraModel → GraphAugmentedLLM / CompositeGraphLLM."""
+        """Navigate PeftModel → LoraModel → GraphAugmentedLLM."""
         inner = model
         if hasattr(inner, 'base_model'):
             inner = inner.base_model
-        if hasattr(inner, 'model') and (
-            hasattr(inner.model, 'pe_proj') or hasattr(inner.model, 'gt_model')
-        ):
+        if hasattr(inner, 'model') and hasattr(inner.model, 'pe_proj'):
             inner = inner.model
         return inner
 
     @staticmethod
-    def _is_augmented(inner):
-        """True for the M4–M9 ``CompositeGraphLLM`` (``gt_model`` + M7 ``injection``)."""
-        return hasattr(inner, "gt_model") and hasattr(inner, "injection")
-
-    @staticmethod
     def _supported(inner):
-        """Either graph-augmented family — has a PE source we can introspect."""
-        return hasattr(inner, "pe_model") or hasattr(inner, "gt_model")
+        """True when the model exposes a PE source we can introspect."""
+        return hasattr(inner, "pe_model")
 
     def _install_hooks(self, model):
         """Install lightweight hooks that observe without duplicating logic.
 
-        Unwraps PEFT so the injection wrapper lives on the actual graph-augmented
+        Unwraps PEFT so the injection wrapper lives on the actual GraphAugmentedLLM
         instance (whose ``forward`` calls it), not on the PeftModel wrapper.
         """
         if self._hooked:
             return
         inner = self._unwrap_peft(model)
-        if self._is_augmented(inner):
-            self._install_augmented_hooks(inner)
-        else:
-            self._install_legacy_hooks(inner)
-        self._hooked = True
-
-    def _install_legacy_hooks(self, inner):
-        """GraphAugmentedLLM: pe_proj output norm + ``_augment_embeddings`` wrap."""
         callback = self
 
         # Hook 1: capture PE norm from pe_proj output via a forward hook.
@@ -177,35 +151,7 @@ class GradientDebugCallback(TrainerCallback):
             return orig_augment(input_ids, graphs, injection_maps)
 
         inner._augment_embeddings = _wrapped_augment
-
-    def _install_augmented_hooks(self, inner):
-        """CompositeGraphLLM: GT output (Y) norm + ``_fuse_embeddings`` wrap.
-
-        The GT output ``Y`` is the structural signal the M7 gate scales into the
-        LLM, so its magnitude (and any NaN) is the analogue of the legacy
-        ``pe_proj`` output. ``_fuse_embeddings`` carries the same signature used
-        at train and eval (``permutation`` keyword), so the wrapper must forward it.
-        """
-        callback = self
-
-        def _gt_hook(_module, _input, output):
-            callback._pe_norm = output.detach().norm().item()
-            callback._pe_has_nan = bool(output.detach().isnan().any())
-
-        inner.gt_model.register_forward_hook(_gt_hook)
-
-        orig_fuse = inner._fuse_embeddings
-
-        def _wrapped_fuse(input_ids, graphs, injection_maps, permutation=None):
-            with torch.no_grad():
-                emb_table = inner.llm.get_input_embeddings()
-                callback._emb_norm = emb_table(input_ids.to(emb_table.weight.device)).norm().item()
-            callback._num_injections = sum(
-                len(spans) for imap in injection_maps for spans in imap.values()
-            )
-            return orig_fuse(input_ids, graphs, injection_maps, permutation=permutation)
-
-        inner._fuse_embeddings = _wrapped_fuse
+        self._hooked = True
 
     @staticmethod
     def _grad_norm(params):
@@ -228,17 +174,7 @@ class GradientDebugCallback(TrainerCallback):
             p for _, p in inner.llm.named_parameters() if p.requires_grad
         )
 
-        if self._is_augmented(inner):
-            # CompositeGraphLLM: GraphTransformer (R-PEARL + blocks) + M7 gate.
-            gt = inner.gt_model
-            self._captured_grad_norms["gt"] = self._grad_norm(gt.parameters())
-            self._captured_grad_norms["rpearl"] = self._grad_norm(gt.pe_model.parameters())
-            self._captured_grad_norms["gt_blocks"] = self._grad_norm(gt.blocks.parameters())
-            self._captured_grad_norms["gt_output_norm"] = self._grad_norm(gt.output_norm.parameters())
-            self._captured_grad_norms["gate"] = self._grad_norm([inner.injection.gate])
-            return
-
-        # Legacy GraphAugmentedLLM: pe_model (+ optional GT) + pe_proj + pe_gain.
+        # GraphAugmentedLLM: pe_model (+ optional GT) + pe_proj + pe_gain.
         self._captured_grad_norms["gnn"] = self._grad_norm(inner.pe_model.parameters())
         self._captured_grad_norms["pe_proj"] = self._grad_norm(inner.pe_proj.parameters())
         self._captured_grad_norms["pe_gain"] = self._grad_norm([inner.pe_gain])
@@ -261,41 +197,24 @@ class GradientDebugCallback(TrainerCallback):
         lr = state.log_history[-1].get("learning_rate", float("nan")) if state.log_history else float("nan")
         g = self._captured_grad_norms
 
-        if self._is_augmented(inner):
-            # CompositeGraphLLM (composite_graph_gt): R-PEARL + GT + M7 gate.
-            metrics = {
-                "debug/grad_norm_lora": g.get("lora", 0.0),
-                "debug/grad_norm_gt": g.get("gt", 0.0),
-                "debug/grad_norm_rpearl": g.get("rpearl", 0.0),
-                "debug/grad_norm_gt_blocks": g.get("gt_blocks", 0.0),
-                "debug/grad_norm_gt_output_norm": g.get("gt_output_norm", 0.0),
-                "debug/grad_norm_gate": g.get("gate", 0.0),
-                "debug/gt_output_norm": self._pe_norm,
-                "debug/gt_has_nan": int(self._pe_has_nan),
-                "debug/embedding_norm": self._emb_norm,
-                "debug/num_injections": self._num_injections,
-                "debug/gate_value": float(inner.injection.gate.detach().float().mean().item()),
-                "debug/lr": lr,
-            }
-        else:
-            # GraphAugmentedLLM (rpearl_llm / rpearl_gt_llm).
-            metrics = {
-                "debug/grad_norm_gnn": g.get("gnn", 0.0),
-                "debug/grad_norm_pe_proj": g.get("pe_proj", 0.0),
-                "debug/grad_norm_lora": g.get("lora", 0.0),
-                "debug/pe_output_norm": self._pe_norm,
-                "debug/pe_has_nan": int(self._pe_has_nan),
-                "debug/embedding_norm": self._emb_norm,
-                "debug/num_injections": self._num_injections,
-                "debug/lr": lr,
-                "debug/pe_gain": inner.pe_gain.item(),
-                "debug/grad_norm_pe_gain": g.get("pe_gain", 0.0),
-            }
-            # rpearl_gt_llm: split gradient norms by GT sub-component.
-            if hasattr(inner.pe_model, "blocks"):
-                metrics["debug/grad_norm_rpearl"] = g.get("rpearl", 0.0)
-                metrics["debug/grad_norm_gt_blocks"] = g.get("gt_blocks", 0.0)
-                metrics["debug/grad_norm_gt_output_norm"] = g.get("gt_output_norm", 0.0)
+        # GraphAugmentedLLM (rpearl_llm / rpearl_gt_llm).
+        metrics = {
+            "debug/grad_norm_gnn": g.get("gnn", 0.0),
+            "debug/grad_norm_pe_proj": g.get("pe_proj", 0.0),
+            "debug/grad_norm_lora": g.get("lora", 0.0),
+            "debug/pe_output_norm": self._pe_norm,
+            "debug/pe_has_nan": int(self._pe_has_nan),
+            "debug/embedding_norm": self._emb_norm,
+            "debug/num_injections": self._num_injections,
+            "debug/lr": lr,
+            "debug/pe_gain": inner.pe_gain.item(),
+            "debug/grad_norm_pe_gain": g.get("pe_gain", 0.0),
+        }
+        # rpearl_gt_llm: split gradient norms by GT sub-component.
+        if hasattr(inner.pe_model, "blocks"):
+            metrics["debug/grad_norm_rpearl"] = g.get("rpearl", 0.0)
+            metrics["debug/grad_norm_gt_blocks"] = g.get("gt_blocks", 0.0)
+            metrics["debug/grad_norm_gt_output_norm"] = g.get("gt_output_norm", 0.0)
 
         if wandb.run is not None:
             wandb.log(metrics, step=state.global_step)

@@ -1,4 +1,5 @@
 import copy
+import importlib
 from collections import defaultdict
 
 import torch
@@ -22,6 +23,29 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
     ``forward(data) -> Tensor[n, d_model]``.  Two options are supported:
       - ``RandomGNNPositionalEncodings`` (R-PEARL only, no GT blocks)
       - ``GraphTransformer`` (full Sparse GT with R-PEARL inside)
+
+    Positional-injection scheme — the LLM sees ``RoPE(X) + Ψ`` at every layer:
+        ``X`` is the word-embedding matrix and ``Ψ`` the graph PE placed at the
+        node-name token spans. RoPE is applied *inside every attention layer* to
+        the projected query/key (``apply_rotary_pos_emb``), so adding Ψ to the
+        residual stream would make the LLM compute ``RoPE(W·(X+Ψ))`` — Ψ spun by
+        the *sequence-position* rotation, which is wrong for a *graph* positional
+        code. (A residual-stream counter-rotation ``R_p^{-1}Ψ`` can't fix this:
+        ``W_q``/``W_k`` don't commute with the per-head rotation, and one residual
+        vector can't satisfy the q- and k-constraints at once.)
+
+        Instead we patch each attention layer's forward (``_install_pe_injection``)
+        to add Ψ *after* RoPE, in the projected query/key/value space::
+
+            q = RoPE(W_q · h) + W_q · Ψ
+            k = RoPE(W_k · h) + W_k · Ψ
+            v =      W_v · h  + W_v · Ψ     # value/content path ("content too")
+
+        Ψ is projected through that layer's own (LoRA-adapted) q/k/v_proj, so the
+        graph signal enters the query/key dot product *unrotated* — exact
+        ``RoPE(X) + Ψ`` — at all layers. Ψ is supplied per forward via
+        ``self._pe_signal`` (``[B, seq, hidden]``); injection is skipped on cached
+        single-token decode steps (seq mismatch), so only prompt tokens carry it.
 
     Args:
         llm (nn.Module): LLM to perform classical planning
@@ -52,12 +76,91 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             LipschitzNorm(llm.config.hidden_size, eps=eps, device=device),
         )
         # Learnable gate on the PE injection: g = tanh(pe_gain) ∈ (-1,1). Lets the
-        # model regulate how strongly (and with which sign) Ψ enters the sum X + g·Ψ.
+        # model regulate how strongly (and with which sign) Ψ enters RoPE(X) + g·Ψ.
         # Init pe_gain = 1.0 → g ≈ 0.76, so Ψ is active from the first step (near the
         # token-embedding scale) and the optimizer can scale it down toward 0 or up
         # toward ±‖X‖. The init is deliberately nonzero: pe_gain=0 would give
         # tanh(0)=0 and switch the positional signal off entirely at the start.
         self.pe_gain = nn.Parameter(torch.tensor(1.0, device=device))
+
+        # Per-forward graph signal Ψ ([B, seq, hidden]); read by the patched
+        # attention forwards and set by _augment_embeddings / inference.
+        self._pe_signal: torch.Tensor | None = None
+        # Whether Ψ also enters the value/content path (v += W_v·Ψ).
+        self._pe_inject_value: bool = True
+        self._install_pe_injection()
+
+    def _decoder_layers(self):
+        """Return the LLM's decoder layer list (Llama/Qwen2: ``<CausalLM>.model.layers``)."""
+        base = getattr(self.llm, "model", None)
+        if base is not None and hasattr(base, "layers"):
+            return base.layers
+        return self.llm.get_decoder().layers
+
+    def _install_pe_injection(self) -> None:
+        """Patch every self-attention layer so Ψ is added *after* RoPE (RoPE(X)+Ψ).
+
+        Each attention module's ``forward`` is replaced with a faithful copy of the
+        HF implementation that additionally injects ``W_q·Ψ`` / ``W_k·Ψ`` into the
+        post-rotary query/key (and ``W_v·Ψ`` into the value path when
+        ``_pe_inject_value``). Ψ is projected through the same (LoRA-adapted)
+        projections as the content stream, so the graph code enters the q·k score
+        unrotated at all layers. Patching instance methods (not the class) keeps it
+        scoped to this LLM and survives PEFT, which swaps leaf Linears in place.
+        """
+        for layer in self._decoder_layers():
+            attn = layer.self_attn
+            attn.forward = self._make_injected_attention_forward(attn)
+
+    def _make_injected_attention_forward(self, attn):
+        # Resolve the model-family helpers from the module that defines this
+        # attention class (works for Llama, Qwen2, … which share this layout).
+        mod = importlib.import_module(type(attn).__module__)
+        apply_rotary_pos_emb = mod.apply_rotary_pos_emb
+        attn_fns = mod.ALL_ATTENTION_FUNCTIONS
+        eager = mod.eager_attention_forward
+        model = self  # captured for the per-forward Ψ signal
+
+        def forward(hidden_states, position_embeddings=None, attention_mask=None,
+                    past_key_values=None, **kwargs):
+            input_shape = hidden_states.shape[:-1]
+            hidden_shape = (*input_shape, -1, attn.head_dim)
+
+            query_states = attn.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            key_states = attn.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            value_states = attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+            cos, sin = position_embeddings
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+            # --- RoPE(X) + Ψ : add the graph signal AFTER the rotation ---------
+            psi = model._pe_signal
+            if (psi is not None and psi.shape[0] == hidden_states.shape[0]
+                    and psi.shape[1] == hidden_states.shape[1]):
+                psi = psi.to(query_states.dtype)
+                query_states = query_states + attn.q_proj(psi).view(hidden_shape).transpose(1, 2)
+                key_states = key_states + attn.k_proj(psi).view(hidden_shape).transpose(1, 2)
+                if model._pe_inject_value:
+                    value_states = value_states + attn.v_proj(psi).view(hidden_shape).transpose(1, 2)
+            # ------------------------------------------------------------------
+
+            if past_key_values is not None:
+                key_states, value_states = past_key_values.update(
+                    key_states, value_states, attn.layer_idx)
+
+            attention_interface = attn_fns.get_interface(
+                attn.config._attn_implementation, eager)
+            attn_output, attn_weights = attention_interface(
+                attn, query_states, key_states, value_states, attention_mask,
+                dropout=0.0 if not attn.training else attn.attention_dropout,
+                scaling=attn.scaling, **kwargs,
+            )
+
+            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+            attn_output = attn.o_proj(attn_output)
+            return attn_output, attn_weights
+
+        return forward
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         self.llm.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
@@ -71,33 +174,31 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         except AttributeError:
             return getattr(self.llm, name)
 
-    def _augment_embeddings(
+    def build_pe_signal(
         self,
-        input_ids: torch.Tensor,
+        embeddings: torch.Tensor,
         graphs: Batch,
         injection_maps: list[dict[int, list[tuple[int, int]]]],
+        permutation=None,
     ) -> torch.Tensor:
-        """Compute GNN/GT-augmented input embeddings. Shared by forward() and generate().
+        """Assemble the graph signal Ψ ([B, seq, hidden]) placed at node-token spans.
+
+        Ψ is consumed *inside* the patched attention layers (added post-RoPE), so
+        here we only build the placed, scaled, gated signal — no rotation.
 
         Args:
-            input_ids: [B, seq_len] token IDs.
+            embeddings: [B, seq, hidden] token embeddings (for magnitude scaling).
             graphs: PyG Batch (or list) of graphs, one per batch element.
-            injection_maps: Per-batch-element dict mapping node index to a list
-                of (start, end) token spans where that node's PE should be added.
+            injection_maps: Per-batch-element dict mapping node index to a list of
+                (start, end) token spans where that node's PE should be placed.
+            permutation: Optional node permutation passed to ``pe_model`` (used by
+                eval-time permutation-equivariance checks; ``None`` in training).
         """
-        # Clone so that in-place additions below don't corrupt the embedding table's
-        # gradient. The clone itself is in the autograd graph, so gradients flow
-        # through the additions back to pe_model / pe_proj normally.
-        embeddings = (
-            self.llm.get_input_embeddings()(input_ids)
-                .clone()
-                .to(input_ids.device)
-        )  # [B, seq_len, d]
-
-        for b in range(input_ids.shape[0]):
-            pe = self.pe_proj(self.pe_model(graphs[b]))  # [n, hidden_size]
-            # Scale Ψ to the token-embedding magnitude, then apply the learnable gate,
-            # so the LLM sees RoPE(X + g·Ψ): a genuine sum the model can regulate.
+        B, seq_len, hidden = embeddings.shape
+        psi = torch.zeros(B, seq_len, hidden, device=embeddings.device, dtype=embeddings.dtype)
+        for b in range(B):
+            pe = self.pe_proj(self.pe_model(graphs[b], permutation=permutation))  # [n, hidden_size]
+            # Scale Ψ to the token-embedding magnitude, then apply the learnable gate.
             # pe_proj ends in a LipschitzNorm, so Ψ exits at ~unit norm and would be
             # drowned out; matching it to the mean token-embedding norm makes it a
             # full-strength positional signal, and g = tanh(pe_gain) ∈ (-1,1)
@@ -105,10 +206,31 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             pe = pe * embeddings[b].norm(dim=-1).mean().detach() * torch.tanh(self.pe_gain)
             for node_idx, spans in injection_maps[b].items():
                 for start, end in spans:
-                    end = min(end, input_ids.shape[1])
+                    end = min(end, seq_len)
                     if start < end:
-                        embeddings[b, start:end] = embeddings[b, start:end] + pe[node_idx]
+                        psi[b, start:end] = psi[b, start:end] + pe[node_idx].to(psi.dtype)
+        return psi
 
+    def _augment_embeddings(
+        self,
+        input_ids: torch.Tensor,
+        graphs: Batch,
+        injection_maps: list[dict[int, list[tuple[int, int]]]],
+    ) -> torch.Tensor:
+        """Return plain token embeddings and arm Ψ for the patched attention layers.
+
+        Unlike the legacy residual-stream injection, Ψ is no longer added to the
+        embeddings here — it is registered on ``self._pe_signal`` and added *after*
+        RoPE inside every attention layer (see ``_install_pe_injection``), so the
+        LLM sees ``RoPE(X) + Ψ``. Returns the unmodified ``X`` embeddings to feed as
+        ``inputs_embeds``.
+        """
+        embeddings = (
+            self.llm.get_input_embeddings()(input_ids)
+                .clone()
+                .to(input_ids.device)
+        )  # [B, seq_len, d]
+        self._pe_signal = self.build_pe_signal(embeddings, graphs, injection_maps)
         return embeddings
 
     def forward(
@@ -125,12 +247,20 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         kwargs.pop("inputs_embeds", None)
         kwargs.pop("input_ids", None)
 
-        return self.llm(
-            inputs_embeds=embeddings,
-            attention_mask=attention_mask,
-            labels=labels,
-            **kwargs,
-        )
+        try:
+            return self.llm(
+                inputs_embeds=embeddings,
+                attention_mask=attention_mask,
+                labels=labels,
+                **kwargs,
+            )
+        finally:
+            # Disarm Ψ so a later forward can't inject a stale signal. But under
+            # gradient checkpointing the backward pass *recomputes* the attention
+            # forwards and must see the same Ψ, so keep it armed in that case (it
+            # is rebuilt/overwritten at the start of every forward anyway).
+            if not getattr(self.llm, "is_gradient_checkpointing", False):
+                self._pe_signal = None
 
 
 def has_match(input_ids_b: list[int], to_match:list[int],start_pos:int):
