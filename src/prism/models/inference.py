@@ -25,7 +25,13 @@ class InMemoryLLM:
         return [{"role": "user", "content": f"task: {base_request}. scene graph {graph_as_json}"}]
 
     def _decode(self, outputs) -> str:
-        return self.tokenizer.batch_decode(outputs, skip_special_tokens=True)[0].strip()
+        # clean_up_tokenization_spaces=False: the cleanup step is a WordPiece
+        # post-process that is destructive for BPE (Llama) — it strips spaces
+        # before punctuation and corrupts the generated plan text. Off here also
+        # silences the transformers warning.
+        return self.tokenizer.batch_decode(
+            outputs, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )[0].strip()
 
     def _generate_tokens(self, input_ids, attention_mask, msg, max_new_tokens):
         """Abstracts token generation. In the base case, it's just calling `model.generate`"""
