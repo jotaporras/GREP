@@ -98,9 +98,9 @@ log "Task ${TASK_ID}/$((TOTAL_TASKS - 1)): ckpt=${CKPT_NAME}  size=${SIZE}  perm
 
 CMD=(
     srun
-    python scripts/evaluate_suite.py
-    "$CHECKPOINT"
-    --pattern "$EVAL_FILE"
+    python -m prism.eval.scalability_evaluation
+    --checkpoint "$CHECKPOINT"
+    --graphs "$EVAL_FILE"
     --four-bit
     --permutation-seed "${PERM_SEEDS[@]}"
     --output "$RESULTS_DIR"

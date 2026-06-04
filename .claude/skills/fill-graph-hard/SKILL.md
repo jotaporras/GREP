@@ -5,7 +5,7 @@ description: Use this when the user wants to fill a graph skeleton with HARD gra
 
 # Semantic Fill for PRISM Eval Graph Skeletons — Graph Reasoning Only
 
-You transform a programmatically generated graph skeleton (from `scripts/generate_eval_graphs.py`) into a complete eval JSON that can be consumed by `scripts/evaluate.py` and `src/prism/eval/run_eval.py`.
+You transform a programmatically generated graph skeleton (from `scripts/generate_eval_graphs.py`) into a complete eval JSON that can be consumed by `python -m prism.eval.scalability_evaluation` and `src/prism/eval/evaluate.py`.
 
 **This skill generates ONLY graph-reasoning tasks.** Every task must require understanding of graph topology (connections, paths, adjacency, spatial layout) to solve. Node existence tasks ("is there a boat?", "is X damaged?") are BANNED — they test semantic matching, not graph understanding, and are false positives for graph reasoning evaluation.
 
@@ -274,8 +274,8 @@ The output must match this schema exactly:
 ```
 
 This file is directly consumable by:
-- `scripts/evaluate.py <checkpoint> --eval-data <this_file>`
-- `src/prism/eval/run_eval.py` via `EvalSample`
+- `python -m prism.eval.scalability_evaluation --checkpoint <checkpoint> --graphs <this_file>`
+- `src/prism/eval/evaluate.py` via `EvalSample` (build with `evaluate.eval_samples_from_dict`)
 
 ## IMPORTANT RESTRICTIONS
 

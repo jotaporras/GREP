@@ -16,13 +16,13 @@ import re
 
 import torch
 
-from prism.models.loaders import graph_augmented_llm_from_pretrained
-from prism.models.inference import GraphAugmentedInMemoryLLM
-from prism.eval.run_eval import EvalSample, eval_answer
-from prism.data.graph_sim import GraphSim
-from spine.mapping.graph_util import GraphHandler
-from spine.prompts.prompts import get_base_prompt_update_graph
-from spine.spine import SPINE
+from prism.models import loaders
+from prism.models import inference
+from prism.eval import evaluate
+from prism.data import graph_sim
+from spine.mapping import graph_util
+from spine.prompts import prompts as spine_prompts
+from spine import spine
 
 
 def main():
@@ -37,7 +37,7 @@ def main():
     print("=" * 60)
     print("STEP 1: Load model")
     print("=" * 60)
-    model, tokenizer = graph_augmented_llm_from_pretrained(args.checkpoint_dir)
+    model, tokenizer = loaders.graph_augmented_llm_from_pretrained(args.checkpoint_dir)
     model.eval()
     device = next(model.parameters()).device
     print(f"  Model type: {type(model).__name__}")
@@ -58,12 +58,14 @@ def main():
         print(f"  ERROR: sample_idx={args.sample_idx} but only {len(tasks)} tasks available")
         return
 
+    import os
     entry = tasks[args.sample_idx]
-    sample = EvalSample(
+    sample = evaluate.EvalSample(
         task=entry["task"],
         answer=entry["answer"],
         graph=graph_data,
         init_node=entry["init_node"],
+        graph_name=os.path.splitext(os.path.basename(args.eval_data))[0],
     )
     print(f"  Task: {sample.task}")
     print(f"  Answer regex: {sample.answer}")
@@ -74,23 +76,23 @@ def main():
     print("\n" + "=" * 60)
     print("STEP 3: Set up graph + SPINE (same as EvalCallback)")
     print("=" * 60)
-    graph_handler = GraphHandler("")
-    graph_sim = GraphSim(graph_handler)
-    client = GraphAugmentedInMemoryLLM(model=model, tokenizer=tokenizer)
-    llm_planner = SPINE(graph=graph_sim.partial_graph, client=client)
+    graph_handler = graph_util.GraphHandler("")
+    graph_sim_inst = graph_sim.GraphSim(graph_handler)
+    client = inference.GraphAugmentedInMemoryLLM(model=model, tokenizer=tokenizer)
+    llm_planner = spine.SPINE(graph=graph_sim_inst.partial_graph, client=client)
 
     # Reset graph with sample data (same as eval_model loop)
-    graph_sim.reset(graph_as_dict=sample.graph, current_location=sample.init_node)
-    llm_planner.graph = graph_sim.partial_graph
+    graph_sim_inst.reset(graph_as_dict=sample.graph, current_location=sample.init_node)
+    llm_planner.graph = graph_sim_inst.partial_graph
 
-    print(f"  Graph handler current_location: {graph_sim.partial_graph.current_location}")
-    print(f"  Graph node count: {len(graph_sim.partial_graph.graph.nodes)}")
+    print(f"  Graph handler current_location: {graph_sim_inst.partial_graph.current_location}")
+    print(f"  Graph node count: {len(graph_sim_inst.partial_graph.graph.nodes)}")
 
     # ── Step 4: Construct SPINE prompt ──────────────────────────────────
     print("\n" + "=" * 60)
     print("STEP 4: Construct SPINE prompt")
     print("=" * 60)
-    scene_graph_json = graph_sim.partial_graph.as_json_str
+    scene_graph_json = graph_sim_inst.partial_graph.as_json_str
     print(f"  Scene graph JSON (first 500 chars):")
     print(f"  {scene_graph_json[:500]}")
 
@@ -104,7 +106,7 @@ def main():
         print(f"  current_location value: {scene_dict['current_location']}")
 
     request_str = f"task: {sample.task}"
-    msg = get_base_prompt_update_graph(
+    msg = spine_prompts.get_base_prompt_update_graph(
         request=request_str, scene_graph=scene_graph_json
     )
 
@@ -190,7 +192,7 @@ def main():
     else:
         planner_response = {"response": {}}
 
-    result, formatted_answer = eval_answer(planner_response, sample.answer)
+    result, formatted_answer = evaluate._construct_eval_result(planner_response, sample.answer)
     print(f"  Formatted: {result.formatted}")
     print(f"  Keyword match: {result.plan_keyword}")
     print(f"  Correct: {result.is_correct()}")

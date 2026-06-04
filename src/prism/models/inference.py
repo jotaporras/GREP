@@ -25,7 +25,13 @@ class InMemoryLLM:
         return [{"role": "user", "content": f"task: {base_request}. scene graph {graph_as_json}"}]
 
     def _decode(self, outputs) -> str:
-        return self.tokenizer.batch_decode(outputs, skip_special_tokens=True)[0].strip()
+        # clean_up_tokenization_spaces=False: the cleanup step is a WordPiece
+        # post-process that is destructive for BPE (Llama) — it strips spaces
+        # before punctuation and corrupts the generated plan text. Off here also
+        # silences the transformers warning.
+        return self.tokenizer.batch_decode(
+            outputs, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )[0].strip()
 
     def _generate_tokens(self, input_ids, attention_mask, msg, max_new_tokens):
         """Abstracts token generation. In the base case, it's just calling `model.generate`"""
@@ -139,7 +145,7 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
             )
             return outputs[:, input_ids.shape[-1]:]
 
-        # Compute base embeddings once
+        # Compute base embeddings once (plain X — Ψ is injected inside attention).
         embeddings = (
             self.model.llm.get_input_embeddings()(input_ids)
             .clone()
@@ -153,21 +159,20 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
             for name in pyg_graph.node_names
         ]
         injection_map = build_injection_map(input_ids_list, node_token_seqs)
-        pe = self.model.pe_proj(self.model.pe_model(pyg_graph, permutation=self.permutation))  # [n, hidden_size]
 
-        # Rescale PE to match embedding norm. pe_proj ends with LipschitzNorm which
-        # forces output to norm ≈ sqrt(d_model) ≈ 64, while LLM embeddings
-        # (pre-RMSNorm) sit at ~0.5. Without rescaling, PE overwhelms embeddings.
-        target_norm = embeddings.norm(dim=-1).mean()
-        pe = torch.nn.functional.normalize(pe, dim=-1) * target_norm
-
-        for node_idx, spans in injection_map.items():
-            for start, end in spans:
-                end = min(end, input_ids.shape[1])
-                embeddings[0, start:end] = embeddings[0, start:end] + pe[node_idx]
-
-        return self.model.llm.generate(
-            inputs_embeds=embeddings, attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens, use_cache=True, temperature=0.01, min_p=0.1,
-            pad_token_id=self.tokenizer.eos_token_id,
-        )
+        # Build Ψ exactly as training (build_pe_signal: scale to mean token-embedding
+        # norm, apply the learnable tanh gate, place at node-name spans) and arm it on
+        # the model so the patched attention layers add it post-RoPE → RoPE(X) + Ψ.
+        # Injection auto-skips cached single-token decode steps (seq mismatch), so only
+        # the prompt tokens carry Ψ.
+        psi = self.model.build_pe_signal(
+            embeddings, [pyg_graph], [injection_map], permutation=self.permutation)
+        self.model._pe_signal = psi
+        try:
+            return self.model.llm.generate(
+                inputs_embeds=embeddings, attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens, use_cache=True, temperature=0.01, min_p=0.1,
+                pad_token_id=self.tokenizer.eos_token_id,
+            )
+        finally:
+            self.model._pe_signal = None

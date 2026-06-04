@@ -5,7 +5,7 @@ description: Use this when the user wants to fill a graph skeleton with semantic
 
 # Semantic Fill for PRISM Eval Graph Skeletons
 
-You transform a programmatically generated graph skeleton (from `scripts/generate_eval_graphs.py`) into a complete eval JSON that can be consumed by `scripts/evaluate.py` and `src/prism/eval/run_eval.py`.
+You transform a programmatically generated graph skeleton (from `scripts/generate_eval_graphs.py`) into a complete eval JSON that can be consumed by `python -m prism.eval.scalability_evaluation` and `src/prism/eval/evaluate.py`.
 
 ## Input
 
@@ -163,8 +163,8 @@ The output must match the schema of `data/eval/eval_1_multi_step.json` exactly:
 ```
 
 This file is directly consumable by:
-- `scripts/evaluate.py <checkpoint> --eval-data <this_file>`
-- `src/prism/eval/run_eval.py` via `EvalSample`
+- `python -m prism.eval.scalability_evaluation --checkpoint <checkpoint> --graphs <this_file>`
+- `src/prism/eval/evaluate.py` via `EvalSample` (build with `evaluate.eval_samples_from_dict`)
 
 ## IMPORTANT RESTRICTIONS
 

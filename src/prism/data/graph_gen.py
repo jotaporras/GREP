@@ -3,7 +3,7 @@ from typing import List, Optional
 
 from spine.mapping.graph_util import GraphHandler
 
-from prism.data import utils
+from prism.data import local_llm, utils
 
 
 QUERY = r"""
@@ -642,8 +642,16 @@ Return ONLY valid JSON in the following format — no extra text, no reasoning, 
 """
 
 class TaskGraphGen:
-    def __init__(self):
-        self.client = utils.GPTQueryClient()  # OpenAI()
+    def __init__(self, client=None):
+        # Backend selected by PRISM_LLM_BACKEND (default "openai"). Set it to
+        # "hf" to populate graphs/tasks with a local Gemma 4 model instead of
+        # the OpenAI API. An explicit `client` always wins.
+        if client is not None:
+            self.client = client
+        elif local_llm.hf_backend_enabled():
+            self.client = local_llm.LocalHFQueryClient()
+        else:
+            self.client = utils.GPTQueryClient()  # OpenAI()
 
     def build_prompt(
         self,
@@ -652,6 +660,7 @@ class TaskGraphGen:
         prior: Optional[str] = "",
         previous_tasks: Optional[str] = "",
         task_types: Optional[List[int]] = None,
+        task_complexities: Optional[List[int]] = None,
     ):
         query = (
             UPDATED_QUERY
@@ -670,6 +679,16 @@ class TaskGraphGen:
                 "corresponding task type above."
             )
 
+        if task_complexities is not None:
+            query += (
+                "\n\nTask Complexity\n"
+                "0. Simple\n"
+                "1. Complex\n"
+                f"\nHere is a list of the complexities for the tasks: {task_complexities}\n"
+                "Generate tasks in order, matching each entry in the list to the "
+                "corresponding complexity above."
+            )
+
         if previous_tasks != "":
             query += f"\nPrevious tasks are: {previous_tasks}\nTry not to duplicate"
 
@@ -685,6 +704,8 @@ class TaskGraphGen:
         description="",
         previous_tasks: str = "",
         task_types: Optional[List[int]] = None,
+        task_complexities: Optional[List[int]] = None,
+        reasoning_effort: str = "low",
     ) -> List[str]:
         """Get GPT generated tasks for putting planner data
 
@@ -698,6 +719,12 @@ class TaskGraphGen:
             Number of tasks to generate, by default 2
         description : str, optional
             an example/prior scene description to give the LLM to base the tasks on.
+        task_types : list[int], optional
+            Per-task type labels (see TASK_TAXONOMY) to steer the task mix.
+        task_complexities : list[int], optional
+            Per-task complexity labels (0=Simple, 1=Complex).
+        reasoning_effort : str
+            Reasoning effort passed through to the LLM client.
 
         Returns
         -------
@@ -711,17 +738,26 @@ class TaskGraphGen:
                 base_graph=base_graph,
                 previous_tasks=previous_tasks,
                 task_types=task_types,
-            )
+                task_complexities=task_complexities,
+            ),
+            reasoning_effort=reasoning_effort,
         )
 
-        return self.parse_response(response, description=description)
+        return self.parse_response(response, description=description, n_tasks=n_tasks)
 
-    def parse_response(self, response: str, description: str = "") -> dict:
-        """Validate and parse a raw GPT response string into a task dict."""
+    def parse_response(
+        self, response: str, description: str = "", n_tasks: Optional[int] = None
+    ) -> dict:
+        """Validate and parse a raw GPT response string into a task dict.
+
+        When ``n_tasks`` is given, the parsed ``tasks`` list is hard-capped to
+        that many entries — the LLM does not reliably honour the requested
+        count, so this guarantees at most ``n_tasks`` tasks per graph.
+        """
         print(response)
         json_content = json.loads(response)
         json_content["description"] = description
-        graph_handle = GraphHandler(graph="")
+        graph_handle = GraphHandler(graph_path="")
         graph_handle.reset(
             json_content["graph"],
             current_location=json_content["graph"]["robot_location"],
@@ -731,6 +767,17 @@ class TaskGraphGen:
         for [source, end] in graph_handle.graph.edges:
             assert source in graph_handle.graph.nodes, f"{source} not in graph"
             assert end in graph_handle.graph.nodes, f"{end} not in graph"
+
+        # Enforce the requested task count: the model may over-produce (e.g. 21
+        # when asked for 20), so truncate to exactly n_tasks.
+        if n_tasks is not None and isinstance(json_content.get("tasks"), list):
+            n_got = len(json_content["tasks"])
+            if n_got != n_tasks:
+                print(
+                    f"[graph-gen] model returned {n_got} tasks; "
+                    f"capping to requested n_tasks={n_tasks}"
+                )
+            json_content["tasks"] = json_content["tasks"][:n_tasks]
 
         return json_content
 

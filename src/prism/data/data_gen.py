@@ -7,7 +7,7 @@ import numpy as np
 from spine.mapping.graph_util import GraphHandler
 from spine.spine import SPINE
 
-from prism.data import graph_gen, graph_sim, planning_sim, utils
+from prism.data import graph_gen, graph_sim, local_llm, planning_sim, utils
 
 TASK_TAXONOMY = {
     0: "Existence",
@@ -224,7 +224,7 @@ class DataGenerator:
         )
 
         for idx, response in enumerate(responses):
-            rnd_data = self.context_gen.parse_response(response)
+            rnd_data = self.context_gen.parse_response(response, n_tasks=n_tasks)
             with open(f"{log_dir}/data_gen_{idx:03d}.json", "w") as f:
                 f.write(json.dumps(rnd_data, indent=2))
             with open(f"{log_dir}/graph_gen_{idx:03d}.json", "w") as f:
@@ -278,6 +278,14 @@ class DataGenerator:
 
         data_counter = 0
 
+        # When PRISM_LLM_BACKEND selects the local backend, drive the SPINE
+        # planner with a shared local Gemma client (same model instance as the
+        # populate phase). Otherwise leave client=None so SPINE uses its own
+        # default (OpenAI). Built once so the model is reused across all tasks.
+        spine_client = (
+            local_llm.GemmaSpineClient() if local_llm.hf_backend_enabled() else None
+        )
+
         for idx, data_path in enumerate(generated_data):
             try:
                 with open(data_path) as f:
@@ -320,12 +328,19 @@ class DataGenerator:
                 try:
                     task = task_entry["task"]
                     init_location = task_entry["init_node"]
-                    graph_handle = GraphHandler(graph=graph, init_node=init_location)
+                    # SPINE's GraphHandler loads from a path; build an empty one
+                    # and populate it from the in-memory graph dict via reset()
+                    # (same idiom as parse_response / the eval path) so GraphSim
+                    # sees a populated graph at construction.
+                    graph_handle = GraphHandler(graph_path="")
+                    graph_handle.reset(graph, current_location=init_location)
                     graph_data_gen = graph_sim.GraphSim(graph_handle)
                     unknown_pct = self.unknown_pcts[task_idx % len(self.unknown_pcts)]
                     graph_data_gen.randomly_remove_nodes(pct=unknown_pct)
                     planner = SPINE(
-                        graph=graph_data_gen.partial_graph, log_name=log_name
+                        graph=graph_data_gen.partial_graph,
+                        log_name=log_name,
+                        client=spine_client,
                     )
                     out = self.planning_sim.run_planning(
                         llm_planner=planner, task=task, graph_data_gen=graph_data_gen

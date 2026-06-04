@@ -118,9 +118,9 @@ log "Task ${TASK_ID}/$((TOTAL_TASKS - 1)): ckpt=${CKPT_NAME}  size=${SIZE}  grap
 
 CMD=(
     srun
-    python scripts/evaluate_suite.py
-    "$CHECKPOINT"
-    --pattern "$PATTERN"
+    python -m prism.eval.scalability_evaluation
+    --checkpoint "$CHECKPOINT"
+    --graphs "$PATTERN"
     --four-bit
     --permutation-seed "${PERM_SEEDS[@]}"
     --output "$RESULTS_DIR"
