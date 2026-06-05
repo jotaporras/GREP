@@ -33,6 +33,16 @@
   .badge.fmt-ok { background:#2a4a6b; color:var(--user); }
   .badge.fmt-fail { background:#4a2020; color:var(--warn); }
   .badge.turns { background:var(--border); color:var(--fg); }
+  .badge.subj-ok { background:#1f4d3a; color:#7fd9b5; }
+  .badge.subj-fail { background:#4d2030; color:#d98fb0; }
+  .badge.fp { background:#5a3a10; color:#f0c070; }
+  .badge.fn { background:#3a1050; color:#c79ae0; }
+  .badge.judge { background:#23405a; color:#79c0e0; }
+  .graph-group { padding:6px 12px 4px; font-size:10px; font-weight:700; text-transform:uppercase;
+    letter-spacing:.5px; color:var(--accent); background:var(--panel2);
+    border-bottom:1px solid var(--border); position:sticky; top:0; z-index:1;
+    display:flex; justify-content:space-between; }
+  .graph-group .gg-acc { color:var(--muted); font-weight:600; }
   .main { flex:1; overflow-y:auto; padding:16px 20px; }
   .controls { display:flex; gap:8px; align-items:center; margin-bottom:14px; }
   button { background:var(--panel2); color:var(--fg); border:1px solid var(--border);
@@ -110,12 +120,35 @@
     letter-spacing:.5px; }
   .graph-stats { font-size:12px; color:var(--muted); }
   .graph-stats b { color:var(--fg); }
+  .run-meta { background:var(--panel); border:1px solid var(--border); border-radius:6px;
+    padding:10px 14px; margin-bottom:12px; font-size:12px; }
+  .run-meta .sec-label { margin-bottom:6px; }
+  .run-meta table { width:100%; }
+  .run-meta td { border:none; padding:2px 8px 2px 0; vertical-align:top; }
+  .run-meta td.k { color:var(--muted); white-space:nowrap; width:1%; text-transform:uppercase;
+    font-size:10px; letter-spacing:.5px; }
+  .run-meta td.v { color:var(--fg); font-family:ui-monospace,monospace; word-break:break-all; }
+  .metrics { background:var(--panel); border:1px solid var(--border); border-radius:6px;
+    padding:10px 14px; margin-bottom:12px; }
+  .metrics .sec-label { margin-bottom:6px; }
+  .metrics table { width:auto; }
+  .metrics td.k { color:var(--muted); text-transform:uppercase; font-size:10px; letter-spacing:.5px; }
+  .metrics td.v { font-family:ui-monospace,monospace; }
+  .metric-good { color:var(--ok); }
+  .metric-bad { color:var(--warn); }
+  .metric-null { color:var(--muted); font-style:italic; }
+  .final-response { background:var(--panel); border:1px solid var(--accent); border-radius:6px;
+    padding:10px 14px; margin-bottom:12px; }
+  .final-response .sec-label { margin-bottom:6px; }
+  .traceback { background:#2a1414; border:1px solid var(--warn); border-radius:6px;
+    padding:10px 14px; margin-bottom:12px; }
+  .traceback pre { background:transparent; border:none; color:#e0a0a0; max-height:240px; }
 </style>
 </head>
 <body>
 <header>
   <h1>PRISM Eval Rollout Viewer</h1>
-  <div class="file-group"><label>Eval:</label><input type="file" id="file" accept=".json" /></div>
+  <div class="file-group"><label>Eval:</label><input type="file" id="file" accept=".json" multiple /></div>
   <div class="file-group"><label>Graph:</label><input type="file" id="graph-file" accept=".json" /></div>
   <span class="stats" id="stats">No eval log loaded</span>
   <span class="graph-stats" id="graph-stats"></span>
@@ -123,9 +156,10 @@
 <div class="layout">
   <div class="sidebar" id="sidebar"></div>
   <div class="main" id="main">
-    <div class="empty">Load an eval results JSON file to begin.<br/><br/>
-      Supports the <code>{samples: [{interaction_trace: [...]}]}</code> format
-      produced by <code>eval_checkpoint_on_graphs.py</code>.<br/><br/>
+    <div class="empty">Load one or more eval results JSON files to begin.<br/><br/>
+      Supports the <code>{checkpoint, architecture, accuracy, samples:[...]}</code> format
+      produced by <code>eval_checkpoint_on_graphs.py</code> — select multiple files
+      (e.g. all of <code>results/pww85dt8/</code>) to view them together.<br/><br/>
       Optionally load a <b>Graph</b> JSON to see the scene graph and acceptance criteria
       matched to each sample's task.</div>
   </div>
@@ -138,12 +172,19 @@ let TASK_INDEX = {};   // task text -> {task, answer, init_node, acceptance_crit
 const $ = id => document.getElementById(id);
 
 $('file').addEventListener('change', e => {
-  const r = new FileReader();
-  r.onload = () => {
-    try { load(JSON.parse(r.result), e.target.files[0].name); }
-    catch(ex) { alert('Failed to parse JSON: ' + ex.message); }
-  };
-  r.readAsText(e.target.files[0]);
+  const files = [...e.target.files];
+  if (!files.length) return;
+  const readFile = f => new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => { try { res({ parsed: JSON.parse(r.result), name: f.name }); } catch(ex) { rej(ex); } };
+    r.onerror = () => rej(r.error);
+    r.readAsText(f);
+  });
+  // sort by name so multi-file order is stable/predictable
+  files.sort((a, b) => a.name.localeCompare(b.name));
+  Promise.all(files.map(readFile))
+    .then(loadMany)
+    .catch(ex => alert('Failed to parse JSON: ' + ex.message));
 });
 
 $('graph-file').addEventListener('change', e => {
@@ -172,21 +213,53 @@ function loadGraph(parsed, name) {
   if (CUR >= 0) show(CUR);
 }
 
-function load(parsed, name) {
-  DATA = parsed.samples || (Array.isArray(parsed) ? parsed : []);
+// Run-level metadata keys carried at the top of each eval artifact.
+const RUN_META_KEYS = ['checkpoint', 'graph_file', 'architecture', 'text_edge_list',
+  'accuracy', 'num_samples', 'num_correct'];
+
+function loadMany(files) {
+  DATA = [];
+  files.forEach(({ parsed, name }) => {
+    const run = {};
+    RUN_META_KEYS.forEach(k => { if (parsed[k] !== undefined) run[k] = parsed[k]; });
+    run.__file = name;
+    const samples = parsed.samples || (Array.isArray(parsed) ? parsed : []);
+    samples.forEach(s => { s.__run = run; DATA.push(s); });
+  });
   const nc = DATA.filter(s => s.correct).length;
   const nf = DATA.filter(s => s.formatted).length;
+  const ns = DATA.filter(s => s.subjective_correct).length;
+  const fp = DATA.filter(s => s.false_positive).length;
+  const fn = DATA.filter(s => s.false_negative).length;
+  const total = DATA.length || 1;
+  const label = files.length === 1 ? files[0].name : `${files.length} files`;
   $('stats').innerHTML =
-    `<b>${name}</b> &nbsp; ${DATA.length} samples &nbsp; ` +
-    `correct: <b style="color:var(--pass)">${nc}/${DATA.length}</b> &nbsp; ` +
-    `formatted: <b>${nf}/${DATA.length}</b>`;
+    `<b>${escapeHtml(label)}</b> &nbsp; ${DATA.length} samples &nbsp; ` +
+    `objective: <b style="color:var(--pass)">${nc}/${DATA.length}</b> (${(nc/total*100).toFixed(0)}%) &nbsp; ` +
+    `subjective: <b style="color:var(--pass)">${ns}/${DATA.length}</b> (${(ns/total*100).toFixed(0)}%) &nbsp; ` +
+    `formatted: <b>${nf}/${DATA.length}</b> &nbsp; ` +
+    `<span style="color:var(--warn)">FP ${fp}</span> / <span style="color:#c79ae0">FN ${fn}</span>`;
   renderSidebar();
   show(0);
 }
 
+// Back-compat single-file loader (kept for any external callers).
+function load(parsed, name) { loadMany([{ parsed, name }]); }
+
 function renderSidebar() {
   $('sidebar').innerHTML = '';
+  let lastGroup = null;
   DATA.forEach((s, i) => {
+    const group = s.graph_name || s.__run?.__file || '';
+    if (group !== lastGroup) {
+      lastGroup = group;
+      const acc = s.__run && s.__run.accuracy !== undefined ? s.__run.accuracy : null;
+      const gh = document.createElement('div');
+      gh.className = 'graph-group';
+      gh.innerHTML = `<span>${escapeHtml(group)}</span>` +
+        (acc !== null ? `<span class="gg-acc">acc ${(acc * 100).toFixed(0)}%</span>` : '');
+      $('sidebar').appendChild(gh);
+    }
     const turns = (s.interaction_trace || []).length;
     const d = document.createElement('div');
     d.className = 'ex-item';
@@ -195,6 +268,10 @@ function renderSidebar() {
       <div class="task-text">${escapeHtml(s.task)}</div>
       <div class="badges">
         <span class="badge ${s.correct ? 'pass' : 'fail'}">${s.correct ? 'PASS' : 'FAIL'}</span>
+        ${s.subjective_correct !== undefined
+          ? `<span class="badge ${s.subjective_correct ? 'subj-ok' : 'subj-fail'}">judge ${s.subjective_correct ? '✓' : '✗'}</span>` : ''}
+        ${s.false_positive ? '<span class="badge fp">FP</span>' : ''}
+        ${s.false_negative ? '<span class="badge fn">FN</span>' : ''}
         <span class="badge ${s.formatted ? 'fmt-ok' : 'fmt-fail'}">${s.formatted ? 'formatted' : 'bad format'}</span>
         <span class="badge turns">${turns} turn${turns !== 1 ? 's' : ''}</span>
       </div>`;
@@ -223,6 +300,8 @@ function show(i) {
   html += `<div class="sample-header">
     <div class="task">${escapeHtml(s.task)}</div>
     <div class="meta">
+      ${s.graph_name ? `<span>graph: <b>${escapeHtml(s.graph_name)}</b></span>` : ''}
+      ${s.idx !== undefined ? `<span>idx: <b>${escapeHtml(String(s.idx))}</b></span>` : ''}
       <span>answer key: <span class="answer-key">${escapeHtml(s.answer_key || '')}</span></span>
       <span>terminated by: <b>${escapeHtml(s.terminated_by || '—')}</b></span>
       ${s.error ? `<span style="color:var(--warn)">error: ${escapeHtml(s.error)}</span>` : ''}
@@ -231,11 +310,42 @@ function show(i) {
 
   // Verdict
   const vclass = s.correct ? 'pass' : 'fail';
+  const yn = v => v === undefined ? '—' : (v ? 'yes' : 'no');
   html += `<div class="verdict ${vclass}">
-    ${s.correct ? '✓ CORRECT' : '✗ INCORRECT'} &nbsp;·&nbsp;
-    formatted: ${s.formatted ? 'yes' : 'no'} &nbsp;·&nbsp;
-    plan keyword match: ${s.plan_keyword ? 'yes' : 'no'}
+    ${s.correct ? '✓ CORRECT (regex)' : '✗ INCORRECT (regex)'} &nbsp;·&nbsp;
+    ${s.subjective_correct !== undefined
+      ? `judge verdict: <b>${s.subjective_correct ? '✓ correct' : '✗ incorrect'}</b> &nbsp;·&nbsp;` : ''}
+    ${s.false_positive ? '<b style="color:#f0c070">false positive</b> &nbsp;·&nbsp;' : ''}
+    ${s.false_negative ? '<b style="color:#c79ae0">false negative</b> &nbsp;·&nbsp;' : ''}
+    formatted: ${yn(s.formatted)} &nbsp;·&nbsp;
+    plan keyword match: ${yn(s.plan_keyword)} &nbsp;·&nbsp;
+    llm judge pass: ${yn(s.llm_judge_pass)}
   </div>`;
+
+  // Run metadata
+  if (s.__run) {
+    const r = s.__run;
+    const rows = [];
+    if (r.architecture) rows.push(['architecture', r.architecture]);
+    if (r.checkpoint) rows.push(['checkpoint', r.checkpoint]);
+    if (r.graph_file) rows.push(['graph file', r.graph_file]);
+    if (r.text_edge_list !== undefined) rows.push(['text edge list', r.text_edge_list]);
+    if (r.accuracy !== undefined) rows.push(['run accuracy', `${(r.accuracy * 100).toFixed(1)}%`]);
+    if (r.num_correct !== undefined && r.num_samples !== undefined)
+      rows.push(['run correct', `${r.num_correct} / ${r.num_samples}`]);
+    if (r.__file) rows.push(['source file', r.__file]);
+    if (rows.length) {
+      html += `<div class="run-meta"><div class="sec-label">run metadata</div><table>` +
+        rows.map(([k, v]) => `<tr><td class="k">${escapeHtml(k)}</td>
+          <td class="v">${escapeHtml(String(v))}</td></tr>`).join('') +
+        `</table></div>`;
+    }
+  }
+
+  // Path metrics
+  if (s.path_metrics && Object.keys(s.path_metrics).length) {
+    html += `<div class="metrics"><div class="sec-label">path metrics</div>${renderMetrics(s.path_metrics)}</div>`;
+  }
 
   // Matched graph task (acceptance criterion + graph)
   const matched = TASK_INDEX[s.task];
@@ -252,6 +362,38 @@ function show(i) {
         <div class="turn-body">${renderGraphSection(matched.__graph)}</div>
       </div>`;
     }
+  }
+
+  // Final planner response (top-level summary of the run's last answer)
+  const fr = s.response;
+  if (fr && typeof fr === 'object' && Object.keys(fr).length) {
+    html += `<div class="final-response"><div class="sec-label">final response</div>
+      <div class="response-grid">`;
+    if (fr.primary_goal) html += field('primary_goal', fr.primary_goal);
+    if (fr.relevant_graph) html += field('relevant_graph', fr.relevant_graph);
+    html += `</div>`;
+    if (fr.reasoning) html += `<div style="margin-top:8px">${field('reasoning', fr.reasoning)}</div>`;
+    if (fr.plan) {
+      html += `<div style="margin-top:8px"><div class="field-label sec-label">plan</div>`;
+      const plan = Array.isArray(fr.plan) ? fr.plan : [fr.plan];
+      plan.forEach(p => {
+        const act = Array.isArray(p) ? p[0] : (p.action || p);
+        const arg = Array.isArray(p) ? p[1] : (p.node || p.arg || p.region || p.object || '');
+        html += `<div class="plan-step ${act === 'answer' ? 'answer' : ''}">
+          <span class="act">${escapeHtml(String(act))}</span>( ${escapeHtml(String(arg))} )</div>`;
+      });
+      html += `</div>`;
+    }
+    html += `</div>`;
+  } else if (typeof fr === 'string' && fr.trim()) {
+    html += `<div class="final-response"><div class="sec-label">final response</div>
+      <pre>${escapeHtml(fr)}</pre></div>`;
+  }
+
+  // Traceback (if the sample errored)
+  if (s.traceback) {
+    html += `<div class="traceback"><div class="sec-label" style="color:var(--warn)">traceback</div>
+      <pre>${escapeHtml(s.traceback)}</pre></div>`;
   }
 
   // Interaction trace
@@ -336,6 +478,27 @@ function field(label, val) {
 
 function toggleIter(id) {
   document.getElementById(id).classList.toggle('collapsed');
+}
+
+function renderMetrics(m) {
+  // boolean / rate metrics get a good/bad color; null/empty shown muted.
+  const order = ['num_parsed', 'parsed_nodes', 'nodes_exist_rate', 'edge_validity_rate',
+    'start_goal_ok', 'full_path_valid', 'cost_optimality', 'judge_used', 'llm_judge_pass'];
+  const keys = order.filter(k => k in m).concat(Object.keys(m).filter(k => !order.includes(k)));
+  const fmt = (k, v) => {
+    if (v === null || v === undefined) return `<span class="metric-null">null</span>`;
+    if (Array.isArray(v)) return v.length ? escapeHtml(JSON.stringify(v)) : `<span class="metric-null">[]</span>`;
+    if (typeof v === 'boolean')
+      return `<span class="${v ? 'metric-good' : 'metric-bad'}">${v}</span>`;
+    if (typeof v === 'number' && k.endsWith('_rate')) {
+      const cls = v >= 0.999 ? 'metric-good' : (v <= 0 ? 'metric-bad' : '');
+      return `<span class="${cls}">${(v * 100).toFixed(0)}%</span>`;
+    }
+    return escapeHtml(String(v));
+  };
+  return `<table>` + keys.map(k =>
+    `<tr><td class="k">${escapeHtml(k)}</td><td class="v">${fmt(k, m[k])}</td></tr>`).join('') +
+    `</table>`;
 }
 
 function renderGraphSection(g) {
