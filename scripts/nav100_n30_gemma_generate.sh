@@ -22,10 +22,13 @@
 # Run scripts/nav100_n30_gemma_single_example.sh spot-check first if you want to
 # validate task/rollout quality before paying for the full run (compute, not $).
 #
-# Usage: bash scripts/nav100_n30_gemma_generate.sh [GPU_ID] [MODEL]
-#   GPU_ID  single CUDA device id to run on (default 0), OR -1 to use ALL GPUs
-#           simultaneously (device_map="auto" shards the model across them).
-#   MODEL   HF model id (default google/gemma-4-26B-A4B-it). Overrides $PRISM_HF_MODEL.
+# Usage: bash scripts/nav100_n30_gemma_generate.sh [GPU_ID] [MODEL] [N_GRAPHS]
+#   GPU_ID   single CUDA device id to run on (default 0), OR -1 to use ALL GPUs
+#            simultaneously (device_map="auto" shards the model across them).
+#   MODEL    HF model id (default google/gemma-4-26B-A4B-it). Overrides $PRISM_HF_MODEL.
+#   N_GRAPHS number of graphs to generate (default 36). Training examples ~=
+#            N_GRAPHS * 10 tasks * success_rate * 0.8 (train split); 36 targets
+#            >=180 training examples with headroom.
 
 set -euo pipefail
 
@@ -89,8 +92,14 @@ GEN_SEED=42
 NC=3
 NPC=8
 
-# 10 seeds x 1 config = 10 skeletons.
-seeds=(42 101 102 103 104 105 106 107 108 109)
+# Number of graphs (skeletons). Each graph yields up to N_TASKS rollouts, and
+# the train/val split keeps ~80% for training, so training examples are roughly
+#   N_GRAPHS * N_TASKS * rollout_success_rate * 0.8.
+# Default 36 (x10 tasks = 360 pairs) clears the >=180 training-example target
+# with headroom even at a ~65% rollout success rate. Override as the 3rd arg.
+N_GRAPHS="${3:-36}"
+# Distinct per-graph seeds (101..), embedded in skeleton filenames for provenance.
+seeds=( $(seq 101 $((100 + N_GRAPHS))) )
 
 mkdir -p "$SKEL_DIR"
 
@@ -99,6 +108,7 @@ echo "    CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<all>} (require_single_gp
 echo "    PRISM_LLM_BACKEND=${PRISM_LLM_BACKEND}"
 echo "    PRISM_HF_MODEL=${PRISM_HF_MODEL}"
 echo "    PRISM_HF_QUANT=${PRISM_HF_QUANT}"
+echo "    N_GRAPHS=${N_GRAPHS} x N_TASKS=${N_TASKS} = $((N_GRAPHS * N_TASKS)) (graph,task) pairs"
 
 echo ""
 echo "=== Preflight: verify data-gen code is current (fails fast vs. a 12-min load on a stale file) ==="

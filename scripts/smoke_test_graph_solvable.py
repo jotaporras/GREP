@@ -46,7 +46,10 @@ except ImportError:                 # graceful fallback so the tool runs anywher
     HAVE_NX = False
 
 # ---------------------------------------------------------------------------- graph
-NODE_RE = re.compile(r"[a-z][a-z_]*_\d+")
+# Node ids may carry several numeric segments (e.g. grid names like ``bay_3_26_1``),
+# so match one-or-more ``_<int>`` tails — a single-segment ``_\d+`` would truncate
+# ``bay_3_26_1`` to ``bay_3`` and wrongly report a phantom entity.
+NODE_RE = re.compile(r"[a-z][a-z_]*(?:_\d+)+")
 
 
 class SceneGraph:
@@ -157,10 +160,21 @@ def phantom_ids(text, nodes):
     return sorted({t for t in NODE_RE.findall(text or "") if t not in nodes})
 
 
+def strip_regex(answer):
+    """Drop regex word-boundaries / inline flags so NODE_RE reads clean node ids.
+    Without this, ``\\bhangar_1`` is scanned as the bogus token ``bhangar_1``."""
+    return re.sub(r"\\b|\(\?[a-z]+\)", " ", answer or "")
+
+
+def answer_node_ids(answer, nodes):
+    """Real graph node-ids named (in order) by an answer regex."""
+    return [t for t in NODE_RE.findall(strip_regex(answer)) if t in nodes]
+
+
 def route_alternatives(answer, nodes):
     """Node-sequences encoded by a path-style regex (handles '->' and '.*')."""
     alts = []
-    for chunk in (answer or "").split("|"):
+    for chunk in strip_regex(answer).split("|"):
         seq = [t for t in NODE_RE.findall(chunk) if t in nodes]
         if len(seq) >= 2:
             alts.append(seq)
@@ -177,8 +191,27 @@ def excluded_nodes(text, nodes):
 
 
 def task_type(answer, criterion, nodes):
-    if route_alternatives(answer, nodes):
-        return "path"
+    """Classify by what the ANSWER is shaped to accept (authoritative), falling back
+    to criterion cues only for the affirm/already distinction:
+
+      deny / affirm / already – a yes/no polarity answer
+      route                    – >=2 node ids joined by a '.*' wildcard (endpoints /
+                                 waypoints only; connectivity, not a literal edge-walk)
+      path                     – >=2 node ids with NO wildcard (a full ordered edge-walk)
+      identify_node            – a single bare node id ("Where is …", "Which area …")
+      identify_count           – a bare integer ("How many …")
+    """
+    cleaned = strip_regex(answer)
+    if re.search(r"(?i)\bno\b", cleaned):
+        return "deny"
+    if re.search(r"(?i)\byes\b", cleaned):
+        return "already" if ALREADY_CUES.search(criterion or "") else "affirm"
+    if route_alternatives(answer, nodes):       # >=2 node ids ordered within one branch
+        return "route" if ".*" in (answer or "") else "path"
+    if [t for t in NODE_RE.findall(cleaned) if t in nodes]:   # bare/alternated node id(s)
+        return "identify_node"
+    if re.search(r"\d", cleaned):
+        return "identify_count"
     if DENY_CUES.search(criterion or ""):
         return "deny"
     if ALREADY_CUES.search(criterion or ""):
@@ -247,6 +280,46 @@ def path_battery(valid_route, invalid_routes):
     return correct, wrong
 
 
+def route_reach_battery(waypoints):
+    """For endpoint/waypoint answers (``A .* B``): correct answers name the waypoints
+    in order; wrong ones deny the route or list them reversed (fails the ordered '.*')."""
+    correct = [
+        "Yes, a route exists: " + " -> ".join(waypoints) + ".",
+        "Go " + " then ".join(waypoints) + ".",
+        "Route: " + ", ".join(waypoints) + ".",
+    ]
+    wrong = [
+        "No, there is no route.",
+        "The destination is unreachable.",
+    ]
+    if len(waypoints) >= 2:
+        wrong.append("Route: " + ", ".join(reversed(waypoints)) + ".")
+    return correct, wrong
+
+
+def identify_node_battery(target, distractors):
+    """For "name the area/object" answers: accept the named node, reject other nodes."""
+    t = target or "the area"
+    correct = [
+        f"The answer is {t}.",
+        f"It is {t}.",
+        f"{t}.",
+        f"The area is {t}.",
+    ]
+    wrong = [f"The answer is {d}." for d in distractors]
+    wrong += ["No, the robot cannot reach it.", "There is no such area."]
+    return correct, wrong
+
+
+def identify_count_battery(num):
+    """For "how many" answers: accept the integer, reject neighbouring integers."""
+    n = int(num)
+    correct = [f"The answer is {num}.", f"{num}", f"There are {num} areas."]
+    wrong = [f"The answer is {w}." for w in {str(n + 1), str(n + 2), str(max(0, n - 1))} - {str(n)}]
+    wrong += ["No, the robot cannot reach it."]
+    return correct, wrong
+
+
 def regex_scores(pattern, correct, wrong):
     try:
         rx = re.compile(pattern)
@@ -287,6 +360,39 @@ def check_task(G, nodes, task):
         correct, wrong = path_battery(valid[0], invalid)
         if invalid:
             graph_note = f"regex also lists {len(invalid)} non-traversable route(s)"
+    elif ttype == "route":
+        # Endpoint/waypoint answer (A .* B): verify connectivity between consecutive
+        # waypoints (a real walk through them exists), not literal adjacency.
+        seq = answer_node_ids(answer, nodes)
+        wp = [seq[i] for i in range(len(seq)) if i == 0 or seq[i] != seq[i - 1]]
+        if len(wp) < 2:
+            return verdict(ttype, False, "route answer names fewer than two nodes", None, None, "")
+        target = wp[-1]
+        broken = next(((wp[i], wp[i + 1]) for i in range(len(wp) - 1)
+                       if not reachable(G, wp[i], wp[i + 1])), None)
+        if broken:
+            return verdict(ttype, False, f"no path {broken[0]} -> {broken[1]} (route infeasible)",
+                           None, None, "")
+        if init is not None and wp[0] != init and not reachable(G, init, wp[0]):
+            graph_ok = False
+            graph_note = f"route start {wp[0]} unreachable from init {init}"
+        correct, wrong = route_reach_battery(wp)
+    elif ttype == "identify_node":
+        ids = answer_node_ids(answer, nodes)
+        target = ids[0] if ids else None
+        if target is None:
+            return verdict(ttype, False, "answer names no known node", None, None, "")
+        if init is not None and not reachable(G, init, target):
+            graph_ok = False
+            graph_note = f"identified node '{target}' unreachable from init {init}"
+        distractors = [n for n in sorted(nodes) if n != target and n != init][:3]
+        correct, wrong = identify_node_battery(target, distractors)
+    elif ttype == "identify_count":
+        m = re.search(r"\d+", strip_regex(answer))
+        if not m:
+            return verdict(ttype, False, "count answer has no integer", None, None, "")
+        target = m.group(0)
+        correct, wrong = identify_count_battery(target)
     elif ttype == "deny":
         # entities must exist & be observable; verify the denial only if a constraint is parseable.
         if excluded and refs:
@@ -297,12 +403,28 @@ def check_task(G, nodes, task):
                 target = tgt
                 graph_note = "" if graph_ok else "deny claim is FALSE: target IS reachable under the stated constraint"
         else:
-            verified = False
-            graph_note = "deny claim not graph-verifiable (no explicit constraint); checked entity existence only"
-            for n in ids_in(text, nodes):
-                if n != init and not reachable(G, init, n):
-                    graph_ok, graph_note = False, f"referenced entity '{n}' unreachable from {init}"
-                    break
+            adj = ADJ_DENY_RE.search(crit)
+            cut = CUT_DENY_RE.search(crit)
+            if adj and adj.group(1) in G and adj.group(2) in G:
+                # criterion makes an explicit adjacency claim ("A is not directly
+                # connected to B" / "A is not one move from B") — verify it directly.
+                a, b = adj.group(1), adj.group(2)
+                graph_ok = not G.has_edge(a, b)
+                target = b
+                graph_note = "" if graph_ok else f"deny claim FALSE: {a} IS directly connected to {b}"
+            elif cut and all(cut.group(i) in G for i in (1, 2, 3)):
+                # "all paths A->B must pass through C": true iff removing C disconnects them.
+                a, b, c = cut.group(1), cut.group(2), cut.group(3)
+                graph_ok = not reachable(G, a, b, frozenset({c}))
+                target = b
+                graph_note = "" if graph_ok else f"deny claim FALSE: {a}->{b} still reachable without {c}"
+            else:
+                verified = False
+                graph_note = "deny claim not graph-verifiable (no explicit constraint); checked entity existence only"
+                for n in ids_in(text, nodes):
+                    if n != init and not reachable(G, init, n):
+                        graph_ok, graph_note = False, f"referenced entity '{n}' unreachable from {init}"
+                        break
         correct, wrong = affirm_battery(target)
         correct, wrong = wrong, correct                 # deny: a "no" answer is correct
     else:  # affirm / already
