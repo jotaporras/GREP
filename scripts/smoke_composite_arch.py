@@ -93,6 +93,7 @@ check("relative-position signal present in H0 (not negligible)", delta > 0.1,
 
 # ---------- 4. second-moment identity (no C formed) vs explicit ----------
 pe.fixed_seed_mode, pe.fixed_seed_value = True, 7
+pe.center_second_moment = False                # this check tests the raw associativity
 with torch.no_grad():
     cx_a = pe.second_moment_apply(pe_data, seeded)
     # explicit: Σ_s Φ_s (Φ_sᵀ seeded)/m, then the SAME magnitude match
@@ -103,10 +104,28 @@ with torch.no_grad():
                                 pool=False)
     acc = sum(P[s] @ (P[s].T @ seeded) for s in range(P.shape[0])) / pe.m_test
     ratio = seeded.float().norm(dim=-1).mean() / acc.float().norm(dim=-1).mean().clamp(min=1e-6)
-    cx_b = acc * ratio
+    cx_b = acc * ratio * torch.tanh(pe.output_gain)        # include the R-PEARL output gate
 check("C·seeded == explicit ΣΦ(Φᵀs)/m (no N×N formed)",
       torch.allclose(cx_a, cx_b, atol=1e-4),
       f"maxerr={(cx_a-cx_b).abs().max():.2e}")
+
+# ---------- 4b. centering recovers position rank (raw E[ΦΦᵀ] is rank-1 DC) ----------
+import numpy as np
+ntok = int(cg.is_token.sum())
+def Ctok(center):
+    pe.center_second_moment = center
+    Ct = torch.zeros(ntok, ntok)
+    with torch.no_grad():
+        for n in range(ntok):
+            s1 = torch.zeros(cg.num_nodes, d_model); s1[torch.where(cg.is_token)[0][n], 0] = 1.0
+            Ct[:, n] = pe.second_moment_apply(pe_data, s1)[cg.is_token, 0]
+    sv = np.linalg.svd(Ct.numpy(), compute_uv=False)
+    return int((sv > 1e-3 * sv[0]).sum())
+rank_raw, rank_cen = Ctok(False), Ctok(True)
+check("raw E[ΦΦᵀ] collapses to ~rank-1 DC; centering C−ΨΨᵀ restores rank",
+      rank_raw <= 2 and rank_cen > rank_raw,
+      f"raw rank={rank_raw}, centered rank={rank_cen} / {ntok}")
+pe.center_second_moment = True
 pe.fixed_seed_mode = False
 
 # ---------- 5. full GT forward: magnitude pinned to embedding scale ----------
@@ -116,13 +135,24 @@ def run_gt(mode, **kw):
                           eps=1e-6, m_test=8, spectral_norm_linears=False,
                           pe_readout=mode, **kw)
     return gt
+import math
 gt = run_gt("second_moment")
 gt.eval()
 with torch.no_grad():
     Y = gt(pe_data, token_embeddings=X, is_token=cg.is_token)
 ytok = Y[cg.is_token].norm(dim=-1).mean().item()
-check("GT output token rows pinned to embedding scale", abs(ytok - EMB) / EMB < 0.05,
-      f"Y token norm={ytok:.2f} vs emb {EMB}")
+# Output is now embedding-scale-rescaled THEN gated by g = tanh(output_gain)
+# (init output_gain=1 -> g ~ 0.762), so the pinned magnitude is g*EMB.
+gate = math.tanh(float(gt.output_gain))
+check("GT output token rows pinned to tanh(g)*embedding scale",
+      abs(ytok - EMB * gate) / (EMB * gate) < 0.05,
+      f"Y token norm={ytok:.2f} vs tanh(g)*emb {EMB * gate:.2f}")
+with torch.no_grad():
+    gt.output_gain.data.fill_(10.0)                 # tanh(10) ~ 1 -> full embedding scale
+    Yhi = gt(pe_data, token_embeddings=X, is_token=cg.is_token)
+    gt.output_gain.data.fill_(1.0)
+check("tanh(g) output gate scales the GT magnitude (g large -> full ‖X‖)",
+      abs(Yhi[cg.is_token].norm(dim=-1).mean().item() - EMB) / EMB < 0.05)
 check("GT output finite & correct shape",
       torch.isfinite(Y).all().item() and Y.shape == (cg.num_nodes, d_model))
 check("last block is norm-free", len(gt.blocks[-1].norms) == 0)
@@ -145,8 +175,10 @@ for mode in ("none", "additive", "interpolate"):
 gtm = run_gt("mean"); gtm.eval()
 with torch.no_grad():
     Ym = gtm(pe_data, token_embeddings=X, is_token=cg.is_token)
-check("mean-readout path finite & embedding-scaled",
-      torch.isfinite(Ym).all().item() and abs(Ym[cg.is_token].norm(dim=-1).mean().item()-EMB)/EMB < 0.05)
+gate_m = math.tanh(float(gtm.output_gain))
+check("mean-readout path finite & tanh(g)*embedding-scaled",
+      torch.isfinite(Ym).all().item()
+      and abs(Ym[cg.is_token].norm(dim=-1).mean().item() - EMB * gate_m) / (EMB * gate_m) < 0.05)
 
 # ---------- 8. gradient flow (train mode) ----------
 gt.train()

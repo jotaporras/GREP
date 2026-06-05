@@ -354,6 +354,10 @@ class TrainConfig:
     # moment E_q[Φ(q)] (default); "second_moment" = C @ X for C = E_q[Φ(q)Φ(q)ᵀ],
     # which carries the relative position the first moment collapses away.
     pe_readout: str = "mean"
+    # Center the second moment into a covariance (C·s = E[Φ(Φᵀs)] − Ψ(Ψᵀs)). Required
+    # for "second_moment" to carry position: the nonlinear GCN gives Φ a nonzero mean
+    # whose rank-1 ΨΨᵀ otherwise dominates E[ΦΦᵀ] and collapses C to pure averaging.
+    pe_center_moment: bool = True
     # Gated injection
     injection_mode: str = "interpolate"
     gate_init: float = 0.0
@@ -593,6 +597,7 @@ def train_model(config: TrainConfig, config_file: str = None):
             # spectrally normalized (only the PE-side R-PEARL projection is).
             spectral_norm_linears=False,
             pe_readout=config.pe_readout,
+            center_second_moment=config.pe_center_moment,
         )
         composite_kwargs = dict(
             gate_init=config.gate_init,
@@ -752,6 +757,7 @@ def train_model(config: TrainConfig, config_file: str = None):
                 "injection_mode": config.injection_mode, "gate_init": config.gate_init,
                 "gate_per_dim": config.gate_per_dim, "disable_rope": config.disable_rope,
                 "structural_lr_mult": config.structural_lr_mult, "pe_readout": config.pe_readout,
+                "pe_center_moment": config.pe_center_moment,
                 "cycle_weight": config.cycle_weight, "cycle_directed": config.cycle_directed,
                 "crosslink_weight": config.crosslink_weight,
                 "crosslink_mention_to_node": config.crosslink_mention_to_node,

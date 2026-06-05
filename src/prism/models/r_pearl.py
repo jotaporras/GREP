@@ -47,6 +47,7 @@ class RandomGNNPositionalEncodings(nn.Module):
         fixed_seed_mode: bool = False,
         fixed_seed_value: int = 0,
         max_probe_rows: int = 65536,
+        center_second_moment: bool = True,
     ):
         super().__init__()
         if probe_distribution not in ("gaussian", "rademacher"):
@@ -77,6 +78,11 @@ class RandomGNNPositionalEncodings(nn.Module):
             self.norm = LipschitzNorm(d_model, eps=eps)
         else:
             self.norm = nn.BatchNorm1d(d_model)
+        # Learnable tanh(g) gate on the R-PEARL output (first moment Ψ in forward() and
+        # the second moment C·signal in second_moment_apply()). g = tanh(output_gain)
+        # ∈ (-1, 1); init output_gain=1 → g ≈ 0.76. Lets the model scale the positional
+        # signal up/down instead of it being fixed by the norm/rescale. Scalar, saved.
+        self.output_gain = nn.Parameter(torch.tensor(1.0))
         # m_train / m_test probe counts (R7); self.M kept as the train alias.
         self.m_train = num_samples
         self.m_test = num_samples if m_test is None else m_test
@@ -92,6 +98,10 @@ class RandomGNNPositionalEncodings(nn.Module):
         # per-chunk means are accumulated (the MC estimate is mean-over-probes, so
         # this is identical to a single pass — only the peak memory differs).
         self.max_probe_rows = max_probe_rows
+        # Center the second-moment readout into a covariance (C·s = E[Φ(Φᵀs)] − Ψ(Ψᵀs)).
+        # Required for the second moment to carry position: the nonlinear GCN gives Φ a
+        # nonzero mean whose rank-1 outer product ΨΨᵀ otherwise dominates E[ΦΦᵀ].
+        self.center_second_moment = center_second_moment
         self.eps = eps
 
     def _sample_probes(self, num_nodes: int, m: int, device,
@@ -216,7 +226,7 @@ class RandomGNNPositionalEncodings(nn.Module):
         pooled_pe = pooled_sum / m
 
         pooled_pe = self.norm(pooled_pe)
-        return pooled_pe
+        return pooled_pe * torch.tanh(self.output_gain).to(pooled_pe.dtype)
 
     def second_moment_apply(self, data, signal: torch.Tensor) -> torch.Tensor:
         """Apply the probe second moment ``C = E_q[Φ(q)Φ(q)ᵀ]`` to ``signal``.
@@ -273,7 +283,9 @@ class RandomGNNPositionalEncodings(nn.Module):
             mc = Qc.shape[1]
             # Per-probe responses P_s = Φ(q^(s)) ∈ [N, d] (pool=False keeps them
             # un-meaned); accumulate Σ_s P_s (P_sᵀ s) so the [d, d] inner product
-            # is the only dense intermediate — the N×N matrix is never formed.
+            # is the only dense intermediate — the N×N matrix is never formed. Also
+            # accumulate Σ_s P_s (the un-pooled first moment) so the readout can be
+            # centered into a covariance (see below).
             P = self._batched_gcn_forward(
                 Qc, ei, num_nodes, mc, edge_weight=edge_weight, device=device, pool=False
             )  # [mc, N, d]
@@ -282,18 +294,30 @@ class RandomGNNPositionalEncodings(nn.Module):
                 Ps = P[si]                                   # [N, d]
                 contrib = Ps @ (Ps.transpose(0, 1) @ s)      # [N, d] @ ([d, N] @ [N, d])
                 out = contrib if out is None else out + contrib
-            return out
+            return out, P.sum(dim=0)                          # (Σ_s Φ Φᵀ s, Σ_s Φ)
 
         acc = None
+        psi_acc = None
         for start in range(0, m, chunk):
             Qc = Q[:, start:start + chunk]
             if torch.is_grad_enabled():
                 dummy = Qc.new_ones(1, requires_grad=True)
-                contrib = checkpoint(_chunk_apply, Qc, edge_index, dummy, use_reentrant=False)
+                contrib, psi_c = checkpoint(_chunk_apply, Qc, edge_index, dummy, use_reentrant=False)
             else:
-                contrib = _chunk_apply(Qc, edge_index)
+                contrib, psi_c = _chunk_apply(Qc, edge_index)
             acc = contrib if acc is None else acc + contrib
-        result = acc / m
+            psi_acc = psi_c if psi_acc is None else psi_acc + psi_c
+        result = acc / m                                     # E_q[Φ(Φᵀ s)] (uncentered second moment)
+        if self.center_second_moment:
+            # Center to the COVARIANCE: C·s = E[ΦΦᵀ]s − E[Φ]E[Φ]ᵀ s = E[Φ(Φᵀs)] − Ψ(Ψᵀs).
+            # The proof's circulant C = h(S)h(S)* assumes the zero-mean linear response
+            # Φ'=h(S)q; the nonlinear GCN gives Φ a nonzero mean whose outer product
+            # ΨΨᵀ is a rank-1 DC term that otherwise dominates E[ΦΦᵀ] (collapsing C to
+            # pure averaging). Subtracting it (Ψ = E_q[Φ], same raw probes) restores the
+            # position-bearing covariance the proof guarantees. Ψ here is the un-normed
+            # pooled Φ, matching the un-normed Φ in the second moment.
+            psi = psi_acc / m                                # E_q[Φ]  [N, d]
+            result = result - psi @ (psi.transpose(0, 1) @ s)
         # Scale C·signal to the SIGNAL's magnitude rather than to unit norm. A unit
         # LipschitzNorm here would leave C·signal at ~4% of H0 = signal + C·signal
         # (token rows of `signal` are X at ~‖X‖), drowning out the relative-position
@@ -304,5 +328,6 @@ class RandomGNNPositionalEncodings(nn.Module):
         # loads in old checkpoints and is the toggle point for unit-norm output.
         cur = result.float().norm(dim=-1).mean().clamp(min=1e-6)
         target = s.float().norm(dim=-1).mean()
-        return result * (target / cur).to(result.dtype)
+        # Magnitude-match to the signal, then the learnable tanh(g) output gate.
+        return result * (target / cur).to(result.dtype) * torch.tanh(self.output_gain).to(result.dtype)
 

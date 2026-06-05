@@ -305,7 +305,8 @@ class GraphTransformer(nn.Module):
                  eps: float = 1e-8, use_layer_norm: bool = True,
                  probe_distribution: str = "gaussian", m_test: int = None,
                  fixed_seed_mode: bool = False, fixed_seed_value: int = 0,
-                 spectral_norm_linears: bool = True, pe_readout: str = "mean"):
+                 spectral_norm_linears: bool = True, pe_readout: str = "mean",
+                 center_second_moment: bool = True):
         super().__init__()
         if pe_readout not in ("mean", "second_moment"):
             raise ValueError(
@@ -335,6 +336,7 @@ class GraphTransformer(nn.Module):
             num_samples=num_samples, dropout=dropout, k=k_pe, eps=eps, use_layer_norm=use_layer_norm,
             probe_distribution=probe_distribution, m_test=m_test,
             fixed_seed_mode=fixed_seed_mode, fixed_seed_value=fixed_seed_value,
+            center_second_moment=center_second_moment,
         )
         # Blocks 0..L-2 keep their LipschitzNorms (stability through depth); the final
         # block is norm-free (normalize=False) so the output magnitude survives for the
@@ -351,6 +353,13 @@ class GraphTransformer(nn.Module):
         # toggle point if a bounded unit-norm output is ever wanted again. Currently
         # bypassed in forward() in favor of the embedding-scale rescale.
         self.output_norm = LipschitzNorm(d_model, eps=eps)
+        # Learnable tanh(g) gate replacing the removed output LipschitzNorm: the GT
+        # output is scaled by the embedding-scale rescale AND by g = tanh(output_gain)
+        # ∈ (-1, 1). Lets the model dial the structural output's magnitude up toward
+        # ±‖X‖ or down toward 0 (recovering the base LLM) instead of it being pinned
+        # at full embedding scale. Init output_gain=1.0 → g ≈ 0.76 (active, in tanh's
+        # responsive region); a single scalar, transferable, saved with gt_model.
+        self.output_gain = nn.Parameter(torch.tensor(1.0))
 
     @torch.no_grad()
     def _expand_edge_index(self, edge_index: Tensor, num_nodes: int, k_hops: int = 1) -> Tensor:
@@ -503,5 +512,8 @@ class GraphTransformer(nn.Module):
                 tok = x if is_token is None else x[is_token]
                 cur = tok.float().norm(dim=-1).mean().clamp(min=self.eps)
                 target = token_embeddings.float().norm(dim=-1).mean()
-                x = x * (target / cur).to(x.dtype)
+                # Embedding-scale rescale, then the learnable tanh(g) magnitude gate
+                # (replaces the removed output norm; g can attenuate the structural
+                # output toward 0 or push it to full ±‖X‖ scale).
+                x = x * (target / cur).to(x.dtype) * torch.tanh(self.output_gain).to(x.dtype)
         return x

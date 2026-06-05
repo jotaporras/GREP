@@ -283,6 +283,10 @@ class GradientDebugCallback(TrainerCallback):
                 "debug/embedding_norm": self._emb_norm,
                 "debug/num_injections": self._num_injections,
                 "debug/gate_value": float(inner.injection.gate.detach().float().mean().item()),
+                # Learnable tanh(g) output gates (GT output + R-PEARL output): the
+                # effective magnitude multiplier the model has learned on each signal.
+                "debug/gt_output_gain": float(inner.gt_model.output_gain.detach().tanh().item()),
+                "debug/rpearl_output_gain": float(inner.gt_model.pe_model.output_gain.detach().tanh().item()),
                 "debug/lr": lr,
             }
         else:

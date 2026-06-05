@@ -156,6 +156,7 @@ def graph_augmented_llm_from_pretrained(
             fixed_seed_value=gnn_cfg.get("fixed_seed_value", 0),
             spectral_norm_linears=False,  # M6 fusion path (token embeddings fused)
             pe_readout=gnn_cfg.get("pe_readout", "mean"),
+            center_second_moment=gnn_cfg.get("pe_center_moment", True),
         )
         composite_kwargs = dict(
             gate_init=gnn_cfg.get("gate_init", 0.0),

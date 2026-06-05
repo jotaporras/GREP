@@ -4,9 +4,9 @@ wandb_project: GREP-PRISM
 wandb_run_name: e5_llm_graph_oriented_data_fixed
 wandb_tag: e5_graph_oriented_data
 checkpoint_dir: outputs/e5_graph_oriented_data
-data: /home/shared/GREP-PRISM/data/gen/e5_graph_oriented_data/split/formatted_all_new__train.json
-val_data: /home/shared/GREP-PRISM/data/gen/e5_graph_oriented_data/split/formatted_all_new__val.json
-eval_data: /home/shared/GREP-PRISM/data/gen/e5_graph_oriented_data/split/test_graphs/data_gen_004.json
+data: data/gen/nav100_n30_gemma_data/split/formatted_all_new__train.json
+val_data: data/gen/nav100_n30_gemma_data/split/formatted_all_new__val.json
+eval_data: data/gen/nav100_n30_gemma_data/split/test_graphs/data_gen_005.json
 base_model: meta-llama/Llama-3.1-8B-Instruct
 bit4: true
 per_device_train_batch_size: 1

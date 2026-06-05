@@ -1,7 +1,7 @@
 name: e7
 architecture: composite_graph_gt
 wandb_project: GREP-PRISM
-wandb_run_name: e7_composite_graph_gt_no_edges
+wandb_run_name: e7_composite_graph_gt_centered_no_edges   
 wandb_tag: e7_architecture_experiments
 checkpoint_dir: outputs/e7_architecture_improvements
 data: data/gen/nav100_n30_gemma_data/split/formatted_all_new__train.json
@@ -22,10 +22,10 @@ d_model: 4096
 gt_num_layers: 3
 gt_heads: 8
 pe_hidden_channels: 256
-pe_num_layers: 5
-num_samples: 40
-dropout: 0.1
-k_pe: 5
+pe_num_layers: 2
+num_samples: 96
+dropout: 0.05
+k_pe: 3
 k_gt: 2
 eps: 1e-6
 use_layer_norm: true
@@ -43,18 +43,19 @@ crosslink_mention_clique: true
 # R-PEARL sampling
 probe_distribution: gaussian
 m_test: 128
-fixed_seed_mode: false     # Switch
+fixed_seed_mode: false
 fixed_seed_value: 0
-pe_readout: second_moment  # Switch
+pe_readout: second_moment
+pe_center_moment: true
 # Gated injection
 injection_mode: none
 gate_init: 0.3
 gate_per_dim: false
-structural_lr_mult: 20.0
-lora_warmup_steps: 200
+structural_lr_mult: 5.0
+lora_warmup_steps: 20
 # LLM
 disable_rope: true
-n_icl_examples: 2         # Switch
+n_icl_examples: 2
 # Debug / viz
 log_fiedler: true
 log_scene_mass: true

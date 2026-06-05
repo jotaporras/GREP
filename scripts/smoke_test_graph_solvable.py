@@ -138,7 +138,10 @@ DENY_CUES = re.compile(
 ALREADY_CUES = re.compile(r"\balready\b|already\s+(?:there|at)", re.I)
 CONSTRAINT_RE = re.compile(
     r"(?:without\s+(?:using|passing\s+through|going\s+through)|does\s+not\s+use|"
-    r"avoid(?:s|ing)?|excluding|not\s+via|not\s+using)\b(.*?)(?:\.|$)", re.I)
+    r"avoid(?:s|ing)?|excluding|not\s+via|not\s+using)\b(.*?)"
+    # stop at a clause boundary so illustrative "..., such as via X" route hints
+    # are not swept into the avoid-set (which would over-block reachability).
+    r"(?:[.,;]|\bsuch\s+as\b|\bfor\s+example\b|\be\.g\.|$)", re.I)
 
 
 def ids_in(text, nodes):
