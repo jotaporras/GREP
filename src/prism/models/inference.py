@@ -178,7 +178,7 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
             )
             return outputs[:, input_ids.shape[-1]:]
 
-        # Compute base embeddings once
+        # Compute base embeddings once (plain X — Ψ is injected inside attention).
         embeddings = (
             graph_model.llm.get_input_embeddings()(input_ids)
             .clone()
@@ -229,20 +229,20 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
                 pad_token_id=self.tokenizer.eos_token_id,
             )
 
-        pe = graph_model.pe_proj(graph_model.pe_model(pyg_graph, permutation=self.permutation))  # [n, hidden_size]
-        # Mirror _augment_embeddings exactly so eval matches training: scale Ψ to the
-        # token-embedding magnitude, then apply the learnable tanh gate. (The old
-        # `pe * pe_gain` used the raw gain with no embedding-scale, which — with
-        # pe_gain≈0 — left the eval PE effectively off and disagreeing with training.)
-        pe = pe * embeddings[0].norm(dim=-1).mean() * torch.tanh(graph_model.pe_gain)
-
-        for node_idx, spans in injection_map.items():
-            for start, end in spans:
-                end = min(end, input_ids.shape[1])
-                embeddings[0, start:end] = embeddings[0, start:end] + pe[node_idx]
-
-        return graph_model.llm.generate(
-            inputs_embeds=embeddings, attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens, use_cache=True, temperature=0.01, min_p=0.1,
-            pad_token_id=self.tokenizer.eos_token_id,
-        )
+        # Base R-PEARL GraphAugmentedLLM (non-composite): apply RoPE(X) + Ψ exactly as
+        # training. build_pe_signal scales Ψ to the mean token-embedding norm, applies
+        # the learnable tanh gate, and places it at the scoped node-name spans; arming
+        # it on the model makes the patched attention layers add it post-RoPE. Injection
+        # auto-skips cached single-token decode steps (seq mismatch), so only the prompt
+        # tokens carry Ψ. Disarm afterwards so no stale signal leaks into a later call.
+        psi = graph_model.build_pe_signal(
+            embeddings, [pyg_graph], [injection_map], permutation=self.permutation)
+        graph_model._pe_signal = psi
+        try:
+            return graph_model.llm.generate(
+                inputs_embeds=embeddings, attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens, use_cache=True, temperature=0.01, min_p=0.1,
+                pad_token_id=self.tokenizer.eos_token_id,
+            )
+        finally:
+            graph_model._pe_signal = None

@@ -1,9 +1,42 @@
 import json
+import os
+import sys
 from typing import List, Optional
 
 from spine.mapping.graph_util import GraphHandler
 
 from prism.data import local_llm, utils
+
+
+def _validate_tasks(json_content: dict) -> None:
+    """Best-effort post-generation viability gate.
+
+    Reuses the deterministic smoke test (``scripts/smoke_test_graph_solvable``)
+    to flag, at generation time, any task that is unsolvable (entity missing /
+    unreachable / non-traversable route) or whose ``answer`` regex leaks (rewards
+    a wrong-polarity or premise-echo answer). Failures are logged, not raised, so
+    a validation hiccup never aborts a generation run; the leaky/narrow regex is
+    later canonicalised by ``scripts/fix_answer_regexes.py``.
+    """
+    try:
+        scripts_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
+            "scripts",
+        )
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        from smoke_test_graph_solvable import build_graph, check_task
+
+        G, nodes, _ = build_graph(json_content["graph"])
+        for i, task in enumerate(json_content.get("tasks", [])):
+            r = check_task(G, nodes, task)
+            if r["verdict"] == "FAIL":
+                print(
+                    f"[graph-gen][VALIDATION FAIL] task {i}: {r.get('note', '')} "
+                    f"| {task.get('task', '')[:80]}"
+                )
+    except Exception as e:  # never let validation break generation
+        print(f"[graph-gen] task validation skipped ({type(e).__name__}: {e})")
 
 
 QUERY = r"""
@@ -332,7 +365,7 @@ Return ONLY valid JSON in the following format — no extra text, no reasoning, 
 
 """
 
-UPDATED_QUERY = """
+UPDATED_QUERY = r"""
 You are generating data for training an LLM-based planner, like the SPINE paper from Ravichandran et al.
 
 You will be given a base scene graph in the following format:
@@ -571,15 +604,21 @@ For example, if the graph contains a `fuel_depot_1` region with a `fuel_tank_1` 
 
 {
   "task": "Is there any fuel storage facility nearby?",
-  "answer": "(?i)(yes|there is|fuel)",
+  "answer": "(?i)\byes\b",
   "init_node": "clearing_1",
   "acceptance_criterion": "A correct answer affirms that fuel_depot_1 exists and contains fuel_tank_1."
 }
 
 **Answer regex rules:**
-- Include synonyms and common phrasings so the regex does not miss valid answers
-- Avoid ambiguous substrings that would match incorrect responses (e.g., don't use `"no"` as a pattern — it matches "north", "node", etc.)
-- Yes/no patterns must match the correct polarity only. For a "yes" answer, use `(?i)(yes|there is|it does)` — never a pattern that also matches "no"
+The `answer` regex is only a coarse automatic check — the `acceptance_criterion` is the authoritative grader. Keep the regex SIMPLE; it must accept correct answers and reject wrong ones.
+
+- Wrap every word or phrase in `\b` word boundaries (e.g. `\byes\b`, `\bcan\b`). Without them a token matches inside larger words and silently accepts wrong answers — bare `can` matches "cannot", `possible` matches "impossible", `reachable` matches "unreachable", `no` matches "node"/"north".
+- Yes/no tasks — POLARITY LEAK is the most common bug: never use a phrase for one polarity that also appears inside the opposite answer. `there is` is INVALID for a "yes" answer because it occurs in the "no" answer "there is no ..."; likewise never key a "yes" on `reachable`, `connected`, or `possible` unguarded (they occur in "not reachable", "not connected", "not possible"). The planner reliably says "yes" or "no", so use exactly:
+  - "yes" answer → `(?i)\byes\b`
+  - "no" answer → `(?i)\bno\b`
+  Then test the regex against the WRONG-polarity answer (e.g. "No, it cannot ..." for a yes-task); if it still matches, the regex is invalid — fix it.
+- Navigability tasks — the regex matches only the route's FIRST and LAST hop: the start (init_node) region and the destination region, in order — e.g. `(?i)\bcrew_quarters_1\b.*\bcoolant_station_1\b`. If the task names a required waypoint, include it too: `(?i)\bcrew_quarters_1\b.*\bpower_conduit_1\b.*\bcoolant_station_1\b`. NEVER encode the full path — many valid routes exist and a full-path regex rejects correct alternatives. The yes/no correctness and the middle of the route are checked by the judge, not the regex.
+- Existence/location tasks — match the answer node name with `\b` boundaries: `(?i)\bfuel_depot_1\b`, never bare `fuel_depot_1` (which also matches `fuel_depot_10`).
 - Do NOT anchor with `^` or `$`. The regex should match anywhere in the response.
 
 **Acceptance criterion rules:**
@@ -623,6 +662,7 @@ Before producing your final output, verify ALL of the following. If any conditio
 9. `robot_location` references a valid renamed region
 10. All `init_node` values in tasks reference valid renamed regions
 11. Every task has a non-empty `acceptance_criterion` that names the answer entity by its node name
+12. Every `answer` regex uses `\b` word boundaries, rejects the opposite-polarity answer for yes/no tasks, and for Navigability tasks matches only the first and last hop (start and destination regions, plus any required waypoint), never a full path
 
 ### Output format
 
@@ -779,6 +819,7 @@ class TaskGraphGen:
                 )
             json_content["tasks"] = json_content["tasks"][:n_tasks]
 
+        _validate_tasks(json_content)
         return json_content
 
 

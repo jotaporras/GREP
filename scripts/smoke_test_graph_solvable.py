@@ -204,8 +204,24 @@ def affirm_battery(target):
         f"No, {t} is unreachable.",
         f"It is impossible to reach {t}.",
         f"The robot is unable to reach {t}.",
+        # two-word negations a `\b`-only template misses (substring guards do not
+        # catch "not reachable" / "not able to reach" — only "unreachable").
+        f"No, it is not reachable.",
+        f"No, the robot is not able to reach {t}.",
     ]
     return correct, wrong
+
+
+def premise_echo(target):
+    """Neutral restatements of the question — NOT a verdict, so they must be
+    rejected regardless of task polarity. Exercises the narration-noun leak
+    (`a path`/`a route` matching a non-answer). Appended to the WRONG set of
+    every task type (never flipped into a 'correct' battery)."""
+    t = target or "the area"
+    return [
+        f"The question is whether there is a path to {t}.",
+        f"I must determine if a route to {t} exists.",
+    ]
 
 
 def already_battery(target):
@@ -298,6 +314,8 @@ def check_task(G, nodes, task):
                 break
         correct, wrong = (already_battery(target) if ttype == "already" else affirm_battery(target))
 
+    # A neutral premise restatement is never a correct answer for ANY polarity.
+    wrong = wrong + premise_echo(target)
     acc, rej, rx_err = regex_scores(answer, correct, wrong)
     return verdict(ttype, graph_ok, graph_note, acc, rej, rx_err, verified,
                    invalid_route=(ttype == "path" and bool(graph_note)))

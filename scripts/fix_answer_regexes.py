@@ -22,15 +22,21 @@ import sys
 sys.path.insert(0, os.path.dirname(__file__))
 from smoke_test_graph_solvable import build_graph, task_type, route_alternatives
 
-# A "yes": needs one positive cue as a whole word. `\b` already blocks the
-# cannot/impossible/unreachable substrings; the `(?<!not )` guard kills the only
-# remaining leak ("not possible").
-AFFIRM_RX = (r"(?i)(?:\byes\b|\baffirmative\b|\bcan reach\b|\bable to reach\b|"
-             r"\breachable\b|\ba path\b|\ba route\b|\balready\b|(?<!not )\bpossible\b)")
+# A "yes": needs one *unambiguously affirmative* cue as a whole word. `\b`
+# already blocks the cannot/impossible/unreachable substrings; the `(?<!not )`
+# guards kill the two-word negation leaks ("not reachable", "not able to reach",
+# "not possible"). Bare narration nouns `a path`/`a route` are intentionally
+# dropped — they match premise echoes ("...whether there is a path to X")
+# without stating a verdict; the affirm answers that used them still match via
+# `yes`/`affirmative`.
+AFFIRM_RX = (r"(?i)(?:\byes\b|\baffirmative\b|\bcan reach\b|(?<!not )\bable to reach\b|"
+             r"(?<!not )\breachable\b|(?<!not )\bpossible\b|\balready\b)")
 
-# A "no": any negation cue as a whole word.
-DENY_RX = (r"(?i)(?:\bno\b|\bcannot\b|\bnot\b|\bunreachable\b|"
-           r"\bimpossible\b|\bunable\b)")
+# A "no": a negation bound to a navigation verb/noun. Bare `no`/`not` are
+# intentionally dropped — they match discourse incidentals ("No problem",
+# "not in one move") and would false-accept an affirmative answer as a denial.
+DENY_RX = (r"(?i)(?:\bcannot\b|\bcan't\b|\bunreachable\b|\bimpossible\b|\bunable\b|"
+           r"\bnot\s+(?:reachable|possible|able)\b|\bno\s+(?:path|route|way)\b)")
 
 
 def path_rx(answer, nodes):
