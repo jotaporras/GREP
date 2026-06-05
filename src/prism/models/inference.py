@@ -9,6 +9,7 @@ from prism.data.data import remove_edge_list
 from prism.models.gnn_llm import (
     CompositeGraphLLM,
     GraphAugmentedLLM,
+    InjectedCompositeGraphLLM,
     build_injection_map,
     find_last_graph_scope,
 )
@@ -199,6 +200,22 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
         print(f"[spine-llm] injection scope_start={scope_start} / {len(input_ids_list)} tokens")
 
         injection_map = build_injection_map(input_ids_list, node_token_seqs, scope_start=scope_start)
+
+        if isinstance(graph_model, InjectedCompositeGraphLLM):
+            # e-u-aligned variant: the GT code is added post-RoPE into q/k/v inside
+            # every attention layer (prepare_generation arms self._pe_signal and returns
+            # the plain X embeddings). Injection auto-skips cached decode steps, so only
+            # the prompt carries it; generated tokens ride on RoPE. Disarm afterwards.
+            inputs_embeds = graph_model.prepare_generation(
+                input_ids, [pyg_graph], [injection_map], permutation=self.permutation)
+            try:
+                return graph_model.llm.generate(
+                    inputs_embeds=inputs_embeds, attention_mask=attention_mask,
+                    max_new_tokens=max_new_tokens, use_cache=True, temperature=0.01, min_p=0.1,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                )
+            finally:
+                graph_model._pe_signal = None
 
         if isinstance(graph_model, CompositeGraphLLM):
             # M9: assemble the composite graph (cycle + scene + cross-links) from the

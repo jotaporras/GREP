@@ -149,6 +149,14 @@ class GraphSFTTrainer(SFTTrainer):
                 p.requires_grad = True
             for p in self.model.injection.parameters():
                 p.requires_grad = True
+            # In-attention injection variant: the dedicated q/k(/v) code projections are
+            # non-LoRA params too, so PEFT froze them — re-enable or they stay at init.
+            if hasattr(self.model, "pe_q_proj"):
+                for name in ("pe_q_proj", "pe_k_proj", "pe_v_proj"):
+                    mod = getattr(self.model, name, None)
+                    if mod is not None:
+                        for p in mod.parameters():
+                            p.requires_grad = True
         else:
             for p in self.model.pe_model.parameters():
                 p.requires_grad = True
@@ -174,6 +182,13 @@ class GraphSFTTrainer(SFTTrainer):
         opt_model = self.model
         if self.gnn_config.get("architecture") == "composite_graph_gt":
             structural = list(self.model.gt_model.parameters()) + list(self.model.injection.parameters())
+            # In-attention injection variant: the dedicated q/k(/v) code projections are
+            # structural too — without the boosted LR their gradients sit far below LoRA.
+            if hasattr(self.model, "pe_q_proj"):
+                for name in ("pe_q_proj", "pe_k_proj", "pe_v_proj"):
+                    mod = getattr(self.model, name, None)
+                    if mod is not None:
+                        structural += list(mod.parameters())
         else:
             structural = (list(self.model.pe_model.parameters())
                           + list(self.model.pe_proj.parameters()) + [self.model.pe_gain])
@@ -224,10 +239,17 @@ class GraphSFTTrainer(SFTTrainer):
             json.dump(self.gnn_config, f, indent=2)
         if self.gnn_config.get("architecture") == "composite_graph_gt":
             # M9: save the Graph Transformer (R-PEARL inside) and the M7 gate.
-            torch.save({
+            gnn_state = {
                 'gt_model': self.model.gt_model.state_dict(),
                 'injection': self.model.injection.state_dict(),
-            }, os.path.join(output_dir, "gnn_weights.pt"))
+            }
+            # In-attention injection variant: persist the dedicated q/k(/v) projections.
+            if hasattr(self.model, "pe_q_proj"):
+                gnn_state['pe_q_proj'] = self.model.pe_q_proj.state_dict()
+                gnn_state['pe_k_proj'] = self.model.pe_k_proj.state_dict()
+                if getattr(self.model, "pe_v_proj", None) is not None:
+                    gnn_state['pe_v_proj'] = self.model.pe_v_proj.state_dict()
+            torch.save(gnn_state, os.path.join(output_dir, "gnn_weights.pt"))
             torch.save({
                 'rpearl': self.model.gt_model.pe_model.state_dict(),
             }, os.path.join(output_dir, "rpearl_weights.pt"))
@@ -337,6 +359,15 @@ class TrainConfig:
     gate_init: float = 0.0
     gate_per_dim: bool = False
     disable_rope: bool = True
+    # In-attention injection variant (composite_graph_gt only): when True the GT-refined
+    # code Y[V_Tx] = GT([X;Ψ]+C·[X;Ψ]) is injected into q/k(/v) *inside every attention
+    # layer* through dedicated W_q/W_k/W_v, in place of RoPE (disable_rope governs the
+    # RoPE-off content path); inputs_embeds is the gated GT blend (the Layer-0 M7
+    # injection). Written in eval_unification's patched-attention style.
+    pe_qk_injection: bool = False
+    # Also inject into the attention *value* (v += W_v·Y_tok), not just q/k. False =
+    # q/k only (no value/readout path).
+    pe_inject_v: bool = True
     # Structural-path optimization (R6): the GT + R-PEARL + gate train at
     # structural_lr_mult × the base LR (they otherwise get gradients orders of
     # magnitude below LoRA and never open the gate); lora_warmup_steps freezes the
@@ -563,8 +594,7 @@ def train_model(config: TrainConfig, config_file: str = None):
             spectral_norm_linears=False,
             pe_readout=config.pe_readout,
         )
-        model = gnn_llm.CompositeGraphLLM(
-            llm, gt_model, d_model=config.d_model,
+        composite_kwargs = dict(
             gate_init=config.gate_init,
             gate_per_dim=config.gate_per_dim,
             injection_mode=config.injection_mode,
@@ -575,6 +605,15 @@ def train_model(config: TrainConfig, config_file: str = None):
             crosslink_mention_to_node=config.crosslink_mention_to_node,
             crosslink_mention_clique=config.crosslink_mention_clique,
         )
+        if config.pe_qk_injection:
+            # In-attention q/k(/v) injection in place of RoPE (disable_rope governs the
+            # RoPE-off content path; inputs_embeds is the M7 gated GT blend).
+            composite_kwargs["inject_v"] = config.pe_inject_v
+            model = gnn_llm.InjectedCompositeGraphLLM(
+                llm, gt_model, d_model=config.d_model, **composite_kwargs)
+        else:
+            model = gnn_llm.CompositeGraphLLM(
+                llm, gt_model, d_model=config.d_model, **composite_kwargs)
         collator = data.SpineDataCollator(tokenizer, mlm=False)
 
         if config.freeze_llm:
@@ -716,7 +755,9 @@ def train_model(config: TrainConfig, config_file: str = None):
                 "cycle_weight": config.cycle_weight, "cycle_directed": config.cycle_directed,
                 "crosslink_weight": config.crosslink_weight,
                 "crosslink_mention_to_node": config.crosslink_mention_to_node,
-                "crosslink_mention_clique": config.crosslink_mention_clique}
+                "crosslink_mention_clique": config.crosslink_mention_clique,
+                "pe_qk_injection": config.pe_qk_injection,
+                "pe_inject_v": config.pe_inject_v}
                if config.architecture == "composite_graph_gt" else {}),
         }
         trainer = GraphSFTTrainer(

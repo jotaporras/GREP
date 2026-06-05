@@ -157,8 +157,7 @@ def graph_augmented_llm_from_pretrained(
             spectral_norm_linears=False,  # M6 fusion path (token embeddings fused)
             pe_readout=gnn_cfg.get("pe_readout", "mean"),
         )
-        model = gnn_llm.CompositeGraphLLM(
-            llm, gt_model, d_model=gnn_cfg["d_model"],
+        composite_kwargs = dict(
             gate_init=gnn_cfg.get("gate_init", 0.0),
             gate_per_dim=gnn_cfg.get("gate_per_dim", False),
             injection_mode=gnn_cfg.get("injection_mode", "interpolate"),
@@ -169,9 +168,25 @@ def graph_augmented_llm_from_pretrained(
             crosslink_mention_to_node=gnn_cfg.get("crosslink_mention_to_node", True),
             crosslink_mention_clique=gnn_cfg.get("crosslink_mention_clique", True),
         )
+        if gnn_cfg.get("pe_qk_injection", False):
+            # In-attention q/k(/v) injection in place of RoPE: dedicated W_q/W_k/W_v
+            # inject the GT code at every layer; inputs_embeds is the M7 gated blend.
+            # disable_llm_rope comes from composite_kwargs (the base disable_rope).
+            model = gnn_llm.InjectedCompositeGraphLLM(
+                llm, gt_model, d_model=gnn_cfg["d_model"],
+                inject_v=gnn_cfg.get("pe_inject_v", True),
+                **composite_kwargs,
+            )
+        else:
+            model = gnn_llm.CompositeGraphLLM(llm, gt_model, d_model=gnn_cfg["d_model"], **composite_kwargs)
         gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
         model.gt_model.load_state_dict(gnn_weights["gt_model"], strict=False)
         model.injection.load_state_dict(gnn_weights["injection"])
+        if hasattr(model, "pe_q_proj") and "pe_q_proj" in gnn_weights:
+            model.pe_q_proj.load_state_dict(gnn_weights["pe_q_proj"])
+            model.pe_k_proj.load_state_dict(gnn_weights["pe_k_proj"])
+            if getattr(model, "pe_v_proj", None) is not None and "pe_v_proj" in gnn_weights:
+                model.pe_v_proj.load_state_dict(gnn_weights["pe_v_proj"])
     else:
         pe_model = r_pearl.RandomGNNPositionalEncodings(
             pe_hidden_channels=gnn_cfg["pe_hidden_channels"],

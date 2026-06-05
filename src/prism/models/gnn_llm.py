@@ -1,4 +1,5 @@
 import copy
+import importlib
 from collections import defaultdict
 
 import torch
@@ -303,12 +304,19 @@ class CompositeGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             crosslink_mention_clique=self.crosslink_mention_clique,
         )
 
-    def _fuse_embeddings(self, input_ids, graphs, injection_maps, permutation=None):
-        """Build G per sequence and run M4→M6→M7, returning ``inputs_embeds`` [B, c, d]."""
+    def _fuse_embeddings(self, input_ids, graphs, injection_maps, permutation=None,
+                         return_token_pe=False):
+        """Build G per sequence and run M4→M6→M7, returning ``inputs_embeds`` [B, c, d].
+
+        When ``return_token_pe`` is True, also returns the un-gated GT token-row
+        output ``Y[V_Tx]`` stacked as ``[B, c, d]`` — the per-position structural
+        code that ``InjectedCompositeGraphLLM`` injects into q/k/v at every layer.
+        """
         X = self.llm.get_input_embeddings()(input_ids)  # [B, c, d]
         device = X.device
         c = input_ids.shape[1]
         fused = []
+        token_pe = [] if return_token_pe else None
         for b in range(input_ids.shape[0]):
             aug = self._composite_graph(graphs[b], injection_maps[b], c, device, permutation=permutation)
             aug_data = Data(
@@ -318,14 +326,20 @@ class CompositeGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             aug_data.edge_weight = aug.edge_weight
             # M6: token embeddings on V_Tx, zeros on V_Sc, fused with R-PEARL Ψ.
             Y = self.gt_model(aug_data, token_embeddings=X[b], is_token=aug.is_token)
+            Ytok = Y[aug.is_token]
             # M7: blend X with the token-node outputs Y[V_Tx] through the gate.
-            fused.append(self.injection(X[b], Y[aug.is_token]))
+            fused.append(self.injection(X[b], Ytok))
+            if return_token_pe:
+                token_pe.append(Ytok)
         # The GT runs in float32 (sparse sampled_addmm is fp32-only) and the gate
         # promotes the bf16 X to fp32, so cast inputs_embeds back to the LLM's dtype.
         # Training tolerated the fp32 mismatch under autocast; generate() has no
         # autocast, so the fp32 hidden state would hit the bf16 lm_head and raise
         # "expected scalar type Float but found BFloat16".
-        return torch.stack(fused, dim=0).to(X.dtype)
+        inputs_embeds = torch.stack(fused, dim=0).to(X.dtype)
+        if return_token_pe:
+            return inputs_embeds, torch.stack(token_pe, dim=0)
+        return inputs_embeds
 
     def forward(
         self,
@@ -345,6 +359,182 @@ class CompositeGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             labels=labels,
             **kwargs,
         )
+
+
+class InjectedCompositeGraphLLM(CompositeGraphLLM):
+    """Composite-graph LLM that injects the GT code into q/k/v *inside attention* at
+    every layer, in place of RoPE.
+
+    Written in eval_unification's style (per-instance patched attention forward,
+    ``_install_pe_injection`` / ``_make_injected_attention_forward`` / ``_pe_signal`` /
+    ``_pe_inject_value`` / ``_decoder_layers``, model-agnostic via ``importlib``) so the
+    two files read the same — but the *mathematics* is this branch's RoPE-replacement
+    design, not e-u's ``RoPE(X)+Ψ``. Per attention layer ``l``::
+
+        q_l = W^q_l · h_l + W_q · S
+        k_l = W^k_l · h_l + W_k · S
+        v_l = W^v_l · h_l + W_v · S            (if ``inject_v``)
+
+    Differences from e-u, by design:
+      - **RoPE is OFF** (``disable_llm_rope=True``, identity rotary): the injected code
+        is the sole position signal, present at every depth — there is no native
+        rotation on the content q/k.
+      - **Dedicated projections** ``W_q``/``W_k``/``W_v`` (shared across layers, the
+        "shared/raw" map) carry the code into the q/k/v spaces — *not* the LLM's own
+        content projections.
+      - The signal is the GT-refined composite second-moment code
+        ``S = Y_tok = GT([X;Ψ] + C·[X;Ψ])[V_Tx]`` (un-gated; the M7 gate is on the
+        layer-0 blend, below).
+      - ``inputs_embeds`` is the **gated GT blend** ``M7(X, Y_tok)`` (the Layer-0
+        injection), *then* the same code is re-injected into q/k/v at every layer.
+
+    The code is supplied per forward via ``self._pe_signal`` ([B, seq, hidden]) and,
+    matching e-u's plumbing, skipped on cached single-token decode steps (seq mismatch)
+    — so only prompt tokens carry it. (With RoPE off, generated tokens then have no
+    position; that is the known trade-off of replacing RoPE.)
+
+    The attention forward is patched per-instance (faithful copy of the HF
+    implementation); it survives PEFT, which swaps the leaf Linears in place.
+    """
+
+    def __init__(self, *args, inject_v: bool = True,
+                 disable_llm_rope: bool = True, **kwargs):
+        # RoPE OFF by default (disable_llm_rope=True): the injected code replaces RoPE.
+        kwargs["disable_llm_rope"] = disable_llm_rope
+        super().__init__(*args, **kwargs)
+
+        cfg = self.llm.config
+        hidden = cfg.hidden_size
+        n_heads = cfg.num_attention_heads
+        n_kv = getattr(cfg, "num_key_value_heads", n_heads)
+        head_dim = getattr(cfg, "head_dim", None) or (hidden // n_heads)
+        try:
+            device = next(self.llm.parameters()).device
+        except StopIteration:
+            device = torch.device("cpu")
+        # Dedicated shared projections from the d_model code into the q / k (/ v) spaces
+        # (one set, reused at every layer). Default Linear init (std ≈ 1/√d_model) maps a
+        # code of row-norm ≈‖X‖ to a per-element std comparable to the attention logits'
+        # scale. No bias (a constant shift across positions carries no order). q gets
+        # H·Dh, k/v get Hkv·Dh (GQA).
+        self.pe_q_proj = nn.Linear(hidden, n_heads * head_dim, bias=False, device=device)
+        self.pe_k_proj = nn.Linear(hidden, n_kv * head_dim, bias=False, device=device)
+        if inject_v:
+            self.pe_v_proj = nn.Linear(hidden, n_kv * head_dim, bias=False, device=device)
+
+        # Per-forward graph code S = Y_tok ([B, seq, hidden]); read by the patched
+        # attention forwards, set by forward()/prepare_generation().
+        self._pe_signal = None
+        self._pe_inject_value = inject_v
+        self._install_pe_injection()
+
+    # ----- attention patch (ported from eval_unification, model-agnostic) -------
+    def _decoder_layers(self):
+        """Return the LLM's decoder layer list (Llama/Qwen2: ``<CausalLM>.model.layers``)."""
+        base = getattr(self.llm, "model", None)
+        if base is not None and hasattr(base, "layers"):
+            return base.layers
+        return self.llm.get_decoder().layers
+
+    def _install_pe_injection(self):
+        """Patch every self-attention forward so S is added post-RoPE in q/k/(v)."""
+        for layer in self._decoder_layers():
+            attn = layer.self_attn
+            attn.forward = self._make_injected_attention_forward(attn)
+
+    def _make_injected_attention_forward(self, attn):
+        # Resolve the model-family helpers from the module that defines this attention
+        # class (Llama, Qwen2, … share this layout).
+        mod = importlib.import_module(type(attn).__module__)
+        apply_rotary_pos_emb = mod.apply_rotary_pos_emb
+        attn_fns = mod.ALL_ATTENTION_FUNCTIONS
+        eager = mod.eager_attention_forward
+        model = self  # captured for the per-forward signal
+
+        def forward(hidden_states, position_embeddings=None, attention_mask=None,
+                    past_key_values=None, **kwargs):
+            input_shape = hidden_states.shape[:-1]
+            hidden_shape = (*input_shape, -1, attn.head_dim)
+
+            query_states = attn.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            key_states = attn.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            value_states = attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+            cos, sin = position_embeddings
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+            # --- replace RoPE: add the GT code through dedicated projections at every
+            # layer. RoPE is off (identity rotary), so the rotation above is a no-op and
+            # the code is the sole position signal. ---
+            psi = model._pe_signal
+            if (psi is not None and psi.shape[0] == hidden_states.shape[0]
+                    and psi.shape[1] == hidden_states.shape[1]):
+                def _proj(linear):
+                    out = linear(psi.to(linear.weight.dtype)).to(query_states.dtype)
+                    return out.view(hidden_shape).transpose(1, 2)
+                query_states = query_states + _proj(model.pe_q_proj)
+                key_states = key_states + _proj(model.pe_k_proj)
+                if model._pe_inject_value:
+                    value_states = value_states + _proj(model.pe_v_proj)
+            # ------------------------------------------------------------------
+
+            if past_key_values is not None:
+                key_states, value_states = past_key_values.update(
+                    key_states, value_states, attn.layer_idx)
+
+            attention_interface = attn_fns.get_interface(
+                attn.config._attn_implementation, eager)
+            attn_output, attn_weights = attention_interface(
+                attn, query_states, key_states, value_states, attention_mask,
+                dropout=0.0 if not attn.training else attn.attention_dropout,
+                scaling=attn.scaling, **kwargs,
+            )
+
+            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+            attn_output = attn.o_proj(attn_output)
+            return attn_output, attn_weights
+
+        return forward
+
+    # ----- signal / forward / generation ---------------------------------------
+    def _build_signal(self, input_ids, graphs, injection_maps, permutation=None):
+        """Return (inputs_embeds, code S=[B, seq, hidden]).
+
+        ``inputs_embeds`` is the **gated GT blend** ``M7(X, Y_tok)`` (the Layer-0
+        injection); the code ``S = Y_tok`` is then re-injected into q/k/v at every layer
+        by the patched attention forward.
+        """
+        inputs_embeds, token_pe = self._fuse_embeddings(
+            input_ids, graphs, injection_maps, permutation=permutation,
+            return_token_pe=True)
+        return inputs_embeds, token_pe
+
+    def forward(self, input_ids=None, attention_mask=None, labels=None,
+                graphs=None, injection_maps=None, **kwargs):
+        inputs_embeds, self._pe_signal = self._build_signal(input_ids, graphs, injection_maps)
+        kwargs.pop("inputs_embeds", None)
+        kwargs.pop("input_ids", None)
+        try:
+            return self.llm(
+                inputs_embeds=inputs_embeds, attention_mask=attention_mask,
+                labels=labels, **kwargs)
+        finally:
+            # Disarm S unless gradient checkpointing will recompute the attention
+            # forwards in backward (they must see the same S; it is rebuilt every
+            # forward anyway). Mirrors eval_unification.
+            if not getattr(self.llm, "is_gradient_checkpointing", False):
+                self._pe_signal = None
+
+    def prepare_generation(self, input_ids, graphs, injection_maps, permutation=None):
+        """Arm the in-attention injection and return ``inputs_embeds`` (plain X).
+
+        The caller hands the returned X to ``self.llm.generate`` and must reset
+        ``self._pe_signal = None`` afterwards. Injection auto-skips cached decode
+        steps, so only prompt tokens carry S (generated tokens ride on RoPE).
+        """
+        inputs_embeds, self._pe_signal = self._build_signal(
+            input_ids, graphs, injection_maps, permutation=permutation)
+        return inputs_embeds
 
 
 def find_last_graph_scope(input_ids_b, tokenizer) -> int:
