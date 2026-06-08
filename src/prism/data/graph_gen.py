@@ -569,27 +569,33 @@ Generate EXACTLY n_tasks tasks (specified in `_metadata`). The tasks should pres
    - "Which other item is stored in the same area as the charger bank?"
    - "Where are the charger bank and spare battery kept together?"
 
-3. **Reachability** — assess reachability: is one node directly connected to another node, i.e. one hop?
-   These tasks ask whether the robot can move directly between two areas in a single step — one edge traversal. They range from naming both areas explicitly to referencing the robot's current position or object descriptions.
+3. **Reachability** — reach a target and SHOW the route: which edges connect the start to the target?
+   These tasks ask the planner to reach a target area (often a short hop away) and report the connecting edge(s) and the route taken — never a bare yes/no. They range from naming both areas explicitly to referencing the robot's current position or object descriptions.
    Simple examples:
-   - "Can the robot move directly from the cold storage area to the area with the parking pay station?"
-   - "Is the pump house directly connected to the radar pier?"
-   - "Can the robot move directly from the main harbor plaza to the chart archive?"
+   - "Reach the cold storage area from the parking pay station and give the connecting edges and route."
+   - "Show how the pump house connects to the radar pier; list the edge and the path."
+   - "Get from the main harbor plaza to the chart archive and report the route taken."
    Complex examples:
-   - "From the southern aircraft service apron, can the robot reach the weather-check balloon in one move?"
-   - "From the waterfront pier, is there a direct link to the remote cache?"
-   - "Can the robot reach the damaged meteorological balloon from its starting area?"
+   - "From the southern aircraft service apron, reach the weather-check balloon and give the edges traversed."
+   - "Route from the waterfront pier to the remote cache and list each connecting edge."
+   - "Reach the damaged meteorological balloon from the starting area and show the path."
 
-4. **Navigability** — understand navigation: give a path from node a to node b, potentially multi-hop?
-   These tasks ask whether a multi-step route exists, what path to take, or which intermediate areas to use. They range from simple reachability over multiple hops to constrained path planning with avoidance, specific waypoints, or structural graph queries.
+4. **Navigability** — multi-hop routing: give the full path from area a to area b.
+   These tasks ask for a multi-step route and the path to take, with optional constraints (required waypoints or avoided areas).
    Simple examples:
-   - "Can a route from the starting area reach the area containing the air purifier?"
-   - "Can the robot get from the dockyard gate to the oxygen cart using mapped areas?"
-   - "From the starting area, can the robot reach the area with the medical pack?"
+   - "Give the route from the starting area to the area containing the air purifier."
+   - "Route the robot from the dockyard gate to the oxygen cart and list the path."
+   - "From the starting area, give the path to the area with the medical pack."
    Complex examples:
-   - "Which intermediate area gives a two-step route from the starting area to the quadcopter's area?"
-   - "Can the robot get from the ice-core storage area to the locked satellite phone by passing through the communications bunker and cable vault?"
-   - "Starting at the place with the cargo pallet, can the robot reach the laboratory with the spectrometer without using the main command area?"
+   - "Give the two-step route from the starting area to the quadcopter's area and name the intermediate area."
+   - "Route from the ice-core storage area to the locked satellite phone by passing through the communications bunker and cable vault; give the full path."
+   - "From the cargo-pallet area, give the route to the laboratory with the spectrometer without using the main command area."
+
+**Existence tasks are NOT allowed** (bare yes/no node-existence is a semantic-matching false positive). Generate only Positionality, Reachability, and Navigability — every task must require graph topology to solve and must be answered with edges and (for Reachability/Navigability) a route, never a polar yes/no.
+
+**Required answer content — EDGES and PATHS (applies to every task):**
+- Phrase each `task` so the planner must report the relevant connecting edges as `A <-> B` and, for Reachability/Navigability, the full route as `A -> B -> C`. End reachability/navigability prompts with a clause such as "give the connecting edges and the route".
+- Grading is deterministic over the graph: a correct answer must STATE the containment/adjacency edge(s) (`A <-> B`) and, for routes, a valid walk from the start region to the destination region (honouring any required waypoint and avoided area). No yes/no.
 
 Each task must be a JSON object with the following structure:
 
@@ -600,44 +606,40 @@ Each task must be a JSON object with the following structure:
   "acceptance_criterion": "one sentence describing what a correct response must convey"
 }
 
-For example, if the graph contains a `fuel_depot_1` region with a `fuel_tank_1` object:
+For example, if the graph contains a `fuel_depot_1` region holding a `fuel_tank_1` object, reached from `clearing_1` via `comm_bunker_1`:
 
 {
-  "task": "Is there any fuel storage facility nearby?",
-  "answer": "(?i)\byes\b",
+  "task": "Reach the area holding the fuel tank from the starting area and report the connecting edges and the route.",
+  "answer": "(?i)\bclearing_1\b.*\bfuel_depot_1\b",
   "init_node": "clearing_1",
-  "acceptance_criterion": "A correct answer affirms that fuel_depot_1 exists and contains fuel_tank_1."
+  "acceptance_criterion": "A correct answer reaches fuel_depot_1 (which contains fuel_tank_1) via comm_bunker_1, stating the edge fuel_depot_1 <-> fuel_tank_1 and a route clearing_1 -> comm_bunker_1 -> fuel_depot_1."
 }
 
-**Answer regex rules:**
-The `answer` regex is only a coarse automatic check — the `acceptance_criterion` is the authoritative grader. Keep the regex SIMPLE; it must accept correct answers and reject wrong ones.
+**Answer regex rules (a coarse parallel check — grading is deterministic over the graph):**
+The deterministic grader reads the goal region, any waypoints, the avoided areas, and the containment edge(s) directly from the `acceptance_criterion` (and this `answer`), then validates the planner's stated edges and route against the NetworkX graph. The regex is a secondary signal — keep it SIMPLE and node-naming, never a bare polarity.
 
-- Wrap every word or phrase in `\b` word boundaries (e.g. `\byes\b`, `\bcan\b`). Without them a token matches inside larger words and silently accepts wrong answers — bare `can` matches "cannot", `possible` matches "impossible", `reachable` matches "unreachable", `no` matches "node"/"north".
-- Yes/no tasks — POLARITY LEAK is the most common bug: never use a phrase for one polarity that also appears inside the opposite answer. `there is` is INVALID for a "yes" answer because it occurs in the "no" answer "there is no ..."; likewise never key a "yes" on `reachable`, `connected`, or `possible` unguarded (they occur in "not reachable", "not connected", "not possible"). The planner reliably says "yes" or "no", so use exactly:
-  - "yes" answer → `(?i)\byes\b`
-  - "no" answer → `(?i)\bno\b`
-  Then test the regex against the WRONG-polarity answer (e.g. "No, it cannot ..." for a yes-task); if it still matches, the regex is invalid — fix it.
-- Navigability tasks — the regex matches only the route's FIRST and LAST hop: the start (init_node) region and the destination region, in order — e.g. `(?i)\bcrew_quarters_1\b.*\bcoolant_station_1\b`. If the task names a required waypoint, include it too: `(?i)\bcrew_quarters_1\b.*\bpower_conduit_1\b.*\bcoolant_station_1\b`. NEVER encode the full path — many valid routes exist and a full-path regex rejects correct alternatives. The yes/no correctness and the middle of the route are checked by the judge, not the regex.
-- Existence/location tasks — match the answer node name with `\b` boundaries: `(?i)\bfuel_depot_1\b`, never bare `fuel_depot_1` (which also matches `fuel_depot_10`).
+- Wrap every node name in `\b` word boundaries: `(?i)\bfuel_depot_1\b`, never bare `fuel_depot_1` (which also matches `fuel_depot_10`).
+- NEVER use a bare yes/no regex for Positionality, Reachability, or Navigability — those tasks are graded on edges and paths, not polarity.
+- Positionality — match the answer (destination) region name: `(?i)\bfuel_depot_1\b`.
+- Reachability/Navigability — match only the route's FIRST and LAST hop (start region then destination), in order: `(?i)\bcrew_quarters_1\b.*\bcoolant_station_1\b`. If the task names a required waypoint, include it: `(?i)\bcrew_quarters_1\b.*\bpower_conduit_1\b.*\bcoolant_station_1\b`. Never encode the full path in the regex — the full walk is checked deterministically against the graph.
 - Do NOT anchor with `^` or `$`. The regex should match anywhere in the response.
 
-**Acceptance criterion rules:**
-- Write ONE sentence describing what a correct planner response must convey
-- Reference the answer entity by its node name (e.g., `fuel_depot_1`) so an LLM judge can verify without re-solving the task
-- For yes/no tasks: state the correct polarity plus the supporting entity
-- Do NOT restate the task; describe the *answer*
-- The criterion is for offline grading ONLY — it will never be shown to the planner
+**Acceptance criterion rules (these drive the deterministic grader):**
+- Write ONE sentence describing what a correct planner response must convey.
+- Name, by node id, the destination region (the goal), every required waypoint (write "via <node>" / "passing through <node>"), every avoided area (write "without using <node>"), and each object whose containment is part of the answer — so the grader can resolve the goal, constraints, and required `region <-> object` edges deterministically.
+- For Reachability/Navigability the criterion must name the start region, the destination region, and require a valid route between them (plus any waypoint/avoid). For Positionality it must name the region and the contained object(s) so the containment edge is required.
+- Do NOT restate the task; describe the *answer*. The criterion is for offline grading ONLY — it is never shown to the planner.
 
 Examples of good acceptance criteria:
-- "A correct answer identifies fuel_depot_1 as the region containing fuel_tank_1."
-- "A correct answer affirms reachability and cites the path through storage_tent_1."
-- "A correct answer is the number 2, the count of regions with exactly three neighbors."
+- "A correct answer identifies fuel_depot_1 as the region containing fuel_tank_1, stating the edge fuel_depot_1 <-> fuel_tank_1."
+- "A correct answer gives a route from clearing_1 to coolant_station_1 via power_conduit_1 and lists each connecting edge."
+- "A correct answer routes from decon_chamber_1 to quarantine_bay_1 without using ventilation_hub_1 and shows the full path."
 
 **Task generation instructions:**
-- DO NOT reference specific objects or nodes in the task text. Make the planner infer these.
-- Tasks should request specific information, not general exploration. Make the planner map or inspect certain entities. For example, start tasks with phrases such as "what", "I heard", "find out", "map", "inspect", "Can I", "is there", and likewise.
+- DO NOT reference specific objects or nodes by id in the task text. Make the planner infer these from semantic content.
+- Phrase each task so the planner must output the connecting edges (`A <-> B`) and, for Reachability/Navigability, the route (`A -> B -> C`).
 - Each task must be solvable from the graph alone.
-- Mix task types across all four categories. Do not generate all tasks of the same type.
+- Mix the three allowed types (Positionality, Reachability, Navigability). Do not generate all tasks of the same type, and never generate an Existence (yes/no) task.
 
 ### Step 6: Update robot location
 
@@ -709,14 +711,15 @@ class TaskGraphGen:
 
         if task_types is not None:
             query += (
-                "\n\nTask Taxonomy\n"
-                "0. Existence (of a node)\n"
-                "1. Positionality (within graph)\n"
-                "2. Reachability (with one edge)\n"
-                "3. Navigability (with multiple edges)\n"
+                "\n\nTask Taxonomy (Existence is DISALLOWED — treat any 0 as Positionality)\n"
+                "0. Positionality (Existence is banned; generate Positionality instead)\n"
+                "1. Positionality (within graph) — answer with containment edge(s)\n"
+                "2. Reachability (reach the target; answer with the edge(s) and the route)\n"
+                "3. Navigability (multi-hop; answer with the full route and its edges)\n"
                 f"\nHere is a list of the types for the tasks: {task_types}\n"
-                "Generate tasks in order, matching each entry in the list to the "
-                "corresponding task type above."
+                "Generate tasks in order, matching each entry to the type above. Every "
+                "task must be answered with edges (A <-> B) and, for Reachability/"
+                "Navigability, a route (A -> B -> C) — never a bare yes/no."
             )
 
         if task_complexities is not None:

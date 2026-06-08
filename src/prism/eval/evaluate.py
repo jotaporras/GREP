@@ -290,22 +290,34 @@ def eval_model_single_graph(
             print(f"correct answer: {result.plan_keyword}")
 
             pm = _sample_path_metrics(planner_response, eval_sample)
+            structured = bool(pm and pm.get("structured"))
             judge_pass = (pm or {}).get("llm_judge_pass")
-            ac_present = bool(eval_sample.acceptance_criterion)
-            if ac_present and judge_pass is None:
-                n_judge_fallback += 1
-            # Two completely separate graders. `objective_*` is the pure
-            # RegEx/NetworkX score (the judge never touches it). `subjective_*` is
-            # the Gemma judge's score where it ran, else it mirrors the objective.
-            # The judge moves the subjective column only: down on a false positive
-            # (RegEx correct, judge wrong), up on a false negative (RegEx wrong,
-            # judge correct).
-            v = path_validator.combine_verdict(
-                regex_correct=result.is_correct(),
-                regex_keyword=result.plan_keyword,
-                judge_pass=judge_pass,
-                acceptance_criterion_present=ac_present,
-            )
+            if structured:
+                # Structural task (positionality / reachability / navigability):
+                # the objective verdict is the deterministic NetworkX edge/path
+                # check; the Gemma judge is not run. No subjective column, no
+                # false-positive/negative diagnostics.
+                sc = bool(pm.get("structured_correct"))
+                v = {
+                    "objective_correct": sc, "objective_keyword": sc,
+                    "subjective_correct": None, "false_positive": False,
+                    "false_negative": False, "judged": False,
+                }
+            else:
+                # Legacy / non-structural (yes-no, count): two completely separate
+                # graders. `objective_*` is the pure RegEx/NetworkX score (the judge
+                # never touches it). `subjective_*` is the Gemma judge's score where
+                # it ran. The judge moves the subjective column only: down on a false
+                # positive (RegEx correct, judge wrong), up on a false negative.
+                ac_present = bool(eval_sample.acceptance_criterion)
+                if ac_present and judge_pass is None:
+                    n_judge_fallback += 1
+                v = path_validator.combine_verdict(
+                    regex_correct=result.is_correct(),
+                    regex_keyword=result.plan_keyword,
+                    judge_pass=judge_pass,
+                    acceptance_criterion_present=ac_present,
+                )
             sample_results.append({
                 "graph_name": eval_sample.graph_name,
                 "idx": i,
@@ -322,6 +334,7 @@ def eval_model_single_graph(
                 # with RegEx. `llm_judge_pass` is the raw judge verdict (None unless
                 # yes/no or an acceptance_criterion exists).
                 "correct": v["objective_correct"],
+                "structured": structured,
                 "subjective_correct": v["subjective_correct"],
                 "false_positive": v["false_positive"],
                 "false_negative": v["false_negative"],
@@ -358,7 +371,8 @@ def eval_model_single_graph(
                 "terminated_by": planning_result.terminated_by if planning_result else "exception",
                 "formatted": False,
                 "plan_keyword": False,
-                "correct": False,           # objective (RegEx) — sample crashed
+                "correct": False,           # objective — sample crashed
+                "structured": False,
                 "subjective_correct": None,  # not judged
                 "false_positive": False,
                 "false_negative": False,
@@ -676,6 +690,18 @@ def _aggregate_path_metrics(sample_results: List[dict]) -> dict:
         "cost_optimality": _mean("cost_optimality"),
         "num_with_path": len(pms),
     }
+    # Deterministic structural aggregates (present when structured tasks ran).
+    structured = [p for p in pms if p.get("structured")]
+    if structured:
+        def _srate(key):
+            return sum(1 for p in structured if p.get(key)) / len(structured)
+        agg.update({
+            "structured_pass_rate": _srate("structured_correct"),
+            "waypoints_ok_rate": _srate("waypoints_ok"),
+            "avoid_ok_rate": _srate("avoid_ok"),
+            "required_edges_rate": _srate("required_edges_present"),
+            "num_structured": len(structured),
+        })
     judged = [p["llm_judge_pass"] for p in pms if p.get("llm_judge_pass") is not None]
     if judged:
         agg["llm_judge_accuracy"] = sum(judged) / len(judged)

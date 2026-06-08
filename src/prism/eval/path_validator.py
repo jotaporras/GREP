@@ -73,22 +73,27 @@ def build_graph(graph_dict: dict, directed: bool = False) -> nx.Graph:
     return G
 
 
+_ARROW_CHAIN = re.compile(rf"{_NODE_TOKEN.pattern}(?:\s*->\s*{_NODE_TOKEN.pattern})+")
+
+
 def parse_path(text: str, valid_nodes: Optional[set] = None) -> List[str]:
     """Extract the ordered route from planner text.
 
-    Tries ``->`` arrows first (the spec form), then ``goto(...)`` actions. Each
-    segment is reduced to its node token and, when ``valid_nodes`` is given,
-    filtered to exact matches (sidestepping substring ambiguity). Returns [] on
-    malformed/empty input.
+    Pulls the longest ``a -> b -> c`` chain (the spec form), then ``goto(...)``
+    actions. Undirected edge statements ``u <-> v`` are neutralised first so the
+    ``->`` inside ``<->`` is never mistaken for a route hop — a response may carry
+    both an edge list and a path. When ``valid_nodes`` is given, tokens are
+    filtered to exact matches. Returns [] on malformed/empty input.
     """
     if not text or not isinstance(text, str):
         return []
     nodes: List[str] = []
-    if "->" in text:
-        for seg in _ARROW.split(text):
-            m = _NODE_TOKEN.search(seg.strip().strip(".,;:[]()"))
-            if m:
-                nodes.append(m.group(0))
+    route_text = text.replace("<->", " ").replace("<-", " ")  # drop edge arrows
+    if "->" in route_text:
+        chains = _ARROW_CHAIN.findall(route_text)
+        if chains:
+            best = max(chains, key=lambda c: c.count("->"))
+            nodes = _NODE_TOKEN.findall(best)
     elif "goto(" in text:
         nodes = _GOTO.findall(text)
     if valid_nodes is not None:
@@ -263,6 +268,146 @@ def judge_acceptance(
         return None
 
 
+# --------------------------------------------------------------------------
+# Deterministic structured grading (edges + paths) — replaces the judge for
+# positionality / reachability / navigability
+# --------------------------------------------------------------------------
+# Structural tasks are graded against the graph itself, not a yes/no regex or the
+# LLM judge: a correct answer must STATE the relevant edges (``u <-> v``) and, for
+# reachability/navigability, give a valid route to the goal. The goal, waypoints
+# and avoid-set are read from the task's ``answer`` regex + ``acceptance_criterion``
+# (which already name the node ids), so no new data schema is needed.
+
+# A node id: lowercase type prefix + one-or-more ``_<int>`` tails (grid ids like
+# ``bay_3_26_1`` carry several).
+_NODE_ID = re.compile(r"[a-z][a-z_]*(?:_\d+)+")
+_EDGE_STMT = re.compile(rf"({_NODE_ID.pattern})\s*<->\s*({_NODE_ID.pattern})")
+_VIA = re.compile(
+    r"(?:\bvia\b|\bthrough\b|passing\s+through|going\s+through|by\s+way\s+of|crossing)"
+    r"(.*?)(?:[.;]|\bwithout\b|\bavoid|$)", re.I)
+_AVOID = re.compile(
+    r"(?:without\s+(?:using|passing\s+through|going\s+through|entering)|does\s+not\s+use|"
+    r"avoid(?:s|ing)?|excluding|not\s+via|not\s+using)\b(.*?)(?:[.,;]|$)", re.I)
+# A path task (reachability/navigability) vs a positionality task (edges only).
+_PATH_CUE = re.compile(
+    r"\broute\b|\bpath\b|\bnavigat|\breach\b|\bget\s+from\b|\bmove\s+(?:to|from|directly)|"
+    r"\bdirectly\s+connected\b|\bone\s+(?:move|hop|step)\b|\btravel", re.I)
+
+
+def _strip_regex(s: Optional[str]) -> str:
+    """Drop regex boundaries / inline flags / lookarounds so node ids read clean."""
+    return re.sub(r"\\b|\(\?[a-z]*\)|\(\?<?[!=][^)]*\)", " ", s or "")
+
+
+def _ordered_subseq(sub: List[str], seq: List[str]) -> bool:
+    """True iff every element of ``sub`` appears in ``seq`` in order."""
+    it = iter(seq)
+    return all(any(x == s for x in it) for s in sub)
+
+
+def parse_edges(text: str, valid_nodes: Optional[set] = None) -> set:
+    """Undirected edges stated as ``u <-> v`` in ``text`` (as frozenset pairs)."""
+    out = set()
+    for u, v in _EDGE_STMT.findall(text or ""):
+        if valid_nodes is None or (u in valid_nodes and v in valid_nodes):
+            out.add(frozenset((u, v)))
+    return out
+
+
+def derive_targets(graph_dict: dict, *, init_node, answer, criterion, task):
+    """Resolve (goal, waypoints, avoid, required_edges, kind) from task fields.
+
+    ``kind`` is ``"path"`` (reachability/navigability — grade a route to the goal)
+    or ``"edges"`` (positionality — grade the stated containment edges). Endpoints
+    come from the ``answer`` regex when it names an ordered route, else from the
+    criterion; each referenced object's containment edge becomes a required edge.
+    Returns ``goal=None`` when no graph target can be resolved (e.g. a count task).
+    """
+    regions = {r["name"] for r in graph_dict.get("regions", [])}
+    objects = {o["name"] for o in graph_dict.get("objects", [])}
+    host = {}
+    for a, b in graph_dict.get("object_connections", []):
+        if a in objects and b in regions:
+            host[a] = b
+        elif b in objects and a in regions:
+            host[b] = a
+    nodes = regions | objects
+    blob = f"{criterion or ''} || {task or ''}"
+
+    def ids(s):
+        seen, out = set(), []
+        for t in _NODE_ID.findall(s or ""):
+            if t in nodes and t not in seen:
+                seen.add(t)
+                out.append(t)
+        return out
+
+    avoid = {t for span in _AVOID.findall(blob) for t in _NODE_ID.findall(span) if t in nodes}
+    waypoints = [t for span in _VIA.findall(blob) for t in _NODE_ID.findall(span)
+                 if t in nodes and t != init_node and t not in avoid]
+    seen_wp = dict.fromkeys(waypoints)  # de-dup, keep order
+    waypoints = list(seen_wp)
+
+    # Union of answer-named ids (ordered, authoritative for path endpoints) and
+    # criterion/task ids — so a positionality answer that names only the region
+    # still picks up the contained object (and its containment edge) from the
+    # criterion.
+    ans_ids = [t for t in ids(_strip_regex(answer)) if t != init_node and t not in avoid]
+    crit_ids = [t for t in ids(blob)
+                if t != init_node and t not in avoid and t not in waypoints]
+    ordered = ans_ids + [t for t in crit_ids if t not in ans_ids]
+    region_refs = [t for t in ordered if t in regions]
+    object_refs = [t for t in ordered if t in objects]
+
+    goal = region_refs[-1] if region_refs else (host.get(object_refs[0]) if object_refs else None)
+    required_edges = [frozenset((host[o], o)) for o in object_refs if o in host]
+    kind = "path" if (_PATH_CUE.search(blob) or waypoints or len(region_refs) >= 2) else "edges"
+    return goal, waypoints, sorted(avoid), required_edges, kind
+
+
+def validate_structured(
+    generated_text: str,
+    graph_dict: dict,
+    *,
+    init_node: Optional[str],
+    answer: Optional[str],
+    criterion: Optional[str],
+    task: Optional[str],
+    directed: bool = False,
+) -> Optional[Dict]:
+    """Deterministic edge/path verdict for a structural task. Never raises.
+
+    Returns the ``validate_path`` metrics extended with ``goal``, ``kind``,
+    ``waypoints_ok``, ``avoid_ok``, ``required_edges_present`` and the boolean
+    ``structured_correct`` — or ``None`` when the task isn't graph-structural
+    (no resolvable goal), so the caller falls back to the regex/judge path.
+    """
+    goal, waypoints, avoid, required_edges, kind = derive_targets(
+        graph_dict, init_node=init_node, answer=answer, criterion=criterion, task=task)
+    if goal is None:
+        return None
+    m = validate_path(generated_text, graph_dict, start=init_node, goal=goal, directed=directed)
+    parsed = m["parsed_nodes"]
+    stated = parse_edges(generated_text, set(build_graph(graph_dict, directed=directed).nodes))
+    m["goal"] = goal
+    m["kind"] = kind
+    m["waypoints_ok"] = _ordered_subseq(waypoints, parsed)
+    m["avoid_ok"] = not (set(avoid) & set(parsed))
+    m["required_edges"] = [sorted(e) for e in required_edges]
+    m["required_edges_present"] = all(e in stated for e in required_edges)
+    if kind == "edges":  # positionality: name the goal and state its containment edge(s).
+        goal_named = bool(re.search(rf"\b{re.escape(goal)}\b", generated_text or ""))
+        # Containment positionality must state the edge; an edge-less structural
+        # query (e.g. "northmost area") passes on correctly naming the goal.
+        m["structured_correct"] = bool(
+            goal_named and (m["required_edges_present"] if required_edges else True))
+    else:  # reachability / navigability: a valid constrained walk to the goal.
+        m["structured_correct"] = bool(
+            m["full_path_valid"] and m["start_goal_ok"] and m["waypoints_ok"]
+            and m["avoid_ok"] and m["required_edges_present"])
+    return m
+
+
 def evaluate_sample(
     task: str,
     response_text: str,
@@ -275,15 +420,27 @@ def evaluate_sample(
     full_response: Optional[str] = None,
     directed: bool = False,
 ) -> Dict:
-    """M10 per-sample verdict: regex/NetworkX path metrics + (conditional) judge.
+    """M10 per-sample verdict: deterministic structured grade, else regex + judge.
 
-    ``init_node`` is the route start (``start_goal_ok``). The Gemma judge runs
-    when the task has an ``acceptance_criterion`` OR is a yes/no task; it grades
-    against the criterion if present, else the regex ``answer`` (the ground-truth
-    pattern). Its boolean lands in ``llm_judge_pass`` (None when not run / judge
-    unavailable); ``judge_used`` records whether judging was attempted.
+    A structural task (positionality / reachability / navigability — one whose
+    answer/criterion resolves to a graph goal) is graded deterministically by
+    ``validate_structured``; ``structured`` is True and the Gemma judge is
+    skipped. Otherwise ``init_node`` is the route start and the judge runs when
+    the task has an ``acceptance_criterion`` OR is a yes/no task (grading against
+    the criterion if present, else the regex ``answer``). ``llm_judge_pass`` is
+    None when not run / judge unavailable; ``judge_used`` records the attempt.
     """
+    structured = validate_structured(
+        response_text, graph_dict, init_node=init_node, answer=answer,
+        criterion=acceptance_criterion, task=task, directed=directed)
+    if structured is not None:
+        structured["structured"] = True
+        structured["judge_used"] = False
+        structured["llm_judge_pass"] = None
+        return structured
+
     metrics = validate_path(response_text, graph_dict, start=init_node, goal=goal, directed=directed)
+    metrics["structured"] = False
     should_judge = bool(acceptance_criterion) or is_yes_no_task(task, answer)
     metrics["judge_used"] = should_judge
     metrics["llm_judge_pass"] = (

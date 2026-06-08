@@ -103,10 +103,11 @@ if __name__ == "__main__":
         default=None,
         metavar=("EXIST", "POS", "REACH", "NAV"),
         help=(
-            "Multinomial weights for the four task types: "
-            "Existence, Positionality, Reachability, Navigability. "
-            "Values are normalised to sum to 1. "
-            "E.g. --task-proportions 1 1 1 1 for uniform."
+            "Multinomial weights for the task types: "
+            "Existence (DISALLOWED — remapped to Positionality), Positionality, "
+            "Reachability, Navigability. Values are normalised to sum to 1. "
+            "Existence/yes-no tasks are no longer generated; put 0 in the first "
+            "slot. E.g. --task-proportions 0 1 1 1."
         ),
     )
     parser.add_argument(
