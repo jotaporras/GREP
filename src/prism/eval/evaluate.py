@@ -29,6 +29,7 @@ Public surface:
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 import traceback as traceback_mod
@@ -77,6 +78,47 @@ from prism.models import utils as model_utils
 from prism.data import graph_sim
 from prism.data import planning_sim
 from prism.eval import path_validator
+
+
+# ----------------------------------------------------------------------------
+# Tool-calling toggle
+# ----------------------------------------------------------------------------
+# SPINE's "tools" are the environment-interrogating actions the planner emits in
+# its plan: they reveal new graph structure / descriptions and drive the
+# explore->feedback loop. The terminal `answer` action is NOT a tool — it is
+# detected by `PlanningSim.run_planning` itself, independent of `take_action`.
+_SPINE_TOOL_ACTIONS = frozenset(
+    {"map_region", "explore_region", "extend_map", "inspect", "goto"}
+)
+
+
+def _spine_tools_disabled() -> bool:
+    """True when PRISM_DISABLE_SPINE_TOOLS opts the eval out of tool calling."""
+    return os.environ.get("PRISM_DISABLE_SPINE_TOOLS", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+class _NoToolsGraphSim(graph_sim.GraphSim):
+    """GraphSim that drops every SPINE tool action.
+
+    Disabling tool calling without crippling the planner's ability to reason: a
+    tool action becomes a no-op that reveals nothing and returns "no updates", so
+    `run_planning` neither breaks early nor advances the observed graph. Because
+    the loop keeps running until the planner emits `answer` (or hits
+    `max_iterations`), the model retains its full multi-turn reasoning budget —
+    it may take several turns and answer — it simply has no tools to call and must
+    reason from the graph it was already given. `answer` falls through to the base
+    implementation unchanged.
+    """
+
+    def take_action(self, action, argument) -> bool:
+        if action in _SPINE_TOOL_ACTIONS:
+            return False
+        return super().take_action(action, argument)
 
 
 # ----------------------------------------------------------------------------
@@ -184,7 +226,8 @@ def eval_model_single_graph(
         `sample_results` is a list of dicts with one entry per sample.
     """
     graph_handler = graph_util.GraphHandler("")
-    graph_simulation = graph_sim.GraphSim(graph_handler)
+    graph_sim_cls = _NoToolsGraphSim if _spine_tools_disabled() else graph_sim.GraphSim
+    graph_simulation = graph_sim_cls(graph_handler)
 
     strip_edges = not include_edge_list
     is_gnn = _is_graph_augmented(model)
