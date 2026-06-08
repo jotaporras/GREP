@@ -1,5 +1,4 @@
 import json
-import math
 import torch
 import wandb
 from pathlib import Path
@@ -117,6 +116,8 @@ class GradientDebugCallback(TrainerCallback):
     """
 
     def __init__(self):
+        self._pe_norm = float("nan")
+        self._pe_has_nan = False
         self._emb_norm = float("nan")
         self._num_injections = 0
         self._hooked = False
@@ -145,7 +146,7 @@ class GradientDebugCallback(TrainerCallback):
         return hasattr(inner, "pe_model") or hasattr(inner, "gt_model")
 
     def _install_hooks(self, model):
-        """Install a lightweight wrapper that observes without duplicating logic.
+        """Install lightweight hooks that observe without duplicating logic.
 
         Unwraps PEFT so the injection wrapper lives on the actual graph-augmented
         instance (whose ``forward`` calls it), not on the PeftModel wrapper.
@@ -163,8 +164,15 @@ class GradientDebugCallback(TrainerCallback):
         """GraphAugmentedLLM: pe_proj output norm + ``_augment_embeddings`` wrap."""
         callback = self
 
-        # Wrap _augment_embeddings on the actual GraphAugmentedLLM so that
-        # self._augment_embeddings() inside forward() hits our wrapper.
+        # Hook 1: capture PE norm from pe_proj output via a forward hook.
+        def _pe_proj_hook(_module, _input, output):
+            callback._pe_norm = output.detach().norm().item()
+            callback._pe_has_nan = bool(output.detach().isnan().any())
+
+        inner.pe_proj.register_forward_hook(_pe_proj_hook)
+
+        # Hook 2: wrap _augment_embeddings on the actual GraphAugmentedLLM so
+        # that self._augment_embeddings() inside forward() hits our wrapper.
         orig_augment = inner._augment_embeddings
 
         def _wrapped_augment(input_ids, graphs, injection_maps):
