@@ -1,7 +1,7 @@
 name: e5
 architecture: rpearl_gt_llm
 wandb_project: GREP-PRISM
-wandb_run_name: e5_rpearl_graph_oriented_data_gt_no_edges_fixed
+wandb_run_name: e5_rpearl_graph_oriented_data_gt_no_edges_revised
 wandb_tag: e5_graph_oriented_data
 checkpoint_dir: outputs/e5_graph_oriented_data
 data: data/gen/nav100_n30_gemma_data/split/formatted_all_new__train.json
@@ -19,13 +19,13 @@ max_seq_length: 8192
 text_edge_list: none
 # Graph Transformer + R-PEARL params
 d_model: 1024
-gt_num_layers: 3
+gt_num_layers: 2
 gt_heads: 8
 pe_hidden_channels: 256
-pe_num_layers: 5
+pe_num_layers: 3
 num_samples: 40
 dropout: 0.1
-k_pe: 3
+k_pe: 1
 k_gt: 2
 eps: 1e-6
 use_layer_norm: true

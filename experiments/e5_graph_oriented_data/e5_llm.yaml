@@ -1,7 +1,7 @@
 name: e5
 architecture: llm
 wandb_project: GREP-PRISM
-wandb_run_name: e5_llm_graph_oriented_data_fixed
+wandb_run_name: e5_llm_graph_oriented_data_revised
 wandb_tag: e5_graph_oriented_data
 checkpoint_dir: outputs/e5_graph_oriented_data
 data: data/gen/nav100_n30_gemma_data/split/formatted_all_new__train.json

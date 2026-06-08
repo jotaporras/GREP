@@ -1,7 +1,7 @@
 name: e7
 architecture: composite_graph_gt
 wandb_project: GREP-PRISM
-wandb_run_name: e7_composite_graph_gt_centered_no_edges   
+wandb_run_name: e7_composite_graph_gt_centered_no_edges_revised
 wandb_tag: e7_architecture_experiments
 checkpoint_dir: outputs/e7_architecture_improvements
 data: data/gen/nav100_n30_gemma_data/split/formatted_all_new__train.json
@@ -11,7 +11,7 @@ base_model: meta-llama/Llama-3.1-8B-Instruct
 bit4: true
 per_device_train_batch_size: 1
 learning_rate: 0.0002
-epochs: 2
+epochs: 3
 r: 16
 debug: true
 dataset_proportion: 1.0
@@ -19,13 +19,13 @@ max_seq_length: 8192
 text_edge_list: none
 # Graph Transformer + R-PEARL params
 d_model: 4096
-gt_num_layers: 3
+gt_num_layers: 2
 gt_heads: 8
 pe_hidden_channels: 256
-pe_num_layers: 2
+pe_num_layers: 3
 num_samples: 96
 dropout: 0.05
-k_pe: 3
+k_pe: 1
 k_gt: 2
 eps: 1e-6
 use_layer_norm: true
