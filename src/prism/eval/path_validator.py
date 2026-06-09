@@ -10,8 +10,8 @@ Two layers:
    by ``distance_m``). Malformed/empty input is invalid, never raises.
 
 2. **LLM judge (separate, subjective score).** When a task carries an
-   ``acceptance_criterion`` (or is a yes/no task), an LLM-as-judge (Gemma 4 E4B QAT,
-   ``GEMMA_JUDGE_MODEL``, default ``google/gemma-4-E4B-it-qat-w4a16-ct``) grades the response
+   ``acceptance_criterion`` (or is a yes/no task), an LLM-as-judge (Gemma 4 E4B,
+   ``GEMMA_JUDGE_MODEL``, default ``google/gemma-4-E4B-it``) grades the response
    against that rubric. For acceptance_criterion tasks the judge runs *every*
    evaluation turn (validation and test). The judge score and the RegEx score are
    kept **completely separate** — computed from disjoint inputs, neither reading the
@@ -39,12 +39,9 @@ from typing import Dict, List, Optional
 
 import networkx as nx
 
-# Gemma 4 E4B QAT judge. Defaults to the official gated
-# "google/gemma-4-E4B-it-qat-w4a16-ct" repo — a quantization-aware-trained w4a16
-# checkpoint (compressed-tensors) that loads through the same
-# AutoModelForImageTextToText path with near-bf16 quality at ~4-bit weight memory
+# Gemma 4 E4B judge. Defaults to the official gated "google/gemma-4-E4B-it" repo
 # (requires an HF auth token with access granted); set GREP_JUDGE_MODEL to override.
-GEMMA_JUDGE_MODEL = os.environ.get("GREP_JUDGE_MODEL", "google/gemma-4-E4B-it-qat-w4a16-ct")
+GEMMA_JUDGE_MODEL = os.environ.get("GREP_JUDGE_MODEL", "google/gemma-4-E4B-it")
 
 # Route formats: "a -> b -> c" (spec form) or PRISM "goto(a), goto(b)" actions.
 _ARROW = re.compile(r"\s*->\s*")
@@ -155,32 +152,30 @@ def validate_path(
 
 
 # --------------------------------------------------------------------------
-# Conditional LLM-as-judge (Gemma 4 E4B QAT) — used only when acceptance_criterion set
+# Conditional LLM-as-judge (Gemma 4 E4B) — used only when acceptance_criterion set
 # --------------------------------------------------------------------------
 
 _JUDGE = {"gen": None, "loaded": False}
 
 
 def _load_judge():
-    """Lazily load the Gemma 4 E4B QAT judge once, returning a
-    ``generate(prompt)->str`` callable (or None if the model can't be loaded).
+    """Lazily load the Gemma 4 E4B judge once, returning a ``generate(prompt)->str``
+    callable (or None if the model can't be loaded).
 
     Gemma 4 E4B is an image-text-to-text model, so we drive it text-only through
     its chat template + ``generate`` rather than the text-generation pipeline.
-    ``dtype="auto"`` lets the w4a16 QAT (compressed-tensors) quant config engage
-    instead of forcing bf16 over the 4-bit weights.
     """
     if _JUDGE["loaded"]:
         return _JUDGE["gen"]
     _JUDGE["loaded"] = True
     try:
-        import torch  # noqa: F401  (used by the no_grad/generate path below)
+        import torch
         from transformers import AutoModelForImageTextToText, AutoProcessor
 
         processor = AutoProcessor.from_pretrained(GEMMA_JUDGE_MODEL)
         model = AutoModelForImageTextToText.from_pretrained(
             GEMMA_JUDGE_MODEL,
-            dtype="auto",
+            torch_dtype=torch.bfloat16,
             low_cpu_mem_usage=True,
         )
         model.eval()
@@ -235,7 +230,7 @@ def judge_acceptance(
     acceptance_criterion: Optional[str] = None,
     answer_regex: Optional[str] = None,
 ) -> Optional[bool]:
-    """Grade a response with the Gemma 4 E4B QAT judge against a reference.
+    """Grade a response with the Gemma 4 E4B judge against a reference.
 
     Reference precedence: ``acceptance_criterion`` if given, else the regex
     ground-truth ``answer_regex`` (so yes/no tasks without a criterion are still

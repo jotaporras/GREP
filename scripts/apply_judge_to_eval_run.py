@@ -39,7 +39,7 @@ Usage:
         --dataset data/gen/nav100_n30_gemma_data/populated_graphs --in-place
 
     # override the judge model (default is path_validator.GEMMA_JUDGE_MODEL)
-    python scripts/apply_judge_to_eval_run.py run.json --model google/gemma-4-E4B-it-qat-w4a16-ct
+    python scripts/apply_judge_to_eval_run.py run.json --model google/gemma-4-E4B-it
 """
 from __future__ import annotations
 
