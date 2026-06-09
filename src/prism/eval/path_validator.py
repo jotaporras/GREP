@@ -10,8 +10,8 @@ Two layers:
    by ``distance_m``). Malformed/empty input is invalid, never raises.
 
 2. **LLM judge (separate, subjective score).** When a task carries an
-   ``acceptance_criterion`` (or is a yes/no task), an LLM-as-judge (Gemma 4 E2B,
-   ``GEMMA_JUDGE_MODEL``, default ``google/gemma-4-E2B-it``) grades the response
+   ``acceptance_criterion`` (or is a yes/no task), an LLM-as-judge (Gemma 4 E4B QAT,
+   ``GEMMA_JUDGE_MODEL``, default ``google/gemma-4-E4B-it-qat-w4a16-ct``) grades the response
    against that rubric. For acceptance_criterion tasks the judge runs *every*
    evaluation turn (validation and test). The judge score and the RegEx score are
    kept **completely separate** — computed from disjoint inputs, neither reading the
@@ -39,10 +39,12 @@ from typing import Dict, List, Optional
 
 import networkx as nx
 
-# Gemma 4 E2B judge. Defaults to the official gated "google/gemma-4-E2B-it" repo
-# (requires an HF auth token with access granted); set GREP_JUDGE_MODEL to override
-# (e.g. the ungated "unsloth/gemma-4-E2B-it" mirror when no auth is configured).
-GEMMA_JUDGE_MODEL = os.environ.get("GREP_JUDGE_MODEL", "google/gemma-4-E2B-it")
+# Gemma 4 E4B QAT judge. Defaults to the official gated
+# "google/gemma-4-E4B-it-qat-w4a16-ct" repo — a quantization-aware-trained w4a16
+# checkpoint (compressed-tensors) that loads through the same
+# AutoModelForImageTextToText path with near-bf16 quality at ~4-bit weight memory
+# (requires an HF auth token with access granted); set GREP_JUDGE_MODEL to override.
+GEMMA_JUDGE_MODEL = os.environ.get("GREP_JUDGE_MODEL", "google/gemma-4-E4B-it-qat-w4a16-ct")
 
 # Route formats: "a -> b -> c" (spec form) or PRISM "goto(a), goto(b)" actions.
 _ARROW = re.compile(r"\s*->\s*")
@@ -153,30 +155,32 @@ def validate_path(
 
 
 # --------------------------------------------------------------------------
-# Conditional LLM-as-judge (Gemma E2B) — used only when acceptance_criterion set
+# Conditional LLM-as-judge (Gemma 4 E4B QAT) — used only when acceptance_criterion set
 # --------------------------------------------------------------------------
 
 _JUDGE = {"gen": None, "loaded": False}
 
 
 def _load_judge():
-    """Lazily load the Gemma E2B judge once, returning a ``generate(prompt)->str``
-    callable (or None if the model can't be loaded).
+    """Lazily load the Gemma 4 E4B QAT judge once, returning a
+    ``generate(prompt)->str`` callable (or None if the model can't be loaded).
 
-    Gemma 3n is an image-text-to-text model, so we drive it text-only through its
-    chat template + ``generate`` rather than the text-generation pipeline.
+    Gemma 4 E4B is an image-text-to-text model, so we drive it text-only through
+    its chat template + ``generate`` rather than the text-generation pipeline.
+    ``dtype="auto"`` lets the w4a16 QAT (compressed-tensors) quant config engage
+    instead of forcing bf16 over the 4-bit weights.
     """
     if _JUDGE["loaded"]:
         return _JUDGE["gen"]
     _JUDGE["loaded"] = True
     try:
-        import torch
+        import torch  # noqa: F401  (used by the no_grad/generate path below)
         from transformers import AutoModelForImageTextToText, AutoProcessor
 
         processor = AutoProcessor.from_pretrained(GEMMA_JUDGE_MODEL)
         model = AutoModelForImageTextToText.from_pretrained(
             GEMMA_JUDGE_MODEL,
-            torch_dtype=torch.bfloat16,
+            dtype="auto",
             low_cpu_mem_usage=True,
         )
         model.eval()
@@ -231,7 +235,7 @@ def judge_acceptance(
     acceptance_criterion: Optional[str] = None,
     answer_regex: Optional[str] = None,
 ) -> Optional[bool]:
-    """Grade a response with the Gemma E2B judge against a reference.
+    """Grade a response with the Gemma 4 E4B QAT judge against a reference.
 
     Reference precedence: ``acceptance_criterion`` if given, else the regex
     ground-truth ``answer_regex`` (so yes/no tasks without a criterion are still
@@ -292,7 +296,10 @@ _EDGE_STMTS = (
 )
 _VIA = re.compile(
     r"(?:\bvia\b|\bthrough\b|passing\s+through|going\s+through|by\s+way\s+of|crossing)"
-    r"(.*?)(?:[.;]|\bwithout\b|\bavoid|$)", re.I)
+    # stop before any clause that merely *describes* the route ("stating ...",
+    # "and lists ...", an example "a -> b" walk) so the example path isn't swept
+    # in as extra waypoints.
+    r"(.*?)(?:[.;]|->|\bwithout\b|\bavoid|\bstating\b|\broute\b|\band\s+lists?\b|$)", re.I)
 _AVOID = re.compile(
     r"(?:without\s+(?:using|passing\s+through|going\s+through|entering)|does\s+not\s+use|"
     r"avoid(?:s|ing)?|excluding|not\s+via|not\s+using)\b(.*?)(?:[.,;]|$)", re.I)
@@ -375,6 +382,7 @@ def derive_targets(graph_dict: dict, *, init_node, answer, criterion, task):
     object_refs = [t for t in ordered if t in objects]
 
     goal = region_refs[-1] if region_refs else (host.get(object_refs[0]) if object_refs else None)
+    waypoints = [w for w in waypoints if w != goal]  # the goal is never a waypoint
     required_edges = [frozenset((host[o], o)) for o in object_refs if o in host]
     kind = "path" if (_PATH_CUE.search(blob) or waypoints or len(region_refs) >= 2) else "edges"
     return goal, waypoints, sorted(avoid), required_edges, kind

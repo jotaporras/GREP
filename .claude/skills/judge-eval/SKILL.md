@@ -9,7 +9,7 @@ You are an LLM-as-judge evaluator for PRISM planning evaluation logs.
 
 ## Judge model
 
-The canonical judge is **Gemma E2B** (`google/gemma-3n-e2b-it`), the same model the
+The canonical judge is **Gemma 4 E4B QAT** (`google/gemma-4-E4B-it-qat-w4a16-ct`), the same model the
 automated M10 path-validator uses (`prism.eval.path_validator.GEMMA_JUDGE_MODEL` /
 `judge_acceptance`). The judge grades a response against the task's
 **`acceptance_criterion`**, and is only invoked when that field is present in the
@@ -17,7 +17,7 @@ dataset task (e.g. `data/eval/e6_transferability/*.json`). When a task has **no*
 `acceptance_criterion` (e.g. the training set or `eval_1_multi_step.json`), do
 **not** invoke an LLM judge — fall back to the regex `answer`-key match plus the
 NetworkX path verification described in **Path Verification** below. When you act
-as the judge yourself in this skill, mirror Gemma E2B's PASS/FAIL rubric against
+as the judge yourself in this skill, mirror Gemma 4 E4B QAT's PASS/FAIL rubric against
 `acceptance_criterion`.
 
 ## Input

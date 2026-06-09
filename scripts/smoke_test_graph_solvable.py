@@ -436,8 +436,12 @@ def check_task(G, nodes, task):
                 break
         correct, wrong = (already_battery(target) if ttype == "already" else affirm_battery(target))
 
-    # A neutral premise restatement is never a correct answer for ANY polarity.
-    wrong = wrong + premise_echo(target)
+    # A neutral premise restatement is never a correct answer for ANY polarity --
+    # EXCEPT for identify tasks, where `target` IS the answer node: a "premise echo"
+    # that names it ("...a route to fuel_depot_1 exists") actually identifies the
+    # answer, so feeding it as a WRONG sample manufactures a false leak.
+    if ttype not in ("identify_node", "identify_count"):
+        wrong = wrong + premise_echo(target)
     acc, rej, rx_err = regex_scores(answer, correct, wrong)
     return verdict(ttype, graph_ok, graph_note, acc, rej, rx_err, verified,
                    invalid_route=(ttype == "path" and bool(graph_note)))
