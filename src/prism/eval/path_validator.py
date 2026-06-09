@@ -9,6 +9,14 @@ Two layers:
    ``start_goal_ok``, ``cost_optimality`` (emitted weighted cost ÷ shortest path
    by ``distance_m``). Malformed/empty input is invalid, never raises.
 
+   **Gemma path rescue.** When the regex finds NO route in a path-bearing answer,
+   the Gemma judge (``write_path_with_judge``) is asked to recreate the route the
+   planner intended — strictly in the ``a -> b -> c`` notation — and the SAME
+   NetworkX diagnostics are re-run on that recreated route. It is one-way: an
+   empty/hallucinated rewrite scores as no/invalid path and can never inflate a
+   verdict. ``path_rescued`` flags samples whose route came from this rescue.
+   Disable with ``GREP_PATH_RESCUE=0``.
+
 2. **LLM judge (separate, subjective score).** When a task carries an
    ``acceptance_criterion`` (or is a yes/no task), an LLM-as-judge (Gemma 4 E4B,
    ``GEMMA_JUDGE_MODEL``, default ``google/gemma-4-E4B-it``) grades the response
@@ -107,17 +115,36 @@ def validate_path(
     start: Optional[str] = None,
     goal: Optional[str] = None,
     directed: bool = False,
+    rescue_response: Optional[str] = None,
+    task: Optional[str] = None,
 ) -> Dict:
     """Validate a generated route against the graph (regex + NetworkX). Never raises.
 
     Returns a metrics dict: ``parsed_nodes``, ``num_parsed``, ``nodes_exist_rate``,
     ``edge_validity_rate``, ``full_path_valid``, ``start_goal_ok``,
-    ``cost_optimality`` (None unless ``full_path_valid`` and ≥2 nodes).
+    ``cost_optimality`` (None unless ``full_path_valid`` and ≥2 nodes),
+    ``path_rescued``.
+
+    ``rescue_response``: when the regex (`parse_path`) finds NO route in
+    ``generated_text`` and this is given (and ``GREP_PATH_RESCUE`` is enabled), the
+    Gemma judge is asked to recreate the route the planner intended — in the
+    canonical ``a -> b -> c`` notation — from this fuller text, and the SAME
+    NetworkX diagnostics below are run on that recreated route. One-way rescue: an
+    empty/hallucinated rewrite simply scores as no/invalid path, never inflates.
     """
     G = build_graph(graph_dict, directed=directed)
     node_set = set(G.nodes)
     # Parse without filtering first so hallucinated nodes are visible in the rate.
     parsed = parse_path(generated_text)
+    rescued = False
+    if not parsed and rescue_response and _path_rescue_enabled():
+        # RegEx detected no path. Ask the Gemma judge to rewrite the route the
+        # model was trying to express in our `a -> b -> c` notation, then grade
+        # THAT route with the identical NetworkX diagnostics below.
+        rescued_route = write_path_with_judge(
+            rescue_response, node_set, task=task, start=start, goal=goal)
+        parsed = parse_path(rescued_route)
+        rescued = bool(parsed)
     result = {
         "parsed_nodes": parsed,
         "num_parsed": len(parsed),
@@ -126,6 +153,7 @@ def validate_path(
         "full_path_valid": False,
         "start_goal_ok": False,
         "cost_optimality": None,
+        "path_rescued": rescued,
     }
     if not parsed:
         return result
@@ -268,6 +296,73 @@ def judge_acceptance(
 
 
 # --------------------------------------------------------------------------
+# Gemma path rescue — recreate the route in `a -> b -> c` notation when the
+# RegEx could not detect one, then re-run the NetworkX diagnostics on it.
+# --------------------------------------------------------------------------
+# A route can be many hops of long grid ids, so it needs far more than the
+# 4-token PASS/FAIL verdict budget.
+_RESCUE_MAX_NEW_TOKENS = 256
+
+
+def _path_rescue_enabled() -> bool:
+    """True unless GREP_PATH_RESCUE explicitly disables the Gemma path rescue."""
+    return os.environ.get("GREP_PATH_RESCUE", "1").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def write_path_with_judge(
+    response: str,
+    valid_nodes: Optional[set] = None,
+    *,
+    task: Optional[str] = None,
+    start: Optional[str] = None,
+    goal: Optional[str] = None,
+) -> str:
+    """Re-express the planner's intended route in the canonical ``a -> b -> c``
+    arrow notation using the Gemma judge — the path counterpart of
+    ``judge_acceptance``'s one-way rescue.
+
+    Invoked ONLY when the regex (`parse_path`) found no route, to recover a path the
+    model expressed off-spec. The reply is fed straight back through ``parse_path``
+    + the NetworkX diagnostics, so an empty/hallucinated answer just scores as
+    no/invalid path — it can rescue, never inflate. Returns "" when the judge can't
+    be loaded or there is nothing to read.
+    """
+    generate = _load_judge()
+    if generate is None or not response:
+        return ""
+    node_list = ", ".join(sorted(valid_nodes)) if valid_nodes else ""
+    ends = ""
+    if start:
+        ends += f"\nThe route starts at node: {start}"
+    if goal:
+        ends += f"\nThe route ends at node: {goal}"
+    prompt = (
+        "You are reading a robot planner's answer and must recover the single route "
+        "it was trying to express. Output ONLY that route, as a chain of node ids in "
+        "exactly this form:\n"
+        "node_a -> node_b -> node_c\n"
+        "Use ONLY ids from the allowed list, copied exactly, with consecutive nodes "
+        "connected in the graph. Output nothing else — no prose, no explanation. If "
+        "the answer expresses no route at all, output NONE.\n"
+        f"Allowed node ids: {node_list}\n"
+        f"Task: {task or ''}"
+        f"{ends}\n"
+        f"Planner answer: {response}\n"
+        "Route:"
+    )
+    try:
+        return generate(prompt, max_new_tokens=_RESCUE_MAX_NEW_TOKENS) or ""
+    except Exception as e:
+        print(f"[path_validator] Gemma path-writer call failed ({type(e).__name__}: {e}).")
+        return ""
+
+
+# --------------------------------------------------------------------------
 # Deterministic structured grading (edges + paths) — replaces the judge for
 # positionality / reachability / navigability
 # --------------------------------------------------------------------------
@@ -392,6 +487,7 @@ def validate_structured(
     criterion: Optional[str],
     task: Optional[str],
     directed: bool = False,
+    full_response: Optional[str] = None,
 ) -> Optional[Dict]:
     """Deterministic edge/path verdict for a structural task. Never raises.
 
@@ -399,12 +495,19 @@ def validate_structured(
     ``waypoints_ok``, ``avoid_ok``, ``required_edges_present`` and the boolean
     ``structured_correct`` — or ``None`` when the task isn't graph-structural
     (no resolvable goal), so the caller falls back to the regex/judge path.
+
+    For a ``kind == "path"`` task (reachability / navigability) the Gemma path
+    rescue runs when the regex finds no route, recreating it from ``full_response``
+    so ``structured_correct`` is graded on the re-derived path. ``kind == "edges"``
+    (positionality) expects no route and is never rescued.
     """
     goal, waypoints, avoid, required_edges, kind = derive_targets(
         graph_dict, init_node=init_node, answer=answer, criterion=criterion, task=task)
     if goal is None:
         return None
-    m = validate_path(generated_text, graph_dict, start=init_node, goal=goal, directed=directed)
+    m = validate_path(
+        generated_text, graph_dict, start=init_node, goal=goal, directed=directed,
+        rescue_response=(full_response if kind == "path" else None), task=task)
     parsed = m["parsed_nodes"]
     stated = parse_edges(generated_text, set(build_graph(graph_dict, directed=directed).nodes))
     m["goal"] = goal
@@ -454,14 +557,17 @@ def evaluate_sample(
     """
     structured = validate_structured(
         response_text, graph_dict, init_node=init_node, answer=answer,
-        criterion=acceptance_criterion, task=task, directed=directed)
+        criterion=acceptance_criterion, task=task, directed=directed,
+        full_response=full_response or response_text)
     if structured is not None:
         structured["structured"] = True
         structured["judge_used"] = False
         structured["llm_judge_pass"] = None
         return structured
 
-    metrics = validate_path(response_text, graph_dict, start=init_node, goal=goal, directed=directed)
+    metrics = validate_path(
+        response_text, graph_dict, start=init_node, goal=goal, directed=directed,
+        rescue_response=full_response or response_text, task=task)
     metrics["structured"] = False
     should_judge = bool(acceptance_criterion) or is_yes_no_task(task, answer)
     metrics["judge_used"] = should_judge

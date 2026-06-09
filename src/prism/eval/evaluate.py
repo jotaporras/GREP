@@ -732,6 +732,9 @@ def _aggregate_path_metrics(sample_results: List[dict]) -> dict:
         "start_goal_ok_rate": _rate("start_goal_ok"),
         "cost_optimality": _mean("cost_optimality"),
         "num_with_path": len(pms),
+        # Routes recovered by the Gemma path rescue (regex found none, judge
+        # rewrote it in `a -> b -> c` and NetworkX re-graded it).
+        "num_rescued": sum(1 for p in pms if p.get("path_rescued")),
     }
     # Deterministic structural aggregates (present when structured tasks ran).
     structured = [p for p in pms if p.get("structured")]

@@ -12,6 +12,11 @@ each recorded planner answer through the SAME grading framework a live eval uses
     (regex + NetworkX: node existence, edge validity, full-path validity,
     start/goal, cost optimality; plus the deterministic edge/path check for
     structural positionality / reachability / navigability tasks).
+  * When the regex finds NO route in a path-bearing answer, the Gemma judge is
+    invoked to rewrite the route in ``a -> b -> c`` notation and the NetworkX
+    diagnostics are re-run on it (``path_rescued`` flags such samples). This is
+    the same one-way rescue a live ``evaluate.py`` run applies; disable with
+    ``GREP_PATH_RESCUE=0``.
   * For acceptance_criterion / yes-no tasks it then runs the Gemma judge
     (``path_validator.judge_acceptance``) and folds the verdict in with
     ``path_validator.combine_verdict`` — exactly as
@@ -192,7 +197,10 @@ def _regrade_sample(sample: dict, graph_dict, task, path_validator) -> dict:
     columns. Nothing objective is reused from the recording — it is all rederived.
     """
     ac_present = bool(task.get("acceptance_criterion"))
-    stats = {"judged": False, "ac": ac_present, "false_positive": False, "false_negative": False}
+    stats = {"judged": False, "ac": ac_present, "structured": False,
+             "judge_eligible": False, "judge_fallback": False,
+             "false_positive": False, "false_negative": False,
+             "path_rescued": False}
 
     if sample.get("error") is not None:
         # Hard crash — eval_model_single_graph's `except` branch: objective verdict
@@ -251,9 +259,19 @@ def _regrade_sample(sample: dict, graph_dict, task, path_validator) -> dict:
     sample["false_positive"] = false_positive
     sample["false_negative"] = false_negative
 
+    stats["structured"] = structured
+    # Judge-eligible = a non-structural task the judge SHOULD run on (AC or yes/no;
+    # ``judge_used`` is evaluate_sample's own should_judge flag). Structural tasks
+    # are graded deterministically by NetworkX and never reach the judge.
+    stats["judge_eligible"] = (not structured) and (
+        bool(pm and pm.get("judge_used")) or ac_present)
+    # Mirrors evaluate.eval_model_single_graph's n_judge_fallback: a non-structural
+    # AC task the judge could not score (model unavailable / returned no verdict).
+    stats["judge_fallback"] = (not structured) and ac_present and judge_pass is None
     stats["judged"] = judge_pass is not None
     stats["false_positive"] = false_positive
     stats["false_negative"] = false_negative
+    stats["path_rescued"] = bool(pm and pm.get("path_rescued"))
     return stats
 
 
@@ -282,6 +300,9 @@ def _aggregate_path_metrics(samples: list) -> dict:
         "start_goal_ok_rate": _rate("start_goal_ok"),
         "cost_optimality": _mean("cost_optimality"),
         "num_with_path": len(pms),
+        # Routes recovered by the Gemma path rescue (regex found none, judge
+        # rewrote it in `a -> b -> c` and NetworkX re-graded it).
+        "num_rescued": sum(1 for p in pms if p.get("path_rescued")),
     }
     structured = [p for p in pms if p.get("structured")]
     if structured:
@@ -371,7 +392,8 @@ def main() -> None:
     shared_index = _dataset_index(args.dataset) if args.dataset else None
 
     grand = {"files": 0, "samples": 0, "matched": 0, "judged": 0, "ac": 0,
-             "fp": 0, "fn": 0, "unmatched": 0}
+             "structured": 0, "eligible": 0, "fallback": 0,
+             "fp": 0, "fn": 0, "unmatched": 0, "rescued": 0}
 
     for rf in result_files:
         with open(rf) as f:
@@ -395,6 +417,7 @@ def main() -> None:
             result.get("name") or os.path.basename(rf)))[0]
 
         n_match = n_judge = n_ac = n_fp = n_fn = n_unmatched = 0
+        n_struct = n_eligible = n_fallback = n_rescued = 0
         for sample in samples:
             picked = _pick_task(index, sample, result_stem)
             if picked is None:
@@ -405,8 +428,12 @@ def main() -> None:
             n_match += 1
             n_ac += int(st["ac"])
             n_judge += int(st["judged"])
+            n_struct += int(st["structured"])
+            n_eligible += int(st["judge_eligible"])
+            n_fallback += int(st["judge_fallback"])
             n_fp += int(st["false_positive"])
             n_fn += int(st["false_negative"])
+            n_rescued += int(st["path_rescued"])
 
         _reaggregate(result)
 
@@ -418,30 +445,50 @@ def main() -> None:
         subj = result.get("subjective_accuracy")
         subj_s = f"{subj:.1%}" if subj is not None else "n/a"
         warn = ""
-        if n_ac and n_judge == 0:
-            warn = "  ⚠ judge produced 0 verdicts (weights/auth still unavailable?)"
+        # Only a genuine weights/auth problem warrants the judge warning — i.e. a
+        # NON-structural AC task the judge could not score (evaluate.py's
+        # n_judge_fallback). Structural tasks skip the judge by design.
+        if n_fallback:
+            warn += (f"  ⚠ {n_fallback} judge-eligible task(s) scored no verdict — "
+                     f"check Gemma weights / HF auth")
+        elif n_eligible == 0 and n_struct:
+            warn += (f"  (all {n_struct} structural; NetworkX-graded, judge not used "
+                     f"for scoring by design — Gemma loads only if a path rescue fires)")
         if n_unmatched:
             warn += f"  ⚠ {n_unmatched} sample(s) unmatched to a dataset task"
         print(f"[apply-judge] {os.path.basename(rf)}: matched {n_match}/{len(samples)}, "
-              f"ac={n_ac}, judged={n_judge}, FP={n_fp}, FN={n_fn}, SubjAcc={subj_s} "
-              f"-> {out}{warn}")
+              f"ac={n_ac}, structural={n_struct}, judge_eligible={n_eligible}, "
+              f"judged={n_judge}, path_rescued={n_rescued}, FP={n_fp}, FN={n_fn}, "
+              f"SubjAcc={subj_s} -> {out}{warn}")
 
         grand["files"] += 1
         grand["samples"] += len(samples)
         grand["matched"] += n_match
         grand["judged"] += n_judge
         grand["ac"] += n_ac
+        grand["structured"] += n_struct
+        grand["eligible"] += n_eligible
+        grand["fallback"] += n_fallback
         grand["fp"] += n_fp
         grand["fn"] += n_fn
         grand["unmatched"] += n_unmatched
+        grand["rescued"] += n_rescued
 
     print(f"\n[apply-judge] DONE  files={grand['files']}  samples={grand['samples']}  "
-          f"matched={grand['matched']}  ac={grand['ac']}  judged={grand['judged']}  "
+          f"matched={grand['matched']}  ac={grand['ac']}  structural={grand['structured']}  "
+          f"judge_eligible={grand['eligible']}  judged={grand['judged']}  "
+          f"path_rescued={grand['rescued']}  "
           f"FP={grand['fp']}  FN={grand['fn']}  unmatched={grand['unmatched']}")
-    if grand["ac"] and grand["judged"] == 0:
-        print("[apply-judge] WARNING: acceptance_criterion tasks were present but the "
-              "judge scored none — check that the Gemma weights / HF auth are available "
-              "(see path_validator.GEMMA_JUDGE_MODEL).")
+    if grand["fallback"]:
+        print(f"[apply-judge] WARNING: {grand['fallback']} non-structural acceptance_criterion "
+              "task(s) could not be judged — check that the Gemma weights / HF auth are "
+              "available (see path_validator.GEMMA_JUDGE_MODEL).")
+    elif grand["eligible"] == 0 and grand["ac"]:
+        print("[apply-judge] NOTE: every acceptance_criterion task is graph-structural "
+              "(positionality / reachability / navigability). These are graded "
+              "deterministically by NetworkX and DO NOT use the LLM judge — so the Gemma "
+              "model is intentionally never loaded, exactly as a live evaluate.py run. "
+              "judged=0 here is correct, not a failure.")
 
 
 if __name__ == "__main__":
