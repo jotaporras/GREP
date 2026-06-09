@@ -102,16 +102,26 @@ PY
 
 echo ""
 echo "=== Stage 1: Generate one skeleton (${NC} communities x ${NPC} nodes/community, ${N_TASKS} tasks) ==="
-python scripts/generate_eval_graphs.py \
-  --n-communities "$NC" \
-  --nodes-per-community "$NPC" \
-  --intra-community-prob 0.6 \
-  --inter-community-prob 0.05 \
-  --object-rate 0.3 \
-  --description-prob 0.05 \
-  --n-tasks "$N_TASKS" \
-  --seed "$SEED" \
-  --output "${SKEL_DIR}/eval_graph_unique_30_seed${SEED}.json"
+
+# Reuse-existing guard: if the skeleton already exists AND a graph has already
+# been populated, keep what is on disk so populate resumes against it.
+SKEL_FILE="${SKEL_DIR}/eval_graph_unique_30_seed${SEED}.json"
+populated_count=$(find "${RUN_DIR}/populated_graphs" -maxdepth 1 -name 'data_gen_*.json' 2>/dev/null | wc -l | tr -d ' ')
+if [ -f "$SKEL_FILE" ] && [ "$populated_count" -gt 0 ]; then
+  echo "Reusing existing data: skeleton ${SKEL_FILE} present and "
+  echo "${populated_count} populated graph(s) in ${RUN_DIR}/populated_graphs — skipping skeleton generation."
+else
+  python scripts/generate_eval_graphs.py \
+    --n-communities "$NC" \
+    --nodes-per-community "$NPC" \
+    --intra-community-prob 0.6 \
+    --inter-community-prob 0.05 \
+    --object-rate 0.3 \
+    --description-prob 0.05 \
+    --n-tasks "$N_TASKS" \
+    --seed "$SEED" \
+    --output "$SKEL_FILE"
+fi
 
 echo ""
 echo "=== Stage 2: Populate (local Gemma) + run SPINE rollouts (local Gemma) ==="

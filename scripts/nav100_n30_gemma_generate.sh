@@ -133,19 +133,39 @@ PY
 
 echo ""
 echo "=== Stage 1: Generate skeletons (${#seeds[@]} seeds x 1 config = ${#seeds[@]} skeletons, ~30 nodes each) ==="
+
+# Reuse-existing guard: if ALL N skeletons already exist AND at least one graph
+# has already been populated, an interrupted run is in progress — keep what is
+# on disk (do NOT regenerate/overwrite skeletons) so the populate phase resumes
+# against the exact skeletons it started from.
+all_skeletons_exist=true
 for SEED in "${seeds[@]}"; do
-  echo "--- N~30 (${NC} communities x ${NPC} nodes/community) seed=${SEED} ---"
-  python scripts/generate_eval_graphs.py \
-    --n-communities "$NC" \
-    --nodes-per-community "$NPC" \
-    --intra-community-prob "$INTRA_PROB" \
-    --inter-community-prob "$INTER_PROB" \
-    --object-rate "$OBJECT_RATE" \
-    --description-prob "$DESC_PROB" \
-    --n-tasks "$N_TASKS" \
-    --seed "$SEED" \
-    --output "${SKEL_DIR}/eval_graph_unique_30_seed${SEED}.json"
+  if [ ! -f "${SKEL_DIR}/eval_graph_unique_30_seed${SEED}.json" ]; then
+    all_skeletons_exist=false
+    break
+  fi
 done
+populated_count=$(find "${RUN_DIR}/populated_graphs" -maxdepth 1 -name 'data_gen_*.json' 2>/dev/null | wc -l | tr -d ' ')
+
+if [ "$all_skeletons_exist" = true ] && [ "$populated_count" -gt 0 ]; then
+  echo "Reusing existing data: all ${#seeds[@]} skeletons present in ${SKEL_DIR} and "
+  echo "${populated_count} populated graph(s) in ${RUN_DIR}/populated_graphs."
+  echo "Skipping skeleton generation (use --fresh by clearing those dirs to regenerate)."
+else
+  for SEED in "${seeds[@]}"; do
+    echo "--- N~30 (${NC} communities x ${NPC} nodes/community) seed=${SEED} ---"
+    python scripts/generate_eval_graphs.py \
+      --n-communities "$NC" \
+      --nodes-per-community "$NPC" \
+      --intra-community-prob "$INTRA_PROB" \
+      --inter-community-prob "$INTER_PROB" \
+      --object-rate "$OBJECT_RATE" \
+      --description-prob "$DESC_PROB" \
+      --n-tasks "$N_TASKS" \
+      --seed "$SEED" \
+      --output "${SKEL_DIR}/eval_graph_unique_30_seed${SEED}.json"
+  done
+fi
 
 echo ""
 echo "=== Stage 2: Populate (local Gemma) + run SPINE rollouts (local Gemma) ==="
