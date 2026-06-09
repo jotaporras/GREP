@@ -62,7 +62,16 @@ _ICL_EXAMPLES_2 = examples.EXAMPLE_1 + examples.EXAMPLE_2
 def _fixed_get_base_prompt(request, scene_graph, use_icl=True):
     # use_icl=True -> exactly the 2 training ICL examples; use_icl=False -> 1
     # (EXAMPLE_1), preserving the prior minimal-prompt behavior for that flag.
-    header = [spine_prompts.SYS_PROMPT] + (_ICL_EXAMPLES_2 if use_icl else examples.EXAMPLE_1)
+    sys_prompt = spine_prompts.SYS_PROMPT
+    if _spine_tools_disabled():
+        # Tell the model what `_NoToolsGraphSim` already enforces: the API actions
+        # are a planning notation only — nothing executes, no feedback comes back.
+        # Build a fresh dict so the shared SYS_PROMPT object is never mutated.
+        sys_prompt = {
+            "role": sys_prompt["role"],
+            "content": sys_prompt["content"] + _NO_TOOL_CALL_DIRECTIVE,
+        }
+    header = [sys_prompt] + (_ICL_EXAMPLES_2 if use_icl else examples.EXAMPLE_1)
     return header + [
         {"role": "user",
          "content": f"{request}\nAdvice: \n- Recall the scene may be incomplete. \n- Carefully explain your reasoning in a step-by-step manner.\n- Reason over connections, coordinates, and semantic relationships between objects and regions in the scene.\n\n"
@@ -100,6 +109,27 @@ def _spine_tools_disabled() -> bool:
         "yes",
         "on",
     )
+
+
+# Appended to SYS_PROMPT (by `_fixed_get_base_prompt`) only when tools are
+# disabled. It reframes the API as a planning vocabulary so the model's prompt
+# matches the runtime contract `_NoToolsGraphSim` enforces: no action executes
+# and no observation ever returns. Written as advice in SPINE's own register
+# (plan over the actions, then commit to answer()).
+_NO_TOOL_CALL_DIRECTIVE = (
+    "\n\nTOOL CALLING IS DISABLED FOR THIS TASK — READ CAREFULLY:\n"
+    "- The API actions (goto, explore_region, map_region, inspect, extend_map) are "
+    "available ONLY as a vocabulary to lay out and explain your plan. They are NOT "
+    "executed.\n"
+    "- You will receive NO updates, observations, descriptions, or feedback in "
+    "response to any action. Never wait for, assume, or refer to a result from any "
+    "step — there is none.\n"
+    "- Treat the scene graph you are given as the complete and only information you "
+    "will ever have. Reason over it directly; do not plan to discover anything new.\n"
+    "- Still express your reasoning as a plan over these actions, then commit to a "
+    "final answer(). Your answer() must stand entirely on its own, justified by the "
+    "given graph alone and not by any executed step."
+)
 
 
 class _NoToolsGraphSim(graph_sim.GraphSim):

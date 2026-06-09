@@ -149,7 +149,7 @@
 <header>
   <h1>PRISM Eval Rollout Viewer</h1>
   <div class="file-group"><label>Eval:</label><input type="file" id="file" accept=".json" multiple /></div>
-  <div class="file-group"><label>Graph:</label><input type="file" id="graph-file" accept=".json" /></div>
+  <div class="file-group"><label>Graph:</label><input type="file" id="graph-file" accept=".json" multiple /></div>
   <span class="stats" id="stats">No eval log loaded</span>
   <span class="graph-stats" id="graph-stats"></span>
 </header>
@@ -160,8 +160,9 @@
       Supports the <code>{checkpoint, architecture, accuracy, samples:[...]}</code> format
       produced by <code>eval_checkpoint_on_graphs.py</code> — select multiple files
       (e.g. all of <code>results/pww85dt8/</code>) to view them together.<br/><br/>
-      Optionally load a <b>Graph</b> JSON to see the scene graph and acceptance criteria
-      matched to each sample's task.</div>
+      Optionally load one or more <b>Graph</b> JSON files (e.g. all the matching
+      <code>test_graphs/</code> for a results folder) to see the scene graph and acceptance
+      criteria matched to each sample by graph name + task.</div>
   </div>
 </div>
 <script>
@@ -188,30 +189,58 @@ $('file').addEventListener('change', e => {
 });
 
 $('graph-file').addEventListener('change', e => {
-  const r = new FileReader();
-  r.onload = () => {
-    try { loadGraph(JSON.parse(r.result), e.target.files[0].name); }
-    catch(ex) { alert('Failed to parse graph JSON: ' + ex.message); }
-  };
-  r.readAsText(e.target.files[0]);
+  const files = [...e.target.files];
+  if (!files.length) return;
+  const readFile = f => new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => { try { res({ parsed: JSON.parse(r.result), name: f.name }); } catch(ex) { rej(ex); } };
+    r.onerror = () => rej(r.error);
+    r.readAsText(f);
+  });
+  files.sort((a, b) => a.name.localeCompare(b.name));
+  Promise.all(files.map(readFile))
+    .then(loadGraphs)
+    .catch(ex => alert('Failed to parse graph JSON: ' + ex.message));
 });
 
-function loadGraph(parsed, name) {
-  const entries = Array.isArray(parsed) ? parsed : [parsed];
-  GRAPH_DATA = entries.length === 1 ? entries[0] : entries[0];
+// Derive the graph_name used in eval samples from a graph filename (strip dir + .json).
+function graphStem(name) {
+  return String(name).replace(/^.*[\\/]/, '').replace(/\.json$/i, '');
+}
+// Composite index key so identical task texts in different graphs don't collide.
+function taskKey(graphName, task) { return `${graphName}\u0000${task}`; }
+
+// Index one or more graph files. Each sample is matched by graph_name + task
+// (with a bare-task fallback) so acceptance criteria resolve to the right graph.
+function loadGraphs(files) {
   TASK_INDEX = {};
-  let totalTasks = 0;
-  entries.forEach(entry => {
-    const tasks = entry.tasks || [];
-    totalTasks += tasks.length;
-    tasks.forEach(t => { TASK_INDEX[t.task] = { ...t, __graph: entry.graph }; });
+  GRAPH_DATA = null;
+  let totalTasks = 0, totalReg = 0, totalObj = 0;
+  files.forEach(({ parsed, name }) => {
+    const entries = Array.isArray(parsed) ? parsed : [parsed];
+    entries.forEach(entry => {
+      const stem = graphStem(name);
+      const tasks = entry.tasks || [];
+      totalTasks += tasks.length;
+      totalReg += (entry.graph?.regions || []).length;
+      totalObj += (entry.graph?.objects || []).length;
+      if (!GRAPH_DATA) GRAPH_DATA = entry;
+      tasks.forEach(t => {
+        const rec = { ...t, __graph: entry.graph, __graphName: stem };
+        TASK_INDEX[taskKey(stem, t.task)] = rec;
+        TASK_INDEX[t.task] = rec; // bare-task fallback (last write wins on collisions)
+      });
+    });
   });
-  const nObj = (GRAPH_DATA.graph?.objects || []).length;
-  const nReg = (GRAPH_DATA.graph?.regions || []).length;
+  const label = files.length === 1 ? files[0].name : `${files.length} graph files`;
   $('graph-stats').innerHTML =
-    `<b>${escapeHtml(name)}</b> &nbsp; ${nReg} regions, ${nObj} objects, ${totalTasks} tasks`;
+    `<b>${escapeHtml(label)}</b> &nbsp; ${totalReg} regions, ${totalObj} objects, ${totalTasks} tasks`;
+  renderSidebar();
   if (CUR >= 0) show(CUR);
 }
+
+// Back-compat single-graph loader (kept for any external callers).
+function loadGraph(parsed, name) { loadGraphs([{ parsed, name }]); }
 
 // Run-level metadata keys carried at the top of each eval artifact.
 const RUN_META_KEYS = ['checkpoint', 'graph_file', 'architecture', 'text_edge_list',
@@ -347,8 +376,10 @@ function show(i) {
     html += `<div class="metrics"><div class="sec-label">path metrics</div>${renderMetrics(s.path_metrics)}</div>`;
   }
 
-  // Matched graph task (acceptance criterion + graph)
-  const matched = TASK_INDEX[s.task];
+  // Matched graph task (acceptance criterion + graph). Prefer the graph-name +
+  // task composite key so identical task texts across graphs resolve correctly,
+  // falling back to a bare task-text match.
+  const matched = TASK_INDEX[taskKey(s.graph_name, s.task)] || TASK_INDEX[s.task];
   if (matched) {
     if (matched.acceptance_criterion) {
       html += `<div class="acceptance">

@@ -281,7 +281,15 @@ def judge_acceptance(
 # A node id: lowercase type prefix + one-or-more ``_<int>`` tails (grid ids like
 # ``bay_3_26_1`` carry several).
 _NODE_ID = re.compile(r"[a-z][a-z_]*(?:_\d+)+")
-_EDGE_STMT = re.compile(rf"({_NODE_ID.pattern})\s*<->\s*({_NODE_ID.pattern})")
+# An edge may be stated as ``u <-> v`` (spec form) or in SPINE's native pair forms
+# ``[u, v]`` / ``(u, v)`` that the planner emits in its ``answer(...)`` — and the
+# pair nodes are often quoted (``['u', 'v']``). Accept all.
+_Q = r"['\"]?"
+_EDGE_STMTS = (
+    re.compile(rf"({_NODE_ID.pattern})\s*<->\s*({_NODE_ID.pattern})"),
+    re.compile(rf"\[\s*{_Q}({_NODE_ID.pattern}){_Q}\s*,\s*{_Q}({_NODE_ID.pattern}){_Q}\s*\]"),
+    re.compile(rf"\(\s*{_Q}({_NODE_ID.pattern}){_Q}\s*,\s*{_Q}({_NODE_ID.pattern}){_Q}\s*\)"),
+)
 _VIA = re.compile(
     r"(?:\bvia\b|\bthrough\b|passing\s+through|going\s+through|by\s+way\s+of|crossing)"
     r"(.*?)(?:[.;]|\bwithout\b|\bavoid|$)", re.I)
@@ -306,11 +314,13 @@ def _ordered_subseq(sub: List[str], seq: List[str]) -> bool:
 
 
 def parse_edges(text: str, valid_nodes: Optional[set] = None) -> set:
-    """Undirected edges stated as ``u <-> v`` in ``text`` (as frozenset pairs)."""
+    """Undirected edges stated in ``text`` (``u <-> v``, ``[u, v]`` or ``(u, v)``)
+    as frozenset pairs. Self-loops (``u == v``) are dropped."""
     out = set()
-    for u, v in _EDGE_STMT.findall(text or ""):
-        if valid_nodes is None or (u in valid_nodes and v in valid_nodes):
-            out.add(frozenset((u, v)))
+    for pat in _EDGE_STMTS:
+        for u, v in pat.findall(text or ""):
+            if u != v and (valid_nodes is None or (u in valid_nodes and v in valid_nodes)):
+                out.add(frozenset((u, v)))
     return out
 
 
@@ -342,17 +352,22 @@ def derive_targets(graph_dict: dict, *, init_node, answer, criterion, task):
                 out.append(t)
         return out
 
+    # The answer regex authoritatively names the route's endpoints/waypoints;
+    # those nodes are required and must NEVER be treated as avoided — otherwise a
+    # criterion that mentions an endpoint inside a "without using ..." clause
+    # (e.g. "without using the bridge_1 <-> specimen_vault_1 edge") would drop the
+    # goal and silently fall back to the judge.
+    ans_ids = [t for t in ids(_strip_regex(answer)) if t != init_node]
     avoid = {t for span in _AVOID.findall(blob) for t in _NODE_ID.findall(span) if t in nodes}
+    avoid -= set(ans_ids) | ({init_node} if init_node else set())
     waypoints = [t for span in _VIA.findall(blob) for t in _NODE_ID.findall(span)
                  if t in nodes and t != init_node and t not in avoid]
-    seen_wp = dict.fromkeys(waypoints)  # de-dup, keep order
-    waypoints = list(seen_wp)
+    waypoints = list(dict.fromkeys(waypoints))  # de-dup, keep order
 
     # Union of answer-named ids (ordered, authoritative for path endpoints) and
     # criterion/task ids — so a positionality answer that names only the region
     # still picks up the contained object (and its containment edge) from the
     # criterion.
-    ans_ids = [t for t in ids(_strip_regex(answer)) if t != init_node and t not in avoid]
     crit_ids = [t for t in ids(blob)
                 if t != init_node and t not in avoid and t not in waypoints]
     ordered = ans_ids + [t for t in crit_ids if t not in ans_ids]
@@ -402,9 +417,13 @@ def validate_structured(
         m["structured_correct"] = bool(
             goal_named and (m["required_edges_present"] if required_edges else True))
     else:  # reachability / navigability: a valid constrained walk to the goal.
+        # The route's hop-edges are validated by `full_path_valid` (every
+        # consecutive pair is a real graph edge); the target object's containment
+        # edge is a positionality fact, NOT required here (it stays in
+        # `required_edges_present` as a diagnostic only).
         m["structured_correct"] = bool(
             m["full_path_valid"] and m["start_goal_ok"] and m["waypoints_ok"]
-            and m["avoid_ok"] and m["required_edges_present"])
+            and m["avoid_ok"])
     return m
 
 

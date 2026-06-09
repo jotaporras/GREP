@@ -206,6 +206,7 @@ The deterministic grader reads the goal region, waypoints, avoided areas, and th
 
 - Write ONE sentence describing what a correct planner response must convey.
 - Name, by node id, the destination region (the goal), every required waypoint (write "via <node>" / "passing through <node>"), every avoided area (write "without using <node>"), and each object whose containment is part of the answer — so the grader resolves the goal, constraints, and required `region <-> object` edges deterministically.
+- An avoided area must be a REAL region that is neither the start nor the destination and that the intended route genuinely bypasses. Never write a vacuous constraint: do not reference a non-existent edge, do not hedge ("if it existed"), and do not name the start/goal/waypoint in the "without using" clause.
 - For Reachability/Navigability: name the start region, the destination region, and require a valid route between them (plus any waypoint/avoid), with the connecting edges. For Positionality: name the region and its contained object(s) so the containment edge is required.
 - Do NOT restate the task; describe the *answer*.
 

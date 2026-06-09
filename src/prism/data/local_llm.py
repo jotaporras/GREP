@@ -39,10 +39,14 @@ shape-MISMATCH errors), and native FP4 compute needs a Blackwell GPU. To use it,
 serve it with vLLM/TensorRT-LLM instead. For eager HF Transformers, prefer the
 bf16 model above with ``PRISM_HF_QUANT=4bit`` to hit a comparable footprint.
 
-Gemma 4 ships a step-by-step "thinking" mode. For data generation we want clean
-JSON (Phase 1) and clean SPINE plans (Phase 2), so thinking is disabled via
-``apply_chat_template(..., enable_thinking=False)`` and any residual thinking
-markup is stripped by ``processor.parse_response``.
+Gemma 4 ships a step-by-step "thinking" mode. It is ENABLED here (both phases)
+via ``apply_chat_template(..., enable_thinking=True)`` so the model reasons
+before answering; the reasoning is emitted in a ``<think>`` block that
+``processor.parse_response`` strips, so the saved data stays clean JSON (Phase 1)
+and clean SPINE plans (Phase 2). NOTE: thinking consumes generation tokens, so
+the budgets account for the ``<think>`` block — Phase 1 keeps 10240, Phase 2 is
+raised from 2048 to 4096. If a harder model still truncates before emitting
+``answer(...)``, raise ``max_new_tokens`` further.
 
 Runtime deps (install on the GPU node):
     pip install -U transformers torch accelerate
@@ -244,9 +248,10 @@ class LocalHFQueryClient:
     generator is unchanged. ``temperature`` and ``max_tokens`` map directly to
     ``model.generate`` (the populate path uses the ``GPTQueryClient`` defaults
     of ``temperature=0.31`` / ``max_tokens=10240``). ``reasoning_effort`` has no
-    HF equivalent; thinking is disabled so the model returns a single
-    well-formed JSON object in its output (matching gpt-5.1 ``output_text``,
-    whose reasoning never appears inline).
+    HF equivalent; thinking is enabled, and its ``<think>`` block is stripped by
+    ``parse_response`` so the returned output is still a single well-formed JSON
+    object (matching gpt-5.1 ``output_text``, whose reasoning never appears
+    inline).
     """
 
     def __init__(self, model_id: Optional[str] = None, max_new_tokens: int = 10240):
@@ -274,7 +279,7 @@ class LocalHFQueryClient:
             messages,
             tokenize=False,
             add_generation_prompt=True,
-            enable_thinking=False,
+            enable_thinking=True,
         )
         inputs = self.processor(text=text, return_tensors="pt").to(self.model.device)
         input_len = inputs["input_ids"].shape[-1]
@@ -320,12 +325,15 @@ class GemmaSpineClient:
 
     Generation parameters mirror the repo's canonical HF planner client
     (``prism.models.inference.InMemoryLLM``): ``temperature=0.01``,
-    ``min_p=0.1``, ``use_cache=True``, ``max_new_tokens=2048`` and the same
-    ``format_prompt`` wording — so swapping in this backend changes only WHICH
-    model answers, not how the planner is driven.
+    ``min_p=0.1``, ``use_cache=True`` and the same ``format_prompt`` wording — so
+    swapping in this backend changes only WHICH model answers, not how the
+    planner is driven. The one deliberate deviation is ``max_new_tokens=4096``
+    (vs. InMemoryLLM's 2048): with thinking enabled the ``<think>`` block shares
+    the budget with the plan, so the cap is doubled to keep short SPINE plans
+    from being truncated before ``answer(...)`` is emitted.
     """
 
-    def __init__(self, model_id: Optional[str] = None, max_new_tokens: int = 2048):
+    def __init__(self, model_id: Optional[str] = None, max_new_tokens: int = 4096):
         self.model, self.processor = load_gemma(model_id)
         self.max_new_tokens = max_new_tokens
         # pad token for generation; matches inference.InMemoryLLM's
@@ -348,7 +356,7 @@ class GemmaSpineClient:
                 msg,
                 tokenize=False,
                 add_generation_prompt=True,
-                enable_thinking=False,
+                enable_thinking=True,
             )
             inputs = self.processor(text=text, return_tensors="pt").to(
                 self.model.device
