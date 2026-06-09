@@ -394,6 +394,23 @@ def main() -> None:
     print(f"[apply-judge] judge model: {path_validator.GEMMA_JUDGE_MODEL}")
 
     result_files = _resolve(args.results)
+    # Never re-grade our own outputs. A directory/glob sweep would otherwise pick up
+    # the *{suffix}.json files this script writes and re-run the Gemma judge on them
+    # every invocation (and pile up *.judged.judged.json) — an effective infinite
+    # loop. Drop them, UNLESS the user explicitly named a single judged file.
+    judged_suffix = f"{args.suffix}.json"
+    explicit_file = os.path.isfile(args.results) and not any(
+        ch in args.results for ch in ("*", "?", "["))
+    if not explicit_file:
+        kept = [f for f in result_files if not f.endswith(judged_suffix)]
+        skipped = len(result_files) - len(kept)
+        if skipped:
+            print(f"[apply-judge] skipping {skipped} already-judged "
+                  f"'*{judged_suffix}' file(s) to avoid re-grading our own output.")
+        result_files = kept
+    if not result_files:
+        raise SystemExit(f"No result files to grade at {args.results} "
+                         f"(all were already-judged '*{judged_suffix}').")
     # A global --dataset is indexed once; otherwise each result resolves its own.
     shared_index = _dataset_index(args.dataset) if args.dataset else None
 

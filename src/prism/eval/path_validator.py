@@ -123,6 +123,7 @@ def validate_path(
     start: Optional[str] = None,
     goal: Optional[str] = None,
     directed: bool = False,
+    reasoning_text: Optional[str] = None,
     rescue_response: Optional[str] = None,
     task: Optional[str] = None,
 ) -> Dict:
@@ -131,17 +132,23 @@ def validate_path(
     Returns a metrics dict: ``parsed_nodes``, ``num_parsed``, ``nodes_exist_rate``,
     ``edge_validity_rate``, ``full_path_valid``, ``start_goal_ok``,
     ``cost_optimality`` (None unless ``full_path_valid`` and ≥2 nodes),
-    ``path_rescued``.
+    ``path_from_reasoning``, ``path_rescued``.
 
-    ``rescue_response`` is the model's FULL response (reasoning + plan). When the
-    regex finds NO route in ``generated_text`` (the plan), two fallbacks fire in
-    order: (1) the regex re-scans ``rescue_response`` so a route the model stated
-    only in its *reasoning* is still caught, taking the route it states LAST (its
-    final committed path); (2) if that also finds nothing and ``GREP_PATH_RESCUE``
-    is enabled, the Gemma judge recreates the route in the canonical ``a -> b -> c``
-    notation. The SAME NetworkX diagnostics below grade whichever route is found.
-    Both are one-way: an empty/hallucinated route scores as no/invalid path and
-    never inflates. ``path_from_reasoning`` / ``path_rescued`` flag the source.
+    When the regex finds NO route in ``generated_text`` (the plan), two fallbacks
+    fire in order:
+
+    1. **Reasoning scan (always on, deterministic).** The regex re-scans
+       ``reasoning_text`` (the model's full response) so a route the model stated
+       only in its *reasoning* is still caught, taking the route it states LAST
+       (its final committed path). This runs for EVERY task — a route in the
+       reasoning is picked up regardless of the task ``kind``.
+    2. **Gemma rescue (gated).** Only if the reasoning scan also finds nothing and
+       ``rescue_response`` is given and ``GREP_PATH_RESCUE`` is enabled, the Gemma
+       judge recreates the route in the canonical ``a -> b -> c`` notation.
+
+    The SAME NetworkX diagnostics below grade whichever route is found. Both are
+    one-way: an empty/hallucinated route scores as no/invalid path and never
+    inflates. ``path_from_reasoning`` / ``path_rescued`` flag the source.
     """
     G = build_graph(graph_dict, directed=directed)
     node_set = set(G.nodes)
@@ -149,10 +156,10 @@ def validate_path(
     parsed = parse_path(generated_text)
     from_reasoning = False
     rescued = False
-    if not parsed and rescue_response:
+    if not parsed and reasoning_text:
         # The plan carried no route — check the model's reasoning too, taking the
-        # path it commits to LAST (deterministic, no model call).
-        parsed = parse_path(rescue_response, prefer_last=True)
+        # path it commits to LAST (deterministic, no model call). Always on.
+        parsed = parse_path(reasoning_text, prefer_last=True)
         from_reasoning = bool(parsed)
     if not parsed and rescue_response and _path_rescue_enabled():
         # Still nothing. Ask the Gemma judge to rewrite the route the model was
@@ -520,10 +527,11 @@ def validate_structured(
     ``structured_correct`` — or ``None`` when the task isn't graph-structural
     (no resolvable goal), so the caller falls back to the regex/judge path.
 
-    For a ``kind == "path"`` task (reachability / navigability) the Gemma path
-    rescue runs when the regex finds no route, recreating it from ``full_response``
-    so ``structured_correct`` is graded on the re-derived path. ``kind == "edges"``
-    (positionality) expects no route and is never rescued.
+    A route stated in the model's reasoning is always picked up (the deterministic
+    reasoning scan runs for every ``kind``). The Gemma path rescue, by contrast,
+    runs only for a ``kind == "path"`` task (reachability / navigability) when no
+    route is found at all — ``kind == "edges"`` (positionality) expects no route
+    and is never rescued by the model.
     """
     goal, waypoints, avoid, required_edges, kind = derive_targets(
         graph_dict, init_node=init_node, answer=answer, criterion=criterion, task=task)
@@ -531,6 +539,7 @@ def validate_structured(
         return None
     m = validate_path(
         generated_text, graph_dict, start=init_node, goal=goal, directed=directed,
+        reasoning_text=full_response,
         rescue_response=(full_response if kind == "path" else None), task=task)
     parsed = m["parsed_nodes"]
     stated = parse_edges(generated_text, set(build_graph(graph_dict, directed=directed).nodes))
@@ -591,6 +600,7 @@ def evaluate_sample(
 
     metrics = validate_path(
         response_text, graph_dict, start=init_node, goal=goal, directed=directed,
+        reasoning_text=full_response or response_text,
         rescue_response=full_response or response_text, task=task)
     metrics["structured"] = False
     should_judge = bool(acceptance_criterion) or is_yes_no_task(task, answer)
