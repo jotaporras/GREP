@@ -162,12 +162,39 @@ def load_gemma(model_id: Optional[str] = None):
                 f"{n_visible} visible GPU(s); using {where}"
             )
 
+        # A checkpoint that ships its own quantization (e.g. a compressed-tensors
+        # QAT w4a16 build like google/gemma-4-E4B-it-qat-w4a16-ct) must be loaded
+        # WITHOUT a bitsandbytes config: passing a BitsAndBytesConfig on top of a
+        # baked-in CompressedTensorsConfig raises "The model is quantized with
+        # CompressedTensorsConfig but you are passing a BitsAndBytesConfig". We
+        # honour the native quant via dtype="auto" instead (same path the Gemma
+        # judge in eval.path_validator already uses).
+        from transformers import AutoConfig
+
+        try:
+            prequantized = (
+                getattr(AutoConfig.from_pretrained(model_id), "quantization_config", None)
+                is not None
+            )
+        except Exception:
+            prequantized = False
+
         # device_map="auto" shards / offloads across whatever is available.
         # With one visible device above, that means this single GPU (+ CPU
         # offload only if it does not fit) — never a second GPU.
         load_kwargs = {"device_map": "auto"}
         quant = os.environ.get("PRISM_HF_QUANT", "none").lower()
-        if quant in ("4bit", "nf4", "bnb4"):
+        if prequantized:
+            # Native compressed-tensors quant drives the footprint; dtype="auto"
+            # lets it engage. Any PRISM_HF_QUANT bitsandbytes request is ignored.
+            if quant not in ("none", ""):
+                print(
+                    f"[local-llm] {model_id} already ships quantized weights "
+                    f"(compressed-tensors); ignoring PRISM_HF_QUANT={quant!r} "
+                    "and loading the checkpoint's native quantization."
+                )
+            load_kwargs["dtype"] = "auto"
+        elif quant in ("4bit", "nf4", "bnb4"):
             from transformers import BitsAndBytesConfig
 
             load_kwargs["quantization_config"] = BitsAndBytesConfig(
@@ -200,7 +227,8 @@ def load_gemma(model_id: Optional[str] = None):
         except StopIteration:
             param_dtype = "unknown"
         print(
-            f"[local-llm] loaded {model_id} | requested quant={quant} | "
+            f"[local-llm] loaded {model_id} | "
+            f"requested quant={'native(compressed-tensors)' if prequantized else quant} | "
             f"is_loaded_in_4bit={getattr(model, 'is_loaded_in_4bit', False)} "
             f"is_loaded_in_8bit={getattr(model, 'is_loaded_in_8bit', False)} | "
             f"param_dtype={param_dtype}"
