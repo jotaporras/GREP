@@ -12,11 +12,13 @@ each recorded planner answer through the SAME grading framework a live eval uses
     (regex + NetworkX: node existence, edge validity, full-path validity,
     start/goal, cost optimality; plus the deterministic edge/path check for
     structural positionality / reachability / navigability tasks).
-  * When the regex finds NO route in a path-bearing answer, the Gemma judge is
-    invoked to rewrite the route in ``a -> b -> c`` notation and the NetworkX
-    diagnostics are re-run on it (``path_rescued`` flags such samples). This is
-    the same one-way rescue a live ``evaluate.py`` run applies; disable with
-    ``GREP_PATH_RESCUE=0``.
+  * When the recorded ``plan`` carries no route, the route is searched in the
+    model's full *reasoning* too (``path_from_reasoning``), taking the path it
+    commits to LAST. If that also finds nothing, the Gemma judge rewrites the
+    route in ``a -> b -> c`` notation — biased toward the planner's final route —
+    and the NetworkX diagnostics are re-run on it (``path_rescued``). This is the
+    same one-way reasoning-check + rescue a live ``evaluate.py`` run applies; the
+    Gemma rescue is disabled with ``GREP_PATH_RESCUE=0``.
   * For acceptance_criterion / yes-no tasks it then runs the Gemma judge
     (``path_validator.judge_acceptance``) and folds the verdict in with
     ``path_validator.combine_verdict`` — exactly as
@@ -200,7 +202,7 @@ def _regrade_sample(sample: dict, graph_dict, task, path_validator) -> dict:
     stats = {"judged": False, "ac": ac_present, "structured": False,
              "judge_eligible": False, "judge_fallback": False,
              "false_positive": False, "false_negative": False,
-             "path_rescued": False}
+             "path_rescued": False, "path_from_reasoning": False}
 
     if sample.get("error") is not None:
         # Hard crash — eval_model_single_graph's `except` branch: objective verdict
@@ -272,6 +274,7 @@ def _regrade_sample(sample: dict, graph_dict, task, path_validator) -> dict:
     stats["false_positive"] = false_positive
     stats["false_negative"] = false_negative
     stats["path_rescued"] = bool(pm and pm.get("path_rescued"))
+    stats["path_from_reasoning"] = bool(pm and pm.get("path_from_reasoning"))
     return stats
 
 
@@ -300,8 +303,11 @@ def _aggregate_path_metrics(samples: list) -> dict:
         "start_goal_ok_rate": _rate("start_goal_ok"),
         "cost_optimality": _mean("cost_optimality"),
         "num_with_path": len(pms),
-        # Routes recovered by the Gemma path rescue (regex found none, judge
-        # rewrote it in `a -> b -> c` and NetworkX re-graded it).
+        # Routes the plan didn't carry but the model stated in its reasoning
+        # (recovered deterministically by regex, no model call).
+        "num_from_reasoning": sum(1 for p in pms if p.get("path_from_reasoning")),
+        # Routes recovered by the Gemma path rescue (regex found none in plan or
+        # reasoning; judge rewrote it in `a -> b -> c` and NetworkX re-graded it).
         "num_rescued": sum(1 for p in pms if p.get("path_rescued")),
     }
     structured = [p for p in pms if p.get("structured")]
@@ -393,7 +399,7 @@ def main() -> None:
 
     grand = {"files": 0, "samples": 0, "matched": 0, "judged": 0, "ac": 0,
              "structured": 0, "eligible": 0, "fallback": 0,
-             "fp": 0, "fn": 0, "unmatched": 0, "rescued": 0}
+             "fp": 0, "fn": 0, "unmatched": 0, "rescued": 0, "reasoned": 0}
 
     for rf in result_files:
         with open(rf) as f:
@@ -417,7 +423,7 @@ def main() -> None:
             result.get("name") or os.path.basename(rf)))[0]
 
         n_match = n_judge = n_ac = n_fp = n_fn = n_unmatched = 0
-        n_struct = n_eligible = n_fallback = n_rescued = 0
+        n_struct = n_eligible = n_fallback = n_rescued = n_reasoned = 0
         for sample in samples:
             picked = _pick_task(index, sample, result_stem)
             if picked is None:
@@ -434,6 +440,7 @@ def main() -> None:
             n_fp += int(st["false_positive"])
             n_fn += int(st["false_negative"])
             n_rescued += int(st["path_rescued"])
+            n_reasoned += int(st["path_from_reasoning"])
 
         _reaggregate(result)
 
@@ -458,7 +465,8 @@ def main() -> None:
             warn += f"  ⚠ {n_unmatched} sample(s) unmatched to a dataset task"
         print(f"[apply-judge] {os.path.basename(rf)}: matched {n_match}/{len(samples)}, "
               f"ac={n_ac}, structural={n_struct}, judge_eligible={n_eligible}, "
-              f"judged={n_judge}, path_rescued={n_rescued}, FP={n_fp}, FN={n_fn}, "
+              f"judged={n_judge}, path_from_reasoning={n_reasoned}, "
+              f"path_rescued={n_rescued}, FP={n_fp}, FN={n_fn}, "
               f"SubjAcc={subj_s} -> {out}{warn}")
 
         grand["files"] += 1
@@ -473,11 +481,12 @@ def main() -> None:
         grand["fn"] += n_fn
         grand["unmatched"] += n_unmatched
         grand["rescued"] += n_rescued
+        grand["reasoned"] += n_reasoned
 
     print(f"\n[apply-judge] DONE  files={grand['files']}  samples={grand['samples']}  "
           f"matched={grand['matched']}  ac={grand['ac']}  structural={grand['structured']}  "
           f"judge_eligible={grand['eligible']}  judged={grand['judged']}  "
-          f"path_rescued={grand['rescued']}  "
+          f"path_from_reasoning={grand['reasoned']}  path_rescued={grand['rescued']}  "
           f"FP={grand['fp']}  FN={grand['fn']}  unmatched={grand['unmatched']}")
     if grand["fallback"]:
         print(f"[apply-judge] WARNING: {grand['fallback']} non-structural acceptance_criterion "

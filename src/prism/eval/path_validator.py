@@ -9,13 +9,16 @@ Two layers:
    ``start_goal_ok``, ``cost_optimality`` (emitted weighted cost ÷ shortest path
    by ``distance_m``). Malformed/empty input is invalid, never raises.
 
-   **Gemma path rescue.** When the regex finds NO route in a path-bearing answer,
-   the Gemma judge (``write_path_with_judge``) is asked to recreate the route the
-   planner intended — strictly in the ``a -> b -> c`` notation — and the SAME
-   NetworkX diagnostics are re-run on that recreated route. It is one-way: an
-   empty/hallucinated rewrite scores as no/invalid path and can never inflate a
-   verdict. ``path_rescued`` flags samples whose route came from this rescue.
-   Disable with ``GREP_PATH_RESCUE=0``.
+   **Reasoning check + Gemma path rescue.** The route is searched first in the
+   planner's plan, then — when that finds nothing — in its full *reasoning* (the
+   model often states the route there), taking the route it commits to LAST. If
+   reasoning yields nothing either, the Gemma judge (``write_path_with_judge``)
+   recreates the route strictly in ``a -> b -> c`` notation, biased toward the
+   final route the planner commits to. The SAME NetworkX diagnostics are re-run on
+   whichever route is found. Both fallbacks are one-way: an empty/hallucinated
+   route scores as no/invalid path and can never inflate a verdict.
+   ``path_from_reasoning`` / ``path_rescued`` flag the source. The Gemma rescue
+   (only) is disabled with ``GREP_PATH_RESCUE=0``.
 
 2. **LLM judge (separate, subjective score).** When a task carries an
    ``acceptance_criterion`` (or is a yes/no task), an LLM-as-judge (Gemma 4 E4B,
@@ -83,14 +86,19 @@ def build_graph(graph_dict: dict, directed: bool = False) -> nx.Graph:
 _ARROW_CHAIN = re.compile(rf"{_NODE_TOKEN.pattern}(?:\s*->\s*{_NODE_TOKEN.pattern})+")
 
 
-def parse_path(text: str, valid_nodes: Optional[set] = None) -> List[str]:
+def parse_path(
+    text: str, valid_nodes: Optional[set] = None, *, prefer_last: bool = False
+) -> List[str]:
     """Extract the ordered route from planner text.
 
-    Pulls the longest ``a -> b -> c`` chain (the spec form), then ``goto(...)``
-    actions. Undirected edge statements ``u <-> v`` are neutralised first so the
-    ``->`` inside ``<->`` is never mistaken for a route hop — a response may carry
-    both an edge list and a path. When ``valid_nodes`` is given, tokens are
-    filtered to exact matches. Returns [] on malformed/empty input.
+    Pulls an ``a -> b -> c`` chain (the spec form), then ``goto(...)`` actions.
+    Undirected edge statements ``u <-> v`` are neutralised first so the ``->``
+    inside ``<->`` is never mistaken for a route hop — a response may carry both an
+    edge list and a path. By default the LONGEST chain is taken; ``prefer_last``
+    instead takes the chain stated LAST — the model's final committed route, after
+    any earlier exploratory revisions (used when scanning free-form reasoning).
+    When ``valid_nodes`` is given, tokens are filtered to exact matches. Returns []
+    on malformed/empty input.
     """
     if not text or not isinstance(text, str):
         return []
@@ -99,7 +107,7 @@ def parse_path(text: str, valid_nodes: Optional[set] = None) -> List[str]:
     if "->" in route_text:
         chains = _ARROW_CHAIN.findall(route_text)
         if chains:
-            best = max(chains, key=lambda c: c.count("->"))
+            best = chains[-1] if prefer_last else max(chains, key=lambda c: c.count("->"))
             nodes = _NODE_TOKEN.findall(best)
     elif "goto(" in text:
         nodes = _GOTO.findall(text)
@@ -125,25 +133,34 @@ def validate_path(
     ``cost_optimality`` (None unless ``full_path_valid`` and ≥2 nodes),
     ``path_rescued``.
 
-    ``rescue_response``: when the regex (`parse_path`) finds NO route in
-    ``generated_text`` and this is given (and ``GREP_PATH_RESCUE`` is enabled), the
-    Gemma judge is asked to recreate the route the planner intended — in the
-    canonical ``a -> b -> c`` notation — from this fuller text, and the SAME
-    NetworkX diagnostics below are run on that recreated route. One-way rescue: an
-    empty/hallucinated rewrite simply scores as no/invalid path, never inflates.
+    ``rescue_response`` is the model's FULL response (reasoning + plan). When the
+    regex finds NO route in ``generated_text`` (the plan), two fallbacks fire in
+    order: (1) the regex re-scans ``rescue_response`` so a route the model stated
+    only in its *reasoning* is still caught, taking the route it states LAST (its
+    final committed path); (2) if that also finds nothing and ``GREP_PATH_RESCUE``
+    is enabled, the Gemma judge recreates the route in the canonical ``a -> b -> c``
+    notation. The SAME NetworkX diagnostics below grade whichever route is found.
+    Both are one-way: an empty/hallucinated route scores as no/invalid path and
+    never inflates. ``path_from_reasoning`` / ``path_rescued`` flag the source.
     """
     G = build_graph(graph_dict, directed=directed)
     node_set = set(G.nodes)
     # Parse without filtering first so hallucinated nodes are visible in the rate.
     parsed = parse_path(generated_text)
+    from_reasoning = False
     rescued = False
+    if not parsed and rescue_response:
+        # The plan carried no route — check the model's reasoning too, taking the
+        # path it commits to LAST (deterministic, no model call).
+        parsed = parse_path(rescue_response, prefer_last=True)
+        from_reasoning = bool(parsed)
     if not parsed and rescue_response and _path_rescue_enabled():
-        # RegEx detected no path. Ask the Gemma judge to rewrite the route the
-        # model was trying to express in our `a -> b -> c` notation, then grade
-        # THAT route with the identical NetworkX diagnostics below.
+        # Still nothing. Ask the Gemma judge to rewrite the route the model was
+        # trying to express in our `a -> b -> c` notation, then grade THAT route
+        # with the identical NetworkX diagnostics below.
         rescued_route = write_path_with_judge(
             rescue_response, node_set, task=task, start=start, goal=goal)
-        parsed = parse_path(rescued_route)
+        parsed = parse_path(rescued_route, prefer_last=True)
         rescued = bool(parsed)
     result = {
         "parsed_nodes": parsed,
@@ -153,6 +170,7 @@ def validate_path(
         "full_path_valid": False,
         "start_goal_ok": False,
         "cost_optimality": None,
+        "path_from_reasoning": from_reasoning,
         "path_rescued": rescued,
     }
     if not parsed:
@@ -326,11 +344,13 @@ def write_path_with_judge(
     arrow notation using the Gemma judge — the path counterpart of
     ``judge_acceptance``'s one-way rescue.
 
-    Invoked ONLY when the regex (`parse_path`) found no route, to recover a path the
-    model expressed off-spec. The reply is fed straight back through ``parse_path``
-    + the NetworkX diagnostics, so an empty/hallucinated answer just scores as
-    no/invalid path — it can rescue, never inflate. Returns "" when the judge can't
-    be loaded or there is nothing to read.
+    Invoked ONLY when neither the plan nor the reasoning regex found a route, to
+    recover a path the model expressed off-spec. The judge reads the full reasoning
+    and is biased toward the route the planner commits to LAST (its final route,
+    not an earlier discarded attempt). The reply is fed straight back through
+    ``parse_path`` + the NetworkX diagnostics, so an empty/hallucinated answer just
+    scores as no/invalid path — it can rescue, never inflate. Returns "" when the
+    judge can't be loaded or there is nothing to read.
     """
     generate = _load_judge()
     if generate is None or not response:
@@ -342,9 +362,13 @@ def write_path_with_judge(
     if goal:
         ends += f"\nThe route ends at node: {goal}"
     prompt = (
-        "You are reading a robot planner's answer and must recover the single route "
-        "it was trying to express. Output ONLY that route, as a chain of node ids in "
-        "exactly this form:\n"
+        "You are reading a robot planner's reasoning and answer, and must recover "
+        "the single route it was trying to express. Read its full reasoning, not "
+        "just its final line. The planner often explores and REVISES its route while "
+        "thinking, so when it states more than one route, take the LAST one it "
+        "commits to — the route nearest the END of its answer — not an earlier "
+        "discarded attempt.\n"
+        "Output ONLY that route, as a chain of node ids in exactly this form:\n"
         "node_a -> node_b -> node_c\n"
         "Use ONLY ids from the allowed list, copied exactly, with consecutive nodes "
         "connected in the graph. Output nothing else — no prose, no explanation. If "
@@ -352,8 +376,8 @@ def write_path_with_judge(
         f"Allowed node ids: {node_list}\n"
         f"Task: {task or ''}"
         f"{ends}\n"
-        f"Planner answer: {response}\n"
-        "Route:"
+        f"Planner reasoning and answer: {response}\n"
+        "Final route:"
     )
     try:
         return generate(prompt, max_new_tokens=_RESCUE_MAX_NEW_TOKENS) or ""
