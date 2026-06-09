@@ -17,12 +17,27 @@ each recorded planner answer through the SAME grading framework a live eval uses
     ``path_validator.combine_verdict`` — exactly as
     ``evaluate.eval_model_single_graph`` does on a live run.
 
-All original text is preserved. The script only ADDS / refreshes the judge-side
-fields (``path_metrics``, ``llm_judge_pass``, ``subjective_correct``,
-``false_positive``, ``false_negative``, ``structured``) and the summary
-aggregates (``subjective_accuracy``, ``num_judged``, ``num_false_pos``,
-``num_false_neg``, ``path_metrics``). The objective RegEx/NetworkX verdicts
-(``correct``, ``plan_keyword``, ``accuracy`` …) are left untouched.
+The output is byte-for-byte what a live ``evaluate.py`` run on the current dataset
+would have written, given the recorded planner responses. Every per-sample verdict
+and run-level metric is recomputed with the **same functions and inputs** the live
+library uses — ``_construct_eval_result`` (JSON-shape + keyword regex),
+``path_validator.evaluate_sample`` (recreate path → NetworkX grade → Gemma judge),
+the structured / ``combine_verdict`` branch of ``eval_model_single_graph``, and the
+aggregates of ``eval_model_multiple_graphs``:
+
+  * per sample — ``formatted``, ``plan_keyword``, ``correct`` (objective verdict),
+    ``structured``, ``path_metrics``, ``llm_judge_pass``, ``subjective_correct``,
+    ``false_positive``, ``false_negative`` (and ``answer_key`` re-stamped from the
+    dataset regex, exactly as the library does);
+  * run — ``num_total``, ``num_correct``, ``accuracy`` (objective keyword rate),
+    ``num_formatted``, ``num_keyword``, ``num_errors``, ``subjective_accuracy``,
+    ``num_judged``, ``num_false_pos``, ``num_false_neg``, ``path_metrics``.
+
+Only what cannot be recomputed without re-running the model is taken verbatim from
+the recording: the planner ``response``, ``interaction_trace``, ``terminated_by``,
+``error``/``traceback``, and run metadata (``name``, ``path``, ``permutation``,
+``elapsed_s`` …). Hard-crash samples (``error`` set — the library's ``except``
+branch) keep their objective-False verdict and are not graded.
 
 The graph, ``init_node`` and ``acceptance_criterion`` are not stored in the
 result JSON, so the source dataset (the populated-graph file the run scored) is
@@ -47,6 +62,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import sys
 
 # Make the in-repo package importable when run from a bare checkout (mirrors
@@ -146,52 +162,98 @@ def _path_metrics(planner_response, graph_dict, task, path_validator):
         return None
 
 
-def _regrade_sample(sample: dict, graph_dict, task, path_validator) -> dict:
-    """Add judge + path-validation fields to one sample in place; return stats.
+def _eval_result(parsed_answer, answer_key):
+    """``(formatted, plan_keyword)`` — a faithful copy of
+    ``evaluate._construct_eval_result``'s scoring.
 
-    Replays the recorded planner ``response`` (recreate path -> NetworkX grade ->
-    Gemma judge -> ``combine_verdict``), mirroring ``eval_model_single_graph``.
-    The objective RegEx fields already on the sample (``correct``,
-    ``plan_keyword``) are reused, never recomputed, so existing scoring is kept.
+    ``formatted`` is True iff the planner answer carries all four required keys;
+    ``plan_keyword`` is True iff the dataset ``answer`` regex matches the
+    stringified ``plan``. Any error (None / malformed response, bad regex) yields
+    ``(False, False)`` — and, exactly as the library, a failure in the keyword
+    search also discards ``formatted`` (both are returned from the same ``try``).
+    """
+    try:
+        formatted = all(k in parsed_answer for k in
+                        ("primary_goal", "relevant_graph", "reasoning", "plan"))
+        plan_keyword = bool(re.search(answer_key, str(parsed_answer["plan"]), re.IGNORECASE))
+        return formatted, plan_keyword
+    except Exception:
+        return False, False
+
+
+def _regrade_sample(sample: dict, graph_dict, task, path_validator) -> dict:
+    """Recompute every per-sample verdict in place, identically to a live run.
+
+    Reproduces ``eval_model_single_graph``'s per-sample logic exactly: re-derive
+    ``formatted``/``plan_keyword`` against the current dataset regex
+    (``_construct_eval_result``), recreate + grade the path and run the judge
+    (``path_validator.evaluate_sample``), then take the structured verdict or
+    ``combine_verdict`` for the objective ``correct`` and the separate subjective
+    columns. Nothing objective is reused from the recording — it is all rederived.
     """
     ac_present = bool(task.get("acceptance_criterion"))
     stats = {"judged": False, "ac": ac_present, "false_positive": False, "false_negative": False}
-    planner_response = sample.get("response")
-    if planner_response is None:  # crashed / unparseable sample — nothing to grade
-        sample["path_metrics"] = None
+
+    if sample.get("error") is not None:
+        # Hard crash — eval_model_single_graph's `except` branch: objective verdict
+        # False, no path metrics, no judge. (A None response WITHOUT an error is
+        # NOT a crash; the library still grades it below with response_text="".)
+        sample["formatted"] = False
+        sample["plan_keyword"] = False
+        sample["correct"] = False
         sample["structured"] = False
+        sample["path_metrics"] = None
         sample["llm_judge_pass"] = None
-        sample.setdefault("subjective_correct", None)
-        sample.setdefault("false_positive", False)
-        sample.setdefault("false_negative", False)
+        sample["subjective_correct"] = None
+        sample["false_positive"] = False
+        sample["false_negative"] = False
         return stats
+
+    answer = task.get("answer")
+    planner_response = sample.get("response")
+    # _construct_eval_result against the CURRENT dataset answer regex (the
+    # `answer_key` is re-stamped to it, as the library stores eval_sample.answer).
+    formatted, plan_keyword = _eval_result(planner_response, answer)
+    sample["answer_key"] = answer
+    sample["formatted"] = formatted
+    sample["plan_keyword"] = plan_keyword
 
     pm = _path_metrics(planner_response, graph_dict, task, path_validator)
     structured = bool(pm and pm.get("structured"))
     judge_pass = (pm or {}).get("llm_judge_pass")
 
     if structured:
-        # Structural task: graded deterministically by NetworkX; no LLM judge and
-        # no subjective column (matches eval_model_single_graph).
-        v = {"subjective_correct": None, "false_positive": False, "false_negative": False}
+        # Structural task: objective verdict is the deterministic NetworkX edge/path
+        # check; the Gemma judge is not run and there is no subjective column.
+        objective_correct = bool(pm.get("structured_correct"))
+        subjective_correct = None
+        false_positive = false_negative = False
     else:
+        # Non-structural: combine_verdict's two disjoint scores. objective_correct
+        # is the RegEx is_correct (formatted AND keyword); the judge moves only the
+        # subjective column.
         v = path_validator.combine_verdict(
-            regex_correct=bool(sample.get("correct")),
-            regex_keyword=bool(sample.get("plan_keyword")),
+            regex_correct=formatted and plan_keyword,
+            regex_keyword=plan_keyword,
             judge_pass=judge_pass,
             acceptance_criterion_present=ac_present,
         )
+        objective_correct = v["objective_correct"]
+        subjective_correct = v["subjective_correct"]
+        false_positive = v["false_positive"]
+        false_negative = v["false_negative"]
 
     sample["path_metrics"] = pm
     sample["structured"] = structured
+    sample["correct"] = objective_correct
     sample["llm_judge_pass"] = judge_pass
-    sample["subjective_correct"] = v["subjective_correct"]
-    sample["false_positive"] = v["false_positive"]
-    sample["false_negative"] = v["false_negative"]
+    sample["subjective_correct"] = subjective_correct
+    sample["false_positive"] = false_positive
+    sample["false_negative"] = false_negative
 
     stats["judged"] = judge_pass is not None
-    stats["false_positive"] = v["false_positive"]
-    stats["false_negative"] = v["false_negative"]
+    stats["false_positive"] = false_positive
+    stats["false_negative"] = false_negative
     return stats
 
 
@@ -238,13 +300,36 @@ def _aggregate_path_metrics(samples: list) -> dict:
     return agg
 
 
-def _reaggregate(result: dict) -> None:
-    """Refresh the run-level subjective / path-metric aggregates in place.
+def _objective_keyword(sample: dict) -> bool:
+    """The per-sample ``objective_keyword`` that feeds ``accuracy``.
 
-    Objective aggregates (``accuracy``, ``num_correct`` …) are left as the run
-    recorded them; only the judge-derived summary fields are (re)written.
+    Matches ``eval_model_single_graph``'s ``total_correct += int(v["objective_keyword"])``:
+    for a structural task it is ``structured_correct`` (== the recomputed
+    ``correct``); otherwise it is the RegEx ``plan_keyword``.
+    """
+    if sample.get("structured"):
+        return bool(sample.get("correct"))
+    return bool(sample.get("plan_keyword"))
+
+
+def _reaggregate(result: dict) -> None:
+    """Recompute ALL run-level metrics in place, identically to the live driver.
+
+    Objective aggregates mirror ``eval_model_multiple_graphs`` (and ``accuracy``
+    = objective-keyword rate from ``eval_model_single_graph``); subjective and
+    path aggregates mirror the same. Run metadata (``name``, ``permutation``,
+    ``elapsed_s`` …) is left untouched — it is not a metric.
     """
     samples = result.get("samples", [])
+    n = len(samples)
+    # Objective (RegEx/NetworkX) — read only RegEx/structured fields.
+    result["num_total"] = n
+    result["num_correct"] = sum(1 for r in samples if r.get("correct"))
+    result["num_formatted"] = sum(1 for r in samples if r.get("formatted"))
+    result["num_keyword"] = sum(1 for r in samples if r.get("plan_keyword"))
+    result["num_errors"] = sum(1 for r in samples if r.get("error") is not None)
+    result["accuracy"] = (sum(1 for r in samples if _objective_keyword(r)) / n) if n else 0.0
+    # Subjective (Gemma judge) — judge verdict only, over judged samples only.
     judged = [r for r in samples if r.get("llm_judge_pass") is not None]
     num_judged = len(judged)
     result["subjective_accuracy"] = (
