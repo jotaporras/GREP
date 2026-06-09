@@ -24,6 +24,16 @@ each recorded planner answer through the SAME grading framework a live eval uses
     ``path_validator.combine_verdict`` — exactly as
     ``evaluate.eval_model_single_graph`` does on a live run.
 
+With ``--gemma-regrade`` the script ALSO writes a second, parallel reading
+(``*{gemma-suffix}.json``, default ``*.gemma.json``) in which the Gemma judge
+recovers each sample's intended route from the full response and EVERY path /
+structured metric and the objective ``correct`` are regraded on that recovered
+route — not just when the regex found nothing. ``formatted`` / ``plan_keyword``
+still describe the raw response (they are not path-derived); each ``path_metrics``
+block is stamped with ``path_source`` (``gemma_judge`` / ``regex_fallback``) and
+the raw ``gemma_route``, and the result carries ``"reading": "gemma_path_regrade"``.
+The original regex/reasoning ``*{suffix}.json`` reading is left intact alongside.
+
 The output is byte-for-byte what a live ``evaluate.py`` run on the current dataset
 would have written, given the recorded planner responses. Every per-sample verdict
 and run-level metric is recomputed with the **same functions and inputs** the live
@@ -66,6 +76,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import glob
 import json
 import os
@@ -146,18 +157,28 @@ def _pick_task(index: dict, sample: dict, result_stem: str):
     return (ds["graph"], task) if task is not None else None
 
 
-def _path_metrics(planner_response, graph_dict, task, path_validator):
+def _path_metrics(planner_response, graph_dict, task, path_validator,
+                  plan_text_override=None):
     """Recreate + grade the planner's path via ``path_validator.evaluate_sample``.
 
     Mirrors ``evaluate._sample_path_metrics``: the route is pulled from the
     recorded ``plan`` field; the full response is passed for the judge. Never
     raises — returns ``None`` on failure.
+
+    ``plan_text_override`` (the Gemma-recovered route, for the ``--gemma-regrade``
+    reading) replaces the plan text as the path source, so every path/structured
+    metric is graded on that route instead of the recorded plan. The full response
+    is still passed unchanged for the judge and the reasoning fallback.
     """
     try:
-        plan = planner_response.get("plan") if isinstance(planner_response, dict) else planner_response
+        if plan_text_override is not None:
+            plan_text = plan_text_override
+        else:
+            plan = planner_response.get("plan") if isinstance(planner_response, dict) else planner_response
+            plan_text = "" if plan is None else str(plan)
         return path_validator.evaluate_sample(
             task["task"],
-            "" if plan is None else str(plan),
+            plan_text,
             graph_dict,
             init_node=task.get("init_node"),
             acceptance_criterion=task.get("acceptance_criterion"),
@@ -167,6 +188,29 @@ def _path_metrics(planner_response, graph_dict, task, path_validator):
     except Exception as e:
         print(f"[apply-judge] path-metric computation failed: {type(e).__name__}: {e}")
         return None
+
+
+def _gemma_recover_path(planner_response, graph_dict, task, path_validator):
+    """The route the Gemma judge recovers from the FULL recorded response.
+
+    Unlike the live one-way rescue (which fires only when the regex finds nothing),
+    this asks the judge to recreate the planner's intended route in ``a -> b -> c``
+    notation for EVERY sample, so the ``--gemma-regrade`` reading can grade the
+    whole response on the judge's path. Returns "" on any failure / no route.
+    """
+    try:
+        goal, *_ = path_validator.derive_targets(
+            graph_dict, init_node=task.get("init_node"), answer=task.get("answer"),
+            criterion=task.get("acceptance_criterion"), task=task.get("task"))
+        nodes = {n["name"] for n in (*graph_dict.get("regions", []),
+                                     *graph_dict.get("objects", []))}
+        full = "" if planner_response is None else str(planner_response)
+        return path_validator.write_path_with_judge(
+            full, nodes, task=task.get("task"),
+            start=task.get("init_node"), goal=goal) or ""
+    except Exception as e:
+        print(f"[apply-judge] gemma path recovery failed: {type(e).__name__}: {e}")
+        return ""
 
 
 def _eval_result(parsed_answer, answer_key):
@@ -188,7 +232,8 @@ def _eval_result(parsed_answer, answer_key):
         return False, False
 
 
-def _regrade_sample(sample: dict, graph_dict, task, path_validator) -> dict:
+def _regrade_sample(sample: dict, graph_dict, task, path_validator,
+                    *, gemma_path: bool = False) -> dict:
     """Recompute every per-sample verdict in place, identically to a live run.
 
     Reproduces ``eval_model_single_graph``'s per-sample logic exactly: re-derive
@@ -197,12 +242,20 @@ def _regrade_sample(sample: dict, graph_dict, task, path_validator) -> dict:
     (``path_validator.evaluate_sample``), then take the structured verdict or
     ``combine_verdict`` for the objective ``correct`` and the separate subjective
     columns. Nothing objective is reused from the recording — it is all rederived.
+
+    With ``gemma_path=True`` (the ``--gemma-regrade`` reading) the Gemma judge
+    recovers the planner's intended route from the full response, and ALL path /
+    structured metrics and the objective ``correct`` are graded on that route
+    instead of the recorded plan. ``formatted`` / ``plan_keyword`` still describe
+    the raw response (they are not path-derived). ``path_metrics`` is stamped with
+    ``path_source`` (``gemma_judge`` / ``regex_fallback``) and ``gemma_route``.
     """
     ac_present = bool(task.get("acceptance_criterion"))
     stats = {"judged": False, "ac": ac_present, "structured": False,
              "judge_eligible": False, "judge_fallback": False,
              "false_positive": False, "false_negative": False,
-             "path_rescued": False, "path_from_reasoning": False}
+             "path_rescued": False, "path_from_reasoning": False,
+             "gemma_route": False}
 
     if sample.get("error") is not None:
         # Hard crash — eval_model_single_graph's `except` branch: objective verdict
@@ -228,7 +281,23 @@ def _regrade_sample(sample: dict, graph_dict, task, path_validator) -> dict:
     sample["formatted"] = formatted
     sample["plan_keyword"] = plan_keyword
 
-    pm = _path_metrics(planner_response, graph_dict, task, path_validator)
+    # --gemma-regrade: recover the route with the judge and grade the path on it.
+    # Only override when the recovered route actually parses to a path; otherwise
+    # fall back to the normal plan/reasoning grading so a NONE/empty reply can't
+    # erase a route the plan really carried.
+    plan_override = None
+    gemma_route = ""
+    if gemma_path:
+        gemma_route = _gemma_recover_path(planner_response, graph_dict, task, path_validator)
+        if gemma_route and path_validator.parse_path(gemma_route, prefer_last=True):
+            plan_override = gemma_route
+            stats["gemma_route"] = True
+
+    pm = _path_metrics(planner_response, graph_dict, task, path_validator,
+                       plan_text_override=plan_override)
+    if pm is not None and gemma_path:
+        pm["path_source"] = "gemma_judge" if plan_override is not None else "regex_fallback"
+        pm["gemma_route"] = gemma_route
     structured = bool(pm and pm.get("structured"))
     judge_pass = (pm or {}).get("llm_judge_pass")
 
@@ -310,6 +379,10 @@ def _aggregate_path_metrics(samples: list) -> dict:
         # reasoning; judge rewrote it in `a -> b -> c` and NetworkX re-graded it).
         "num_rescued": sum(1 for p in pms if p.get("path_rescued")),
     }
+    # Only the --gemma-regrade reading stamps path_source; add this field there so
+    # the standard reading stays byte-for-byte like a live evaluate.py run.
+    if any(p.get("path_source") for p in pms):
+        agg["num_gemma_path"] = sum(1 for p in pms if p.get("path_source") == "gemma_judge")
     structured = [p for p in pms if p.get("structured")]
     if structured:
         def _srate(key):
@@ -368,6 +441,58 @@ def _reaggregate(result: dict) -> None:
     result["path_metrics"] = _aggregate_path_metrics(samples)
 
 
+def _process_result(result, index, result_stem, path_validator, *, gemma_path=False) -> dict:
+    """Regrade every matched sample of one result in place, then reaggregate.
+
+    The single per-file engine used for BOTH readings: the standard regex/reasoning
+    grade (``gemma_path=False``) and the ``--gemma-regrade`` reading
+    (``gemma_path=True``, every path graded on the judge-recovered route). Returns
+    the per-file counters used for the summary line.
+    """
+    c = dict(match=0, judge=0, ac=0, fp=0, fn=0, unmatched=0, struct=0,
+             eligible=0, fallback=0, rescued=0, reasoned=0, gemma_routes=0)
+    for sample in result.get("samples", []):
+        picked = _pick_task(index, sample, result_stem)
+        if picked is None:
+            c["unmatched"] += 1
+            continue
+        graph_dict, task = picked
+        st = _regrade_sample(sample, graph_dict, task, path_validator, gemma_path=gemma_path)
+        c["match"] += 1
+        c["ac"] += int(st["ac"]); c["judge"] += int(st["judged"])
+        c["struct"] += int(st["structured"]); c["eligible"] += int(st["judge_eligible"])
+        c["fallback"] += int(st["judge_fallback"]); c["fp"] += int(st["false_positive"])
+        c["fn"] += int(st["false_negative"]); c["rescued"] += int(st["path_rescued"])
+        c["reasoned"] += int(st["path_from_reasoning"])
+        c["gemma_routes"] += int(st.get("gemma_route", False))
+    _reaggregate(result)
+    return c
+
+
+def _print_file_summary(rf_base, n_samples, c, result, out, *, gemma=False):
+    """One per-file summary line, shared by both readings."""
+    subj = result.get("subjective_accuracy")
+    subj_s = f"{subj:.1%}" if subj is not None else "n/a"
+    warn = ""
+    if c["fallback"]:
+        warn += (f"  ⚠ {c['fallback']} judge-eligible task(s) scored no verdict — "
+                 f"check Gemma weights / HF auth")
+    elif c["eligible"] == 0 and c["struct"] and not gemma:
+        warn += (f"  (all {c['struct']} structural; NetworkX-graded, judge not used "
+                 f"for scoring by design — Gemma loads only if a path rescue fires)")
+    if c["unmatched"]:
+        warn += f"  ⚠ {c['unmatched']} sample(s) unmatched to a dataset task"
+    path_bits = (f"gemma_path={c['gemma_routes']}" if gemma
+                 else f"path_from_reasoning={c['reasoned']}, path_rescued={c['rescued']}")
+    tag = "[apply-judge|gemma]" if gemma else "[apply-judge]"
+    print(f"{tag} {rf_base}: matched {c['match']}/{n_samples}, "
+          f"acc={result.get('accuracy', 0.0):.0%} "
+          f"(correct={result.get('num_correct', 0)}/{result.get('num_total', 0)}), "
+          f"ac={c['ac']}, structural={c['struct']}, judge_eligible={c['eligible']}, "
+          f"judged={c['judge']}, {path_bits}, FP={c['fp']}, FN={c['fn']}, "
+          f"SubjAcc={subj_s} -> {out}{warn}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -381,6 +506,12 @@ def main() -> None:
                     help="Filename suffix for non-in-place output (default: .judged).")
     ap.add_argument("--model", default=None,
                     help="Judge HF model id (sets GREP_JUDGE_MODEL before loading).")
+    ap.add_argument("--gemma-regrade", action="store_true",
+                    help="Also emit a SECOND reading that regrades every sample's path "
+                         "metrics and correctness on the route the Gemma judge recovers "
+                         "from the full response (written with --gemma-suffix).")
+    ap.add_argument("--gemma-suffix", default=".gemma",
+                    help="Filename suffix for the --gemma-regrade reading (default: .gemma).")
     args = ap.parse_args()
 
     if args.model:
@@ -398,25 +529,27 @@ def main() -> None:
     # the *{suffix}.json files this script writes and re-run the Gemma judge on them
     # every invocation (and pile up *.judged.judged.json) — an effective infinite
     # loop. Drop them, UNLESS the user explicitly named a single judged file.
-    judged_suffix = f"{args.suffix}.json"
+    own_suffixes = (f"{args.suffix}.json", f"{args.gemma_suffix}.json")
     explicit_file = os.path.isfile(args.results) and not any(
         ch in args.results for ch in ("*", "?", "["))
     if not explicit_file:
-        kept = [f for f in result_files if not f.endswith(judged_suffix)]
+        kept = [f for f in result_files if not f.endswith(own_suffixes)]
         skipped = len(result_files) - len(kept)
         if skipped:
-            print(f"[apply-judge] skipping {skipped} already-judged "
-                  f"'*{judged_suffix}' file(s) to avoid re-grading our own output.")
+            print(f"[apply-judge] skipping {skipped} already-graded "
+                  f"'*{own_suffixes[0]}' / '*{own_suffixes[1]}' file(s) "
+                  f"to avoid re-grading our own output.")
         result_files = kept
     if not result_files:
         raise SystemExit(f"No result files to grade at {args.results} "
-                         f"(all were already-judged '*{judged_suffix}').")
+                         f"(all were already-graded outputs of this script).")
     # A global --dataset is indexed once; otherwise each result resolves its own.
     shared_index = _dataset_index(args.dataset) if args.dataset else None
 
     grand = {"files": 0, "samples": 0, "matched": 0, "judged": 0, "ac": 0,
              "structured": 0, "eligible": 0, "fallback": 0,
-             "fp": 0, "fn": 0, "unmatched": 0, "rescued": 0, "reasoned": 0}
+             "fp": 0, "fn": 0, "unmatched": 0, "rescued": 0, "reasoned": 0,
+             "gemma_routes": 0}
 
     for rf in result_files:
         with open(rf) as f:
@@ -439,71 +572,42 @@ def main() -> None:
         result_stem = os.path.splitext(os.path.basename(
             result.get("name") or os.path.basename(rf)))[0]
 
-        n_match = n_judge = n_ac = n_fp = n_fn = n_unmatched = 0
-        n_struct = n_eligible = n_fallback = n_rescued = n_reasoned = 0
-        for sample in samples:
-            picked = _pick_task(index, sample, result_stem)
-            if picked is None:
-                n_unmatched += 1
-                continue
-            graph_dict, task = picked
-            st = _regrade_sample(sample, graph_dict, task, path_validator)
-            n_match += 1
-            n_ac += int(st["ac"])
-            n_judge += int(st["judged"])
-            n_struct += int(st["structured"])
-            n_eligible += int(st["judge_eligible"])
-            n_fallback += int(st["judge_fallback"])
-            n_fp += int(st["false_positive"])
-            n_fn += int(st["false_negative"])
-            n_rescued += int(st["path_rescued"])
-            n_reasoned += int(st["path_from_reasoning"])
+        # Snapshot the raw recording BEFORE the standard regrade mutates verdicts,
+        # so the Gemma reading starts from the same recorded responses.
+        raw = copy.deepcopy(result) if args.gemma_regrade else None
 
-        _reaggregate(result)
-
+        c = _process_result(result, index, result_stem, path_validator)
         out = rf if args.in_place else (
             f"{os.path.splitext(rf)[0]}{args.suffix}{os.path.splitext(rf)[1]}")
         with open(out, "w") as f:
             json.dump(result, f, indent=2, ensure_ascii=False)
-
-        subj = result.get("subjective_accuracy")
-        subj_s = f"{subj:.1%}" if subj is not None else "n/a"
-        warn = ""
-        # Only a genuine weights/auth problem warrants the judge warning — i.e. a
-        # NON-structural AC task the judge could not score (evaluate.py's
-        # n_judge_fallback). Structural tasks skip the judge by design.
-        if n_fallback:
-            warn += (f"  ⚠ {n_fallback} judge-eligible task(s) scored no verdict — "
-                     f"check Gemma weights / HF auth")
-        elif n_eligible == 0 and n_struct:
-            warn += (f"  (all {n_struct} structural; NetworkX-graded, judge not used "
-                     f"for scoring by design — Gemma loads only if a path rescue fires)")
-        if n_unmatched:
-            warn += f"  ⚠ {n_unmatched} sample(s) unmatched to a dataset task"
-        print(f"[apply-judge] {os.path.basename(rf)}: matched {n_match}/{len(samples)}, "
-              f"ac={n_ac}, structural={n_struct}, judge_eligible={n_eligible}, "
-              f"judged={n_judge}, path_from_reasoning={n_reasoned}, "
-              f"path_rescued={n_rescued}, FP={n_fp}, FN={n_fn}, "
-              f"SubjAcc={subj_s} -> {out}{warn}")
+        _print_file_summary(os.path.basename(rf), len(samples), c, result, out)
 
         grand["files"] += 1
         grand["samples"] += len(samples)
-        grand["matched"] += n_match
-        grand["judged"] += n_judge
-        grand["ac"] += n_ac
-        grand["structured"] += n_struct
-        grand["eligible"] += n_eligible
-        grand["fallback"] += n_fallback
-        grand["fp"] += n_fp
-        grand["fn"] += n_fn
-        grand["unmatched"] += n_unmatched
-        grand["rescued"] += n_rescued
-        grand["reasoned"] += n_reasoned
+        for gk, ck in (("matched", "match"), ("judged", "judge"), ("ac", "ac"),
+                       ("structured", "struct"), ("eligible", "eligible"),
+                       ("fallback", "fallback"), ("fp", "fp"), ("fn", "fn"),
+                       ("unmatched", "unmatched"), ("rescued", "rescued"),
+                       ("reasoned", "reasoned")):
+            grand[gk] += c[ck]
 
+        # Second reading: regrade the whole response on the route the Gemma judge
+        # recovers, written to a separate *{gemma_suffix}.json file.
+        if args.gemma_regrade:
+            gc = _process_result(raw, index, result_stem, path_validator, gemma_path=True)
+            raw["reading"] = "gemma_path_regrade"
+            gout = f"{os.path.splitext(rf)[0]}{args.gemma_suffix}{os.path.splitext(rf)[1]}"
+            with open(gout, "w") as f:
+                json.dump(raw, f, indent=2, ensure_ascii=False)
+            _print_file_summary(os.path.basename(rf), len(samples), gc, raw, gout, gemma=True)
+            grand["gemma_routes"] += gc["gemma_routes"]
+
+    gemma_bit = f"  gemma_path={grand['gemma_routes']}" if args.gemma_regrade else ""
     print(f"\n[apply-judge] DONE  files={grand['files']}  samples={grand['samples']}  "
           f"matched={grand['matched']}  ac={grand['ac']}  structural={grand['structured']}  "
           f"judge_eligible={grand['eligible']}  judged={grand['judged']}  "
-          f"path_from_reasoning={grand['reasoned']}  path_rescued={grand['rescued']}  "
+          f"path_from_reasoning={grand['reasoned']}  path_rescued={grand['rescued']}{gemma_bit}  "
           f"FP={grand['fp']}  FN={grand['fn']}  unmatched={grand['unmatched']}")
     if grand["fallback"]:
         print(f"[apply-judge] WARNING: {grand['fallback']} non-structural acceptance_criterion "

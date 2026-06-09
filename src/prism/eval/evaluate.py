@@ -112,6 +112,22 @@ def _spine_tools_disabled() -> bool:
     )
 
 
+def _gemma_regrade_enabled() -> bool:
+    """True when GREP_GEMMA_REGRADE asks for the second Gemma-path reading.
+
+    When on, every sample additionally carries a ``gemma_regrade`` block: its path
+    metrics and objective correctness graded on the route the Gemma judge recovers
+    from the full response. The ORIGINAL regex/reasoning scores stay at the top
+    level untouched — both readings are kept side by side.
+    """
+    return os.environ.get("GREP_GEMMA_REGRADE", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 # Appended to SYS_PROMPT (by `_fixed_get_base_prompt`) on EVERY eval, regardless
 # of the tool toggle. GREP-PRISM injects the graph's connectivity into the
 # model's latent space (the GNN/GREP pathway), so the planner can reason over
@@ -215,6 +231,10 @@ class GraphEvalResultSummary:
     # M10 (R4) path-validity aggregates over this graph's samples. Empty when
     # no sample produced a parseable route.
     path_metrics: dict = field(default_factory=dict)
+    # GREP_GEMMA_REGRADE second reading: objective accuracy / counts / path metrics
+    # recomputed on the Gemma-recovered routes. None when the regrade is off — the
+    # ORIGINAL aggregates above are always the headline.
+    gemma: Optional[dict] = None
 
 
 # ----------------------------------------------------------------------------
@@ -361,7 +381,7 @@ def eval_model_single_graph(
                     judge_pass=judge_pass,
                     acceptance_criterion_present=ac_present,
                 )
-            sample_results.append({
+            sample_dict = {
                 "graph_name": eval_sample.graph_name,
                 "idx": i,
                 "task": task,
@@ -385,7 +405,13 @@ def eval_model_single_graph(
                 "error": None,
                 "traceback": None,
                 "path_metrics": pm,
-            })
+            }
+            # GREP_GEMMA_REGRADE: attach a second reading (scores regraded on the
+            # Gemma-recovered route) alongside the original scores above.
+            if _gemma_regrade_enabled():
+                sample_dict["gemma_regrade"] = _gemma_regrade_block(
+                    planner_response, eval_sample, result, pm)
+            sample_results.append(sample_dict)
             if v["false_positive"]:
                 print("⚑ FALSE POSITIVE: RegEx/NetworkX marked this correct but the Gemma judge "
                       "rejected it — subjective score reduced (objective score unchanged).")
@@ -487,6 +513,26 @@ def eval_model_multiple_graphs(
         num_false_pos = sum(1 for r in sample_results if r.get("false_positive"))
         num_false_neg = sum(1 for r in sample_results if r.get("false_negative"))
 
+        # GREP_GEMMA_REGRADE second reading: same objective/subjective/path
+        # aggregates, computed from each sample's `gemma_regrade` block (scores on
+        # the Gemma-recovered route). None unless the regrade ran.
+        gemma_blocks = [r["gemma_regrade"] for r in sample_results if r.get("gemma_regrade")]
+        gemma = None
+        if gemma_blocks:
+            g_judged = [g for g in gemma_blocks if g.get("llm_judge_pass") is not None]
+            gemma = {
+                "num_total": len(gemma_blocks),
+                "num_correct": sum(1 for g in gemma_blocks if g["correct"]),
+                "accuracy": sum(1 for g in gemma_blocks if g["objective_keyword"]) / len(gemma_blocks),
+                "num_judged": len(g_judged),
+                "subjective_accuracy": (
+                    sum(1 for g in g_judged if g["llm_judge_pass"]) / len(g_judged)
+                    if g_judged else None),
+                "num_false_pos": sum(1 for g in gemma_blocks if g.get("false_positive")),
+                "num_false_neg": sum(1 for g in gemma_blocks if g.get("false_negative")),
+                "path_metrics": _aggregate_path_metrics(gemma_blocks),
+            }
+
         result = GraphEvalResultSummary(
             name=name,
             num_total=len(sample_results),
@@ -505,6 +551,7 @@ def eval_model_multiple_graphs(
             permutation=permutation.to_dict() if permutation is not None else None,
             samples=sample_results,
             path_metrics=_aggregate_path_metrics(sample_results),
+            gemma=gemma,
         )
         results[name] = result
 
@@ -601,6 +648,25 @@ def print_summary_table(results: List[GraphEvalResultSummary]) -> None:
         print(f"  ⚑ Subjective column (judge-only, over {total_judged} judged): {total_false_pos} false "
               f"positive(s) (−) and {total_false_neg} false negative(s) (+); net {net:+.1%} vs the "
               f"judge-free objective column.")
+
+    # GREP_GEMMA_REGRADE block — original vs Gemma-recovered-path objective accuracy.
+    g_results = [r for r in results if r.gemma]
+    if g_results:
+        print("\nGEMMA-REGRADE  (objective accuracy on the Gemma-recovered path vs the original)")
+        print(f"{'Eval File':<{name_width}}  {'Acc(orig)':>9}  {'Acc(gemma)':>10}  "
+              f"{'Correct(o)':>10}  {'Correct(g)':>10}")
+        g_tasks = g_orig = g_gem = 0
+        for r in g_results:
+            g = r.gemma
+            g_tasks += r.num_total
+            g_orig += r.num_correct
+            g_gem += g["num_correct"]
+            print(f"{r.name:<{name_width}}  {r.accuracy:>9.1%}  {g['accuracy']:>10.1%}  "
+                  f"{r.num_correct:>10}  {g['num_correct']:>10}")
+        oa = g_orig / g_tasks if g_tasks else 0.0
+        ga = g_gem / g_tasks if g_tasks else 0.0
+        print(f"{'TOTAL':<{name_width}}  {oa:>9.1%}  {ga:>10.1%}  {g_orig:>10}  {g_gem:>10}")
+        print(sep)
 
     # M10 (R4) path-validity block — only printed when some graph yielded routes.
     pm_results = [r for r in results if r.path_metrics]
@@ -711,6 +777,93 @@ def _sample_path_metrics(planner_response, eval_sample: EvalSample) -> Optional[
         return None
 
 
+def _objective_verdict(pm, result: "_EvalResult", eval_sample: EvalSample):
+    """The ``(v, structured, judge_pass)`` triple for a path-metrics dict.
+
+    Mirrors the per-sample verdict logic in ``eval_model_single_graph`` but with no
+    side effects (no ``n_judge_fallback`` bump), so it can grade the Gemma-regrade
+    path metrics with the SAME rules as the original.
+    """
+    structured = bool(pm and pm.get("structured"))
+    judge_pass = (pm or {}).get("llm_judge_pass")
+    if structured:
+        sc = bool(pm.get("structured_correct"))
+        v = {"objective_correct": sc, "objective_keyword": sc,
+             "subjective_correct": None, "false_positive": False,
+             "false_negative": False, "judged": False}
+    else:
+        v = path_validator.combine_verdict(
+            regex_correct=result.is_correct(),
+            regex_keyword=result.plan_keyword,
+            judge_pass=judge_pass,
+            acceptance_criterion_present=bool(eval_sample.acceptance_criterion),
+        )
+    return v, structured, judge_pass
+
+
+def _sample_gemma_path_metrics(planner_response, eval_sample: EvalSample) -> Optional[dict]:
+    """Path metrics graded on the route the Gemma judge RECOVERS from the full
+    response (the GREP_GEMMA_REGRADE reading). Never raises.
+
+    Asks the judge to recreate the planner's intended route for this sample, then
+    grades it with the same NetworkX diagnostics. Returns the pm (stamped
+    ``path_source='gemma_judge'`` + raw ``gemma_route``), or None when the judge
+    recovers no usable route (the caller then falls back to the original pm).
+    """
+    try:
+        full = "" if planner_response is None else str(planner_response)
+        goal, *_ = path_validator.derive_targets(
+            eval_sample.graph, init_node=eval_sample.init_node,
+            answer=eval_sample.answer, criterion=eval_sample.acceptance_criterion,
+            task=eval_sample.task)
+        nodes = {n["name"] for n in (*eval_sample.graph.get("regions", []),
+                                     *eval_sample.graph.get("objects", []))}
+        route = path_validator.write_path_with_judge(
+            full, nodes, task=eval_sample.task,
+            start=eval_sample.init_node, goal=goal) or ""
+        if not route or not path_validator.parse_path(route, prefer_last=True):
+            return None
+        pm = path_validator.evaluate_sample(
+            eval_sample.task, route, eval_sample.graph,
+            init_node=eval_sample.init_node,
+            acceptance_criterion=eval_sample.acceptance_criterion,
+            answer=eval_sample.answer, full_response=full,
+        )
+        if pm is not None:
+            pm["path_source"] = "gemma_judge"
+            pm["gemma_route"] = route
+        return pm
+    except Exception as e:
+        print(f"[eval] gemma path-metric computation failed: {type(e).__name__}: {e}")
+        return None
+
+
+def _gemma_regrade_block(planner_response, eval_sample: EvalSample,
+                         result: "_EvalResult", original_pm) -> dict:
+    """The ``gemma_regrade`` sub-record: the sample's scores regraded on the
+    Gemma-recovered route, kept ALONGSIDE the original top-level scores.
+
+    Falls back to the original pm (flagged ``path_source='regex_fallback'``) when
+    the judge recovers no route, so the block is always present and comparable.
+    """
+    pm_g = _sample_gemma_path_metrics(planner_response, eval_sample)
+    if pm_g is None:
+        pm_g = dict(original_pm) if original_pm else None
+        if pm_g is not None:
+            pm_g.setdefault("path_source", "regex_fallback")
+    v_g, structured_g, judge_pass_g = _objective_verdict(pm_g, result, eval_sample)
+    return {
+        "correct": v_g["objective_correct"],
+        "objective_keyword": v_g["objective_keyword"],
+        "structured": structured_g,
+        "subjective_correct": v_g["subjective_correct"],
+        "false_positive": v_g["false_positive"],
+        "false_negative": v_g["false_negative"],
+        "llm_judge_pass": judge_pass_g,
+        "path_metrics": pm_g,
+    }
+
+
 def _aggregate_path_metrics(sample_results: List[dict]) -> dict:
     """Mean M10 path metrics over samples that produced a parseable route."""
     pms = [r.get("path_metrics") for r in sample_results]
@@ -739,6 +892,10 @@ def _aggregate_path_metrics(sample_results: List[dict]) -> dict:
         # reasoning; judge rewrote it in `a -> b -> c` and NetworkX re-graded it).
         "num_rescued": sum(1 for p in pms if p.get("path_rescued")),
     }
+    # Only the GREP_GEMMA_REGRADE reading stamps path_source; add this field there
+    # so the original aggregate stays byte-for-byte what a judge-free run writes.
+    if any(p.get("path_source") for p in pms):
+        agg["num_gemma_path"] = sum(1 for p in pms if p.get("path_source") == "gemma_judge")
     # Deterministic structural aggregates (present when structured tasks ran).
     structured = [p for p in pms if p.get("structured")]
     if structured:
