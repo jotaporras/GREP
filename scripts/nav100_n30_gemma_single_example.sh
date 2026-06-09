@@ -116,13 +116,36 @@ python scripts/generate_eval_graphs.py \
 echo ""
 echo "=== Stage 2: Populate (local Gemma) + run SPINE rollouts (local Gemma) ==="
 echo "    task mix: ${TASK_PROPORTIONS} (EXIST POS REACH NAV)"
-# shellcheck disable=SC2086
-python scripts/training_data_generation/generate_data_spine.py \
-  --data-dir "$SKEL_DIR" \
-  --name "$RUN_DIR" \
-  --task-proportions $TASK_PROPORTIONS \
-  --n-tasks "$N_TASKS" \
-  --seed "$SEED"
+# Auto-resume loop: a fatal GPU fault (CUDA launch failure, OOM, device assert)
+# makes the python step exit nonzero, but both pipeline phases are resumable, so
+# we just re-invoke it — each run skips completed graphs/rollouts and continues.
+# Re-running reloads the model (~minutes); that is required for a fresh CUDA
+# context. Tunable via PRISM_MAX_ATTEMPTS / PRISM_RETRY_SLEEP.
+MAX_ATTEMPTS="${PRISM_MAX_ATTEMPTS:-5}"
+RETRY_SLEEP="${PRISM_RETRY_SLEEP:-10}"
+attempt=1
+while true; do
+  # shellcheck disable=SC2086
+  if python scripts/training_data_generation/generate_data_spine.py \
+      --data-dir "$SKEL_DIR" \
+      --name "$RUN_DIR" \
+      --task-proportions $TASK_PROPORTIONS \
+      --n-tasks "$N_TASKS" \
+      --seed "$SEED"; then
+    echo "Stage 2 completed on attempt ${attempt}/${MAX_ATTEMPTS}."
+    break
+  else
+    rc=$?
+    if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
+      echo "ERROR: Stage 2 still failing after ${MAX_ATTEMPTS} attempts (last rc=${rc})." >&2
+      echo "       Re-run the script to resume, or investigate the GPU fault." >&2
+      exit "$rc"
+    fi
+    echo "Stage 2 exited nonzero (attempt ${attempt}/${MAX_ATTEMPTS}, rc=${rc}); resuming in ${RETRY_SLEEP}s..." >&2
+    attempt=$((attempt + 1))
+    sleep "$RETRY_SLEEP"
+  fi
+done
 
 echo ""
 echo "=== Stage 3: Leak check (must print CLEAN) ==="
