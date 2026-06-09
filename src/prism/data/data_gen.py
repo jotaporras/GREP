@@ -117,6 +117,19 @@ class DataGenerator:
         previous_tasks = ""
 
         for idx, base_graph in enumerate(base_graphs):
+            out_path = f"{log_dir}/data_gen_{idx:03d}.json"
+
+            # Resume: skip graphs already populated by a prior (possibly crashed)
+            # run, but still fold their tasks into `previous_tasks` so the
+            # de-duplication hint stays intact across restarts.
+            existing = self._load_valid_populated(out_path)
+            if existing is not None:
+                print(f"Skipping populate for graph {idx}: {out_path} already valid")
+                previous_tasks += ",".join(
+                    e["task"] for e in existing.get("tasks", []) if "task" in e
+                )
+                continue
+
             rnd_data = None
             for _ in range(self.n_graph_gen_attempts):
                 try:
@@ -152,31 +165,47 @@ class DataGenerator:
                     break
 
                 except Exception as ex:
+                    # A GPU fault corrupts the CUDA context for the rest of this
+                    # process, so retrying here (and on every later graph) is
+                    # hopeless. Abort fast; nothing was written for this idx, so
+                    # re-running the script resumes from exactly this graph.
+                    if self._is_fatal_gpu_error(ex):
+                        print(
+                            f"graph {idx}: fatal GPU error — aborting so a re-run "
+                            f"can resume from here: {ex}"
+                        )
+                        raise
                     print(f"graph generator invalid: {ex}")
 
-            # Fail loud instead of silently writing the previous graph's data:
-            # if `rnd_data` were left unset, a graph that fails all attempts
-            # would inherit the last successful `rnd_data` and be written twice.
+            # A graph that fails every attempt for a NON-fatal reason (e.g. the
+            # LLM kept emitting malformed JSON) must not kill the whole run or
+            # write the previous graph's data. Skip it (leaving no output file)
+            # and continue; a later re-run will re-attempt this idx.
             if rnd_data is None:
-                raise RuntimeError(
-                    f"graph {idx} failed all {self.n_graph_gen_attempts} "
-                    f"populate attempts"
+                print(
+                    f"WARNING: graph {idx} failed all {self.n_graph_gen_attempts} "
+                    f"populate attempts — skipping (will be retried on re-run)"
                 )
+                continue
 
             tasks = [entry["task"] for entry in rnd_data["tasks"]]
 
             previous_tasks += ",".join(tasks)
 
             print(f"logging to: {log_dir}")
-            with open(f"{log_dir}/data_gen_{idx:03d}.json", "w") as f:
-                json_str = json.dumps(rnd_data, indent=2)
-                f.write(json_str)
+            # Atomic write: a crash mid-write must not leave a half-written file
+            # that resume would mistake for complete. Write to .tmp then replace.
+            tmp_path = f"{out_path}.tmp"
+            with open(tmp_path, "w") as f:
+                f.write(json.dumps(rnd_data, indent=2))
+            os.replace(tmp_path, out_path)
 
             # save graphs separately for Graph handler
             graph_path = f"{log_dir}/graph_gen_{idx:03d}.json"
-            with open(graph_path, "w") as f:
-                json_str = json.dumps(rnd_data["graph"], indent=2)
-                f.write(json_str)
+            tmp_graph = f"{graph_path}.tmp"
+            with open(tmp_graph, "w") as f:
+                f.write(json.dumps(rnd_data["graph"], indent=2))
+            os.replace(tmp_graph, graph_path)
 
     def populate_graphs_and_tasks_batch(
         self,
@@ -254,6 +283,44 @@ class DataGenerator:
         except Exception:
             return False
         return True
+
+    @staticmethod
+    def _load_valid_populated(path: str):
+        """Return the populated-graph dict at ``path`` if it is complete, else None.
+
+        Lets :meth:`populate_graphs_and_tasks` resume after a crash by skipping
+        graphs already written (a dict with a ``graph`` dict and a non-empty
+        ``tasks`` list). A truncated/half-written file fails json parsing and is
+        treated as missing, so it gets regenerated.
+        """
+        try:
+            with open(path) as f:
+                obj = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(obj, dict):
+            return None
+        if not isinstance(obj.get("graph"), dict):
+            return None
+        if not isinstance(obj.get("tasks"), list) or not obj["tasks"]:
+            return None
+        return obj
+
+    @staticmethod
+    def _is_fatal_gpu_error(ex: Exception) -> bool:
+        """True for GPU faults that corrupt the process CUDA context.
+
+        After a "CUDA error: unspecified launch failure", a device-side assert,
+        cuBLAS failure, or OOM, every later GPU call in the SAME process keeps
+        failing — so retrying in-process is futile. The caller re-raises these to
+        exit fast; a fresh re-run then resumes from the unfinished work.
+        """
+        s = str(ex).lower()
+        return any(
+            tok in s
+            for tok in ("cuda error", "cuda kernel", "device-side assert",
+                        "cublas", "out of memory", "cudnn")
+        )
 
     def generate_example_plans(
         self,
@@ -354,6 +421,19 @@ class DataGenerator:
                         )
                     data_counter += 1
                 except Exception as ex:
+                    # A GPU fault corrupts the CUDA context for every later task
+                    # in this process; abort fast rather than quarantining all of
+                    # them as *_failed. The completed rollouts are already on disk,
+                    # so a re-run resumes (skips them via _has_valid_rollout) and
+                    # retries only the missing/failed ones.
+                    if self._is_fatal_gpu_error(ex):
+                        if os.path.exists(log_name):
+                            os.rename(log_name, log_name.replace(".json", "_failed.json"))
+                        print(
+                            f"sample_{idx:03d}_{task_idx:03d}: fatal GPU error — "
+                            f"aborting so a re-run can resume: {ex}"
+                        )
+                        raise
                     # A malformed graph (e.g. a connection edge whose endpoint
                     # is not a declared node) or any single-task failure must
                     # not abort the run. Quarantine any partial log as
