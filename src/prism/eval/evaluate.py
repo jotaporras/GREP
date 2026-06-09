@@ -63,14 +63,15 @@ def _fixed_get_base_prompt(request, scene_graph, use_icl=True):
     # use_icl=True -> exactly the 2 training ICL examples; use_icl=False -> 1
     # (EXAMPLE_1), preserving the prior minimal-prompt behavior for that flag.
     sys_prompt = spine_prompts.SYS_PROMPT
+    # Eval-only system-prompt additions. The latent-connections note is always
+    # present; the no-tool directive only when tool calling is disabled. Build a
+    # fresh dict either way so the shared SYS_PROMPT object is never mutated.
+    content = sys_prompt["content"] + _LATENT_CONNECTIONS_NOTE
     if _spine_tools_disabled():
         # Tell the model what `_NoToolsGraphSim` already enforces: the API actions
         # are a planning notation only — nothing executes, no feedback comes back.
-        # Build a fresh dict so the shared SYS_PROMPT object is never mutated.
-        sys_prompt = {
-            "role": sys_prompt["role"],
-            "content": sys_prompt["content"] + _NO_TOOL_CALL_DIRECTIVE,
-        }
+        content += _NO_TOOL_CALL_DIRECTIVE
+    sys_prompt = {"role": sys_prompt["role"], "content": content}
     header = [sys_prompt] + (_ICL_EXAMPLES_2 if use_icl else examples.EXAMPLE_1)
     return header + [
         {"role": "user",
@@ -109,6 +110,18 @@ def _spine_tools_disabled() -> bool:
         "yes",
         "on",
     )
+
+
+# Appended to SYS_PROMPT (by `_fixed_get_base_prompt`) on EVERY eval, regardless
+# of the tool toggle. GREP-PRISM injects the graph's connectivity into the
+# model's latent space (the GNN/GREP pathway), so the planner can reason over
+# relationships that may not be spelled out in the textual scene graph. This note
+# makes that latent access explicit in the prompt.
+_LATENT_CONNECTIONS_NOTE = (
+    "\n\nNote: the graph's connections are available to you in latent space. You "
+    "can reason over the relationships and paths between nodes from this latent "
+    "access, even where they are not written out in the textual scene graph."
+)
 
 
 # Appended to SYS_PROMPT (by `_fixed_get_base_prompt`) only when tools are
