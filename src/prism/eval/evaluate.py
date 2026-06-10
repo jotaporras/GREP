@@ -410,7 +410,7 @@ def eval_model_single_graph(
             # Gemma-recovered route) alongside the original scores above.
             if _gemma_regrade_enabled():
                 sample_dict["gemma_regrade"] = _gemma_regrade_block(
-                    planner_response, eval_sample, result, pm)
+                    planner_response, eval_sample, result)
             sample_results.append(sample_dict)
             if v["false_positive"]:
                 print("⚑ FALSE POSITIVE: RegEx/NetworkX marked this correct but the Gemma judge "
@@ -801,56 +801,20 @@ def _objective_verdict(pm, result: "_EvalResult", eval_sample: EvalSample):
     return v, structured, judge_pass
 
 
-def _sample_gemma_path_metrics(planner_response, eval_sample: EvalSample) -> Optional[dict]:
-    """Path metrics graded on the route the Gemma judge RECOVERS from the full
-    response (the GREP_GEMMA_REGRADE reading). Never raises.
-
-    Asks the judge to recreate the planner's intended route for this sample, then
-    grades it with the same NetworkX diagnostics. Returns the pm (stamped
-    ``path_source='gemma_judge'`` + raw ``gemma_route``), or None when the judge
-    recovers no usable route (the caller then falls back to the original pm).
-    """
-    try:
-        full = "" if planner_response is None else str(planner_response)
-        goal, *_ = path_validator.derive_targets(
-            eval_sample.graph, init_node=eval_sample.init_node,
-            answer=eval_sample.answer, criterion=eval_sample.acceptance_criterion,
-            task=eval_sample.task)
-        nodes = {n["name"] for n in (*eval_sample.graph.get("regions", []),
-                                     *eval_sample.graph.get("objects", []))}
-        route = path_validator.write_path_with_judge(
-            full, nodes, task=eval_sample.task,
-            start=eval_sample.init_node, goal=goal) or ""
-        if not route or not path_validator.parse_path(route, prefer_last=True):
-            return None
-        pm = path_validator.evaluate_sample(
-            eval_sample.task, route, eval_sample.graph,
-            init_node=eval_sample.init_node,
-            acceptance_criterion=eval_sample.acceptance_criterion,
-            answer=eval_sample.answer, full_response=full,
-        )
-        if pm is not None:
-            pm["path_source"] = "gemma_judge"
-            pm["gemma_route"] = route
-        return pm
-    except Exception as e:
-        print(f"[eval] gemma path-metric computation failed: {type(e).__name__}: {e}")
-        return None
-
-
 def _gemma_regrade_block(planner_response, eval_sample: EvalSample,
-                         result: "_EvalResult", original_pm) -> dict:
+                         result: "_EvalResult") -> dict:
     """The ``gemma_regrade`` sub-record: the sample's scores regraded on the
     Gemma-recovered route, kept ALONGSIDE the original top-level scores.
 
-    Falls back to the original pm (flagged ``path_source='regex_fallback'``) when
-    the judge recovers no route, so the block is always present and comparable.
+    The path metrics come from ``path_validator.gemma_regrade_path_metrics`` — the
+    SAME shared function the retro-grader (``apply_judge_to_eval_run.py``) uses — so
+    the two readings are byte-identical. It stamps ``path_source``
+    (``gemma_judge`` / ``regex_fallback``) and the raw ``gemma_route``.
     """
-    pm_g = _sample_gemma_path_metrics(planner_response, eval_sample)
-    if pm_g is None:
-        pm_g = dict(original_pm) if original_pm else None
-        if pm_g is not None:
-            pm_g.setdefault("path_source", "regex_fallback")
+    pm_g = path_validator.gemma_regrade_path_metrics(
+        planner_response, eval_sample.graph,
+        init_node=eval_sample.init_node, answer=eval_sample.answer,
+        acceptance_criterion=eval_sample.acceptance_criterion, task=eval_sample.task)
     v_g, structured_g, judge_pass_g = _objective_verdict(pm_g, result, eval_sample)
     return {
         "correct": v_g["objective_correct"],

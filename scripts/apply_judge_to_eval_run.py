@@ -157,25 +157,17 @@ def _pick_task(index: dict, sample: dict, result_stem: str):
     return (ds["graph"], task) if task is not None else None
 
 
-def _path_metrics(planner_response, graph_dict, task, path_validator,
-                  plan_text_override=None):
+def _path_metrics(planner_response, graph_dict, task, path_validator):
     """Recreate + grade the planner's path via ``path_validator.evaluate_sample``.
 
     Mirrors ``evaluate._sample_path_metrics``: the route is pulled from the
     recorded ``plan`` field; the full response is passed for the judge. Never
-    raises — returns ``None`` on failure.
-
-    ``plan_text_override`` (the Gemma-recovered route, for the ``--gemma-regrade``
-    reading) replaces the plan text as the path source, so every path/structured
-    metric is graded on that route instead of the recorded plan. The full response
-    is still passed unchanged for the judge and the reasoning fallback.
+    raises — returns ``None`` on failure. The ``--gemma-regrade`` reading does NOT
+    go through here — it uses the shared ``path_validator.gemma_regrade_path_metrics``.
     """
     try:
-        if plan_text_override is not None:
-            plan_text = plan_text_override
-        else:
-            plan = planner_response.get("plan") if isinstance(planner_response, dict) else planner_response
-            plan_text = "" if plan is None else str(plan)
+        plan = planner_response.get("plan") if isinstance(planner_response, dict) else planner_response
+        plan_text = "" if plan is None else str(plan)
         return path_validator.evaluate_sample(
             task["task"],
             plan_text,
@@ -188,29 +180,6 @@ def _path_metrics(planner_response, graph_dict, task, path_validator,
     except Exception as e:
         print(f"[apply-judge] path-metric computation failed: {type(e).__name__}: {e}")
         return None
-
-
-def _gemma_recover_path(planner_response, graph_dict, task, path_validator):
-    """The route the Gemma judge recovers from the FULL recorded response.
-
-    Unlike the live one-way rescue (which fires only when the regex finds nothing),
-    this asks the judge to recreate the planner's intended route in ``a -> b -> c``
-    notation for EVERY sample, so the ``--gemma-regrade`` reading can grade the
-    whole response on the judge's path. Returns "" on any failure / no route.
-    """
-    try:
-        goal, *_ = path_validator.derive_targets(
-            graph_dict, init_node=task.get("init_node"), answer=task.get("answer"),
-            criterion=task.get("acceptance_criterion"), task=task.get("task"))
-        nodes = {n["name"] for n in (*graph_dict.get("regions", []),
-                                     *graph_dict.get("objects", []))}
-        full = "" if planner_response is None else str(planner_response)
-        return path_validator.write_path_with_judge(
-            full, nodes, task=task.get("task"),
-            start=task.get("init_node"), goal=goal) or ""
-    except Exception as e:
-        print(f"[apply-judge] gemma path recovery failed: {type(e).__name__}: {e}")
-        return ""
 
 
 def _eval_result(parsed_answer, answer_key):
@@ -281,23 +250,17 @@ def _regrade_sample(sample: dict, graph_dict, task, path_validator,
     sample["formatted"] = formatted
     sample["plan_keyword"] = plan_keyword
 
-    # --gemma-regrade: recover the route with the judge and grade the path on it.
-    # Only override when the recovered route actually parses to a path; otherwise
-    # fall back to the normal plan/reasoning grading so a NONE/empty reply can't
-    # erase a route the plan really carried.
-    plan_override = None
-    gemma_route = ""
+    # --gemma-regrade: grade on the route the Gemma judge recovers, via the SAME
+    # shared ``path_validator.gemma_regrade_path_metrics`` the live eval uses, so the
+    # two readings are byte-identical. Otherwise the ordinary plan/reasoning grade.
     if gemma_path:
-        gemma_route = _gemma_recover_path(planner_response, graph_dict, task, path_validator)
-        if gemma_route and path_validator.parse_path(gemma_route, prefer_last=True):
-            plan_override = gemma_route
-            stats["gemma_route"] = True
-
-    pm = _path_metrics(planner_response, graph_dict, task, path_validator,
-                       plan_text_override=plan_override)
-    if pm is not None and gemma_path:
-        pm["path_source"] = "gemma_judge" if plan_override is not None else "regex_fallback"
-        pm["gemma_route"] = gemma_route
+        pm = path_validator.gemma_regrade_path_metrics(
+            planner_response, graph_dict,
+            init_node=task.get("init_node"), answer=task.get("answer"),
+            acceptance_criterion=task.get("acceptance_criterion"), task=task.get("task"))
+        stats["gemma_route"] = bool(pm and pm.get("path_source") == "gemma_judge")
+    else:
+        pm = _path_metrics(planner_response, graph_dict, task, path_validator)
     structured = bool(pm and pm.get("structured"))
     judge_pass = (pm or {}).get("llm_judge_pass")
 

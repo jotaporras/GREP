@@ -643,6 +643,55 @@ def evaluate_sample(
     return metrics
 
 
+def gemma_regrade_path_metrics(
+    planner_response,
+    graph_dict: dict,
+    *,
+    init_node: Optional[str] = None,
+    answer: Optional[str] = None,
+    acceptance_criterion: Optional[str] = None,
+    task: Optional[str] = None,
+    directed: bool = False,
+) -> Optional[Dict]:
+    """GREP_GEMMA_REGRADE path metrics — the SINGLE source of truth shared by the
+    live eval (``evaluate.py``) and the retro-grader (``apply_judge_to_eval_run.py``)
+    so the two readings are byte-identical (and ``scalability_evaluation.py``, which
+    just delegates to ``evaluate``, inherits it).
+
+    For EVERY sample, asks the Gemma judge to recover the route from the FULL
+    recorded response (``write_path_with_judge``) — not only when the regex found
+    nothing — then grades that route with the normal ``evaluate_sample``
+    diagnostics. ``path_source`` is ``'gemma_judge'`` when the judge's route parsed,
+    else ``'regex_fallback'`` (the metrics are then the ordinary plan/reasoning
+    grading, so a NONE/empty reply can't erase a route the plan really carried).
+    ``gemma_route`` always carries the raw judge output. Never raises — returns the
+    grade, or ``None`` only if the grade itself fails.
+    """
+    full = "" if planner_response is None else str(planner_response)
+    plan = planner_response.get("plan") if isinstance(planner_response, dict) else planner_response
+    plan_text = "" if plan is None else str(plan)
+    try:
+        goal, *_ = derive_targets(
+            graph_dict, init_node=init_node, answer=answer,
+            criterion=acceptance_criterion, task=task)
+        nodes = {n["name"] for n in (*graph_dict.get("regions", []),
+                                     *graph_dict.get("objects", []))}
+        route = write_path_with_judge(
+            full, nodes, task=task, start=init_node, goal=goal) or ""
+    except Exception as e:
+        print(f"[path_validator] gemma path recovery failed ({type(e).__name__}: {e}).")
+        route = ""
+    use_route = bool(route and parse_path(route, prefer_last=True))
+    pm = evaluate_sample(
+        task, route if use_route else plan_text, graph_dict,
+        init_node=init_node, acceptance_criterion=acceptance_criterion,
+        answer=answer, full_response=full, directed=directed)
+    if pm is not None:
+        pm["path_source"] = "gemma_judge" if use_route else "regex_fallback"
+        pm["gemma_route"] = route
+    return pm
+
+
 def combine_verdict(
     *,
     regex_correct: bool,
