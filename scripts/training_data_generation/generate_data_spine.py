@@ -134,6 +134,20 @@ if __name__ == "__main__":
         default=10,
         help="Number of tasks to generate per graph in Phase 1.",
     )
+    parser.add_argument(
+        "--max-graphs",
+        type=int,
+        default=None,
+        help=(
+            "Cap the run to the first N graphs (sorted): Phase 1 populates only "
+            "the first N skeletons and Phase 2 rolls out only the first N "
+            "populated graphs. Use this to FINISH an interrupted run at its "
+            "current size — set N to the number of graphs already populated and "
+            "re-run: resume skips the done work, no new graphs are populated, "
+            "and the train/val split is formed from exactly those N graphs. "
+            "Default: no cap (process every skeleton present in --data-dir)."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -165,6 +179,8 @@ if __name__ == "__main__":
         populated_graphs_dir = Path(args.data_dir)
     else:
         graph_paths = sorted(Path(args.data_dir).glob("*graph*json"))
+        if args.max_graphs is not None:
+            graph_paths = graph_paths[: args.max_graphs]
         print(f"Populating graphs and tasks")
         graphs = []
         for graph_path in graph_paths:
@@ -193,6 +209,8 @@ if __name__ == "__main__":
 
     output_generated_plans_dir = Path(output_dir) / "generated_plans"
     generated_graphs_dirs = sorted(populated_graphs_dir.glob("*data_gen*json"))
+    if args.max_graphs is not None:
+        generated_graphs_dirs = generated_graphs_dirs[: args.max_graphs]
     print(f"List of generated graph directories: {generated_graphs_dirs}")
 
 

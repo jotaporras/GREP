@@ -141,6 +141,7 @@ while true; do
       --name "$RUN_DIR" \
       --task-proportions $TASK_PROPORTIONS \
       --n-tasks "$N_TASKS" \
+      --max-graphs 1 \
       --seed "$SEED"; then
     echo "Stage 2 completed on attempt ${attempt}/${MAX_ATTEMPTS}."
     break
