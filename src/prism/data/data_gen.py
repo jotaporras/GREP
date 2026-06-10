@@ -392,6 +392,18 @@ class DataGenerator:
                     )
                     data_counter += 1
                     continue
+                # Atomic-commit a rollout. SPINE rewrites its log file after
+                # EVERY planner turn, so a ^C between turns would otherwise leave
+                # a valid-looking but answer-less `sample_GGG_TTT.json` that
+                # `_has_valid_rollout` mistakes for complete and skips forever.
+                # Instead SPINE writes to a `.partial`, which we rename to the
+                # real name only once planning RETURNS. An interrupted task leaves
+                # only the `.partial` (ignored by resume, split, and aggregate)
+                # and is cleanly regenerated on the next run.
+                failed_name = log_name.replace(".json", "_failed.json")
+                tmp_log = f"{log_name}.partial"
+                if os.path.exists(tmp_log):
+                    os.remove(tmp_log)  # drop any stale partial from a prior ^C
                 try:
                     task = task_entry["task"]
                     init_location = task_entry["init_node"]
@@ -406,46 +418,41 @@ class DataGenerator:
                     graph_data_gen.randomly_remove_nodes(pct=unknown_pct)
                     planner = SPINE(
                         graph=graph_data_gen.partial_graph,
-                        log_name=log_name,
+                        log_name=tmp_log,
                         client=spine_client,
                     )
                     out = self.planning_sim.run_planning(
                         llm_planner=planner, task=task, graph_data_gen=graph_data_gen
                     )
-                    # Mark rollouts that never reached an answer so downstream
-                    # split/aggregate can skip them (split_train_val ignores
-                    # *_failed.json).
-                    if out.terminated_by != "answer":
-                        os.rename(
-                            log_name, log_name.replace(".json", "_failed.json")
-                        )
+                    # Commit: a rollout that reached an answer becomes the real
+                    # sample (picked up by split_train_val); anything else is
+                    # quarantined as *_failed.json (ignored by split, retried on a
+                    # later run since `sample_GGG_TTT.json` stays absent).
+                    os.replace(
+                        tmp_log,
+                        log_name if out.terminated_by == "answer" else failed_name,
+                    )
                     data_counter += 1
                 except Exception as ex:
+                    # Quarantine whatever partial trace exists as *_failed.json.
+                    if os.path.exists(tmp_log):
+                        os.replace(tmp_log, failed_name)
                     # A GPU fault corrupts the CUDA context for every later task
                     # in this process; abort fast rather than quarantining all of
-                    # them as *_failed. The completed rollouts are already on disk,
-                    # so a re-run resumes (skips them via _has_valid_rollout) and
-                    # retries only the missing/failed ones.
+                    # them. Completed rollouts are already committed, so a re-run
+                    # resumes (skips them via _has_valid_rollout) and retries the
+                    # missing/failed ones.
                     if self._is_fatal_gpu_error(ex):
-                        if os.path.exists(log_name):
-                            os.rename(log_name, log_name.replace(".json", "_failed.json"))
                         print(
                             f"sample_{idx:03d}_{task_idx:03d}: fatal GPU error — "
                             f"aborting so a re-run can resume: {ex}"
                         )
                         raise
-                    # A malformed graph (e.g. a connection edge whose endpoint
-                    # is not a declared node) or any single-task failure must
-                    # not abort the run. Quarantine any partial log as
-                    # *_failed.json and move on to the next task.
+                    # Any other single-task failure must not abort the run.
                     print(
                         f"Skipping sample_{idx:03d}_{task_idx:03d}: "
                         f"rollout failed — {type(ex).__name__}: {ex}"
                     )
-                    if os.path.exists(log_name):
-                        os.rename(
-                            log_name, log_name.replace(".json", "_failed.json")
-                        )
 
         utils.aggregate(
             root_dir=log_dir,
