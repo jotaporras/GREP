@@ -43,7 +43,6 @@ The graph is built with the same coords→Euclidean ``distance_m`` convention as
 
 from __future__ import annotations
 
-import ast
 import math
 import os
 import re
@@ -340,45 +339,6 @@ def _path_rescue_enabled() -> bool:
     )
 
 
-def _reasoning_and_answer(response: str) -> str:
-    """The planner's ``reasoning`` chain plus its final ``answer`` text, from a
-    stringified response dict — WITHOUT the ``relevant_graph`` node list.
-
-    The path judge must construct the route from the model's REASONING and ANSWER,
-    not from its ``relevant_graph`` node list (which the judge would otherwise just
-    chain into a bogus route). Given ``str(planner_response)`` (a ``{...}`` dict
-    repr), return ``reasoning`` followed by the ``answer`` action's text, so the
-    route the planner commits to LAST sits at the end. Falls back to the raw text
-    when the fields can't be isolated.
-    """
-    if not isinstance(response, str):
-        response = str(response or "")
-    s = response.strip()
-    if s.startswith("{"):
-        try:
-            d = ast.literal_eval(s)
-        except (ValueError, SyntaxError):
-            d = None
-        if isinstance(d, dict):
-            reasoning = str(d.get("reasoning") or "").strip()
-            answers = []
-            plan = d.get("plan")
-            if isinstance(plan, (list, tuple)):
-                for step in plan:
-                    if (isinstance(step, (list, tuple)) and len(step) >= 2
-                            and step[0] == "answer"):
-                        answers.append(str(step[1]))
-            answer = " ".join(answers).strip()
-            parts = []
-            if reasoning:
-                parts.append("Reasoning: " + reasoning)
-            if answer:
-                parts.append("Answer: " + answer)
-            if parts:
-                return "\n".join(parts)
-    return response
-
-
 def write_path_with_judge(
     response: str,
     valid_nodes: Optional[set] = None,
@@ -391,20 +351,16 @@ def write_path_with_judge(
     arrow notation using the Gemma judge — the path counterpart of
     ``judge_acceptance``'s one-way rescue.
 
-    Constructs the route STRICTLY from the planner's ``reasoning`` chain and its
-    final ``answer`` (extracted by ``_reasoning_and_answer``) — never from its
-    ``relevant_graph`` node list, which the judge would otherwise just chain into a
-    route the model never reasoned. The judge is biased toward the route the planner
-    commits to LAST (its final route, not an earlier discarded attempt). The reply
-    is fed straight back through ``parse_path`` + the NetworkX diagnostics, so an
-    empty/hallucinated answer just scores as no/invalid path — it can rescue, never
-    inflate. Returns "" when the judge can't be loaded or there is nothing to read.
+    Invoked ONLY when neither the plan nor the reasoning regex found a route, to
+    recover a path the model expressed off-spec. The judge reads the full reasoning
+    and is biased toward the route the planner commits to LAST (its final route,
+    not an earlier discarded attempt). The reply is fed straight back through
+    ``parse_path`` + the NetworkX diagnostics, so an empty/hallucinated answer just
+    scores as no/invalid path — it can rescue, never inflate. Returns "" when the
+    judge can't be loaded or there is nothing to read.
     """
     generate = _load_judge()
     if generate is None or not response:
-        return ""
-    chain = _reasoning_and_answer(response)
-    if not chain.strip():
         return ""
     node_list = ", ".join(sorted(valid_nodes)) if valid_nodes else ""
     ends = ""
@@ -413,22 +369,21 @@ def write_path_with_judge(
     if goal:
         ends += f"\nThe route ends at node: {goal}"
     prompt = (
-        "You are reading a robot planner's step-by-step REASONING and its final "
-        "ANSWER, and must reconstruct the single route it works out. Build the route "
-        "ONLY from the moves the reasoning and answer actually describe — do NOT "
-        "simply chain together a list of mentioned or 'relevant' nodes. The planner "
-        "often explores and REVISES its route while thinking, so when more than one "
-        "route appears, take the LAST one it commits to (nearest the END of the "
-        "reasoning / the final answer), not an earlier discarded attempt.\n"
+        "You are reading a robot planner's reasoning and answer, and must recover "
+        "the single route it was trying to express. Read its full reasoning, not "
+        "just its final line. The planner often explores and REVISES its route while "
+        "thinking, so when it states more than one route, take the LAST one it "
+        "commits to — the route nearest the END of its answer — not an earlier "
+        "discarded attempt.\n"
         "Output ONLY that route, as a chain of node ids in exactly this form:\n"
         "node_a -> node_b -> node_c\n"
         "Use ONLY ids from the allowed list, copied exactly, with consecutive nodes "
         "connected in the graph. Output nothing else — no prose, no explanation. If "
-        "no route is described at all, output NONE.\n"
+        "the answer expresses no route at all, output NONE.\n"
         f"Allowed node ids: {node_list}\n"
         f"Task: {task or ''}"
         f"{ends}\n"
-        f"Planner reasoning and answer:\n{chain}\n"
+        f"Planner reasoning and answer: {response}\n"
         "Final route:"
     )
     try:
