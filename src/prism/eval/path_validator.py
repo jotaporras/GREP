@@ -543,12 +543,18 @@ def validate_structured(
         rescue_response=(full_response if kind == "path" else None), task=task)
     parsed = m["parsed_nodes"]
     stated = parse_edges(generated_text, set(build_graph(graph_dict, directed=directed).nodes))
+    # A required containment edge counts as present if the model STATED it
+    # (`u <-> v` notation) OR its route TRAVERSES it (a consecutive pair in the
+    # path) — a reach-object route ends `goal_region -> object`, which expresses
+    # the containment without separate edge notation. (Objects are leaves hosted in
+    # one region, so this can only occur at the route's end.)
+    path_edges = {frozenset((parsed[k], parsed[k + 1])) for k in range(len(parsed) - 1)}
     m["goal"] = goal
     m["kind"] = kind
     m["waypoints_ok"] = _ordered_subseq(waypoints, parsed)
     m["avoid_ok"] = not (set(avoid) & set(parsed))
     m["required_edges"] = [sorted(e) for e in required_edges]
-    m["required_edges_present"] = all(e in stated for e in required_edges)
+    m["required_edges_present"] = all(e in stated or e in path_edges for e in required_edges)
     if kind == "edges":  # positionality: name the goal and state its containment edge(s).
         goal_named = bool(re.search(rf"\b{re.escape(goal)}\b", generated_text or ""))
         # Containment positionality must state the edge; an edge-less structural
@@ -556,10 +562,22 @@ def validate_structured(
         m["structured_correct"] = bool(
             goal_named and (m["required_edges_present"] if required_edges else True))
     else:  # reachability / navigability: a valid constrained walk to the goal.
-        # The route's hop-edges are validated by `full_path_valid` (every
-        # consecutive pair is a real graph edge); the target object's containment
-        # edge is a positionality fact, NOT required here (it stays in
-        # `required_edges_present` as a diagnostic only).
+        # `goal` is the destination REGION. When the task targets an object hosted
+        # there, the planner legitimately ends at the OBJECT, so the route's final
+        # hop is the containment edge `goal_region <-> object` (e.g. vault_1 ->
+        # telescope_1) — NOT the goal region as the last node. Score start_goal_ok
+        # on the start node (always provided in text) plus that containment edge at
+        # the end; ending exactly at the goal region also counts. This overrides
+        # validate_path's literal `parsed[-1] == goal` check, which wrongly failed
+        # every reach-an-object route. The hop-edges (incl. the containment hop) are
+        # still validated by `full_path_valid`.
+        goal_edge = next((e for e in required_edges if goal in e), None)
+        start_ok = init_node is None or (bool(parsed) and parsed[0] == init_node)
+        if goal_edge is not None and len(parsed) >= 2:
+            goal_ok = frozenset((parsed[-2], parsed[-1])) == goal_edge or parsed[-1] == goal
+        else:
+            goal_ok = bool(parsed) and parsed[-1] == goal
+        m["start_goal_ok"] = bool(start_ok and goal_ok)
         m["structured_correct"] = bool(
             m["full_path_valid"] and m["start_goal_ok"] and m["waypoints_ok"]
             and m["avoid_ok"])
