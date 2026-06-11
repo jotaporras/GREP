@@ -19,13 +19,13 @@ max_seq_length: 8192
 text_edge_list: none
 # Graph Transformer + R-PEARL params
 d_model: 1024
-gt_num_layers: 2
+gt_num_layers: 3
 gt_heads: 8
 pe_hidden_channels: 256
-pe_num_layers: 2
+pe_num_layers: 5
 num_samples: 40
 dropout: 0.1
-k_pe: 2
+k_pe: 3
 k_gt: 2
 eps: 1e-6
 use_layer_norm: true
