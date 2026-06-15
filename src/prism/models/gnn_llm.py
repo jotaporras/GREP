@@ -1,5 +1,6 @@
 import copy
 import importlib
+import re
 from collections import defaultdict
 
 import torch
@@ -673,23 +674,56 @@ def find_last_graph_scope(input_ids_b, tokenizer) -> int:
     "infra inputs only the last (query) graph and scopes injection after it
     completes."
 
+    Robust text match (vs. token-subsequence matching, which silently failed on
+    this corpus: ``:`` merges with the following character so the encoded
+    ``"scene graph:"`` marker never appeared as a token subsequence). We decode
+    per-token, anchor on the COMPACT block signature ``scene graph:`` immediately
+    followed by the bullet ``•`` — a prose ``"the scene graph"`` mention inside
+    the model's reasoning is NOT followed by a bullet, so it can't move the
+    scope past the node lists — and map the last match's char offset back to its
+    token index. Returns 0 (whole sequence eligible) when no compact block is
+    present, e.g. the verbose JSON prompt — unchanged behavior for that path.
+
     Used by BOTH the training collator (``SpineDataCollator``) and eval
     (``GraphAugmentedInMemoryLLM``) so the composite graph is assembled with the
-    same scope in train and eval — otherwise the cross-link structure the model
-    trains on differs from what it sees at inference (the divergence grows with
-    ``n_icl_examples``). Returns 0 when no marker is found (whole sequence
-    eligible), matching the previous default.
+    same scope in train and eval.
     """
     seq = list(map(int, input_ids_b))
-    scope_start = 0
-    for surface in ("scene graph:", " scene graph:", "Scene graph:", " Scene graph:"):
-        marker = tokenizer.encode(surface, add_special_tokens=False)
-        if not marker:
-            continue
-        for pos in range(len(seq) - len(marker) + 1):
-            if seq[pos:pos + len(marker)] == marker:
-                scope_start = max(scope_start, pos)
-    return scope_start
+    # Per-token decode; offsets are computed from the SAME pieces we search, so
+    # the char->token mapping is self-consistent regardless of BPE quirks.
+    pieces = tokenizer.batch_decode(
+        [[t] for t in seq], clean_up_tokenization_spaces=False
+    )
+    text = "".join(pieces)
+    matches = list(re.finditer(r"scene graph:\s*•", text, flags=re.IGNORECASE))
+    if not matches:
+        return 0
+    char_start = matches[-1].start()
+    cum = 0
+    for ti, piece in enumerate(pieces):
+        if cum + len(piece) > char_start:
+            return ti
+        cum += len(piece)
+    return 0
+
+
+def node_token_variants(node_names, tokenizer) -> list[list[list[int]]]:
+    """Per-node candidate token-ID sequences for injection matching.
+
+    A node name tokenizes differently with a leading space (the space merges
+    into the first sub-word, changing its id) than standalone. In the compact
+    block a name appears space-preceded in the ``• … nodes:``/comma lists and
+    standalone right after ``[`` in the edge lists, so we match BOTH forms; this
+    is what gets injection to 100% (every node has at least its space-preceded
+    list mention bound). Feed the result straight to :func:`build_injection_map`.
+    """
+    return [
+        [
+            tokenizer.encode(name, add_special_tokens=False),
+            tokenizer.encode(" " + name, add_special_tokens=False),
+        ]
+        for name in node_names
+    ]
 
 
 def has_match(input_ids_b: list[int], to_match:list[int],start_pos:int):
@@ -701,55 +735,60 @@ def has_match(input_ids_b: list[int], to_match:list[int],start_pos:int):
 
 def build_injection_map(
     input_ids_b: list[int],
-    node_token_seqs: list[list[int]],
+    node_token_seqs: list,
     scope_start: int = 0,
 ) -> dict[int, list[tuple[int, int]]]:
     """Build a pre-computed injection map from token IDs and node token sequences.
 
-    Wraps ``bucketize_prompt`` and returns the ``{node_idx: [(start, end), ...]}``
-    format expected by ``GraphAugmentedLLM._augment_embeddings``.
+    Returns the ``{node_idx: [(start, end), ...]}`` format expected by
+    ``GraphAugmentedLLM._augment_embeddings``.
 
-    Two refinements over the raw buckets (M3):
+    ``node_token_seqs[i]`` is EITHER a single token-ID list (one tokenization of
+    the node name — back-compatible) OR a list of candidate token-ID lists
+    (multiple tokenizations, e.g. standalone + space-preceded from
+    :func:`node_token_variants`). Matching any candidate binds the node, which is
+    what reaches 100% coverage: a name tokenizes differently after ``", "`` than
+    after ``"["``, and a single encoding misses one of those forms.
+
+    Two refinements (M3):
 
     - **Scope (``scope_start``):** only matches starting at/after ``scope_start``
-      are kept, so node labels that also appear in earlier ICL-example graphs
-      are ignored and PE lands only on the last (query) graph block. The caller
-      computes the boundary (see ``GraphAugmentedInMemoryLLM._generate_tokens``);
-      the default of 0 keeps the whole sequence eligible.
-    - **Longest-first matching:** nodes are resolved from the longest token span
-      down, claiming the token positions they cover. A label that is a token
-      prefix of a longer one (``barn_shed_1`` inside ``barn_shed_11``) therefore
-      can't steal the longer label's tokens, while a genuine standalone mention
-      elsewhere is still picked up.
-
-    Args:
-        input_ids_b: Flat list of token IDs for a single sequence.
-        node_token_seqs: Per-node list of token-ID subsequences
-            (as returned by ``tokenizer.encode(node_names, add_special_tokens=False)``).
-        scope_start: First token index eligible for matching.
+      are kept, so labels that also appear in earlier ICL-example graphs are
+      ignored and PE lands only on the last (query) graph block.
+    - **Longest-first matching:** spans are resolved longest-first and claim the
+      token positions they cover, so a label that is a token prefix of a longer
+      one (``barn_shed_1`` inside ``barn_shed_11``), or a shorter variant, can't
+      steal a longer match's tokens.
 
     Returns:
         Dict mapping node index to a list of ``(start, end)`` token spans.
     """
-    buckets = bucketize_prompt(input_ids_b, node_token_seqs)
+    n = len(input_ids_b)
+    # Collect every candidate match as (length, node_idx, start), longest-first.
+    spans_all: list[tuple[int, int, int]] = []
+    for nid, seqs in enumerate(node_token_seqs):
+        variants = seqs if (seqs and isinstance(seqs[0], list)) else [seqs]
+        for seq in variants:
+            length = len(seq)
+            if length == 0:
+                continue
+            for start in range(n - length + 1):
+                if input_ids_b[start:start + length] == seq:
+                    spans_all.append((length, nid, start))
+    spans_all.sort(key=lambda x: x[0], reverse=True)
 
-    # Resolve longest labels first so a longer mention claims its tokens before
-    # any shorter prefix label can match inside it.
-    order = sorted(buckets, key=lambda nid: len(node_token_seqs[nid]), reverse=True)
     claimed: set[int] = set()
     injection_map: dict[int, list[tuple[int, int]]] = {}
-    for nid in order:
-        length = len(node_token_seqs[nid])
-        spans = []
-        for start in sorted(buckets[nid]):
-            if start < scope_start:
-                continue
-            positions = range(start, start + length)
-            if claimed.isdisjoint(positions):
-                spans.append((start, start + length))
-                claimed.update(positions)
-        if spans:
-            injection_map[nid] = spans
+    for length, nid, start in spans_all:
+        if start < scope_start:
+            continue
+        positions = range(start, start + length)
+        if claimed.isdisjoint(positions):
+            injection_map.setdefault(nid, []).append((start, start + length))
+            claimed.update(positions)
+    # Stable, deterministic span order per node.
+    for nid in injection_map:
+        injection_map[nid].sort()
     return injection_map
 
 

@@ -4,6 +4,7 @@ from typing import List, Dict
 
 import torch
 
+from prism.data import compact_prompt
 from prism.data import utils
 from prism.data.data import remove_edge_list
 from prism.models.gnn_llm import (
@@ -12,6 +13,7 @@ from prism.models.gnn_llm import (
     InjectedCompositeGraphLLM,
     build_injection_map,
     find_last_graph_scope,
+    node_token_variants,
 )
 
 
@@ -133,18 +135,15 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
         return graphs
 
     def query_llm(self, msg: List[Dict], max_new_tokens: int = 2048):
-        # Always parse PyG graphs from the original message so the GNN has full
-        # connectivity regardless of text_edge_list setting.
+        # Always parse PyG graphs from the ORIGINAL message so the GNN has full
+        # connectivity (coords + edges) regardless of the compact text below.
         pyg_graphs = self._parse_all_pyg_graphs(msg)
 
-        llm_msg = (
-            [
-                {**m, "content": remove_edge_list(m["content"])} if m["role"] == "user" else m
-                for m in msg
-            ]
-            if self.strip_edges
-            else msg
-        )
+        # Forward-translate the SPINE prompt to the compact text the LLM was
+        # trained on (system dropped; scene graph -> compacted node/edge block;
+        # any prior assistant answers -> <think>…</think> form). The GNN keeps the
+        # original `msg` above, so connectivity is unaffected.
+        llm_msg = compact_prompt.spine_to_compact_messages(msg)
 
         input = self.tokenizer.apply_chat_template(
             llm_msg, tokenize=True, add_generation_prompt=True, return_tensors="pt"
@@ -157,8 +156,11 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
         with torch.no_grad():
             outputs = self._generate_tokens(input_ids, attention_mask, pyg_graphs, max_new_tokens)
 
-        planner_response = self._decode(outputs)
-        print(f"[spine-llm] raw_output (first 500 chars): {planner_response[:500]}")
+        compact_response = self._decode(outputs)
+        print(f"[spine-llm] raw_output (first 500 chars): {compact_response[:500]}")
+        # Inverse-translate the compact generation back to a SPINE-JSON string so
+        # SPINE's parser (`try_parse`) and the grader consume it unchanged.
+        planner_response = compact_prompt.compact_output_to_spine_json(compact_response)
         return planner_response, True
 
     def _generate_tokens(self, input_ids, attention_mask, pyg_graphs, max_new_tokens):
@@ -187,10 +189,8 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
 
         pyg_graph = pyg_graphs[-1]
         input_ids_list = input_ids[0].tolist()
-        node_token_seqs = [
-            self.tokenizer.encode(name, add_special_tokens=False)
-            for name in pyg_graph.node_names
-        ]
+        # Standalone + space-preceded tokenizations per node (100% injection).
+        node_token_seqs = node_token_variants(pyg_graph.node_names, self.tokenizer)
 
         # Scope injection to the last (query) graph block: only token positions
         # at/after the final "scene graph:" marker are eligible. Otherwise the

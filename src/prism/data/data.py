@@ -7,8 +7,9 @@ import datasets
 from torch_geometric.data import Batch
 from transformers.data.data_collator import DataCollatorForLanguageModeling
 
+from prism.data import compact_prompt
 from prism.data import utils
-from prism.models.gnn_llm import build_injection_map, find_last_graph_scope
+from prism.models.gnn_llm import build_injection_map, find_last_graph_scope, node_token_variants
 
 
 def preprocess_dataset(
@@ -71,9 +72,20 @@ def preprocess_dataset(
     
     ds = ds.map(lambda e: {"messages": e["conversations"]})
 
-    if architecture in ("rpearl_llm", "rpearl_gt_llm", "composite_graph_gt"):
+    is_graph_arch = architecture in ("rpearl_llm", "rpearl_gt_llm", "composite_graph_gt")
+    if is_graph_arch:
+        # Parse the GNN's scene graph from the ORIGINAL messages first, so the
+        # compact translation below (which only rewrites the LLM-facing text)
+        # leaves the graph the GNN ingests untouched.
         ds = ds.map(_parse_scene_graph)
-    if text_edge_list == "none":
+        # Translate the verbose SPINE text to the compact format the LLM is
+        # trained/evaluated on. The compact block already carries node names +
+        # the bracketed edge lists, so `text_edge_list` stripping is moot here.
+        def _translate_to_compact(example):
+            example["messages"] = compact_prompt.spine_to_compact_messages(example["conversations"])
+            return example
+        ds = ds.map(_translate_to_compact)
+    elif text_edge_list == "none":
         def _strip_edges(example):
             example["messages"] = [
                 {**m, "content": remove_edge_list(m["content"])} if m["role"] == "user" else m
@@ -133,10 +145,9 @@ class SpineDataCollator(DataCollatorForLanguageModeling):
     def _extract_graph(self, example):
         """Build PyG graph and injection map from a preprocessed example."""
         pyg_graph = utils.scene_graph_dict_to_pyg(example["scene_graph_dict"])
-        node_token_seqs = [
-            self.tokenizer.encode(name, add_special_tokens=False)
-            for name in pyg_graph.node_names
-        ]
+        # Standalone + space-preceded tokenizations per node so every list / edge
+        # mention binds (100% injection); see node_token_variants.
+        node_token_seqs = node_token_variants(pyg_graph.node_names, self.tokenizer)
         # Scope injection to the last (query) graph block, matching eval
         # (GraphAugmentedInMemoryLLM) and R10. Without this, training cross-links
         # the query graph's labels to their mentions across the *whole* prompt —
