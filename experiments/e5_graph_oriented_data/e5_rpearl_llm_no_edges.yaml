@@ -20,10 +20,10 @@ text_edge_list: none
 # R-PEARL GNN params
 d_model: 1024
 pe_hidden_channels: 256
-pe_num_layers: 5
+pe_num_layers: 2
 num_samples: 40
 dropout: 0.1
-k_pe: 3
+k_pe: 2
 eps: 1e-6
 use_layer_norm: true
 freeze_llm: false
