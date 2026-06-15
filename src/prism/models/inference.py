@@ -103,17 +103,14 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
     computes GNN-augmented embeddings, and generates via the LoRA-modified LLM.
     Falls back to plain LLM generation when no graph is found in the prompt.
 
-    When ``strip_edges=True`` (matching ``text_edge_list=none`` in the training
-    config), the edge list (object_connections / region_connections) is removed
-    from the text the LLM sees so graph connectivity is communicated exclusively
-    via R-PEARL PE injection.  When ``strip_edges=False`` (``text_edge_list=present``),
-    edges remain in the text and PE is additive.  Graph parsing always runs on the
-    original unmodified message so the GNN retains complete edge information
-    regardless of this setting.
-
-    Extra ICL examples are omitted by the caller (SPINE with use_icl=False),
-    keeping only the system prompt and one ICL example. PE injection operates
-    over the full input_ids without per-message offset correction.
+    The text the LLM sees is the COMPACT translation (``spine_to_compact_messages``):
+    the verbose system prompt and ALL few-shot ICL examples are dropped (the format
+    is learned by SFT, and dropping ICL keeps train/eval symmetric), and the scene
+    graph becomes the compact node/edge block. Graph parsing for the GNN always runs
+    on the ORIGINAL, unmodified message, so the GNN retains complete coords/edges
+    regardless. (``strip_edges`` is now moot for graph models — the compact block
+    always carries the bracketed edge lists.) PE injection operates over the compact
+    input_ids; the model's compact output is inverse-translated back to SPINE JSON.
     """
 
     def __init__(self, model, tokenizer, device=None, strip_edges: bool = False, permutation=None):

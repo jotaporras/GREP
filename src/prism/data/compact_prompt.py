@@ -18,30 +18,29 @@ special tokens (for Llama-3, ``<|start_header_id|>user<|end_header_id|>`` … ),
 and the open assistant turn at eval comes from ``add_generation_prompt=True``.
 This module only fills the per-turn *content*.
 
-Eval messages (from ``populated_graphs/data_gen_*.json``) — one ``user`` turn::
+The scene graph is a leading ``system`` message; tasks then stack as
+``user``/``assistant`` pairs in the same conversation per graph::
 
-    <task>
+    [system]  Scene graph:
+              • Region nodes: hub_1, quarters_1, ...
+              • Object nodes: food_dispenser_1, ...
+              • Robot location: hub_1
 
-    Scene graph:
-    • Region nodes: hub_1, quarters_1, ...
-    • Object nodes: food_dispenser_1, ...
-    • Region edges: [hub_1, mess_hall_1], ...
-    • Object edges: [food_dispenser_1, mess_hall_1], ...
-    • Robot location: hub_1
+    [user]    <task>
 
-Training messages (from ``generated_plans/sample_*.json``) — add an ``assistant``
-turn whose content wraps the reasoning in thinking tokens::
+    [assistant]  <think>Relevant graph: hub_1, mess_hall_1, food_dispenser_1
 
-    <think>Relevant graph: hub_1, mess_hall_1, food_dispenser_1
+                 Reasoning: <reasoning chain></think><plan, answer() unwrapped>
 
-    Reasoning: <reasoning chain></think><answer() unwrapped to its inner prose>
+    [user]    <next task>           # stacks: graph already in the system message
+    [assistant]  <think>…</think><plan>
 
-Multiple tasks over one graph share a single conversation: the ``Scene graph:``
-block is emitted ONCE (first user turn) and later tasks are graph-free user
-turns. Besides the obvious context saving, this keeps PE injection correct across
-tasks — the single ``Scene graph:`` block is the only ``find_last_graph_scope``
-anchor, so injection scopes over every task and answer in the conversation (the
-verbose format restates the graph per task and scopes to the last task only).
+No edges in the block: the compact format is consumed only by graph-augmented
+architectures, whose GNN already ingests connectivity from the full SPINE JSON
+(the plain-LLM baseline is never compacted and keeps the verbose JSON with
+edges). The single ``Scene graph:`` system block is the only
+``find_last_graph_scope`` anchor, so PE injection scopes over every stacked task
+and answer; putting it in the system message also keeps it out of the loss.
 ``build_conversation`` / ``assemble_training_conversation`` construct these; the
 single-task helpers are thin wrappers.
 
@@ -105,47 +104,41 @@ def _node_names(entries: List[dict]) -> str:
     return ", ".join(e["name"] for e in entries)
 
 
-def _edge_list(edges: List[List[str]]) -> str:
-    """Render connection pairs compactly as ``[a, b], [c, d], ...``."""
-    return ", ".join(f"[{a}, {b}]" for a, b in edges)
-
-
 def _graph_block(graph_dict: dict) -> str:
-    """The scene-graph block stated once per conversation.
+    """The scene-graph block, emitted once as a leading system message.
 
     Keeps the ``Scene graph:`` header so it stays the single
     ``find_last_graph_scope`` injection anchor (``gnn_llm.py``). Regions/Objects
-    are bulleted node-name lists; edges are the compacted bracket-pair form of
-    ``region_connections`` / ``object_connections`` (no coordinates, no JSON
-    indentation — far smaller than the verbose dict). Robot location is the
-    starting node. This is the LLM-facing text only; the GNN still ingests the
-    full SPINE scene-graph JSON unchanged.
+    are bulleted node-name lists and the robot's starting node — NO edges: the
+    compact format is used only by graph-augmented architectures, whose GNN
+    already ingests connectivity from the full SPINE scene-graph JSON, so edges
+    in text would be redundant. (The plain-LLM baseline is never compacted and
+    keeps the verbose JSON, edges included.)
     """
     return (
         "Scene graph:\n"
         f"• Region nodes: {_node_names(graph_dict['regions'])}\n"
         f"• Object nodes: {_node_names(graph_dict['objects'])}\n"
-        f"• Region edges: {_edge_list(graph_dict['region_connections'])}\n"
-        f"• Object edges: {_edge_list(graph_dict['object_connections'])}\n"
         f"• Robot location: {graph_dict['robot_location']}"
     )
 
 
 def build_conversation(graph_dict: dict, turns: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """Assemble a multi-task chat ``messages`` list for ONE shared graph.
+    """Assemble a chat ``messages`` list for ONE shared graph.
 
     ``turns`` is an ordered list of ``{"task": str, "assistant": Optional[str]}``.
-    The graph's ``Regions:`` / ``Objects:`` node lists are emitted EXACTLY ONCE,
-    appended to the first user turn; every later user turn carries only its task,
-    because the graph already sits in the conversation history. Each turn with a
+    The scene graph is emitted EXACTLY ONCE as a leading ``system`` message, above
+    the first task; every task is then a bare ``user`` turn, so tasks (and their
+    answers) simply stack in the same conversation per graph. Each turn with a
     non-empty ``"assistant"`` adds an assistant turn after its user turn.
 
-    Stating the node lists once is what makes the compact format correct for
-    multiple tasks over the same graph: the single graph block is the only
-    injection-scope anchor (``find_last_graph_scope``), so PE injection scopes
-    over the whole conversation and every task's / answer's node mentions bind to
-    the one graph — unlike the verbose format, which restates the graph per task
-    and so scopes injection to the last task only.
+    Putting the graph in the system message (above the first task) is what lets
+    tasks stack and keeps the compact format correct for multiple tasks: that
+    single block is the only ``find_last_graph_scope`` injection anchor, so PE
+    injection scopes over the whole conversation and every task's / answer's node
+    mentions bind to the one graph. It also keeps the graph out of the loss
+    (only assistant turns are trained), and stays consistent with eval where new
+    tasks are appended after each answer.
 
     Roles are real message turns (not literal ``User:``/``Assistant:`` text): the
     chat template supplies the delimiters as native special tokens, and the SFT
@@ -153,11 +146,9 @@ def build_conversation(graph_dict: dict, turns: List[Dict[str, str]]) -> List[Di
     """
     if not turns:
         raise ValueError("build_conversation requires at least one turn")
-    messages: List[Dict[str, str]] = []
-    for i, turn in enumerate(turns):
-        task = turn["task"].strip()
-        content = f"{task}\n\n{_graph_block(graph_dict)}" if i == 0 else task
-        messages.append({"role": "user", "content": content})
+    messages: List[Dict[str, str]] = [{"role": "system", "content": _graph_block(graph_dict)}]
+    for turn in turns:
+        messages.append({"role": "user", "content": turn["task"].strip()})
         if turn.get("assistant"):
             messages.append({"role": "assistant", "content": turn["assistant"]})
     return messages
@@ -381,17 +372,14 @@ def _unwrap_plan(plan: str) -> str:
 
 
 def _compact_user_content(content: str) -> str:
-    """Translate one SPINE user turn's content to compact form.
+    """Translate a graph-free SPINE user turn to compact form.
 
-    - Turn with an embedded scene graph -> ``{task}\\n\\n{scene-graph block}``.
-    - ``task:`` / request turn without a graph -> the task text only.
+    - ``task:`` / request turn -> the task text only.
     - Anything else (``updates: …`` / ``Feedback: …``) -> kept verbatim (already
-      short, and carries no graph to compact).
+      short). The scene-graph-bearing query turn is handled by
+      :func:`spine_to_compact_messages`, which hoists the graph to a system
+      message, so this is only ever called on graph-free turns.
     """
-    if re.search(r"[Ss]cene graph:", content):
-        task = _extract_task(content)
-        graph_dict = _extract_scene_graph_dict(content)
-        return f"{task}\n\n{_graph_block(graph_dict)}"
     stripped = content.lstrip()
     if re.match(r"task:", stripped, flags=re.IGNORECASE):
         return _extract_task(content)
@@ -401,30 +389,53 @@ def _compact_user_content(content: str) -> str:
 def spine_to_compact_messages(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
     """FORWARD translator: a SPINE ``messages`` list -> compact ``messages``.
 
-    Per turn: ``system`` is dropped (the compact format carries no system text,
-    on both train and eval, so they stay consistent); ``user`` turns are
-    compacted by :func:`_compact_user_content`; ``assistant`` turns that are the
-    4-key SPINE-JSON answer become the ``<think>…</think>plan`` form via
-    :func:`_format_assistant` (any other assistant content is kept verbatim).
+    Drops BOTH the SPINE system prompt and any few-shot ICL examples (the model
+    is taught the output format by SFT, not by a schema prompt or demonstrations,
+    and dropping ICL keeps train/eval symmetric), then hoists the query's scene
+    graph into a leading ``system`` message so the format is
+    ``[system(scene graph)] + [user task, assistant answer]*`` and tasks stack.
 
-    A ``Scene graph:`` block is emitted wherever the source turn had one, so
-    multi-graph ICL keeps its own blocks and ``find_last_graph_scope`` still
-    resolves to the last (query) graph — matching the GNN's ``pyg_graphs[-1]``.
+    The real task is the LAST ``user`` turn carrying a ``Scene graph:`` block
+    (each ICL example precedes it with its own graph; receding-horizon planning
+    turns — ``updates:`` / replans — follow it). We keep that turn onward, lift
+    its graph to the system message and reduce it to the task text, and translate
+    the rest. ``strip_icl`` is NOT reused: the SPINE eval query turn has no
+    ``task:`` prefix, so the scene-graph marker is the reliable boundary.
+
+    Per surviving turn: the graph-bearing query ``user`` turn -> system(graph) +
+    user(task); other ``user`` turns -> :func:`_compact_user_content`;
+    ``assistant`` 4-key SPINE-JSON answers -> the ``<think>…</think>plan`` form
+    via :func:`_format_assistant` (other assistant content kept verbatim).
     """
+    graph_idxs = [
+        i for i, m in enumerate(messages)
+        if m.get("role") == "user" and re.search(r"[Ss]cene graph:", m.get("content", ""))
+    ]
+    if graph_idxs:
+        messages = messages[graph_idxs[-1]:]  # last (query) graph onward; drops ICL + system
+
     out: List[Dict[str, str]] = []
+    graph_done = False
     for m in messages:
         role = m.get("role")
         if role == "system":
             continue
-        if role == "assistant":
+        if role == "user":
             content = m.get("content", "")
-            try:
-                content = _format_assistant(content)
-            except (json.JSONDecodeError, KeyError, TypeError, AttributeError, ValueError):
-                pass  # not a parseable 4-key SPINE answer — keep the turn verbatim
-            out.append({"role": "assistant", "content": content})
-        else:
-            out.append({"role": "user", "content": _compact_user_content(m.get("content", ""))})
+            if not graph_done and re.search(r"[Ss]cene graph:", content):
+                out.append({"role": "system", "content": _graph_block(_extract_scene_graph_dict(content))})
+                out.append({"role": "user", "content": _extract_task(content)})
+                graph_done = True
+            else:
+                out.append({"role": "user", "content": _compact_user_content(content)})
+            continue
+        # assistant
+        content = m.get("content", "")
+        try:
+            content = _format_assistant(content)
+        except (json.JSONDecodeError, KeyError, TypeError, AttributeError, ValueError):
+            pass  # not a parseable 4-key SPINE answer — keep the turn verbatim
+        out.append({"role": "assistant", "content": content})
     return out
 
 

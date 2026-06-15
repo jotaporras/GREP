@@ -1,25 +1,27 @@
 """Demo: the compact plain-text prompt format fed to the GREP-PRISM models.
 
-Loads a real nav100 sample and prints exactly what the training and eval prompts
-look like once converted from the verbose SPINE JSON (long system prompt + full
-scene-graph JSON) into the compact format: a chat ``messages`` list whose user
-turn carries ``<task>`` + the ``Scene graph:`` block and whose assistant turn
-(training only) carries the reasoning + ``Relevant Nodes:`` + ``Plan:``.
+Shows exactly what training and eval prompts become once the verbose SPINE JSON
+(long system prompt + few-shot ICL examples + full scene-graph JSON) is translated
+to the compact format the LLM consumes:
 
-IMPORTANT: the ``User:`` / ``Assistant:`` turn delimiters are produced by the
-tokenizer's chat template (native role special tokens), NOT literal text — so
-this demo renders through ``apply_chat_template`` when a tokenizer is given,
-which is the byte-for-byte prompt the model receives. Without ``--tokenizer`` it
-prints the raw messages plus an illustrative ``Role:`` view.
+  * the SPINE system prompt and ALL ICL examples are DROPPED (the format is taught
+    by SFT, and dropping ICL keeps train and eval symmetric);
+  * the scene graph becomes a compact ``Scene graph:`` block (bulleted node-name
+    lists + robot location, NO edges — the GNN supplies connectivity) and is
+    placed in a leading ``system`` message, ABOVE the first task;
+  * tasks then stack as ``user``/``assistant`` pairs in the same conversation per
+    graph; the assistant target wraps reasoning in
+    ``<think>Relevant graph: …\\n\\nReasoning: …</think>`` followed by the bare plan.
 
-This is pure pre-processing and does NOT modify anything under data/.
+The ``User:``/``Assistant:`` turn delimiters are produced by the tokenizer's chat
+template (native role special tokens), NOT literal text — so with ``--tokenizer``
+the demo renders the byte-for-byte prompt via ``apply_chat_template``; without it,
+it prints the raw messages plus an illustrative ``Role:`` view.
+
+Pure pre-processing; does NOT modify anything under data/.
 
 Run:  PYTHONPATH=src python scripts/demo_compact_prompt.py
       PYTHONPATH=src python scripts/demo_compact_prompt.py --tokenizer meta-llama/Llama-3.2-3B-Instruct
-      PYTHONPATH=src python scripts/demo_compact_prompt.py \
-          --plan-sample data/gen/nav100_n30_gemma_data/generated_plans/sample_001_001.json \
-          --graph-sample data/gen/nav100_n30_gemma_data/populated_graphs/data_gen_000.json \
-          --task-index 0
 """
 
 import argparse
@@ -31,6 +33,7 @@ from prism.data.compact_prompt import (
     format_eval_messages,
     format_training_messages,
     render,
+    spine_to_compact_messages,
     strip_icl,
     try_load_json,
 )
@@ -39,14 +42,18 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = REPO_ROOT / "data" / "gen" / "nav100_n30_gemma_data"
 DEFAULT_PLAN = DATA_DIR / "generated_plans" / "sample_000_000.json"
 DEFAULT_GRAPH = DATA_DIR / "populated_graphs" / "data_gen_000.json"
+SECOND_GRAPH = DATA_DIR / "populated_graphs" / "data_gen_001.json"
 
 
 def _rule(title: str) -> None:
     print(f"\n{'=' * 78}\n{title}\n{'=' * 78}")
 
 
+def _roles(messages) -> str:
+    return " ".join(m["role"][0].upper() for m in messages)  # e.g. "S U A U A"
+
+
 def _show(messages, tokenizer, add_generation_prompt: bool) -> None:
-    """Print the raw messages list and the rendered chat-template string."""
     print("\n-- messages (roles handled by apply_chat_template) --")
     print(json.dumps(messages, indent=2))
     label = "apply_chat_template" if tokenizer is not None else "illustrative Role: view"
@@ -57,7 +64,6 @@ def _show(messages, tokenizer, add_generation_prompt: bool) -> None:
 
 
 def _make_counter(tokenizer):
-    """Return a (label, count_fn) pair for the context-reduction summary."""
     if tokenizer is not None:
         return "tokens", lambda s: len(tokenizer.encode(s, add_special_tokens=False))
     return "chars", len
@@ -65,24 +71,23 @@ def _make_counter(tokenizer):
 
 def _reduction_summary(before_msgs, after_msgs, tokenizer) -> None:
     label, count = _make_counter(tokenizer)
-    before = render(before_msgs, tokenizer=tokenizer)
-    after = render(after_msgs, tokenizer=tokenizer)
-    b, a = count(before), count(after)
+    b = count(render(before_msgs, tokenizer=tokenizer))
+    a = count(render(after_msgs, tokenizer=tokenizer))
     saved = 100.0 * (b - a) / b if b else 0.0
     print(f"\n  context ({label}):  before={b:,}  after={a:,}  saved={saved:.1f}%")
 
 
+def _verbose_baseline(graph_dict, task):
+    """Illustrative 'before' baseline: the full graph dict restated per task."""
+    return [{"role": "user", "content": f"task: {task}\nScene graph:{graph_dict}"}]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--plan-sample", type=Path, default=DEFAULT_PLAN,
-                        help="generated_plans/*.json conversation (training prompt source)")
-    parser.add_argument("--graph-sample", type=Path, default=DEFAULT_GRAPH,
-                        help="populated_graphs/data_gen_*.json (eval prompt source)")
-    parser.add_argument("--task-index", type=int, default=0,
-                        help="which task in the graph sample to render as an eval prompt")
-    parser.add_argument("--tokenizer", type=str, default="",
-                        help="HF model/tokenizer id; renders the true chat-template prompt "
-                             "and token counts. Default: messages + illustrative view, char counts.")
+    parser.add_argument("--plan-sample", type=Path, default=DEFAULT_PLAN)
+    parser.add_argument("--graph-sample", type=Path, default=DEFAULT_GRAPH)
+    parser.add_argument("--task-index", type=int, default=0)
+    parser.add_argument("--tokenizer", type=str, default="")
     args = parser.parse_args()
 
     tokenizer = None
@@ -90,58 +95,80 @@ def main() -> None:
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
 
-    # --- Training prompt: from a real generated-plan rollout --------------------
+    payload = try_load_json(args.graph_sample)
+    graph_dict, tasks = payload["graph"], payload["tasks"]
+    task = tasks[args.task_index]["task"]
+
+    # --- 1. Training prompt: a real rollout -> compact (system + ICL dropped) -----
     conversation = try_load_json(args.plan_sample)
     training_messages = format_training_messages(conversation)
     _rule(f"TRAINING PROMPT  (from {args.plan_sample.name})")
     _show(training_messages, tokenizer, add_generation_prompt=False)
-    # Baseline = the current verbose prompt (system + scene-graph JSON + answer),
-    # ICL prefix stripped, in the same messages shape.
     _reduction_summary(strip_icl(conversation), training_messages, tokenizer)
 
-    # --- Eval prompt: from a real populated graph -------------------------------
-    payload = try_load_json(args.graph_sample)
-    graph_dict = payload["graph"]
-    task = payload["tasks"][args.task_index]["task"]
+    # --- 2. Eval prompt: graph + task -> compact (open assistant turn) ------------
     eval_messages = format_eval_messages(graph_dict, task)
     _rule(f"EVAL PROMPT  (from {args.graph_sample.name}, task {args.task_index})")
-    # add_generation_prompt=True mirrors GraphAugmentedInMemoryLLM.query_llm at eval.
-    _show(eval_messages, tokenizer, add_generation_prompt=True)
+    _show(eval_messages, tokenizer, add_generation_prompt=True)  # mirrors query_llm
 
-    # --- Multi-task over ONE graph: graph node lists stated exactly once ---------
-    # Eval side: all tasks of the graph in a single conversation (graph once).
-    all_tasks = [t["task"] for t in payload["tasks"]]
+    # --- 3. MULTI-TURN translation: system + ICL dropped, planning turns kept -----
+    # Synthesize a realistic eval-time SPINE conversation: system + one ICL example
+    # (its own graph) + the real query + a receding-horizon planning continuation
+    # (assistant plan -> updates -> assistant replan). spine_to_compact_messages is
+    # exactly what the eval client feeds the LLM.
+    icl_graph = try_load_json(SECOND_GRAPH)["graph"]
+    answer_json = lambda r, p: json.dumps(
+        {"primary_goal": "g", "relevant_graph": r, "reasoning": "...", "plan": f"[answer({p})]"})
+    spine_convo = [
+        {"role": "system", "content": "<5,992-char SPINE system prompt: API + JSON schema + advice>"},
+        {"role": "user", "content": f"task: an ICL example task\nScene graph:{json.dumps(icl_graph)}"},
+        {"role": "assistant", "content": answer_json("a_1, b_1", "a_1 -> b_1")},
+        {"role": "user", "content": f"{task}\nAdvice: \n- ...\n\nScene graph:{json.dumps(graph_dict)}"},
+        {"role": "assistant", "content": answer_json("hub_1, mess_hall_1", "hub_1 -> mess_hall_1")},
+        {"role": "user", "content": "updates:[no_updates()]"},
+        {"role": "assistant", "content": answer_json("hub_1, mess_hall_1", "hub_1 -> mess_hall_1")},
+    ]
+    compact = spine_to_compact_messages(spine_convo)
+    _rule("MULTI-TURN SPINE -> COMPACT  (SPINE system + ICL dropped; graph hoisted to system)")
+    print(f"  input  roles: [{_roles(spine_convo)}]  ({len(spine_convo)} turns: SPINE system + 1 ICL pair + query + replan loop)")
+    print(f"  output roles: [{_roles(compact)}]  ({len(compact)} turns: system(graph) + query + planning continuation)")
+    sys_msgs = [m for m in compact if m["role"] == "system"]
+    assert len(sys_msgs) == 1 and sys_msgs[0]["content"].startswith("Scene graph:"), "graph not hoisted to one system msg"
+    assert "<5,992-char SPINE system prompt" not in render(compact), "verbose SPINE system leaked"
+    assert sum(c["content"].count("Scene graph:") for c in compact) == 1, "ICL graph leaked"
+    print("  -> ONE system 'Scene graph:' block (the query graph); SPINE system + ICL gone.")
+    _show(compact, tokenizer, add_generation_prompt=False)
+
+    # --- 4. Multi-task over ONE graph: graph in system, tasks stacked -------------
+    all_tasks = [t["task"] for t in tasks]
     multi_eval = format_eval_messages(graph_dict, all_tasks)
-    _rule(f"MULTI-TASK EVAL  ({len(all_tasks)} tasks, {args.graph_sample.name}, one shared graph)")
-    print(f"  {len(multi_eval)} user turns; 'Scene graph:' block appears "
-          f"{sum(c['content'].count('Scene graph:') for c in multi_eval)}x (once).")
-    _reduction_summary(
-        # Baseline: the verbose per-task prompt restated for every task.
-        [m for t in all_tasks for m in format_eval_messages_verbose_baseline(graph_dict, t)],
-        multi_eval, tokenizer,
-    )
+    roles_e = [m["role"] for m in multi_eval]
+    _rule(f"MULTI-TASK EVAL  ({len(all_tasks)} tasks stacked under one shared graph)")
+    print(f"  {len(multi_eval)} turns: 1 system(graph) + {roles_e.count('user')} stacked user tasks; "
+          f"'Scene graph:' block appears {sum(c['content'].count('Scene graph:') for c in multi_eval)}x (once, in system).")
+    _reduction_summary([m for t in all_tasks for m in _verbose_baseline(graph_dict, t)], multi_eval, tokenizer)
 
-    # Training side: assemble the graph's per-task rollouts into one example.
     plan_dir = args.plan_sample.parent
     graph_idx = args.plan_sample.stem.split("_")[1]
     rollout_files = sorted(plan_dir.glob(f"sample_{graph_idx}_*.json"))
     if len(rollout_files) > 1:
         rollouts = [try_load_json(p) for p in rollout_files]
         multi_train = assemble_training_conversation(rollouts)
-        _rule(f"MULTI-TASK TRAINING  ({len(rollout_files)} rollouts, graph {graph_idx}, one shared graph)")
         roles = [m["role"] for m in multi_train]
-        print(f"  {len(multi_train)} turns ({roles.count('user')} user / "
+        _rule(f"MULTI-TASK TRAINING  ({len(rollout_files)} rollouts, graph {graph_idx}, tasks stacked under one graph)")
+        print(f"  {len(multi_train)} turns ({roles.count('system')} system(graph) / {roles.count('user')} user / "
               f"{roles.count('assistant')} assistant); 'Scene graph:' block appears "
-              f"{sum(m['content'].count('Scene graph:') for m in multi_train)}x (once).")
-        _reduction_summary(
-            [m for r in rollouts for m in strip_icl(r)], multi_train, tokenizer)
+              f"{sum(m['content'].count('Scene graph:') for m in multi_train)}x (once, in system).")
+        _reduction_summary([m for r in rollouts for m in strip_icl(r)], multi_train, tokenizer)
+
+        # Rendered view: how multiple tasks per graph actually look stacked.
+        few = assemble_training_conversation(rollouts[:3])
+        n_tasks = sum(1 for m in few if m["role"] == "user")
+        _rule(f"MULTIPLE TASKS PER GRAPH — rendered ({n_tasks} tasks stacked under one shared graph)")
+        print(f"  one system(graph) message, then {n_tasks} (user task, assistant answer) pairs in the same conversation:")
+        _show(few, tokenizer, add_generation_prompt=False)
 
     print()
-
-
-def format_eval_messages_verbose_baseline(graph_dict, task):
-    """Illustrative 'before' baseline: the full graph dict restated per task."""
-    return [{"role": "user", "content": f"task: {task}\nScene graph:{graph_dict}"}]
 
 
 if __name__ == "__main__":
