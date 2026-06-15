@@ -15,7 +15,7 @@ epochs: 3
 r: 16
 debug: true
 dataset_proportion: 1.0
-max_seq_length: 8192
+max_seq_length: 16384
 text_edge_list: none
 # Graph Transformer + R-PEARL params
 d_model: 4096
