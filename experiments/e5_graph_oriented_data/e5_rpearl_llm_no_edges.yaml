@@ -6,7 +6,7 @@ wandb_tag: e5_graph_oriented_data
 checkpoint_dir: outputs/e5_graph_oriented_data
 data: data/gen/nav100_n30_gemma_data/split/formatted_all_new__train.json
 val_data: data/gen/nav100_n30_gemma_data/split/formatted_all_new__val.json
-eval_data: data/gen/nav100_n30_gemma_data/split/test_graphs/data_gen_005.json
+eval_data: data/gen/nav100_n30_gemma_data/split/test_graphs/data_gen_023.json
 base_model: meta-llama/Llama-3.1-8B-Instruct
 bit4: true
 per_device_train_batch_size: 1
