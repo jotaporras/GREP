@@ -75,16 +75,18 @@ fi
 PYTHON="${PYTHON:-python}"
 export PYTHONPATH="${PYTHONPATH:-}:$REPO_ROOT/src"
 
-# --- pin the GPU exactly like scripts/e5_train_and_eval.sh ---
+# --- pin the GPU (mirrors scripts/e5_train_and_eval.sh's CUDA_VISIBLE_DEVICES) ---
 # train_v2 hardcodes device_map={"": 0} and never reads CUDA_VISIBLE_DEVICES, so
 # --device alone leaves training on physical GPU 0. Mask the chosen GPU here so it
 # becomes the only visible device (which then maps to index 0). -1 = auto: leave
 # unmasked and let device_map="auto" decide.
-case "$DEVICE" in
-  -1)           : ;;
-  ''|*[!0-9-]*) echo "ERROR: --device must be an integer, got: $DEVICE" >&2; exit 1 ;;
-  *)            export CUDA_VISIBLE_DEVICES="$DEVICE" ;;
-esac
+if [ "$DEVICE" = "-1" ]; then
+  :  # auto
+elif [ "$DEVICE" -ge 0 ] 2>/dev/null; then
+  export CUDA_VISIBLE_DEVICES="$DEVICE"
+else
+  echo "ERROR: --device must be an integer >= -1, got: $DEVICE" >&2; exit 1
+fi
 
 # --- read checkpoint_dir from the yaml ---
 CHECKPOINT_DIR="$("$PYTHON" -c "import yaml;print(yaml.safe_load(open('$CONFIG'))['checkpoint_dir'])")"
