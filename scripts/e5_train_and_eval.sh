@@ -23,7 +23,7 @@
 #   PRISM_DISABLE_SPINE_TOOLS=1 GREP_GEMMA_REGRADE=1 CUDA_VISIBLE_DEVICES=$GPU \
 #     uv run -m prism.eval.scalability_evaluation \
 #       --checkpoint outputs/e5_graph_oriented_data/$MODEL/ \
-#       --graphs data_store/no_edges/gen/nav100_n30_gemma_data/split/test_graphs/ \
+#       --graphs data/gen/nav100_n30_gemma_data/split/test_graphs/data_gen_023.json \
 #       --output results/${MODEL}_no_spine --four-bit --device $GPU
 #
 # Usage:
@@ -32,7 +32,7 @@
 #   scripts/e5_train_and_eval.sh experiments/e5_graph_oriented_data/e5_rpearl_llm_gt_no_edges.yaml 0
 #
 # Env overrides:
-#   GRAPHS=<path>   eval graph dir (default: data_store/no_edges/gen/nav100_n30_gemma_data/split/test_graphs/)
+#   GRAPHS=<path>   eval graphs (default: data/gen/nav100_n30_gemma_data/split/test_graphs/data_gen_023.json)
 #   PY=<python>     python used to parse the yaml config (default: "uv run python")
 #   DRY_RUN=1       print the train/eval commands instead of running them. Needs
 #                   SMOKE_LOG=<file> to supply a captured wandb log to scrape the
@@ -43,7 +43,7 @@ set -euo pipefail
 # --- repo root, so the relative config/data/output paths resolve ---
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-GRAPHS_DEFAULT="data_store/no_edges/gen/nav100_n30_gemma_data/split/test_graphs/"
+GRAPHS_DEFAULT="data/gen/nav100_n30_gemma_data/split/test_graphs/data_gen_023.json"
 PY="${PY:-uv run python}"
 
 usage() { sed -n '/^# Usage:/,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2; }
