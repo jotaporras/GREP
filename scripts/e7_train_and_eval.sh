@@ -15,7 +15,7 @@
 # Options (also settable as env vars):
 #   --config PATH        e7 yaml             (CONFIG,        default: experiments/e7_architecture_improvements/e7_composite_graph_gt_centered.yaml)
 #   --device N           GPU index, -1=auto  (DEVICE,        default: 0)
-#   --test-graphs PATH   testing-loop graphs (TEST_GRAPHS,   default: data/gen/nav100_n30_gemma_data/split/test_graphs/data_gen_023.json)
+#   --test-graphs PATH   testing-loop graphs (TEST_GRAPHS,   default: data/gen/nav100_n30_gemma_data/split/test_graphs/ — all samples)
 #   --custom-graphs PATH transferability eval graphs (CUSTOM_GRAPHS, optional — skipped if unset)
 #   --checkpoint PATH    eval an existing ckpt and skip training (CHECKPOINT)
 #   --no-train           skip the training stage             (SKIP_TRAIN=true)
@@ -44,8 +44,8 @@ USE_ICL="${USE_ICL:-true}"
 CONDA_ENV="${CONDA_ENV:-GREP-PRISM}"
 SKIP_TRAIN="${SKIP_TRAIN:-false}"
 CHECKPOINT="${CHECKPOINT:-}"
-# testing loop: the nav100_n30_gemma_data test split (overridable via --test-graphs)
-TEST_GRAPHS="${TEST_GRAPHS:-data/gen/nav100_n30_gemma_data/split/test_graphs/data_gen_023.json}"
+# testing loop: all nav100_n30_gemma_data test-split samples (overridable via --test-graphs)
+TEST_GRAPHS="${TEST_GRAPHS:-data/gen/nav100_n30_gemma_data/split/test_graphs/}"
 CUSTOM_GRAPHS="${CUSTOM_GRAPHS:-}"
 
 # --- arg parsing (first non-flag positional => CUSTOM_GRAPHS) ---
