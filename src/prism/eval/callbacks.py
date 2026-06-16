@@ -204,14 +204,15 @@ class GradientDebugCallback(TrainerCallback):
 
         orig_fuse = inner._fuse_embeddings
 
-        def _wrapped_fuse(input_ids, graphs, injection_maps, permutation=None):
+        def _wrapped_fuse(input_ids, graphs, injection_maps, permutation=None, **kwargs):
             with torch.no_grad():
                 emb_table = inner.llm.get_input_embeddings()
                 callback._emb_norm = emb_table(input_ids.to(emb_table.weight.device)).norm().item()
             callback._num_injections = sum(
                 len(spans) for imap in injection_maps for spans in imap.values()
             )
-            return orig_fuse(input_ids, graphs, injection_maps, permutation=permutation)
+            # Forward extra kwargs (e.g. return_c_tok for the c_per_layer path) untouched.
+            return orig_fuse(input_ids, graphs, injection_maps, permutation=permutation, **kwargs)
 
         inner._fuse_embeddings = _wrapped_fuse
 
