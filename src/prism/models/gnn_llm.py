@@ -667,13 +667,16 @@ class InjectedCompositeGraphLLM(CompositeGraphLLM):
             C = model._pe_C
             if (C is not None and C.shape[0] == hidden_states.shape[0]
                     and C.shape[1] == hidden_states.shape[1]):
-                Cf = C.float()
+                # C_tok is built once on the embedding device; under device_map="auto"
+                # each decoder layer can live on a different GPU, so move C onto this
+                # layer's device (q/k) before the einsum.
+                Cf = C.to(device=query_states.device, dtype=torch.float32)
 
                 def _mix(t):  # t: [B, H, seq, head_dim]
                     # fp32 einsum: C_tok carries fine relative structure (the c(n-m)
                     # decay) that bf16 would crush before the renorm; the GT runs fp32
                     # anyway. Cast back to t's dtype at the end.
-                    out = torch.einsum("bnm,bhmd->bhnd", Cf, t.float())
+                    out = torch.einsum("bnm,bhmd->bhnd", Cf.to(t.device), t.float())
                     # RoPE-like scale stability: RoPE preserves ‖q‖ exactly; C_tok is a
                     # PSD covariance scaled to ‖X‖ at the layer-0 manifold, but Llama's
                     # residual-stream norm grows with depth, so rescale C_tok·t back to
