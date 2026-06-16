@@ -126,10 +126,8 @@ fi
 echo; echo "Resolved checkpoint: $CHECKPOINT"
 
 # --- 2. eval on the training-data test set ---
-# GREP_GEMMA_REGRADE=1 attaches the per-sample Gemma-recovered-path second reading
-# (matches scripts/e5_train_and_eval.sh so both experiments grade identically).
 echo; echo ">>> [2/3] Scalability eval on TEST SET from training data: $TEST_GRAPHS"
-GREP_GEMMA_REGRADE=1 "$PYTHON" -m prism.eval.scalability_evaluation \
+"$PYTHON" -m prism.eval.scalability_evaluation \
   --checkpoint "$CHECKPOINT" \
   --graphs "$TEST_GRAPHS" \
   --device "$DEVICE" \
@@ -144,7 +142,7 @@ if [ -n "$CUSTOM_GRAPHS" ]; then
   CUSTOM_OUT="$CHECKPOINT/eval_logs/custom_$(basename "${CUSTOM_GRAPHS%/}")"
   echo; echo ">>> [3/3] Transferability eval on custom graphs: $CUSTOM_GRAPHS"
   echo "    output -> $CUSTOM_OUT"
-  GREP_GEMMA_REGRADE=1 "$PYTHON" -m prism.eval.scalability_evaluation \
+  "$PYTHON" -m prism.eval.scalability_evaluation \
     --checkpoint "$CHECKPOINT" \
     --graphs "$CUSTOM_GRAPHS" \
     --device "$DEVICE" \

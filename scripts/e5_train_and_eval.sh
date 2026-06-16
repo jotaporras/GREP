@@ -20,7 +20,7 @@
 #
 # Commands run (CONFIG_PATH and GPU come from the args):
 #   CUDA_VISIBLE_DEVICES=$GPU uv run -m prism.training.train_v2 $CONFIG_PATH
-#   PRISM_DISABLE_SPINE_TOOLS=1 GREP_GEMMA_REGRADE=1 CUDA_VISIBLE_DEVICES=$GPU \
+#   PRISM_DISABLE_SPINE_TOOLS=1 CUDA_VISIBLE_DEVICES=$GPU \
 #     uv run -m prism.eval.scalability_evaluation \
 #       --checkpoint outputs/e5_graph_oriented_data/$MODEL/ \
 #       --graphs data/gen/nav100_n30_gemma_data/split/test_graphs/data_gen_023.json \
@@ -172,7 +172,7 @@ main() {
   if [ "${DRY_RUN:-0}" = "1" ]; then
     echo ">>> [dry-run] ${EVAL_CMD[*]}"
   else
-    echo; echo ">>> [2/2] Scalability eval (no SPINE, gemma regrade)"
+    echo; echo ">>> [2/2] Scalability eval (no SPINE)"
     "${EVAL_CMD[@]}"
   fi
 
