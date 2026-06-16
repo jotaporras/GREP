@@ -41,6 +41,7 @@ diffusers
 dill
 distro
 docstring_parser
+dotenv
 exceptiongroup
 executing
 fastjsonschema
@@ -152,6 +153,7 @@ soupsieve
 stack-data
 sympy
 terminado
+tiktoken
 tinycss2
 tokenizers
 tomli
