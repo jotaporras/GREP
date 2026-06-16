@@ -106,7 +106,7 @@ echo "=== Stage 1: Generate one skeleton (${NC} communities x ${NPC} nodes/commu
 # Reuse-existing guard: if the skeleton already exists AND a graph has already
 # been populated, keep what is on disk so populate resumes against it.
 SKEL_FILE="${SKEL_DIR}/eval_graph_unique_30_seed${SEED}.json"
-populated_count=$(find "${RUN_DIR}/populated_graphs" -maxdepth 1 -name 'data_gen_*.json' 2>/dev/null | wc -l | tr -d ' ')
+populated_count=$(find "${RUN_DIR}/populated_graphs" -maxdepth 1 -name 'data_gen_*.json' 2>/dev/null | wc -l | tr -d ' ' || true)
 if [ -f "$SKEL_FILE" ] && [ "$populated_count" -gt 0 ]; then
   echo "Reusing existing data: skeleton ${SKEL_FILE} present and "
   echo "${populated_count} populated graph(s) in ${RUN_DIR}/populated_graphs — skipping skeleton generation."

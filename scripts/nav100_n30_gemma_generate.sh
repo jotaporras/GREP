@@ -145,7 +145,7 @@ for SEED in "${seeds[@]}"; do
     break
   fi
 done
-populated_count=$(find "${RUN_DIR}/populated_graphs" -maxdepth 1 -name 'data_gen_*.json' 2>/dev/null | wc -l | tr -d ' ')
+populated_count=$(find "${RUN_DIR}/populated_graphs" -maxdepth 1 -name 'data_gen_*.json' 2>/dev/null | wc -l | tr -d ' ' || true)
 
 if [ "$all_skeletons_exist" = true ] && [ "$populated_count" -gt 0 ]; then
   echo "Reusing existing data: all ${#seeds[@]} skeletons present in ${SKEL_DIR} and "
@@ -153,7 +153,7 @@ if [ "$all_skeletons_exist" = true ] && [ "$populated_count" -gt 0 ]; then
   echo "Skipping skeleton generation (use --fresh by clearing those dirs to regenerate)."
 else
   for SEED in "${seeds[@]}"; do
-    echo "--- N~30 (${NC} communities x ${NPC} nodes/community) seed=${SEED} ---"
+    echo "--- N~10 (${NC} communities x ${NPC} nodes/community) seed=${SEED} ---"
     python scripts/generate_eval_graphs.py \
       --n-communities "$NC" \
       --nodes-per-community "$NPC" \
