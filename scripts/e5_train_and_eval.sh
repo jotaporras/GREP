@@ -18,16 +18,18 @@
 #        wandb: Find logs at: .../wandb/run-20260610_143238-902tgbc7/logs
 # The exact checkpoint dir is then "<prefix>_<run_id>".
 #
-# Commands run (CONFIG_PATH and GPU come from the args):
-#   CUDA_VISIBLE_DEVICES=$GPU uv run -m prism.training.train_v2 $CONFIG_PATH
-#   PRISM_DISABLE_SPINE_TOOLS=1 CUDA_VISIBLE_DEVICES=$GPU \
+# Commands run (CONFIG_PATH and GPU come from the args; GPU is a physical index
+# 0,1,... or -1 to use ALL GPUs via device_map="auto"). A single index masks
+# CUDA_VISIBLE_DEVICES=$GPU; -1 leaves every GPU visible (no mask):
+#   [CUDA_VISIBLE_DEVICES=$GPU] uv run -m prism.training.train_v2 $CONFIG_PATH --device $GPU
+#   PRISM_DISABLE_SPINE_TOOLS=1 [CUDA_VISIBLE_DEVICES=$GPU] \
 #     uv run -m prism.eval.scalability_evaluation \
 #       --checkpoint outputs/e5_graph_oriented_data/$MODEL/ \
 #       --graphs data/gen/nav100_n30_gemma_data/split/test_graphs/ \
 #       --output results/${MODEL}_no_spine --four-bit --device $GPU
 #
 # Usage:
-#   scripts/e5_train_and_eval.sh <config_path> <gpu>
+#   scripts/e5_train_and_eval.sh <config_path> <gpu>     # gpu: index 0,1,... or -1 for all GPUs
 # Example:
 #   scripts/e5_train_and_eval.sh experiments/e5_graph_oriented_data/e5_rpearl_llm_gt_no_edges.yaml 0
 #
@@ -123,8 +125,14 @@ main() {
 
   [ -f "$CONFIG" ] || { echo "ERROR: config not found: $CONFIG" >&2; exit 1; }
   case "$GPU" in
-    ''|*[!0-9-]*) echo "ERROR: gpu must be an integer, got: $GPU" >&2; exit 1 ;;
+    ''|*[!0-9-]*) echo "ERROR: gpu must be a GPU index (0,1,...) or -1 for all GPUs, got: $GPU" >&2; exit 1 ;;
   esac
+
+  # GPU selection: a single index (0,1,...) masks to that one physical GPU; -1 uses
+  # ALL visible GPUs (no masking — train_v2 and the eval loaders fall back to
+  # device_map="auto" when --device is -1). --device $GPU is passed through either way.
+  local -a CUDA_ENV=()
+  [ "$GPU" != "-1" ] && CUDA_ENV=("CUDA_VISIBLE_DEVICES=$GPU")
 
   local PREFIX CKPT_DIR
   PREFIX="$(_derive_prefix "$CONFIG")"
@@ -142,13 +150,13 @@ main() {
   # --- 1. train (tee the log so we can scrape the wandb run id) ---
   local LOG
   if [ "${DRY_RUN:-0}" = "1" ]; then
-    echo ">>> [dry-run] CUDA_VISIBLE_DEVICES=$GPU uv run -m prism.training.train_v2 $CONFIG"
+    echo ">>> [dry-run] env ${CUDA_ENV[*]+${CUDA_ENV[*]}} uv run -m prism.training.train_v2 $CONFIG --device $GPU"
     : "${SMOKE_LOG:?DRY_RUN needs SMOKE_LOG=<captured wandb log> to scrape a run id}"
     LOG="$SMOKE_LOG"
   else
     LOG="$(mktemp "${TMPDIR:-/tmp}/e5_train_log.XXXXXX")"
     echo ">>> [1/2] Training (train_v2) -> tee $LOG"
-    CUDA_VISIBLE_DEVICES="$GPU" uv run -m prism.training.train_v2 "$CONFIG" 2>&1 | tee "$LOG"
+    env ${CUDA_ENV[@]+"${CUDA_ENV[@]}"} uv run -m prism.training.train_v2 "$CONFIG" --device "$GPU" 2>&1 | tee "$LOG"
   fi
 
   # --- resolve the checkpoint that this run produced ---
@@ -161,7 +169,7 @@ main() {
 
   # --- 2. no-SPINE scalability eval on the test graphs ---
   local -a EVAL_CMD=(
-    env PRISM_DISABLE_SPINE_TOOLS=1 CUDA_VISIBLE_DEVICES="$GPU"
+    env PRISM_DISABLE_SPINE_TOOLS=1 ${CUDA_ENV[@]+"${CUDA_ENV[@]}"}
     uv run -m prism.eval.scalability_evaluation
     --checkpoint "$CKPT_DIR/$MODEL/"
     --graphs "$GRAPHS"
