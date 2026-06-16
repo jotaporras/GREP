@@ -1,161 +1,190 @@
 #!/usr/bin/env bash
 #
-# e7 augmented-graph: train, then run the scalability eval on the test set.
+# e7 architecture improvements: train, then run the no-SPINE scalability eval on
+# the checkpoint that *this* training run just produced.
 #
-#   1. Train with train_v2.py on the e7 config.
-#   2. scalability_evaluation.py on the TEST SET from the nav100_n30_gemma_data
-#      split (overridable via --test-graphs).
-#   3. (OPTIONAL) scalability_evaluation.py once more on a transferability graph
-#      path of YOUR choosing. Only runs when a custom path is given; transfer
-#      eval is NOT enforced.
+# The wandb run id that train_v2 appends to the checkpoint directory name is not
+# known until training starts, and several runs of the same config share the same
+# name prefix (e.g. both
+#   e7_composite_graph_gt_centered_composite_graph_gt_llama-3.2-3b_r16_4bit_zj4i517s
+#   e7_composite_graph_gt_centered_composite_graph_gt_llama-3.2-3b_r16_4bit_v5nriwvg
+# live under outputs/e7_architecture_improvements/). So "newest mtime" is ambiguous.
+# Instead we:
+#   1. derive the checkpoint name *prefix* from the config (same formula as
+#      train_v2: "{name}_{architecture}_{model_slug}_r{r}[_4bit]"), and
+#   2. scrape the wandb run id out of the training log via regex, matching the
+#      line wandb prints, e.g.:
+#        wandb: 🚀 View run <run_name> at: https://wandb.ai/alelab/GREP-PRISM/runs/902tgbc7
+#        wandb: Find logs at: .../wandb/run-20260610_143238-902tgbc7/logs
+# The exact checkpoint dir is then "<prefix>_<run_id>".
+#
+# Commands run (CONFIG_PATH and GPU come from the args):
+#   CUDA_VISIBLE_DEVICES=$GPU uv run -m prism.training.train_v2 $CONFIG_PATH
+#   PRISM_DISABLE_SPINE_TOOLS=1 CUDA_VISIBLE_DEVICES=$GPU \
+#     uv run -m prism.eval.scalability_evaluation \
+#       --checkpoint outputs/e7_architecture_improvements/$MODEL/ \
+#       --graphs data/gen/nav100_n30_gemma_data/split/test_graphs/ \
+#       --output results/${MODEL}_no_spine --four-bit --device $GPU
 #
 # Usage:
-#   scripts/e7_train_and_eval.sh [custom_eval_graphs] [options]
+#   scripts/e7_train_and_eval.sh <config_path> <gpu>
+# Example:
+#   scripts/e7_train_and_eval.sh experiments/e7_architecture_improvements/e7_composite_graph_gt_centered.yaml 0
 #
-# Options (also settable as env vars):
-#   --config PATH        e7 yaml             (CONFIG,        default: experiments/e7_architecture_improvements/e7_composite_graph_gt_centered.yaml)
-#   --device N           GPU index, -1=auto  (DEVICE,        default: 0)
-#   --test-graphs PATH   testing-loop graphs (TEST_GRAPHS,   default: data/gen/nav100_n30_gemma_data/split/test_graphs/ — all samples)
-#   --custom-graphs PATH transferability eval graphs (CUSTOM_GRAPHS, optional — skipped if unset)
-#   --checkpoint PATH    eval an existing ckpt and skip training (CHECKPOINT)
-#   --no-train           skip the training stage             (SKIP_TRAIN=true)
-#   --no-four-bit        load the model in full precision     (FOUR_BIT=false)
-#   --use-icl true|false SPINE ICL examples   (USE_ICL,       default: true)
-#   --conda-env NAME     conda env to activate (CONDA_ENV,    default: GREP-PRISM)
-#
-# Examples:
-#   scripts/e7_train_and_eval.sh                       # train + test-set eval only
-#   scripts/e7_train_and_eval.sh --device 1
-#   scripts/e7_train_and_eval.sh data/eval/e6_transferability/   # + optional transfer eval
-#   CHECKPOINT=outputs/e7_architecture_improvements/e7_..._abcd1234 \
-#       scripts/e7_train_and_eval.sh --no-train
+# Env overrides:
+#   GRAPHS=<path>   eval graphs (default: data/gen/nav100_n30_gemma_data/split/test_graphs/ — all samples)
+#   PY=<python>     python used to parse the yaml config (default: "uv run python")
+#   DRY_RUN=1       print the train/eval commands instead of running them. Needs
+#                   SMOKE_LOG=<file> to supply a captured wandb log to scrape the
+#                   run id from. Used by the smoke test.
 
 set -euo pipefail
 
-# --- repo root (so relative config/data paths resolve) ---
+# --- repo root, so the relative config/data/output paths resolve ---
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$REPO_ROOT"
 
-# --- defaults (env overridable) ---
-CONFIG="${CONFIG:-experiments/e7_architecture_improvements/e7_composite_graph_gt_centered.yaml}"
-DEVICE="${DEVICE:-0}"
-FOUR_BIT="${FOUR_BIT:-true}"
-USE_ICL="${USE_ICL:-true}"
-CONDA_ENV="${CONDA_ENV:-GREP-PRISM}"
-SKIP_TRAIN="${SKIP_TRAIN:-false}"
-CHECKPOINT="${CHECKPOINT:-}"
-# testing loop: all nav100_n30_gemma_data test-split samples (overridable via --test-graphs)
-TEST_GRAPHS="${TEST_GRAPHS:-data/gen/nav100_n30_gemma_data/split/test_graphs/}"
-CUSTOM_GRAPHS="${CUSTOM_GRAPHS:-}"
+GRAPHS_DEFAULT="data/gen/nav100_n30_gemma_data/split/test_graphs/"
+PY="${PY:-uv run python}"
 
-# --- arg parsing (first non-flag positional => CUSTOM_GRAPHS) ---
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --config)        CONFIG="$2"; shift 2 ;;
-    --device)        DEVICE="$2"; shift 2 ;;
-    --test-graphs)   TEST_GRAPHS="$2"; shift 2 ;;
-    --custom-graphs) CUSTOM_GRAPHS="$2"; shift 2 ;;
-    --checkpoint)    CHECKPOINT="$2"; shift 2 ;;
-    --no-train)      SKIP_TRAIN="true"; shift ;;
-    --no-four-bit)   FOUR_BIT="false"; shift ;;
-    --use-icl)       USE_ICL="$2"; shift 2 ;;
-    --conda-env)     CONDA_ENV="$2"; shift 2 ;;
-    -h|--help)       sed -n '2,40p' "$0"; exit 0 ;;
-    --*)             echo "Unknown option: $1" >&2; exit 1 ;;
-    *)               CUSTOM_GRAPHS="$1"; shift ;;
+usage() { sed -n '/^# Usage:/,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2; }
+
+# --- derive the checkpoint-name prefix from the config (mirrors train_v2.py) ---
+# Prints: "{name}_{architecture}_{model_slug}_r{r}[_4bit]"  (no wandb id)
+_derive_prefix() {
+  local config="$1"
+  $PY - "$config" <<'PYEOF'
+import re, sys, yaml
+cfg = yaml.safe_load(open(sys.argv[1])) or {}
+def slug(bm):                       # mirrors train_v2._model_short_name
+    n = bm.split("/")[-1]
+    n = re.sub(r"-[Ii]nstruct$", "", n)
+    n = n.lower()
+    n = re.sub(r"-+", "-", n)
+    return n
+name = cfg["name"]
+arch = cfg.get("architecture", "rpearl_llm")
+bm   = cfg.get("base_model", "meta-llama/Llama-3.2-3B-Instruct")
+r    = cfg.get("r", 16)
+bit4 = cfg.get("bit4", False)
+sn   = cfg.get("save_name")         # train_v2: "{save_name}_{run_id}" overrides the formula
+prefix = sn if sn else f"{name}_{arch}_{slug(bm)}_r{r}" + ("_4bit" if bit4 else "")
+print(prefix)
+PYEOF
+}
+
+# --- read checkpoint_dir from the config ---
+_derive_checkpoint_dir() {
+  local config="$1"
+  $PY - "$config" <<'PYEOF'
+import sys, yaml
+cfg = yaml.safe_load(open(sys.argv[1])) or {}
+print(cfg.get("checkpoint_dir", "outputs/e7_architecture_improvements"))
+PYEOF
+}
+
+# --- scrape the wandb run id out of a training log ---
+# Matches "https://wandb.ai/<entity>/<project>/runs/<id>" first, then the local
+# "run-<ts>-<id>" dir name; takes the last occurrence (the run just finished).
+_extract_run_id() {
+  local log="$1" rid=""
+  rid="$(grep -oE 'wandb\.ai/[^[:space:]]+/runs/[A-Za-z0-9]+' "$log" 2>/dev/null | tail -n1 | sed -E 's#.*/runs/##')"
+  if [ -z "$rid" ]; then
+    rid="$(grep -oE 'run-[0-9]{8}_[0-9]{6}-[A-Za-z0-9]+' "$log" 2>/dev/null | tail -n1 | sed -E 's#.*-##')"
+  fi
+  # last resort: the wandb/latest-run symlink (run-<ts>-<id>)
+  if [ -z "$rid" ] && [ -L "$REPO_ROOT/wandb/latest-run" ]; then
+    rid="$(basename "$(readlink "$REPO_ROOT/wandb/latest-run")" | sed -E 's#.*-##')"
+  fi
+  printf '%s' "$rid"
+}
+
+# --- combine prefix + run id, verify the dir exists, echo the model name ---
+_resolve_model() {
+  local ckpt_dir="$1" prefix="$2" rid="$3"
+  local model="${prefix}_${rid}"
+  if [ ! -d "$REPO_ROOT/$ckpt_dir/$model" ]; then
+    echo "ERROR: resolved checkpoint dir does not exist: $ckpt_dir/$model" >&2
+    echo "       (prefix='$prefix' run_id='$rid')" >&2
+    echo "       candidates under $ckpt_dir matching the prefix:" >&2
+    ls -d "$REPO_ROOT/$ckpt_dir/${prefix}_"*/ 2>/dev/null | sed "s#$REPO_ROOT/#         #" >&2 || true
+    return 1
+  fi
+  printf '%s' "$model"
+}
+
+main() {
+  if [ "$#" -ne 2 ] || [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+    usage; exit 1
+  fi
+  local CONFIG="$1" GPU="$2"
+  local GRAPHS="${GRAPHS:-$GRAPHS_DEFAULT}"
+
+  cd "$REPO_ROOT"
+
+  [ -f "$CONFIG" ] || { echo "ERROR: config not found: $CONFIG" >&2; exit 1; }
+  case "$GPU" in
+    ''|*[!0-9-]*) echo "ERROR: gpu must be an integer, got: $GPU" >&2; exit 1 ;;
   esac
-done
 
-# --- activate the project conda env if available (AGENTS.md: always activate) ---
-if command -v conda >/dev/null 2>&1; then
-  # shellcheck disable=SC1091
-  source "$(conda info --base)/etc/profile.d/conda.sh"
-  conda activate "$CONDA_ENV" || echo "WARN: could not activate conda env '$CONDA_ENV'; using current python." >&2
+  local PREFIX CKPT_DIR
+  PREFIX="$(_derive_prefix "$CONFIG")"
+  CKPT_DIR="$(_derive_checkpoint_dir "$CONFIG")"
+
+  echo "=================================================================="
+  echo " e7 train + no-SPINE scalability eval"
+  echo "   config         : $CONFIG"
+  echo "   gpu            : $GPU"
+  echo "   checkpoint_dir : $CKPT_DIR"
+  echo "   ckpt prefix    : ${PREFIX}_<wandb_run_id>"
+  echo "   eval graphs    : $GRAPHS"
+  echo "=================================================================="
+
+  # --- 1. train (tee the log so we can scrape the wandb run id) ---
+  local LOG
+  if [ "${DRY_RUN:-0}" = "1" ]; then
+    echo ">>> [dry-run] CUDA_VISIBLE_DEVICES=$GPU uv run -m prism.training.train_v2 $CONFIG"
+    : "${SMOKE_LOG:?DRY_RUN needs SMOKE_LOG=<captured wandb log> to scrape a run id}"
+    LOG="$SMOKE_LOG"
+  else
+    LOG="$(mktemp "${TMPDIR:-/tmp}/e7_train_log.XXXXXX")"
+    echo ">>> [1/2] Training (train_v2) -> tee $LOG"
+    CUDA_VISIBLE_DEVICES="$GPU" uv run -m prism.training.train_v2 "$CONFIG" 2>&1 | tee "$LOG"
+  fi
+
+  # --- resolve the checkpoint that this run produced ---
+  local RUN_ID MODEL
+  RUN_ID="$(_extract_run_id "$LOG")"
+  [ -n "$RUN_ID" ] || { echo "ERROR: could not scrape a wandb run id from the training log ($LOG)." >&2; exit 1; }
+  echo ">>> wandb run id: $RUN_ID"
+  MODEL="$(_resolve_model "$CKPT_DIR" "$PREFIX" "$RUN_ID")"
+  echo ">>> resolved checkpoint: $CKPT_DIR/$MODEL"
+
+  # --- 2. no-SPINE scalability eval on the test graphs ---
+  local -a EVAL_CMD=(
+    env PRISM_DISABLE_SPINE_TOOLS=1 CUDA_VISIBLE_DEVICES="$GPU"
+    uv run -m prism.eval.scalability_evaluation
+    --checkpoint "$CKPT_DIR/$MODEL/"
+    --graphs "$GRAPHS"
+    --output "results/${MODEL}_no_spine"
+    --four-bit
+    --device "$GPU"
+  )
+  if [ "${DRY_RUN:-0}" = "1" ]; then
+    echo ">>> [dry-run] ${EVAL_CMD[*]}"
+  else
+    echo; echo ">>> [2/2] Scalability eval (no SPINE)"
+    "${EVAL_CMD[@]}"
+  fi
+
+  echo; echo "=================================================================="
+  echo " DONE."
+  echo "   checkpoint : $CKPT_DIR/$MODEL"
+  echo "   results    : results/${MODEL}_no_spine"
+  echo "=================================================================="
+}
+
+# Only run main when executed directly; allows the smoke test to source and unit
+# test the helper functions.
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  main "$@"
 fi
-PYTHON="${PYTHON:-python}"
-export PYTHONPATH="${PYTHONPATH:-}:$REPO_ROOT/src"
-
-# --- pin the GPU (mirrors scripts/e5_train_and_eval.sh's CUDA_VISIBLE_DEVICES) ---
-# train_v2 hardcodes device_map={"": 0} and never reads CUDA_VISIBLE_DEVICES, so
-# --device alone leaves training on physical GPU 0. Mask the chosen GPU here so it
-# becomes the only visible device (which then maps to index 0). -1 = auto: leave
-# unmasked and let device_map="auto" decide.
-if [ "$DEVICE" = "-1" ]; then
-  :  # auto
-elif [ "$DEVICE" -ge 0 ] 2>/dev/null; then
-  export CUDA_VISIBLE_DEVICES="$DEVICE"
-else
-  echo "ERROR: --device must be an integer >= -1, got: $DEVICE" >&2; exit 1
-fi
-
-# --- read checkpoint_dir from the yaml ---
-CHECKPOINT_DIR="$("$PYTHON" -c "import yaml;print(yaml.safe_load(open('$CONFIG'))['checkpoint_dir'])")"
-
-FOUR_BIT_ARG=""
-[ "$FOUR_BIT" = "true" ] && FOUR_BIT_ARG="--four-bit"
-
-echo "=================================================================="
-echo " e7 train + scalability eval"
-echo "   config        : $CONFIG"
-echo "   checkpoint_dir : $CHECKPOINT_DIR"
-echo "   device         : $DEVICE   (four_bit=$FOUR_BIT, use_icl=$USE_ICL)"
-echo "   test graphs    : $TEST_GRAPHS"
-echo "   custom graphs  : ${CUSTOM_GRAPHS:-<none — transfer eval skipped>}"
-echo "   skip_train     : $SKIP_TRAIN"
-echo "=================================================================="
-
-# --- 1. train ---
-if [ "$SKIP_TRAIN" != "true" ]; then
-  echo; echo ">>> [1/3] Training (train_v2.py)"
-  "$PYTHON" -m prism.training.train_v2 "$CONFIG" --device "$DEVICE"
-else
-  echo; echo ">>> [1/3] Skipping training (--no-train)"
-fi
-
-# --- resolve the checkpoint dir to evaluate ---
-if [ -z "$CHECKPOINT" ]; then
-  # newest run dir under checkpoint_dir (train_v2 appends a wandb run id we can't know ahead)
-  CHECKPOINT="$(ls -dt "$CHECKPOINT_DIR"/*/ 2>/dev/null | head -1 || true)"
-  CHECKPOINT="${CHECKPOINT%/}"
-fi
-if [ -z "$CHECKPOINT" ] || [ ! -d "$CHECKPOINT" ]; then
-  echo "ERROR: could not resolve a checkpoint dir under '$CHECKPOINT_DIR'." >&2
-  echo "       Pass one explicitly with --checkpoint." >&2
-  exit 1
-fi
-echo; echo "Resolved checkpoint: $CHECKPOINT"
-
-# --- 2. eval on the training-data test set ---
-echo; echo ">>> [2/3] Scalability eval on TEST SET from training data: $TEST_GRAPHS"
-"$PYTHON" -m prism.eval.scalability_evaluation \
-  --checkpoint "$CHECKPOINT" \
-  --graphs "$TEST_GRAPHS" \
-  --device "$DEVICE" \
-  --use-icl "$USE_ICL" \
-  $FOUR_BIT_ARG
-# (text-edge-list auto-resolves from the checkpoint's gnn_config.json -> "none")
-
-# --- 3. (OPTIONAL) transferability eval on a user-chosen path ---
-# Only runs when a custom graph path was supplied; transfer eval is not enforced.
-CUSTOM_OUT=""
-if [ -n "$CUSTOM_GRAPHS" ]; then
-  CUSTOM_OUT="$CHECKPOINT/eval_logs/custom_$(basename "${CUSTOM_GRAPHS%/}")"
-  echo; echo ">>> [3/3] Transferability eval on custom graphs: $CUSTOM_GRAPHS"
-  echo "    output -> $CUSTOM_OUT"
-  "$PYTHON" -m prism.eval.scalability_evaluation \
-    --checkpoint "$CHECKPOINT" \
-    --graphs "$CUSTOM_GRAPHS" \
-    --device "$DEVICE" \
-    --use-icl "$USE_ICL" \
-    --output "$CUSTOM_OUT" \
-    $FOUR_BIT_ARG
-else
-  echo; echo ">>> [3/3] No custom graphs given — skipping transferability eval."
-fi
-
-echo; echo "=================================================================="
-echo " DONE."
-echo "   checkpoint     : $CHECKPOINT"
-echo "   test-set eval  : $CHECKPOINT/eval_logs/cross_eval/"
-[ -n "$CUSTOM_OUT" ] && echo "   custom eval    : $CUSTOM_OUT/"
-echo "=================================================================="
