@@ -1,7 +1,7 @@
 name: e7
 architecture: composite_graph_gt
 wandb_project: GREP-PRISM
-wandb_run_name: e7_composite_graph_gt_centered_no_edges_revised
+wandb_run_name: e7_composite_graph_gt_c_per_layer_no_edges_revised
 wandb_tag: e7_architecture_experiments
 checkpoint_dir: outputs/e7_architecture_improvements
 data: data/gen/nav100_n30_gemma_data/split/formatted_all_new__train.json
@@ -56,6 +56,8 @@ lora_warmup_steps: 20
 # LLM
 disable_rope: true
 n_icl_examples: 2
+c_per_layer: true
+pe_qk_injection: false
 # Debug / viz
 log_fiedler: true
 log_scene_mass: true

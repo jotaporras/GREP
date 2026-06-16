@@ -372,6 +372,13 @@ class TrainConfig:
     # Also inject into the attention *value* (v += W_v·Y_tok), not just q/k. False =
     # q/k only (no value/readout path).
     pe_inject_v: bool = True
+    # c_per_layer: REPLACE the post-RoPE q/k at every layer with the composite token
+    # covariance C_tok (q ← C_tok·q, k ← C_tok·k) instead of the additive W_q/W_k/W_v
+    # code — the page-9 proof's relative operator c(n-m) made literal in the q·k score,
+    # at every depth. C_tok is deterministic (no learnable params) and scaled to ‖X‖.
+    # Selects InjectedCompositeGraphLLM (with pe_qk_injection off, its additive q/k/v
+    # projections are not created). Pairs with disable_rope=True.
+    c_per_layer: bool = False
     # Structural-path optimization (R6): the GT + R-PEARL + gate train at
     # structural_lr_mult × the base LR (they otherwise get gradients orders of
     # magnitude below LoRA and never open the gate); lora_warmup_steps freezes the
@@ -610,10 +617,14 @@ def train_model(config: TrainConfig, config_file: str = None):
             crosslink_mention_to_node=config.crosslink_mention_to_node,
             crosslink_mention_clique=config.crosslink_mention_clique,
         )
-        if config.pe_qk_injection:
-            # In-attention q/k(/v) injection in place of RoPE (disable_rope governs the
-            # RoPE-off content path; inputs_embeds is the M7 gated GT blend).
+        if config.pe_qk_injection or config.c_per_layer:
+            # In-attention injection in place of RoPE (disable_rope governs the RoPE-off
+            # content path; inputs_embeds is the M7 gated GT blend). Either ADD the GT
+            # code into q/k/v (pe_qk_injection) or REPLACE q/k with the composite token
+            # covariance C_tok at every layer (c_per_layer) — the proof's relative
+            # c(n-m) in the score; C_tok is deterministic (no params).
             composite_kwargs["inject_v"] = config.pe_inject_v
+            composite_kwargs["c_per_layer"] = config.c_per_layer
             model = gnn_llm.InjectedCompositeGraphLLM(
                 llm, gt_model, d_model=config.d_model, **composite_kwargs)
         else:
@@ -763,7 +774,8 @@ def train_model(config: TrainConfig, config_file: str = None):
                 "crosslink_mention_to_node": config.crosslink_mention_to_node,
                 "crosslink_mention_clique": config.crosslink_mention_clique,
                 "pe_qk_injection": config.pe_qk_injection,
-                "pe_inject_v": config.pe_inject_v}
+                "pe_inject_v": config.pe_inject_v,
+                "c_per_layer": config.c_per_layer}
                if config.architecture == "composite_graph_gt" else {}),
         }
         trainer = GraphSFTTrainer(

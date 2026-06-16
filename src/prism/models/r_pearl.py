@@ -228,7 +228,8 @@ class RandomGNNPositionalEncodings(nn.Module):
         pooled_pe = self.norm(pooled_pe)
         return pooled_pe * torch.tanh(self.output_gain).to(pooled_pe.dtype)
 
-    def second_moment_apply(self, data, signal: torch.Tensor) -> torch.Tensor:
+    def second_moment_apply(self, data, signal: torch.Tensor,
+                            scale_to_signal: bool = True) -> torch.Tensor:
         """Apply the probe second moment ``C = E_q[Φ(q)Φ(q)ᵀ]`` to ``signal``.
 
         Returns ``C·signal ∈ [N, d_model]`` WITHOUT ever forming the ``[N, N]``
@@ -253,6 +254,13 @@ class RandomGNNPositionalEncodings(nn.Module):
         Args:
             data: PyG Data with the (already-permuted, if any) composite-graph edges.
             signal: [N, d_model] signal to apply ``C`` to (the GT's ``seeded``).
+            scale_to_signal: when True (default) magnitude-match the result to the
+                signal's mean row-norm and apply the learnable ``tanh(g)`` output
+                gate — the GT readout path. When False, return the **raw centered
+                covariance application** ``C·signal`` with no magnitude match and no
+                gate, so a caller can extract the ``C`` operator (e.g. the token
+                block ``C_tok`` for the per-layer q/k injection) and scale it
+                explicitly (e.g. to ``‖X‖``).
 
         Returns:
             ``C·signal`` in [N, d_model], LipschitzNorm-normalized like ``forward``.
@@ -318,6 +326,13 @@ class RandomGNNPositionalEncodings(nn.Module):
             # pooled Φ, matching the un-normed Φ in the second moment.
             psi = psi_acc / m                                # E_q[Φ]  [N, d]
             result = result - psi @ (psi.transpose(0, 1) @ s)
+        if not scale_to_signal:
+            # Raw centered covariance application C·signal — no magnitude match, no
+            # output gate. Used to materialize the C operator (e.g. C_tok) for the
+            # per-layer q/k replacement, which is scaled to ‖X‖ by the caller. The
+            # gate is deliberately skipped here: a tanh(g)→0 would zero the operator,
+            # which under a q←C·q replacement would collapse attention.
+            return result.to(signal.dtype)
         # Scale C·signal to the SIGNAL's magnitude rather than to unit norm. A unit
         # LipschitzNorm here would leave C·signal at ~4% of H0 = signal + C·signal
         # (token rows of `signal` are X at ~‖X‖), drowning out the relative-position
@@ -326,7 +341,13 @@ class RandomGNNPositionalEncodings(nn.Module):
         # terms comparable strength via a single global scalar (per-row structure
         # preserved, transferable). self.norm (LipschitzNorm) is kept as a utility:
         # loads in old checkpoints and is the toggle point for unit-norm output.
-        cur = result.float().norm(dim=-1).mean().clamp(min=1e-6)
+        # Floor is a true div-by-zero guard, NOT a magnitude floor: the centered
+        # covariance is naturally tiny (~1e-8 — the ΨΨᵀ DC term is subtracted, leaving
+        # only the small position-bearing residual), so a 1e-6 floor would clamp `cur`
+        # above the real norm and cap result*(target/cur) at a few % of ‖signal‖,
+        # throttling the relative-position operator in H0 = signal + C·signal. fp32
+        # carries the small value with full precision, so amplifying to ‖signal‖ is safe.
+        cur = result.float().norm(dim=-1).mean().clamp(min=1e-12)
         target = s.float().norm(dim=-1).mean()
         # Magnitude-match to the signal, then the learnable tanh(g) output gate.
         return result * (target / cur).to(result.dtype) * torch.tanh(self.output_gain).to(result.dtype)

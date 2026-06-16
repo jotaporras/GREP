@@ -150,8 +150,10 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
                 key_states, value_states = past_key_values.update(
                     key_states, value_states, attn.layer_idx)
 
-            attention_interface = attn_fns.get_interface(
-                attn.config._attn_implementation, eager)
+            attn_impl = attn.config._attn_implementation
+            attention_interface = (
+                eager if attn_impl == "eager" else attn_fns[attn_impl]
+            )
             attn_output, attn_weights = attention_interface(
                 attn, query_states, key_states, value_states, attention_mask,
                 dropout=0.0 if not attn.training else attn.attention_dropout,
@@ -433,18 +435,24 @@ class CompositeGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         )
 
     def _fuse_embeddings(self, input_ids, graphs, injection_maps, permutation=None,
-                         return_token_pe=False):
+                         return_token_pe=False, return_c_tok=False):
         """Build G per sequence and run M4→M6→M7, returning ``inputs_embeds`` [B, c, d].
 
         When ``return_token_pe`` is True, also returns the un-gated GT token-row
         output ``Y[V_Tx]`` stacked as ``[B, c, d]`` — the per-position structural
         code that ``InjectedCompositeGraphLLM`` injects into q/k/v at every layer.
+
+        When ``return_c_tok`` is True, also returns the composite token-block
+        covariance ``C_tok`` stacked as ``[B, c, c]``, scaled to ``‖X‖`` — the
+        per-layer relative-position operator (``InjectedCompositeGraphLLM`` with
+        ``c_per_layer``). See :meth:`_compute_c_tok`.
         """
         X = self.llm.get_input_embeddings()(input_ids)  # [B, c, d]
         device = X.device
         c = input_ids.shape[1]
         fused = []
         token_pe = [] if return_token_pe else None
+        c_tok = [] if return_c_tok else None
         for b in range(input_ids.shape[0]):
             aug = self._composite_graph(graphs[b], injection_maps[b], c, device, permutation=permutation)
             aug_data = Data(
@@ -459,15 +467,50 @@ class CompositeGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             fused.append(self.injection(X[b], Ytok))
             if return_token_pe:
                 token_pe.append(Ytok)
+            if return_c_tok:
+                c_tok.append(self._compute_c_tok(aug, aug_data, X[b]))
         # The GT runs in float32 (sparse sampled_addmm is fp32-only) and the gate
         # promotes the bf16 X to fp32, so cast inputs_embeds back to the LLM's dtype.
         # Training tolerated the fp32 mismatch under autocast; generate() has no
         # autocast, so the fp32 hidden state would hit the bf16 lm_head and raise
         # "expected scalar type Float but found BFloat16".
         inputs_embeds = torch.stack(fused, dim=0).to(X.dtype)
+        out = [inputs_embeds]
         if return_token_pe:
-            return inputs_embeds, torch.stack(token_pe, dim=0)
-        return inputs_embeds
+            out.append(torch.stack(token_pe, dim=0))
+        if return_c_tok:
+            out.append(torch.stack(c_tok, dim=0))
+        return out[0] if len(out) == 1 else tuple(out)
+
+    def _compute_c_tok(self, aug, aug_data, X_b):
+        """Materialize the composite token-block covariance ``C_tok`` [c, c], scaled to ‖X‖.
+
+        Applies the AugR-PEARL second moment ``C = E_q[Φ(q)Φ(q)ᵀ]`` to the token-row
+        identity, so ``C·e_j`` reads off column ``j`` of ``C`` without forming the N×N
+        matrix; the token rows of the result are the token block ``C[V_Tx, V_Tx]``,
+        which includes token→scene→token paths (the scene coupling the crosslinks
+        build). Raw (un-gated) so the operator is recovered cleanly, then scaled so
+        ``C_tok·X`` matches ``X``'s mean row-norm — "scale C to ‖X‖" — keeping the
+        replaced q/k in the distribution the frozen attention expects. Deterministic
+        (no learnable params).
+        """
+        device = X_b.device
+        N = aug.num_nodes
+        c = int(aug.is_token.sum())
+        # token-row identity signal: [N, c], e_j on the j-th token row, 0 on scene rows.
+        sig = torch.zeros(N, c, device=device, dtype=torch.float32)
+        sig[aug.is_token] = torch.eye(c, device=device, dtype=torch.float32)
+        C_full = self.gt_model.pe_model.second_moment_apply(
+            aug_data, sig, scale_to_signal=False)        # [N, c] = C[:, V_Tx]
+        C_tok = C_full[aug.is_token]                      # [c, c] = C[V_Tx, V_Tx]
+        # Scale the operator to ‖X‖: match mean row-norm of C_tok·X to that of X. The
+        # raw centered covariance is tiny (~1e-8), so the floor is a true div-by-zero
+        # guard (1e-12), not a magnitude floor — fp32 carries the small value, and the
+        # per-layer renorm in attention refines the ‖q‖-proportional scale at each depth.
+        Xf = X_b.float()
+        cur = (C_tok @ Xf).norm(dim=-1).mean().clamp(min=1e-12)
+        target = Xf.norm(dim=-1).mean()
+        return C_tok * (target / cur)
 
     def forward(
         self,
@@ -526,10 +569,19 @@ class InjectedCompositeGraphLLM(CompositeGraphLLM):
     """
 
     def __init__(self, *args, inject_v: bool = True,
-                 disable_llm_rope: bool = True, **kwargs):
+                 disable_llm_rope: bool = True, c_per_layer: bool = False, **kwargs):
         # RoPE OFF by default (disable_llm_rope=True): the injected code replaces RoPE.
         kwargs["disable_llm_rope"] = disable_llm_rope
         super().__init__(*args, **kwargs)
+
+        # ``c_per_layer``: instead of the additive code S=Y_tok in q/k/v, REPLACE the
+        # post-RoPE query/key at every layer with the composite covariance operator
+        # ``C_tok`` mixing across the sequence: ``q ← C_tok·q``, ``k ← C_tok·k`` (page-9
+        # proof: the token block of C is the relative operator ``c(n-m)`` — RoPE made
+        # literal in the q·k score, at every depth). C_tok is deterministic (no params)
+        # and scaled to ‖X‖, so nothing extra is saved/loaded; the dedicated q/k/v
+        # projections below are not created in this mode.
+        self.c_per_layer = c_per_layer
 
         cfg = self.llm.config
         hidden = cfg.hidden_size
@@ -540,19 +592,23 @@ class InjectedCompositeGraphLLM(CompositeGraphLLM):
             device = next(self.llm.parameters()).device
         except StopIteration:
             device = torch.device("cpu")
-        # Dedicated shared projections from the d_model code into the q / k (/ v) spaces
-        # (one set, reused at every layer). Default Linear init (std ≈ 1/√d_model) maps a
-        # code of row-norm ≈‖X‖ to a per-element std comparable to the attention logits'
-        # scale. No bias (a constant shift across positions carries no order). q gets
-        # H·Dh, k/v get Hkv·Dh (GQA).
-        self.pe_q_proj = nn.Linear(hidden, n_heads * head_dim, bias=False, device=device)
-        self.pe_k_proj = nn.Linear(hidden, n_kv * head_dim, bias=False, device=device)
-        if inject_v:
-            self.pe_v_proj = nn.Linear(hidden, n_kv * head_dim, bias=False, device=device)
+        if not c_per_layer:
+            # Dedicated shared projections from the d_model code into the q / k (/ v) spaces
+            # (one set, reused at every layer). Default Linear init (std ≈ 1/√d_model) maps a
+            # code of row-norm ≈‖X‖ to a per-element std comparable to the attention logits'
+            # scale. No bias (a constant shift across positions carries no order). q gets
+            # H·Dh, k/v get Hkv·Dh (GQA).
+            self.pe_q_proj = nn.Linear(hidden, n_heads * head_dim, bias=False, device=device)
+            self.pe_k_proj = nn.Linear(hidden, n_kv * head_dim, bias=False, device=device)
+            if inject_v:
+                self.pe_v_proj = nn.Linear(hidden, n_kv * head_dim, bias=False, device=device)
 
-        # Per-forward graph code S = Y_tok ([B, seq, hidden]); read by the patched
-        # attention forwards, set by forward()/prepare_generation().
+        # Per-forward signals read by the patched attention forwards, set by
+        # forward()/prepare_generation():
+        #   _pe_signal : additive code S=Y_tok ([B, seq, hidden]) — additive variant.
+        #   _pe_C      : composite token covariance C_tok ([B, seq, seq]) — c_per_layer.
         self._pe_signal = None
+        self._pe_C = None
         self._pe_inject_value = inject_v
         self._install_pe_injection()
 
@@ -604,14 +660,42 @@ class InjectedCompositeGraphLLM(CompositeGraphLLM):
                 key_states = key_states + _proj(model.pe_k_proj)
                 if model._pe_inject_value:
                     value_states = value_states + _proj(model.pe_v_proj)
+            # --- c_per_layer: REPLACE q/k with the composite covariance mixing the
+            # sequence, q ← C_tok·q, k ← C_tok·k (the proof's relative c(n-m) in the
+            # score, every layer). Skipped on cached single-token decode (seq mismatch)
+            # — only prompt tokens carry it, like the additive path. Value is content. ---
+            C = model._pe_C
+            if (C is not None and C.shape[0] == hidden_states.shape[0]
+                    and C.shape[1] == hidden_states.shape[1]):
+                Cf = C.float()
+
+                def _mix(t):  # t: [B, H, seq, head_dim]
+                    # fp32 einsum: C_tok carries fine relative structure (the c(n-m)
+                    # decay) that bf16 would crush before the renorm; the GT runs fp32
+                    # anyway. Cast back to t's dtype at the end.
+                    out = torch.einsum("bnm,bhmd->bhnd", Cf, t.float())
+                    # RoPE-like scale stability: RoPE preserves ‖q‖ exactly; C_tok is a
+                    # PSD covariance scaled to ‖X‖ at the layer-0 manifold, but Llama's
+                    # residual-stream norm grows with depth, so rescale C_tok·t back to
+                    # t's current mean row-norm. Keeps q/k — hence the attention logits —
+                    # proportionate to the content at EVERY layer (the global scalar
+                    # preserves C's per-position redistribution, the relative signal).
+                    cur = out.norm(dim=-1).mean().clamp(min=1e-12)
+                    tgt = t.float().norm(dim=-1).mean()
+                    return (out * (tgt / cur)).to(t.dtype)
+
+                query_states = _mix(query_states)
+                key_states = _mix(key_states)
             # ------------------------------------------------------------------
 
             if past_key_values is not None:
                 key_states, value_states = past_key_values.update(
                     key_states, value_states, attn.layer_idx)
 
-            attention_interface = attn_fns.get_interface(
-                attn.config._attn_implementation, eager)
+            attn_impl = attn.config._attn_implementation
+            attention_interface = (
+                eager if attn_impl == "eager" else attn_fns[attn_impl]
+            )
             attn_output, attn_weights = attention_interface(
                 attn, query_states, key_states, value_states, attention_mask,
                 dropout=0.0 if not attn.training else attn.attention_dropout,
@@ -625,21 +709,36 @@ class InjectedCompositeGraphLLM(CompositeGraphLLM):
         return forward
 
     # ----- signal / forward / generation ---------------------------------------
-    def _build_signal(self, input_ids, graphs, injection_maps, permutation=None):
-        """Return (inputs_embeds, code S=[B, seq, hidden]).
+    def _arm_signals(self, input_ids, graphs, injection_maps, permutation=None):
+        """Build ``inputs_embeds`` and arm the per-forward attention signal(s).
 
         ``inputs_embeds`` is the **gated GT blend** ``M7(X, Y_tok)`` (the Layer-0
-        injection); the code ``S = Y_tok`` is then re-injected into q/k/v at every layer
-        by the patched attention forward.
+        injection). Then, per mode, the patched attention is armed:
+
+          - additive (default): ``self._pe_signal = Y_tok`` is re-injected into
+            q/k/v at every layer;
+          - ``c_per_layer``: ``self._pe_C = C_tok`` REPLACES q/k at every layer
+            (``q ← C_tok·q``), the proof's relative ``c(n-m)`` in the score.
+
+        The unused signal is cleared so a stale one can't leak across modes.
         """
-        inputs_embeds, token_pe = self._fuse_embeddings(
-            input_ids, graphs, injection_maps, permutation=permutation,
-            return_token_pe=True)
-        return inputs_embeds, token_pe
+        if self.c_per_layer:
+            inputs_embeds, c_tok = self._fuse_embeddings(
+                input_ids, graphs, injection_maps, permutation=permutation,
+                return_c_tok=True)
+            self._pe_C = c_tok
+            self._pe_signal = None
+        else:
+            inputs_embeds, token_pe = self._fuse_embeddings(
+                input_ids, graphs, injection_maps, permutation=permutation,
+                return_token_pe=True)
+            self._pe_signal = token_pe
+            self._pe_C = None
+        return inputs_embeds
 
     def forward(self, input_ids=None, attention_mask=None, labels=None,
                 graphs=None, injection_maps=None, **kwargs):
-        inputs_embeds, self._pe_signal = self._build_signal(input_ids, graphs, injection_maps)
+        inputs_embeds = self._arm_signals(input_ids, graphs, injection_maps)
         kwargs.pop("inputs_embeds", None)
         kwargs.pop("input_ids", None)
         try:
@@ -647,22 +746,22 @@ class InjectedCompositeGraphLLM(CompositeGraphLLM):
                 inputs_embeds=inputs_embeds, attention_mask=attention_mask,
                 labels=labels, **kwargs)
         finally:
-            # Disarm S unless gradient checkpointing will recompute the attention
-            # forwards in backward (they must see the same S; it is rebuilt every
-            # forward anyway). Mirrors eval_unification.
+            # Disarm the signals unless gradient checkpointing will recompute the
+            # attention forwards in backward (they must see the same signal; it is
+            # rebuilt every forward anyway). Mirrors eval_unification.
             if not getattr(self.llm, "is_gradient_checkpointing", False):
                 self._pe_signal = None
+                self._pe_C = None
 
     def prepare_generation(self, input_ids, graphs, injection_maps, permutation=None):
-        """Arm the in-attention injection and return ``inputs_embeds`` (plain X).
+        """Arm the in-attention injection and return ``inputs_embeds``.
 
-        The caller hands the returned X to ``self.llm.generate`` and must reset
-        ``self._pe_signal = None`` afterwards. Injection auto-skips cached decode
-        steps, so only prompt tokens carry S (generated tokens ride on RoPE).
+        The caller hands the returned embeds to ``self.llm.generate`` and must reset
+        ``self._pe_signal``/``self._pe_C`` to None afterwards. Injection auto-skips
+        cached decode steps, so only prompt tokens carry the signal.
         """
-        inputs_embeds, self._pe_signal = self._build_signal(
+        return self._arm_signals(
             input_ids, graphs, injection_maps, permutation=permutation)
-        return inputs_embeds
 
 
 def find_last_graph_scope(input_ids_b, tokenizer) -> int:

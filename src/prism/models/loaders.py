@@ -169,13 +169,18 @@ def graph_augmented_llm_from_pretrained(
             crosslink_mention_to_node=gnn_cfg.get("crosslink_mention_to_node", True),
             crosslink_mention_clique=gnn_cfg.get("crosslink_mention_clique", True),
         )
-        if gnn_cfg.get("pe_qk_injection", False):
-            # In-attention q/k(/v) injection in place of RoPE: dedicated W_q/W_k/W_v
-            # inject the GT code at every layer; inputs_embeds is the M7 gated blend.
-            # disable_llm_rope comes from composite_kwargs (the base disable_rope).
+        if gnn_cfg.get("pe_qk_injection", False) or gnn_cfg.get("c_per_layer", False):
+            # In-attention injection in place of RoPE (disable_llm_rope from
+            # composite_kwargs). Two variants on the same patched-attention hook:
+            #   pe_qk_injection: dedicated W_q/W_k/W_v ADD the GT code at every layer;
+            #   c_per_layer:     the composite token covariance C_tok REPLACES q/k at
+            #                    every layer (q ← C_tok·q) — the proof's relative
+            #                    c(n-m) in the score. C_tok is deterministic (no params).
+            # inputs_embeds is the M7 gated blend in both.
             model = gnn_llm.InjectedCompositeGraphLLM(
                 llm, gt_model, d_model=gnn_cfg["d_model"],
                 inject_v=gnn_cfg.get("pe_inject_v", True),
+                c_per_layer=gnn_cfg.get("c_per_layer", False),
                 **composite_kwargs,
             )
         else:
