@@ -18,10 +18,13 @@ special tokens (for Llama-3, ``<|start_header_id|>user<|end_header_id|>`` … ),
 and the open assistant turn at eval comes from ``add_generation_prompt=True``.
 This module only fills the per-turn *content*.
 
-The scene graph is a leading ``system`` message; tasks then stack as
-``user``/``assistant`` pairs in the same conversation per graph::
+A short compact-format system prompt (``COMPACT_SYSTEM_PROMPT``) plus the scene
+graph form a leading ``system`` message; tasks then stack as ``user``/``assistant``
+pairs in the same conversation per graph::
 
-    [system]  Scene graph:
+    [system]  <compact system prompt: <think>…</think> contract + latent-connectivity note>
+
+              Scene graph:
               • Region nodes: hub_1, quarters_1, ...
               • Object nodes: food_dispenser_1, ...
               • Robot location: hub_1
@@ -104,6 +107,31 @@ def _node_names(entries: List[dict]) -> str:
     return ", ".join(e["name"] for e in entries)
 
 
+# Short, compact-format system prompt prepended to the scene-graph block in the
+# leading system message (both training and eval, graph-augmented architectures
+# only). States the <think>…</think> output contract and — since edges are not
+# in the compact text — that connectivity is available in latent space (the GNN).
+# Set to "" to run the graph-only baseline for an A/B.
+COMPACT_SYSTEM_PROMPT = (
+    "You are a navigation planner for a mobile robot. Below is a scene graph listing the "
+    "environment's regions, its objects, and the robot's starting location. The connections "
+    "between these nodes — which regions border one another, and which region each object is "
+    "in — are available to you in latent space; reason over reachability and paths from that "
+    "latent access even though the connecting edges are not written out here.\n\n"
+    "Answer in two parts, in this exact order:\n"
+    "1. One <think> … </think> block that holds ALL of your reasoning. Begin it with "
+    '"Relevant graph:" followed by the specific nodes this task depends on — never leave '
+    'this blank — then "Reasoning:" followed by your step-by-step path-finding. Every bit '
+    "of thinking goes inside this block, never after it.\n"
+    "2. Immediately after </think>, give the final plan only: the route the robot follows, "
+    "its nodes in order joined by arrows (for example, "
+    "start_region -> middle_region -> goal_region). Put nothing else there — no further "
+    "reasoning, no labels, and no second <think> block.\n\n"
+    "Several tasks may be asked about this same scene graph in turn; answer each one "
+    "independently in this same format."
+)
+
+
 def _graph_block(graph_dict: dict) -> str:
     """The scene-graph block, emitted once as a leading system message.
 
@@ -121,6 +149,17 @@ def _graph_block(graph_dict: dict) -> str:
         f"• Object nodes: {_node_names(graph_dict['objects'])}\n"
         f"• Robot location: {graph_dict['robot_location']}"
     )
+
+
+def _system_content(graph_dict: dict) -> str:
+    """Leading system-message content: the system prompt + the scene-graph block.
+
+    The prompt precedes the ``Scene graph:`` block, so ``find_last_graph_scope``
+    still anchors on the block and PE injection is unaffected. With
+    ``COMPACT_SYSTEM_PROMPT == ""`` this is the graph block alone (A/B baseline).
+    """
+    block = _graph_block(graph_dict)
+    return f"{COMPACT_SYSTEM_PROMPT}\n\n{block}" if COMPACT_SYSTEM_PROMPT else block
 
 
 def build_conversation(graph_dict: dict, turns: List[Dict[str, str]]) -> List[Dict[str, str]]:
@@ -146,7 +185,7 @@ def build_conversation(graph_dict: dict, turns: List[Dict[str, str]]) -> List[Di
     """
     if not turns:
         raise ValueError("build_conversation requires at least one turn")
-    messages: List[Dict[str, str]] = [{"role": "system", "content": _graph_block(graph_dict)}]
+    messages: List[Dict[str, str]] = [{"role": "system", "content": _system_content(graph_dict)}]
     for turn in turns:
         messages.append({"role": "user", "content": turn["task"].strip()})
         if turn.get("assistant"):
@@ -389,11 +428,12 @@ def _compact_user_content(content: str) -> str:
 def spine_to_compact_messages(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
     """FORWARD translator: a SPINE ``messages`` list -> compact ``messages``.
 
-    Drops BOTH the SPINE system prompt and any few-shot ICL examples (the model
-    is taught the output format by SFT, not by a schema prompt or demonstrations,
-    and dropping ICL keeps train/eval symmetric), then hoists the query's scene
-    graph into a leading ``system`` message so the format is
-    ``[system(scene graph)] + [user task, assistant answer]*`` and tasks stack.
+    Drops BOTH the verbose SPINE system prompt and any few-shot ICL examples
+    (dropping ICL keeps train/eval symmetric), then hoists the query's scene graph
+    into a leading ``system`` message — prefixed with the short compact-format
+    system prompt (``_system_content``) — so the format is
+    ``[system(prompt + scene graph)] + [user task, assistant answer]*`` and tasks
+    stack.
 
     The real task is the LAST ``user`` turn carrying a ``Scene graph:`` block
     (each ICL example precedes it with its own graph; receding-horizon planning
@@ -423,7 +463,7 @@ def spine_to_compact_messages(messages: List[Dict[str, str]]) -> List[Dict[str, 
         if role == "user":
             content = m.get("content", "")
             if not graph_done and re.search(r"[Ss]cene graph:", content):
-                out.append({"role": "system", "content": _graph_block(_extract_scene_graph_dict(content))})
+                out.append({"role": "system", "content": _system_content(_extract_scene_graph_dict(content))})
                 out.append({"role": "user", "content": _extract_task(content)})
                 graph_done = True
             else:

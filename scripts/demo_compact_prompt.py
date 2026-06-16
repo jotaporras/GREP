@@ -4,11 +4,12 @@ Shows exactly what training and eval prompts become once the verbose SPINE JSON
 (long system prompt + few-shot ICL examples + full scene-graph JSON) is translated
 to the compact format the LLM consumes:
 
-  * the SPINE system prompt and ALL ICL examples are DROPPED (the format is taught
-    by SFT, and dropping ICL keeps train and eval symmetric);
+  * the verbose SPINE system prompt and ALL ICL examples are DROPPED (dropping ICL
+    keeps train and eval symmetric), replaced by a short compact-format system
+    prompt (the ``<think>…</think>`` contract + a latent-connectivity note);
   * the scene graph becomes a compact ``Scene graph:`` block (bulleted node-name
-    lists + robot location, NO edges — the GNN supplies connectivity) and is
-    placed in a leading ``system`` message, ABOVE the first task;
+    lists + robot location, NO edges — the GNN supplies connectivity) and follows
+    that system prompt in the same leading ``system`` message, ABOVE the first task;
   * tasks then stack as ``user``/``assistant`` pairs in the same conversation per
     graph; the assistant target wraps reasoning in
     ``<think>Relevant graph: …\\n\\nReasoning: …</think>`` followed by the bare plan.
@@ -133,10 +134,12 @@ def main() -> None:
     print(f"  input  roles: [{_roles(spine_convo)}]  ({len(spine_convo)} turns: SPINE system + 1 ICL pair + query + replan loop)")
     print(f"  output roles: [{_roles(compact)}]  ({len(compact)} turns: system(graph) + query + planning continuation)")
     sys_msgs = [m for m in compact if m["role"] == "system"]
-    assert len(sys_msgs) == 1 and sys_msgs[0]["content"].startswith("Scene graph:"), "graph not hoisted to one system msg"
+    assert len(sys_msgs) == 1, "expected exactly one system message"
+    assert sys_msgs[0]["content"].startswith("You are a navigation planner"), "compact system prompt missing"
+    assert "Scene graph:" in sys_msgs[0]["content"], "scene graph not in the system message"
     assert "<5,992-char SPINE system prompt" not in render(compact), "verbose SPINE system leaked"
     assert sum(c["content"].count("Scene graph:") for c in compact) == 1, "ICL graph leaked"
-    print("  -> ONE system 'Scene graph:' block (the query graph); SPINE system + ICL gone.")
+    print("  -> ONE system message = compact prompt + the query 'Scene graph:'; SPINE system + ICL gone.")
     _show(compact, tokenizer, add_generation_prompt=False)
 
     # --- 4. Multi-task over ONE graph: graph in system, tasks stacked -------------

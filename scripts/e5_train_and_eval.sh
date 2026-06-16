@@ -161,7 +161,7 @@ main() {
 
   # --- 2. no-SPINE scalability eval on the test graphs ---
   local -a EVAL_CMD=(
-    env PRISM_DISABLE_SPINE_TOOLS=1 GREP_GEMMA_REGRADE=1 CUDA_VISIBLE_DEVICES="$GPU"
+    env PRISM_DISABLE_SPINE_TOOLS=1 CUDA_VISIBLE_DEVICES="$GPU"
     uv run -m prism.eval.scalability_evaluation
     --checkpoint "$CKPT_DIR/$MODEL/"
     --graphs "$GRAPHS"
