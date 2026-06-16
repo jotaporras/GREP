@@ -2,7 +2,7 @@
 # Generate navigation-only (~30-node) training data with a LOCAL Gemma 4
 # model via HF Transformers — no OpenAI calls in either phase.
 #
-#   * Graph size : 3 communities x 8 nodes = 24 regions + ~30% objects ~= 30 nodes.
+#   * Graph size : 2 communities x 4 nodes = 8 regions + ~30% objects ~= 10 nodes.
 #   * Task mix   : --task-proportions 0 0 0 1  => 100% Navigability.
 #   * LLM backend: PRISM_LLM_BACKEND=hf routes BOTH phases through the local model:
 #       Phase 1 (populate) -> prism.data.local_llm.LocalHFQueryClient
@@ -87,10 +87,10 @@ N_TASKS=10
 TASK_PROPORTIONS="0 0 0 1"
 GEN_SEED=42
 
-# Single ~30-node config (3 communities x 8 nodes = 24 regions; +~30% objects).
-# Using one config keeps the AVERAGE graph size at ~30 nodes.
-NC=3
-NPC=8
+# Single ~10-node config (2 communities x 4 nodes = 8 regions; +~30% objects).
+# Using one config keeps the AVERAGE graph size at ~10 nodes.
+NC=2
+NPC=4
 
 # Number of graphs (skeletons). Each graph yields up to N_TASKS rollouts, and
 # the train/val split keeps ~80% for training, so training examples are roughly
@@ -132,7 +132,7 @@ print("preflight OK: get_tasks accepts task_complexities + reasoning_effort")
 PY
 
 echo ""
-echo "=== Stage 1: Generate skeletons (${#seeds[@]} seeds x 1 config = ${#seeds[@]} skeletons, ~30 nodes each) ==="
+echo "=== Stage 1: Generate skeletons (${#seeds[@]} seeds x 1 config = ${#seeds[@]} skeletons, ~10 nodes each) ==="
 
 # Reuse-existing guard: if ALL N skeletons already exist AND at least one graph
 # has already been populated, an interrupted run is in progress — keep what is
