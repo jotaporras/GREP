@@ -158,6 +158,7 @@ def graph_augmented_llm_from_pretrained(
             pe_readout=gnn_cfg.get("pe_readout", "mean"),
             center_second_moment=gnn_cfg.get("pe_center_moment", True),
         )
+        gt_model.pe_model.pe_gcn.strict_filter_norm = gnn_cfg.get("strict_filter_norm", False)
         composite_kwargs = dict(
             gate_init=gnn_cfg.get("gate_init", 0.0),
             gate_per_dim=gnn_cfg.get("gate_per_dim", False),
@@ -169,18 +170,21 @@ def graph_augmented_llm_from_pretrained(
             crosslink_mention_to_node=gnn_cfg.get("crosslink_mention_to_node", True),
             crosslink_mention_clique=gnn_cfg.get("crosslink_mention_clique", True),
         )
-        if gnn_cfg.get("pe_qk_injection", False) or gnn_cfg.get("c_per_layer", False):
+        if (gnn_cfg.get("pe_qk_injection", False) or gnn_cfg.get("c_per_layer", False)
+                or gnn_cfg.get("c_bias", False)):
             # In-attention injection in place of RoPE (disable_llm_rope from
-            # composite_kwargs). Two variants on the same patched-attention hook:
+            # composite_kwargs). Variants on the same patched-attention hook:
             #   pe_qk_injection: dedicated W_q/W_k/W_v ADD the GT code at every layer;
-            #   c_per_layer:     the composite token covariance C_tok REPLACES q/k at
-            #                    every layer (q ← C_tok·q) — the proof's relative
-            #                    c(n-m) in the score. C_tok is deterministic (no params).
-            # inputs_embeds is the M7 gated blend in both.
+            #   c_per_layer:     C_tok REPLACES q/k at every layer (q ← C_tok·q);
+            #   c_bias (Design D): NO q/k transform — C_tok is an ADDITIVE logit bias
+            #                    (+ S̃) and a residual value mix; position = c(t−u).
+            # inputs_embeds is the M7 gated blend in all.
             model = gnn_llm.InjectedCompositeGraphLLM(
                 llm, gt_model, d_model=gnn_cfg["d_model"],
                 inject_v=gnn_cfg.get("pe_inject_v", True),
                 c_per_layer=gnn_cfg.get("c_per_layer", False),
+                c_bias=gnn_cfg.get("c_bias", False),
+                use_scene_bias=gnn_cfg.get("use_scene_bias", True),
                 **composite_kwargs,
             )
         else:
@@ -193,6 +197,9 @@ def graph_augmented_llm_from_pretrained(
             model.pe_k_proj.load_state_dict(gnn_weights["pe_k_proj"])
             if getattr(model, "pe_v_proj", None) is not None and "pe_v_proj" in gnn_weights:
                 model.pe_v_proj.load_state_dict(gnn_weights["pe_v_proj"])
+        if getattr(model, "c_bias", False) and "c_bias_gains" in gnn_weights:
+            for k, v in gnn_weights["c_bias_gains"].items():
+                getattr(model, k).data.copy_(v)
     else:
         pe_model = r_pearl.RandomGNNPositionalEncodings(
             pe_hidden_channels=gnn_cfg["pe_hidden_channels"],

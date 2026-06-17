@@ -157,6 +157,11 @@ class GraphSFTTrainer(SFTTrainer):
                     if mod is not None:
                         for p in mod.parameters():
                             p.requires_grad = True
+            # c_bias (Design D): the scalar gains λ_C/λ_S/λ_V are non-LoRA params too.
+            for name in ("lam_c", "lam_s", "lam_v"):
+                p = getattr(self.model, name, None)
+                if p is not None:
+                    p.requires_grad = True
         else:
             for p in self.model.pe_model.parameters():
                 p.requires_grad = True
@@ -189,6 +194,11 @@ class GraphSFTTrainer(SFTTrainer):
                     mod = getattr(self.model, name, None)
                     if mod is not None:
                         structural += list(mod.parameters())
+            # c_bias (Design D): the scalar gains are structural too.
+            for name in ("lam_c", "lam_s", "lam_v"):
+                p = getattr(self.model, name, None)
+                if p is not None:
+                    structural.append(p)
         else:
             structural = (list(self.model.pe_model.parameters())
                           + list(self.model.pe_proj.parameters()) + [self.model.pe_gain])
@@ -249,6 +259,13 @@ class GraphSFTTrainer(SFTTrainer):
                 gnn_state['pe_k_proj'] = self.model.pe_k_proj.state_dict()
                 if getattr(self.model, "pe_v_proj", None) is not None:
                     gnn_state['pe_v_proj'] = self.model.pe_v_proj.state_dict()
+            # c_bias (Design D): persist the scalar gains.
+            if getattr(self.model, "c_bias", False):
+                gnn_state['c_bias_gains'] = {
+                    name: getattr(self.model, name).detach().cpu()
+                    for name in ("lam_c", "lam_s", "lam_v")
+                    if getattr(self.model, name, None) is not None
+                }
             torch.save(gnn_state, os.path.join(output_dir, "gnn_weights.pt"))
             torch.save({
                 'rpearl': self.model.gt_model.pe_model.state_dict(),
@@ -379,6 +396,16 @@ class TrainConfig:
     # Selects InjectedCompositeGraphLLM (with pe_qk_injection off, its additive q/k/v
     # projections are not created). Pairs with disable_rope=True.
     c_per_layer: bool = False
+    # c_bias (Design D, RoPE-free): NO q/k transform. C_tok enters the attention as an
+    # ADDITIVE logit bias (λ_C·c(t−u), extended to generated tokens via the analytic
+    # c(·) row) plus a residual value mix (v ← v + λ_V·C·v); S̃ (token-lifted scene
+    # adjacency) is an optional additive bias (λ_S, via use_scene_bias). Selection
+    # ⟨q,k⟩ is preserved (no c_per_layer collapse). Scalar learnable gains λ_C,λ_S,λ_V.
+    c_bias: bool = False
+    use_scene_bias: bool = True
+    # β=1/F R-PEARL filter-norm invariant: when True the per-forward check RAISES on a
+    # violation; default False = lenient (warn) in training (strict reserved for tests).
+    strict_filter_norm: bool = False
     # Structural-path optimization (R6): the GT + R-PEARL + gate train at
     # structural_lr_mult × the base LR (they otherwise get gradients orders of
     # magnitude below LoRA and never open the gate); lora_warmup_steps freezes the
@@ -617,19 +644,23 @@ def train_model(config: TrainConfig, config_file: str = None):
             crosslink_mention_to_node=config.crosslink_mention_to_node,
             crosslink_mention_clique=config.crosslink_mention_clique,
         )
-        if config.pe_qk_injection or config.c_per_layer:
+        if config.pe_qk_injection or config.c_per_layer or config.c_bias:
             # In-attention injection in place of RoPE (disable_rope governs the RoPE-off
-            # content path; inputs_embeds is the M7 gated GT blend). Either ADD the GT
-            # code into q/k/v (pe_qk_injection) or REPLACE q/k with the composite token
-            # covariance C_tok at every layer (c_per_layer) — the proof's relative
-            # c(n-m) in the score; C_tok is deterministic (no params).
+            # content path; inputs_embeds is the M7 gated GT blend). ADD the GT code into
+            # q/k/v (pe_qk_injection); REPLACE q/k with C_tok (c_per_layer); or use C_tok
+            # as an additive logit bias + residual value mix, no q/k transform (c_bias,
+            # Design D — RoPE-free, selection-preserving).
             composite_kwargs["inject_v"] = config.pe_inject_v
             composite_kwargs["c_per_layer"] = config.c_per_layer
+            composite_kwargs["c_bias"] = config.c_bias
+            composite_kwargs["use_scene_bias"] = config.use_scene_bias
             model = gnn_llm.InjectedCompositeGraphLLM(
                 llm, gt_model, d_model=config.d_model, **composite_kwargs)
         else:
             model = gnn_llm.CompositeGraphLLM(
                 llm, gt_model, d_model=config.d_model, **composite_kwargs)
+        # β=1/F R-PEARL filter-norm fail-loud strictness (default lenient/warn in training).
+        gt_model.pe_model.pe_gcn.strict_filter_norm = config.strict_filter_norm
         collator = data.SpineDataCollator(tokenizer, mlm=False)
 
         if config.freeze_llm:
@@ -775,7 +806,10 @@ def train_model(config: TrainConfig, config_file: str = None):
                 "crosslink_mention_clique": config.crosslink_mention_clique,
                 "pe_qk_injection": config.pe_qk_injection,
                 "pe_inject_v": config.pe_inject_v,
-                "c_per_layer": config.c_per_layer}
+                "c_per_layer": config.c_per_layer,
+                "c_bias": config.c_bias,
+                "use_scene_bias": config.use_scene_bias,
+                "strict_filter_norm": config.strict_filter_norm}
                if config.architecture == "composite_graph_gt" else {}),
         }
         trainer = GraphSFTTrainer(

@@ -1,4 +1,6 @@
 import json
+import warnings
+
 import torch
 import wandb
 from pathlib import Path
@@ -260,6 +262,42 @@ class GradientDebugCallback(TrainerCallback):
         if model is not None and self._supported(self._unwrap_peft(model)):
             self._install_hooks(model)
 
+    @staticmethod
+    def _filter_norm_metrics(inner):
+        """STEP 3: log MEASURED ‖H(S)‖₂ (power iteration on the actual S̄) per R-PEARL
+        filter vs target 1/F, the ratio, and the c_bias Ĉ scale. Fail-loud: re-run the
+        bound check (``gcn.strict_filter_norm`` raises; lenient warns)."""
+        out = {}
+        gcn = getattr(getattr(getattr(inner, "gt_model", None), "pe_model", None), "pe_gcn", None)
+        if gcn is not None and getattr(gcn, "_last_graph", None) is not None:
+            ei, ew, n = gcn._last_graph
+            try:
+                report = gcn.filter_norm_report(ei, ew, n)        # true ‖H(S)‖₂ on S̄
+                worst = 0.0
+                for idx, d in report.items():
+                    out[f"grep/filter_norm/layer{idx}_measured"] = d["measured"]
+                    out[f"grep/filter_norm/layer{idx}_target"] = d["target"]
+                    out[f"grep/filter_norm/layer{idx}_ratio"] = d["ratio"]
+                    worst = max(worst, d["ratio"])
+                out["grep/filter_norm/worst_ratio"] = worst       # ≤ 1 + tol if invariant holds
+                gcn.assert_filter_bounds(strict=getattr(gcn, "strict_filter_norm", False),
+                                         report=report)
+            except Exception as e:  # never let a diagnostic kill training (unless strict raised)
+                if isinstance(e, AssertionError):
+                    raise
+                warnings.warn(f"[filter_norm] measurement skipped: {e}")
+        if getattr(inner, "c_bias", False):
+            try:
+                # analytic Ĉ from the R-PEARL taps (deterministic; c_bias positional kernel)
+                C_hat, c_row = inner._analytic_c_tok(64, next(inner.parameters()).device)
+                out["grep/c_bias/c_hat_diag"] = float(C_hat.diagonal().max())     # =1 (normalized)
+                out["grep/c_bias/c_row_min"] = float(c_row.min())                 # off-peak decay
+                out["grep/c_bias/lam_c"] = float(inner.lam_c.detach())
+                out["grep/c_bias/lam_v"] = float(inner.lam_v.detach())
+            except Exception:
+                pass
+        return out
+
     def on_log(self, args, state, control, model=None, logs=None, **kwargs):
         if model is None:
             return
@@ -290,6 +328,8 @@ class GradientDebugCallback(TrainerCallback):
                 "debug/rpearl_output_gain": float(inner.gt_model.pe_model.output_gain.detach().tanh().item()),
                 "debug/lr": lr,
             }
+            # β=1/F R-PEARL filter-norm invariant (measured, fail-loud) + c_bias Ĉ scale.
+            metrics.update(self._filter_norm_metrics(inner))
         else:
             # GraphAugmentedLLM (rpearl_llm / rpearl_gt_llm).
             metrics = {

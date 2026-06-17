@@ -1,6 +1,8 @@
 import copy
 import importlib
+import math
 import re
+import warnings
 from collections import defaultdict
 
 import torch
@@ -435,7 +437,7 @@ class CompositeGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         )
 
     def _fuse_embeddings(self, input_ids, graphs, injection_maps, permutation=None,
-                         return_token_pe=False, return_c_tok=False):
+                         return_token_pe=False, return_c_tok=False, return_s_tilde=False):
         """Build G per sequence and run M4→M6→M7, returning ``inputs_embeds`` [B, c, d].
 
         When ``return_token_pe`` is True, also returns the un-gated GT token-row
@@ -444,8 +446,12 @@ class CompositeGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
 
         When ``return_c_tok`` is True, also returns the composite token-block
         covariance ``C_tok`` stacked as ``[B, c, c]``, scaled to ``‖X‖`` — the
-        per-layer relative-position operator (``InjectedCompositeGraphLLM`` with
-        ``c_per_layer``). See :meth:`_compute_c_tok`.
+        per-layer relative-position operator (``c_per_layer``). See :meth:`_compute_c_tok`.
+
+        When ``return_s_tilde`` is True (Design D / c_bias), also returns the
+        token-lifted scene adjacency ``S̃`` [B, c, c] (see :meth:`_compute_s_tilde`).
+        (The c_bias positional kernel ``Ĉ`` is computed ANALYTICALLY from the R-PEARL
+        taps in :meth:`_analytic_c_tok`, not here — it is graph-independent.)
         """
         X = self.llm.get_input_embeddings()(input_ids)  # [B, c, d]
         device = X.device
@@ -453,6 +459,7 @@ class CompositeGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         fused = []
         token_pe = [] if return_token_pe else None
         c_tok = [] if return_c_tok else None
+        s_til = [] if return_s_tilde else None
         for b in range(input_ids.shape[0]):
             aug = self._composite_graph(graphs[b], injection_maps[b], c, device, permutation=permutation)
             aug_data = Data(
@@ -469,6 +476,8 @@ class CompositeGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
                 token_pe.append(Ytok)
             if return_c_tok:
                 c_tok.append(self._compute_c_tok(aug, aug_data, X[b]))
+            if return_s_tilde:
+                s_til.append(self._compute_s_tilde(aug, injection_maps[b], c, device))
         # The GT runs in float32 (sparse sampled_addmm is fp32-only) and the gate
         # promotes the bf16 X to fp32, so cast inputs_embeds back to the LLM's dtype.
         # Training tolerated the fp32 mismatch under autocast; generate() has no
@@ -480,37 +489,105 @@ class CompositeGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             out.append(torch.stack(token_pe, dim=0))
         if return_c_tok:
             out.append(torch.stack(c_tok, dim=0))
+        if return_s_tilde:
+            out.append(torch.stack(s_til, dim=0))
         return out[0] if len(out) == 1 else tuple(out)
 
+    def _compute_s_tilde(self, aug, injection_map, c, device):
+        """Token-lifted 1-hop scene adjacency ``S̃ = M S_sc Mᵀ ∈ [c, c]`` (Design D).
+
+        ``M[t, j] = 1`` when token ``t`` mentions scene node ``j`` (from the injection
+        map; each token maps to ≤ 1 node, so ``S̃[n,m] = S_sc[node(n), node(m)]``).
+        ``S_sc`` is the scene–scene block of the GSO. This is the *direct 1-hop* scene
+        affinity (the additive ``λ_S`` bias); ``C_tok`` already carries the diffused
+        multi-hop scene coupling. Zero rows/cols for non-graph tokens.
+        """
+        n_s = aug.num_scene_nodes
+        if n_s == 0:
+            return torch.zeros(c, c, device=device)
+        g = aug.gso.coalesce()
+        idx, val = g.indices(), g.values()
+        m = (idx[0] >= c) & (idx[1] >= c)                     # scene–scene block of S
+        S_sc = torch.zeros(n_s, n_s, device=device)
+        if bool(m.any()):
+            si = idx[:, m] - c
+            S_sc[si[0], si[1]] = val[m].to(S_sc.dtype)
+        M = torch.zeros(c, n_s, device=device)
+        for node_idx, spans in injection_map.items():
+            for s, e in spans:
+                e = min(e, c)
+                if s < e:
+                    M[s:e, node_idx] = 1.0
+        return M @ S_sc @ M.t()                               # [c, c]
+
     def _compute_c_tok(self, aug, aug_data, X_b):
-        """Materialize the composite token-block covariance ``C_tok`` [c, c], scaled to ‖X‖.
+        """Materialize the composite token-block covariance ``C_tok`` [c, c] (c_per_layer).
 
         Applies the AugR-PEARL second moment ``C = E_q[Φ(q)Φ(q)ᵀ]`` to the token-row
         identity, so ``C·e_j`` reads off column ``j`` of ``C`` without forming the N×N
         matrix; the token rows of the result are the token block ``C[V_Tx, V_Tx]``,
         which includes token→scene→token paths (the scene coupling the crosslinks
-        build). Raw (un-gated) so the operator is recovered cleanly, then scaled so
-        ``C_tok·X`` matches ``X``'s mean row-norm — "scale C to ‖X‖" — keeping the
-        replaced q/k in the distribution the frozen attention expects. Deterministic
-        (no learnable params).
+        build). Raw (un-gated), then scaled so ``C_tok·X`` matches ``X``'s mean row-norm.
+        Deterministic (no learnable params). (The c_bias path uses the ANALYTIC
+        :meth:`_analytic_c_tok` instead — see that method.)
         """
         device = X_b.device
         N = aug.num_nodes
         c = int(aug.is_token.sum())
-        # token-row identity signal: [N, c], e_j on the j-th token row, 0 on scene rows.
         sig = torch.zeros(N, c, device=device, dtype=torch.float32)
         sig[aug.is_token] = torch.eye(c, device=device, dtype=torch.float32)
         C_full = self.gt_model.pe_model.second_moment_apply(
             aug_data, sig, scale_to_signal=False)        # [N, c] = C[:, V_Tx]
         C_tok = C_full[aug.is_token]                      # [c, c] = C[V_Tx, V_Tx]
-        # Scale the operator to ‖X‖: match mean row-norm of C_tok·X to that of X. The
-        # raw centered covariance is tiny (~1e-8), so the floor is a true div-by-zero
-        # guard (1e-12), not a magnitude floor — fp32 carries the small value, and the
-        # per-layer renorm in attention refines the ‖q‖-proportional scale at each depth.
         Xf = X_b.float()
         cur = (C_tok @ Xf).norm(dim=-1).mean().clamp(min=1e-12)
         target = Xf.norm(dim=-1).mean()
         return C_tok * (target / cur)
+
+    @staticmethod
+    def _analytic_c_from_taps(H, c, eps: float = 1e-12):
+        """Analytic cycle second moment ``C = h(S_c)h(S_c)*`` from R-PEARL filter taps.
+
+        The proof's whole point: the SAME filter taps that produce Ψ analytically give
+        the relative-position covariance — no random probes, no Monte-Carlo estimate.
+        For the directed circulant cycle ``S_c`` (eigenvalues ``ω^k=e^{2πik/c}``) a graph
+        filter ``h(S_c)=Σ_j H_j S_c^j`` has per-mode response ``ĥ(ω_k)=Σ_j H_j ω_k^j`` and
+
+            ρ_k = ‖ĥ(ω_k)‖²  (≥ 0) ,    c(δ) = (1/c) Σ_k ρ_k ω_k^δ = IDFT(ρ) ,
+            C[t,u] = c(t−u) ,    Ĉ = C / c(0)   (c(0)=mean(ρ) > 0, the peak).
+
+        `H` is ``[K+1, F]`` (one vector tap per polynomial order). This is DETERMINISTIC,
+        PSD by construction (ρ ≥ 0 ⇒ circulant PSD), O(1) after the c(0) normalization
+        (no F-suppression — the RAW O(1) taps are used, the β=1/F forward rescale is a
+        no-grad magnitude scalar that the normalization cancels), and its gradient flows
+        to ``H`` — i.e. it trains the R-PEARL taps. Returns ``(Ĉ [c,c], c_row [c])``.
+        """
+        K1 = H.shape[0]
+        dev = H.device
+        kk = torch.arange(c, device=dev, dtype=torch.float32)
+        jj = torch.arange(K1, device=dev, dtype=torch.float32)
+        ang = (2.0 * math.pi / c) * torch.outer(kk, jj)        # [c, K1]
+        Hf = H.float()
+        hr = torch.cos(ang) @ Hf                                # Re ĥ(ω_k)  [c, F]
+        hi = torch.sin(ang) @ Hf                                # Im ĥ(ω_k)  [c, F]
+        rho = (hr * hr + hi * hi).sum(-1)                       # ρ_k = ‖ĥ(ω_k)‖²  [c]
+        c_vec = torch.fft.ifft(rho.to(torch.complex64)).real    # c(δ) = IDFT(ρ)  [c]
+        c0 = c_vec[0].clamp(min=eps)                            # c(0) = mean(ρ) > 0
+        c_row = c_vec / c0                                      # normalized, c_row[0]=1
+        idx = (kk.long()[:, None] - kk.long()[None, :]) % c     # (t−u) mod c
+        return c_row[idx], c_row                               # Ĉ [c,c] circulant, c_row [c]
+
+    def _analytic_c_tok(self, c, device):
+        """c_bias positional kernel: analytic ``Ĉ`` from the R-PEARL first-TAGConv taps.
+
+        Pulls the R-PEARL graph filter's own taps (``pe_gcn.convs[0].lins[j].weight``,
+        one vector per polynomial order j=0..K) and forms the deterministic cycle
+        second moment via :meth:`_analytic_c_from_taps`. No probes, no 1/c(0) blow-up.
+        """
+        conv0 = self.gt_model.pe_model.pe_gcn.convs[0]
+        H = torch.stack([lin.weight.reshape(lin.weight.shape[0], -1).mean(-1)
+                         for lin in conv0.lins], dim=0)         # [K+1, F]  vector taps
+        return self._analytic_c_from_taps(H.to(device), c)
 
     def forward(
         self,
@@ -569,10 +646,20 @@ class InjectedCompositeGraphLLM(CompositeGraphLLM):
     """
 
     def __init__(self, *args, inject_v: bool = True,
-                 disable_llm_rope: bool = True, c_per_layer: bool = False, **kwargs):
+                 disable_llm_rope: bool = True, c_per_layer: bool = False,
+                 c_bias: bool = False, use_scene_bias: bool = True, **kwargs):
         # RoPE OFF by default (disable_llm_rope=True): the injected code replaces RoPE.
         kwargs["disable_llm_rope"] = disable_llm_rope
         super().__init__(*args, **kwargs)
+
+        # ``c_bias`` (Design D, docs/composite_graph_gt_rope_free_*): no RoPE, no rotary,
+        # no q/k transform. C enters the attention as an ADDITIVE logit bias and the
+        # values as a residual mix; S̃ (token-lifted scene adjacency) is an optional
+        # additive bias. Position is the ALiBi/T5-class relative bias c(t−u), extended
+        # to generated tokens via the analytic c(·) row. Selection (⟨q,k⟩) is preserved,
+        # so the c_per_layer collapse cannot occur.
+        self.c_bias = c_bias
+        self.use_scene_bias = use_scene_bias and c_bias
 
         # ``c_per_layer``: instead of the additive code S=Y_tok in q/k/v, REPLACE the
         # post-RoPE query/key at every layer with the composite covariance operator
@@ -592,7 +679,7 @@ class InjectedCompositeGraphLLM(CompositeGraphLLM):
             device = next(self.llm.parameters()).device
         except StopIteration:
             device = torch.device("cpu")
-        if not c_per_layer:
+        if not c_per_layer and not c_bias:
             # Dedicated shared projections from the d_model code into the q / k (/ v) spaces
             # (one set, reused at every layer). Default Linear init (std ≈ 1/√d_model) maps a
             # code of row-norm ≈‖X‖ to a per-element std comparable to the attention logits'
@@ -603,12 +690,28 @@ class InjectedCompositeGraphLLM(CompositeGraphLLM):
             if inject_v:
                 self.pe_v_proj = nn.Linear(hidden, n_kv * head_dim, bias=False, device=device)
 
+        if c_bias:
+            # Design D gains (scalar, learnable). λ_C init 1.0 so the relative position
+            # bias is ON from step 0 (init 0 would reproduce the position-blind collapse);
+            # λ_S init 0.0 (scene bias ramps in — C already carries scene structure);
+            # λ_V init 0.1 (cold-start residual value mixing). Saved in gnn_weights.pt.
+            self.lam_c = nn.Parameter(torch.tensor(1.0, device=device))
+            self.lam_s = nn.Parameter(torch.tensor(0.0, device=device))
+            self.lam_v = nn.Parameter(torch.tensor(0.1, device=device))
+            # Additive bias needs the score before softmax → force eager attention on the
+            # inner LLM (eager/sdpa add `attention_mask` to the logits; flash cannot).
+            self.llm.config._attn_implementation = "eager"  # ty: ignore[invalid-assignment]
+
         # Per-forward signals read by the patched attention forwards, set by
         # forward()/prepare_generation():
-        #   _pe_signal : additive code S=Y_tok ([B, seq, hidden]) — additive variant.
-        #   _pe_C      : composite token covariance C_tok ([B, seq, seq]) — c_per_layer.
+        #   _pe_signal    : additive code S=Y_tok ([B, seq, hidden]) — additive variant.
+        #   _pe_C         : composite token covariance C_tok ([B, seq, seq]) — c_per_layer / c_bias.
+        #   _pe_S         : token-lifted scene adjacency S̃ ([B, seq, seq]) — c_bias.
+        #   _pe_c_row     : analytic relative row c(·) ([B, seq]) for decode — c_bias.
         self._pe_signal = None
         self._pe_C = None
+        self._pe_S = None
+        self._pe_c_row = None
         self._pe_inject_value = inject_v
         self._install_pe_injection()
 
@@ -654,18 +757,42 @@ class InjectedCompositeGraphLLM(CompositeGraphLLM):
             if (psi is not None and psi.shape[0] == hidden_states.shape[0]
                     and psi.shape[1] == hidden_states.shape[1]):
                 def _proj(linear):
-                    out = linear(psi.to(linear.weight.dtype)).to(query_states.dtype)
+                    # Run on the projection's own device, then move to the (possibly
+                    # sharded) q/k/v device — .to(dtype) alone would strand it on the
+                    # init device under device_map=auto.
+                    w = linear.weight
+                    out = linear(psi.to(device=w.device, dtype=w.dtype))
+                    out = out.to(device=query_states.device, dtype=query_states.dtype)
                     return out.view(hidden_shape).transpose(1, 2)
                 query_states = query_states + _proj(model.pe_q_proj)
                 key_states = key_states + _proj(model.pe_k_proj)
                 if model._pe_inject_value:
                     value_states = value_states + _proj(model.pe_v_proj)
+            # --- Design D (c_bias): residual C-value mix on the PROMPT (mixed V is then
+            # cached). q/k are NOT touched; the additive C/S̃ logit bias is folded into
+            # attention_mask after the cache update (below). ---
+            if model.c_bias:
+                Cv = model._pe_C
+                if (Cv is not None and Cv.shape[1] == hidden_states.shape[1]):
+                    vdev = value_states.device
+                    Cvf = Cv.to(device=vdev, dtype=torch.float32)
+                    mixed = torch.einsum("bnm,bhmd->bhnd", Cvf, value_states.float())
+                    # C is std-normalized (for the bias), so renorm the mixed values back
+                    # to ‖v‖ before the residual — keeps the value graph-diffusion at the
+                    # content scale, λ_V tunes its strength (cold-start 0.1).
+                    mn = mixed.norm(dim=-1).mean().clamp(min=1e-12)
+                    vn = value_states.float().norm(dim=-1).mean()
+                    mixed = mixed * (vn / mn)
+                    # gain follows the (possibly sharded) value device; .to(dtype) alone
+                    # would leave it on the init device and mismatch under device_map=auto.
+                    lam_v = model.lam_v.to(device=vdev, dtype=value_states.dtype)
+                    value_states = value_states + lam_v * mixed.to(value_states.dtype)
             # --- c_per_layer: REPLACE q/k with the composite covariance mixing the
             # sequence, q ← C_tok·q, k ← C_tok·k (the proof's relative c(n-m) in the
             # score, every layer). Skipped on cached single-token decode (seq mismatch)
             # — only prompt tokens carry it, like the additive path. Value is content. ---
             C = model._pe_C
-            if (C is not None and C.shape[0] == hidden_states.shape[0]
+            if (not model.c_bias and C is not None and C.shape[0] == hidden_states.shape[0]
                     and C.shape[1] == hidden_states.shape[1]):
                 # C_tok is built once on the embedding device; under device_map="auto"
                 # each decoder layer can live on a different GPU, so move C onto this
@@ -694,6 +821,39 @@ class InjectedCompositeGraphLLM(CompositeGraphLLM):
             if past_key_values is not None:
                 key_states, value_states = past_key_values.update(
                     key_states, value_states, attn.layer_idx)
+
+            # --- Design D (c_bias): fold the additive C/S̃ position+graph bias into the
+            # attention_mask (eager/sdpa add it to the logits before softmax). Built post-
+            # cache so the decode row spans all cached keys; selection ⟨q,k⟩ is untouched. ---
+            if model.c_bias:
+                key_len = key_states.shape[2]
+                dev = query_states.device
+                # gains follow this layer's (possibly sharded) device; .float() alone
+                # keeps them on the init device → mismatch under device_map=auto.
+                lam_c = model.lam_c.to(device=dev, dtype=torch.float32)
+                lam_s = model.lam_s.to(device=dev, dtype=torch.float32)
+                C = model._pe_C
+                bias = None
+                if C is not None and C.shape[1] == hidden_states.shape[1]:
+                    # PROMPT: full C_tok (+ optional S̃) → [B,1,seq,seq]
+                    b = lam_c * C.to(device=dev, dtype=torch.float32)
+                    S = model._pe_S
+                    if S is not None and model.use_scene_bias:
+                        b = b + lam_s * S.to(device=dev, dtype=torch.float32)
+                    bias = b.unsqueeze(1)
+                elif model._pe_c_row is not None and query_states.shape[2] == 1:
+                    # DECODE: extend position via analytic c(·), offset mod prompt-len.
+                    crow = model._pe_c_row.to(device=dev)                 # [B, c]
+                    cyc = crow.shape[1]
+                    off = (key_len - 1 - torch.arange(key_len, device=dev)) % cyc
+                    bias = (lam_c * crow[:, off].float())[:, None, None, :]
+                if bias is not None:
+                    bias = bias.to(dtype=query_states.dtype)
+                    if attention_mask is None:
+                        attention_mask = bias
+                    else:
+                        am = attention_mask[..., :key_len].to(device=dev, dtype=bias.dtype)
+                        attention_mask = am + bias
 
             attn_impl = attn.config._attn_implementation
             attention_interface = (
@@ -725,11 +885,27 @@ class InjectedCompositeGraphLLM(CompositeGraphLLM):
 
         The unused signal is cleared so a stale one can't leak across modes.
         """
-        if self.c_per_layer:
+        if self.c_bias:
+            # Design D: additive Ĉ/S̃ logit bias + residual Ĉ-value mix; no q/k transform.
+            # Ĉ is the ANALYTIC cycle second moment from the R-PEARL taps (deterministic,
+            # graph-independent → computed once, broadcast over the batch); S̃ is the
+            # graph-dependent scene bias.
+            inputs_embeds, s_til = self._fuse_embeddings(
+                input_ids, graphs, injection_maps, permutation=permutation,
+                return_s_tilde=True)
+            B, c = input_ids.shape[0], input_ids.shape[1]
+            C_hat, c_row = self._analytic_c_tok(c, input_ids.device)   # [c,c], [c]
+            self._pe_C = C_hat.unsqueeze(0).expand(B, -1, -1)
+            self._pe_S = s_til
+            self._pe_c_row = c_row.unsqueeze(0).expand(B, -1)
+            self._pe_signal = None
+        elif self.c_per_layer:
             inputs_embeds, c_tok = self._fuse_embeddings(
                 input_ids, graphs, injection_maps, permutation=permutation,
                 return_c_tok=True)
             self._pe_C = c_tok
+            self._pe_S = None
+            self._pe_c_row = None
             self._pe_signal = None
         else:
             inputs_embeds, token_pe = self._fuse_embeddings(
@@ -737,6 +913,8 @@ class InjectedCompositeGraphLLM(CompositeGraphLLM):
                 return_token_pe=True)
             self._pe_signal = token_pe
             self._pe_C = None
+            self._pe_S = None
+            self._pe_c_row = None
         return inputs_embeds
 
     def forward(self, input_ids=None, attention_mask=None, labels=None,
@@ -755,6 +933,8 @@ class InjectedCompositeGraphLLM(CompositeGraphLLM):
             if not getattr(self.llm, "is_gradient_checkpointing", False):
                 self._pe_signal = None
                 self._pe_C = None
+                self._pe_S = None
+                self._pe_c_row = None
 
     def prepare_generation(self, input_ids, graphs, injection_maps, permutation=None):
         """Arm the in-attention injection and return ``inputs_embeds``.

@@ -214,6 +214,8 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
             finally:
                 graph_model._pe_signal = None
                 graph_model._pe_C = None
+                graph_model._pe_S = None
+                graph_model._pe_c_row = None
 
         if isinstance(graph_model, CompositeGraphLLM):
             # M9: assemble the composite graph (cycle + scene + cross-links) from the
