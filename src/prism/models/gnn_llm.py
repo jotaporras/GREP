@@ -545,22 +545,16 @@ class CompositeGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         return C_tok * (target / cur)
 
     @staticmethod
-    def _analytic_c_from_taps(H, c, eps: float = 1e-12):
-        """Analytic cycle second moment ``C = h(S_c)h(S_c)*`` from R-PEARL filter taps.
+    def _analytic_c_row_from_taps(H, c, eps: float = 1e-12):
+        """Analytic relative-position row ``c_row[δ] = c(δ)/c(0)`` from R-PEARL taps.
 
-        The proof's whole point: the SAME filter taps that produce Ψ analytically give
-        the relative-position covariance — no random probes, no Monte-Carlo estimate.
-        For the directed circulant cycle ``S_c`` (eigenvalues ``ω^k=e^{2πik/c}``) a graph
-        filter ``h(S_c)=Σ_j H_j S_c^j`` has per-mode response ``ĥ(ω_k)=Σ_j H_j ω_k^j`` and
-
-            ρ_k = ‖ĥ(ω_k)‖²  (≥ 0) ,    c(δ) = (1/c) Σ_k ρ_k ω_k^δ = IDFT(ρ) ,
-            C[t,u] = c(t−u) ,    Ĉ = C / c(0)   (c(0)=mean(ρ) > 0, the peak).
-
-        `H` is ``[K+1, F]`` (one vector tap per polynomial order). This is DETERMINISTIC,
-        PSD by construction (ρ ≥ 0 ⇒ circulant PSD), O(1) after the c(0) normalization
-        (no F-suppression — the RAW O(1) taps are used, the β=1/F forward rescale is a
-        no-grad magnitude scalar that the normalization cancels), and its gradient flows
-        to ``H`` — i.e. it trains the R-PEARL taps. Returns ``(Ĉ [c,c], c_row [c])``.
+        The proof's point: the SAME taps that produce Ψ give the relative-position
+        covariance analytically (no probes). For the directed circulant cycle ``S_c``
+        (eigenvalues ``ω^k=e^{2πik/c}``) a graph filter ``h(S_c)=Σ_j H_j S_c^j`` has
+        per-mode response ``ĥ(ω_k)=Σ_j H_j ω_k^j``; ``ρ_k=‖ĥ(ω_k)‖²≥0``,
+        ``c(δ)=IDFT(ρ)``, normalized by ``c(0)=mean(ρ)>0``. ``H`` is ``[K+1, F]``.
+        This is the cheap ``[c]`` part — used directly at decode (the full ``[c,c]`` is
+        only needed for the prompt bias / value-mix). Gradient flows to ``H``.
         """
         K1 = H.shape[0]
         dev = H.device
@@ -572,22 +566,32 @@ class CompositeGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         hi = torch.sin(ang) @ Hf                                # Im ĥ(ω_k)  [c, F]
         rho = (hr * hr + hi * hi).sum(-1)                       # ρ_k = ‖ĥ(ω_k)‖²  [c]
         c_vec = torch.fft.ifft(rho.to(torch.complex64)).real    # c(δ) = IDFT(ρ)  [c]
-        c0 = c_vec[0].clamp(min=eps)                            # c(0) = mean(ρ) > 0
-        c_row = c_vec / c0                                      # normalized, c_row[0]=1
-        idx = (kk.long()[:, None] - kk.long()[None, :]) % c     # (t−u) mod c
-        return c_row[idx], c_row                               # Ĉ [c,c] circulant, c_row [c]
+        return c_vec / c_vec[0].clamp(min=eps)                  # c_row [c], c_row[0]=1
+
+    @classmethod
+    def _analytic_c_from_taps(cls, H, c, eps: float = 1e-12):
+        """Full analytic ``Ĉ`` [c,c] (circulant) + ``c_row`` [c] from R-PEARL taps.
+
+        PSD by construction (ρ≥0), O(1) (the c(0) normalization cancels the no-grad
+        β=1/F forward rescale), deterministic, and its gradient trains ``H``.
+        """
+        c_row = cls._analytic_c_row_from_taps(H, c, eps)
+        kk = torch.arange(c, device=H.device)
+        idx = (kk[:, None] - kk[None, :]) % c                  # (t−u) mod c
+        return c_row[idx], c_row                               # Ĉ [c,c] , c_row [c]
+
+    def _analytic_taps(self):
+        """The R-PEARL graph filter's OWN taps ``[K+1, F]`` (grad-carrying) — the same
+        weights that produce Ψ. Small (≈(K+1)·F), so they can be moved to each sharded
+        layer's device cheaply, keeping the tap gradient fully trainable on multi-GPU
+        while only this tiny tensor (not the [c,c] kernel) crosses device streams."""
+        conv0 = self.gt_model.pe_model.pe_gcn.convs[0]
+        return torch.stack([lin.weight.reshape(lin.weight.shape[0], -1).mean(-1)
+                            for lin in conv0.lins], dim=0)      # [K+1, F]
 
     def _analytic_c_tok(self, c, device):
-        """c_bias positional kernel: analytic ``Ĉ`` from the R-PEARL first-TAGConv taps.
-
-        Pulls the R-PEARL graph filter's own taps (``pe_gcn.convs[0].lins[j].weight``,
-        one vector per polynomial order j=0..K) and forms the deterministic cycle
-        second moment via :meth:`_analytic_c_from_taps`. No probes, no 1/c(0) blow-up.
-        """
-        conv0 = self.gt_model.pe_model.pe_gcn.convs[0]
-        H = torch.stack([lin.weight.reshape(lin.weight.shape[0], -1).mean(-1)
-                         for lin in conv0.lins], dim=0)         # [K+1, F]  vector taps
-        return self._analytic_c_from_taps(H.to(device), c)
+        """Convenience: full analytic ``Ĉ`` on ``device`` (used by the debug callback)."""
+        return self._analytic_c_from_taps(self._analytic_taps().to(device), c)
 
     def forward(
         self,
@@ -702,21 +706,20 @@ class InjectedCompositeGraphLLM(CompositeGraphLLM):
             # inner LLM (eager/sdpa add `attention_mask` to the logits; flash cannot).
             self.llm.config._attn_implementation = "eager"  # ty: ignore[invalid-assignment]
 
-        # Is the LLM sharded across >1 device (device_map="auto")? If so, the analytic Ĉ
-        # (built from the cuda:0 R-PEARL taps) is DETACHED at the attention site so the
-        # tap gradients don't accumulate across device streams (the AccumulateGrad
-        # stream-mismatch warning + the sync stall it causes). The taps still learn via
-        # the single-device GT path; on one GPU the gradient reaches them directly.
+        # Is the LLM sharded across >1 device (device_map="auto")? If so, c_bias arms the
+        # small grad-carrying TAPS and each layer recomputes Ĉ on its own device, so the
+        # R-PEARL taps stay FULLY trainable and only the tiny [K+1,F] tensor crosses device
+        # streams (not the [c,c] kernel). On one GPU the kernel is precomputed once.
         self._llm_sharded = False
         dm = getattr(self.llm, "hf_device_map", None)
         if dm:
             real = {str(d) for d in dm.values() if d not in ("cpu", "disk", -1)}
             self._llm_sharded = len(real) > 1
         if c_bias and self._llm_sharded:
-            # The 3 scalar gains λ_C/λ_S/λ_V live on one device but are applied in every
-            # (sharded) layer, so their grads accumulate across streams — benign (3 scalars,
-            # negligible sync) and they MUST keep their gradient. Silence the now-expected
-            # warning (the costly [c,c] Ĉ mismatch is already removed by the detach above).
+            # The taps + the 3 scalar gains λ_C/λ_S/λ_V live on one device but are applied
+            # in every (sharded) layer, so their grads accumulate across streams — benign
+            # (tiny tensors, negligible sync) and they MUST keep their gradient. Silence the
+            # now-expected stream-mismatch warning (the costly [c,c] mismatch is gone).
             _setw = getattr(getattr(torch.autograd, "graph", None),
                             "set_warn_on_accumulate_grad_stream_mismatch", None)
             if _setw is not None:
@@ -732,6 +735,8 @@ class InjectedCompositeGraphLLM(CompositeGraphLLM):
         self._pe_C = None
         self._pe_S = None
         self._pe_c_row = None
+        self._pe_taps = None      # c_bias multi-GPU: grad-carrying taps, Ĉ recomputed per layer
+        self._pe_cyc = None       # cycle length c for the analytic kernel
         self._pe_inject_value = inject_v
         self._install_pe_injection()
 
@@ -788,25 +793,35 @@ class InjectedCompositeGraphLLM(CompositeGraphLLM):
                 key_states = key_states + _proj(model.pe_k_proj)
                 if model._pe_inject_value:
                     value_states = value_states + _proj(model.pe_v_proj)
-            # --- Design D (c_bias): residual C-value mix on the PROMPT (mixed V is then
-            # cached). q/k are NOT touched; the additive C/S̃ logit bias is folded into
-            # attention_mask after the cache update (below). ---
+            # --- Design D (c_bias): per-layer analytic kernel Ĉ [c,c] / c_row [c] on THIS
+            # layer's device. Single-GPU: reuse the precomputed _pe_C. Multi-GPU: recompute
+            # from the small grad-carrying taps so the taps stay FULLY trainable while only
+            # the tiny [K+1,F] tensor crosses device streams (not the [c,c] kernel). ---
+            cb_C = cb_crow = None
             if model.c_bias:
-                Cv = model._pe_C
-                if (Cv is not None and Cv.shape[1] == hidden_states.shape[1]):
-                    vdev = value_states.device
-                    Cvf = Cv.to(device=vdev, dtype=torch.float32)
-                    mixed = torch.einsum("bnm,bhmd->bhnd", Cvf, value_states.float())
-                    # C is std-normalized (for the bias), so renorm the mixed values back
-                    # to ‖v‖ before the residual — keeps the value graph-diffusion at the
-                    # content scale, λ_V tunes its strength (cold-start 0.1).
-                    mn = mixed.norm(dim=-1).mean().clamp(min=1e-12)
-                    vn = value_states.float().norm(dim=-1).mean()
-                    mixed = mixed * (vn / mn)
-                    # gain follows the (possibly sharded) value device; .to(dtype) alone
-                    # would leave it on the init device and mismatch under device_map=auto.
-                    lam_v = model.lam_v.to(device=vdev, dtype=value_states.dtype)
-                    value_states = value_states + lam_v * mixed.to(value_states.dtype)
+                qdev = query_states.device
+                seq = hidden_states.shape[1]
+                if model._pe_taps is not None:                  # multi-GPU: recompute here
+                    taps = model._pe_taps.to(qdev)
+                    if seq == model._pe_cyc:
+                        cb_C, cb_crow = model._analytic_c_from_taps(taps, model._pe_cyc)
+                    elif seq == 1:
+                        cb_crow = model._analytic_c_row_from_taps(taps, model._pe_cyc)
+                else:                                           # single-GPU: precomputed
+                    if model._pe_C is not None and model._pe_C.shape[1] == seq:
+                        cb_C = model._pe_C[0].to(device=qdev, dtype=torch.float32)
+                    if model._pe_c_row is not None:
+                        cb_crow = model._pe_c_row[0].to(device=qdev)
+            # residual Ĉ-value mix on the PROMPT (mixed V is then cached); q/k untouched.
+            if model.c_bias and cb_C is not None:
+                mixed = torch.einsum("nm,bhmd->bhnd", cb_C.to(value_states.device),
+                                     value_states.float())
+                # renorm the mixed values back to ‖v‖ (Ĉ is O(1)); λ_V tunes strength.
+                mn = mixed.norm(dim=-1).mean().clamp(min=1e-12)
+                vn = value_states.float().norm(dim=-1).mean()
+                mixed = mixed * (vn / mn)
+                lam_v = model.lam_v.to(device=value_states.device, dtype=value_states.dtype)
+                value_states = value_states + lam_v * mixed.to(value_states.dtype)
             # --- c_per_layer: REPLACE q/k with the composite covariance mixing the
             # sequence, q ← C_tok·q, k ← C_tok·k (the proof's relative c(n-m) in the
             # score, every layer). Skipped on cached single-token decode (seq mismatch)
@@ -852,21 +867,20 @@ class InjectedCompositeGraphLLM(CompositeGraphLLM):
                 # keeps them on the init device → mismatch under device_map=auto.
                 lam_c = model.lam_c.to(device=dev, dtype=torch.float32)
                 lam_s = model.lam_s.to(device=dev, dtype=torch.float32)
-                C = model._pe_C
                 bias = None
-                if C is not None and C.shape[1] == hidden_states.shape[1]:
-                    # PROMPT: full C_tok (+ optional S̃) → [B,1,seq,seq]
-                    b = lam_c * C.to(device=dev, dtype=torch.float32)
+                if cb_C is not None:
+                    # PROMPT: λ_C·Ĉ [c,c] (+ optional λ_S·S̃) → [B,1,seq,seq]
+                    b = lam_c * cb_C.to(dev)[None]                          # [1,c,c]
                     S = model._pe_S
                     if S is not None and model.use_scene_bias:
-                        b = b + lam_s * S.to(device=dev, dtype=torch.float32)
+                        b = b + lam_s * S.to(device=dev, dtype=torch.float32)  # [B,c,c]
                     bias = b.unsqueeze(1)
-                elif model._pe_c_row is not None and query_states.shape[2] == 1:
+                elif cb_crow is not None and query_states.shape[2] == 1:
                     # DECODE: extend position via analytic c(·), offset mod prompt-len.
-                    crow = model._pe_c_row.to(device=dev)                 # [B, c]
-                    cyc = crow.shape[1]
+                    crow = cb_crow.to(dev)                                  # [c]
+                    cyc = crow.shape[0]
                     off = (key_len - 1 - torch.arange(key_len, device=dev)) % cyc
-                    bias = (lam_c * crow[:, off].float())[:, None, None, :]
+                    bias = (lam_c * crow[off])[None, None, None, :]
                 if bias is not None:
                     bias = bias.to(dtype=query_states.dtype)
                     if attention_mask is None:
@@ -914,14 +928,22 @@ class InjectedCompositeGraphLLM(CompositeGraphLLM):
                 input_ids, graphs, injection_maps, permutation=permutation,
                 return_s_tilde=True)
             B, c = input_ids.shape[0], input_ids.shape[1]
-            C_hat, c_row = self._analytic_c_tok(c, input_ids.device)   # [c,c], [c]
-            if self._llm_sharded:
-                # multi-GPU: detach so tap grads don't cross device streams (see __init__).
-                C_hat, c_row = C_hat.detach(), c_row.detach()
-            self._pe_C = C_hat.unsqueeze(0).expand(B, -1, -1)
             self._pe_S = s_til
-            self._pe_c_row = c_row.unsqueeze(0).expand(B, -1)
             self._pe_signal = None
+            self._pe_cyc = c
+            if self._llm_sharded:
+                # multi-GPU: arm the small grad-carrying TAPS; each layer recomputes Ĉ on
+                # its own device → the taps stay FULLY trainable and only this tiny tensor
+                # crosses device streams (not the [c,c] kernel). _pe_C/_pe_c_row stay None.
+                self._pe_taps = self._analytic_taps()
+                self._pe_C = None
+                self._pe_c_row = None
+            else:
+                # single GPU: precompute Ĉ once (full grad, no cross-device), reuse all layers.
+                C_hat, c_row = self._analytic_c_from_taps(self._analytic_taps().to(input_ids.device), c)
+                self._pe_C = C_hat.unsqueeze(0).expand(B, -1, -1)
+                self._pe_c_row = c_row.unsqueeze(0).expand(B, -1)
+                self._pe_taps = None
         elif self.c_per_layer:
             inputs_embeds, c_tok = self._fuse_embeddings(
                 input_ids, graphs, injection_maps, permutation=permutation,
@@ -958,6 +980,7 @@ class InjectedCompositeGraphLLM(CompositeGraphLLM):
                 self._pe_C = None
                 self._pe_S = None
                 self._pe_c_row = None
+                self._pe_taps = None
 
     def prepare_generation(self, input_ids, graphs, injection_maps, permutation=None):
         """Arm the in-attention injection and return ``inputs_embeds``.
