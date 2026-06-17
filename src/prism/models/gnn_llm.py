@@ -702,6 +702,26 @@ class InjectedCompositeGraphLLM(CompositeGraphLLM):
             # inner LLM (eager/sdpa add `attention_mask` to the logits; flash cannot).
             self.llm.config._attn_implementation = "eager"  # ty: ignore[invalid-assignment]
 
+        # Is the LLM sharded across >1 device (device_map="auto")? If so, the analytic Ĉ
+        # (built from the cuda:0 R-PEARL taps) is DETACHED at the attention site so the
+        # tap gradients don't accumulate across device streams (the AccumulateGrad
+        # stream-mismatch warning + the sync stall it causes). The taps still learn via
+        # the single-device GT path; on one GPU the gradient reaches them directly.
+        self._llm_sharded = False
+        dm = getattr(self.llm, "hf_device_map", None)
+        if dm:
+            real = {str(d) for d in dm.values() if d not in ("cpu", "disk", -1)}
+            self._llm_sharded = len(real) > 1
+        if c_bias and self._llm_sharded:
+            # The 3 scalar gains λ_C/λ_S/λ_V live on one device but are applied in every
+            # (sharded) layer, so their grads accumulate across streams — benign (3 scalars,
+            # negligible sync) and they MUST keep their gradient. Silence the now-expected
+            # warning (the costly [c,c] Ĉ mismatch is already removed by the detach above).
+            _setw = getattr(getattr(torch.autograd, "graph", None),
+                            "set_warn_on_accumulate_grad_stream_mismatch", None)
+            if _setw is not None:
+                _setw(False)
+
         # Per-forward signals read by the patched attention forwards, set by
         # forward()/prepare_generation():
         #   _pe_signal    : additive code S=Y_tok ([B, seq, hidden]) — additive variant.
@@ -895,6 +915,9 @@ class InjectedCompositeGraphLLM(CompositeGraphLLM):
                 return_s_tilde=True)
             B, c = input_ids.shape[0], input_ids.shape[1]
             C_hat, c_row = self._analytic_c_tok(c, input_ids.device)   # [c,c], [c]
+            if self._llm_sharded:
+                # multi-GPU: detach so tap grads don't cross device streams (see __init__).
+                C_hat, c_row = C_hat.detach(), c_row.detach()
             self._pe_C = C_hat.unsqueeze(0).expand(B, -1, -1)
             self._pe_S = s_til
             self._pe_c_row = c_row.unsqueeze(0).expand(B, -1)
