@@ -702,9 +702,13 @@ class InjectedCompositeGraphLLM(CompositeGraphLLM):
             self.lam_c = nn.Parameter(torch.tensor(1.0, device=device))
             self.lam_s = nn.Parameter(torch.tensor(0.0, device=device))
             self.lam_v = nn.Parameter(torch.tensor(0.1, device=device))
-            # Additive bias needs the score before softmax → force eager attention on the
-            # inner LLM (eager/sdpa add `attention_mask` to the logits; flash cannot).
-            self.llm.config._attn_implementation = "eager"  # ty: ignore[invalid-assignment]
+            # Additive bias needs a backend that adds a float `attention_mask` to the
+            # scores before softmax. BOTH eager and sdpa do; only flash-attn can't. Use
+            # SDPA (fused, memory-efficient) — eager materializes the full [B,H,c,c] score
+            # tensor (~8.6 GB/layer at c=8192) and softmaxes in Python, which is the
+            # c_bias-specific slowdown. SDPA falls back to its mem-efficient/math kernel
+            # when given a custom additive mask, but never materializes all heads at once.
+            self.llm.config._attn_implementation = "sdpa"  # ty: ignore[invalid-assignment]
 
         # Is the LLM sharded across >1 device (device_map="auto")? If so, c_bias arms the
         # small grad-carrying TAPS and each layer recomputes Ĉ on its own device, so the
@@ -884,6 +888,15 @@ class InjectedCompositeGraphLLM(CompositeGraphLLM):
                 if bias is not None:
                     bias = bias.to(dtype=query_states.dtype)
                     if attention_mask is None:
+                        # SDPA passes no mask and would apply is_causal internally; supplying
+                        # an explicit mask disables that, so fold the causal triangle into the
+                        # bias (prompt only — a single decode query attends all cached keys).
+                        q_len = query_states.shape[2]
+                        if q_len > 1:
+                            causal = torch.triu(
+                                torch.full((q_len, key_len), float("-inf"), device=dev,
+                                           dtype=bias.dtype), diagonal=key_len - q_len + 1)
+                            bias = bias + causal[None, None]
                         attention_mask = bias
                     else:
                         am = attention_mask[..., :key_len].to(device=dev, dtype=bias.dtype)

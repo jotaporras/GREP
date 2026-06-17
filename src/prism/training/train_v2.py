@@ -325,6 +325,12 @@ class TrainConfig:
     per_device_train_batch_size: int = 1
     per_device_eval_batch_size: int = 1
     gradient_accumulation_steps: int = 2
+    # Recompute layer activations in backward instead of retaining them — the
+    # dominant activation-memory lever for an 8B/32-layer LLM at long context.
+    # use_reentrant=False is required: the GT feeds `inputs_embeds` (grad-carrying),
+    # which the reentrant checkpoint mishandles. The injection disarm logic
+    # (gnn_llm) already keeps Ψ/Ĉ armed while GC recomputes the attention forwards.
+    gradient_checkpointing: bool = True
     dataloader_num_workers: int = 4
     report_to: str = "wandb"
     learning_rate: float = 2e-4
@@ -753,6 +759,9 @@ def train_model(config: TrainConfig, config_file: str = None):
         weight_decay=config.weight_decay,
         lr_scheduler_type="linear",
         logging_steps=15,
+        # Activation recompute — the main fix for backward-pass OOM at long context.
+        gradient_checkpointing=config.gradient_checkpointing,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         # precision
         fp16=_fp16_supported(),
         bf16=_bf16_supported(),

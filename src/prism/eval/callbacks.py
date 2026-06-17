@@ -288,12 +288,15 @@ class GradientDebugCallback(TrainerCallback):
                 warnings.warn(f"[filter_norm] measurement skipped: {e}")
         if getattr(inner, "c_bias", False):
             try:
-                # analytic Ĉ from the R-PEARL taps (deterministic; c_bias positional kernel)
-                C_hat, c_row = inner._analytic_c_tok(64, next(inner.parameters()).device)
-                out["grep/c_bias/c_hat_diag"] = float(C_hat.diagonal().max())     # =1 (normalized)
-                out["grep/c_bias/c_row_min"] = float(c_row.min())                 # off-peak decay
-                out["grep/c_bias/lam_c"] = float(inner.lam_c.detach())
-                out["grep/c_bias/lam_v"] = float(inner.lam_v.detach())
+                # analytic Ĉ from the R-PEARL taps (deterministic; c_bias positional kernel).
+                # no_grad: logging only — Ĉ is built from grad-carrying taps, so without it
+                # float(...) on those tensors warns (and would build a throwaway grad graph).
+                with torch.no_grad():
+                    C_hat, c_row = inner._analytic_c_tok(64, next(inner.parameters()).device)
+                    out["grep/c_bias/c_hat_diag"] = float(C_hat.diagonal().max())  # =1 (normalized)
+                    out["grep/c_bias/c_row_min"] = float(c_row.min())             # off-peak decay
+                    out["grep/c_bias/lam_c"] = float(inner.lam_c)
+                    out["grep/c_bias/lam_v"] = float(inner.lam_v)
             except Exception:
                 pass
         return out
