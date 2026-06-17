@@ -304,6 +304,7 @@ class GraphTransformer(nn.Module):
                  dropout: float = 0.1, k_pe: int = 3, k_gt: int = 3,
                  eps: float = 1e-8, use_layer_norm: bool = True,
                  probe_distribution: str = "gaussian", m_test: int = None,
+                 max_gather_rows: int = 2_000_000,
                  fixed_seed_mode: bool = False, fixed_seed_value: int = 0,
                  spectral_norm_linears: bool = True, pe_readout: str = "mean",
                  center_second_moment: bool = True):
@@ -335,6 +336,7 @@ class GraphTransformer(nn.Module):
             pe_hidden_channels=pe_hidden_channels, pe_num_layers=pe_num_layers, d_model=d_model,
             num_samples=num_samples, dropout=dropout, k=k_pe, eps=eps, use_layer_norm=use_layer_norm,
             probe_distribution=probe_distribution, m_test=m_test,
+            max_gather_rows=max_gather_rows,
             fixed_seed_mode=fixed_seed_mode, fixed_seed_value=fixed_seed_value,
             center_second_moment=center_second_moment,
         )

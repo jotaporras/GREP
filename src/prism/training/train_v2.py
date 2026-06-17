@@ -371,6 +371,7 @@ class TrainConfig:
     # R-PEARL sampling
     probe_distribution: str = "gaussian"
     m_test: int = 128
+    max_gather_rows: int = 2_000_000
     fixed_seed_mode: bool = False
     fixed_seed_value: int = 0
     # R-PEARL readout fed to the GT (composite_graph_gt only): "mean" = first
@@ -631,6 +632,7 @@ def train_model(config: TrainConfig, config_file: str = None):
             use_layer_norm=config.use_layer_norm,
             probe_distribution=config.probe_distribution,
             m_test=config.m_test,
+            max_gather_rows=config.max_gather_rows,
             fixed_seed_mode=config.fixed_seed_mode,
             fixed_seed_value=config.fixed_seed_value,
             # Token embeddings are fused (M6) -> the X-carrying GT path is not
@@ -804,6 +806,7 @@ def train_model(config: TrainConfig, config_file: str = None):
             **({"k_gt": config.k_gt, "gt_num_layers": config.gt_num_layers,
                 "gt_heads": config.gt_heads,
                 "probe_distribution": config.probe_distribution, "m_test": config.m_test,
+                "max_gather_rows": config.max_gather_rows,
                 "fixed_seed_mode": config.fixed_seed_mode, "fixed_seed_value": config.fixed_seed_value,
                 "injection_mode": config.injection_mode, "gate_init": config.gate_init,
                 "gate_per_dim": config.gate_per_dim, "disable_rope": config.disable_rope,

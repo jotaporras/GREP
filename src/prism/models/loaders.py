@@ -152,6 +152,7 @@ def graph_augmented_llm_from_pretrained(
             use_layer_norm=gnn_cfg["use_layer_norm"],
             probe_distribution=gnn_cfg.get("probe_distribution", "gaussian"),
             m_test=gnn_cfg.get("m_test"),
+            max_gather_rows=gnn_cfg.get("max_gather_rows", 2_000_000),
             fixed_seed_mode=gnn_cfg.get("fixed_seed_mode", False),
             fixed_seed_value=gnn_cfg.get("fixed_seed_value", 0),
             spectral_norm_linears=False,  # M6 fusion path (token embeddings fused)

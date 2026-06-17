@@ -156,7 +156,11 @@ main() {
   else
     LOG="$(mktemp "${TMPDIR:-/tmp}/e7_train_log.XXXXXX")"
     echo ">>> [1/2] Training (train_v2) -> tee $LOG"
-    env ${CUDA_ENV[@]+"${CUDA_ENV[@]}"} uv run -m prism.training.train_v2 "$CONFIG" --device "$GPU" 2>&1 | tee "$LOG"
+    # expandable_segments lets the allocator reclaim "reserved but unallocated"
+    # fragmentation (the R-PEARL second-moment recompute needed ~5 GiB that was
+    # stranded in the reserve). Pure allocator behavior — no numeric/perf change.
+    env PYTORCH_ALLOC_CONF=expandable_segments:True ${CUDA_ENV[@]+"${CUDA_ENV[@]}"} \
+      uv run -m prism.training.train_v2 "$CONFIG" --device "$GPU" 2>&1 | tee "$LOG"
   fi
 
   # --- resolve the checkpoint that this run produced ---
@@ -173,7 +177,7 @@ main() {
   # spike. Eval falls back to RegEx/NetworkX only (objective accuracy unchanged;
   # the subjective/judge column is simply not produced).
   local -a EVAL_CMD=(
-    env PRISM_DISABLE_SPINE_TOOLS=1 GREP_JUDGE=0 ${CUDA_ENV[@]+"${CUDA_ENV[@]}"}
+    env PRISM_DISABLE_SPINE_TOOLS=1 GREP_JUDGE=0 PYTORCH_ALLOC_CONF=expandable_segments:True ${CUDA_ENV[@]+"${CUDA_ENV[@]}"}
     uv run -m prism.eval.scalability_evaluation
     --checkpoint "$CKPT_DIR/$MODEL/"
     --graphs "$GRAPHS"

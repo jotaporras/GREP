@@ -47,6 +47,7 @@ class RandomGNNPositionalEncodings(nn.Module):
         fixed_seed_mode: bool = False,
         fixed_seed_value: int = 0,
         max_probe_rows: int = 65536,
+        max_gather_rows: int = 2_000_000,
         center_second_moment: bool = True,
     ):
         super().__init__()
@@ -98,6 +99,17 @@ class RandomGNNPositionalEncodings(nn.Module):
         # per-chunk means are accumulated (the MC estimate is mean-over-probes, so
         # this is identical to a single pass — only the peak memory differs).
         self.max_probe_rows = max_probe_rows
+        # Companion cap on the TAGConv MESSAGE gather. The batched GCN materialises
+        # x_j = [chunk * num_EDGES, channels] in message passing; this is the tensor
+        # that OOMs, and it scales with edges, not nodes. ``max_probe_rows`` bounds
+        # chunk*num_nodes and is blind to edge count, so a dense composite graph
+        # (long token cycle + mention cliques, E >> N) blows past the node-based
+        # bound. ``max_gather_rows`` bounds chunk*num_edges as well; chunk is the
+        # min of the two caps. For ordinary graphs (E ~ N) the node cap binds and
+        # chunk is unchanged (bit-identical output, same speed); only edge-dense
+        # graphs — the ones that previously OOMed — get the smaller, fitting chunk.
+        # Pure MC-estimate invariant: same probes, only the chunk grouping differs.
+        self.max_gather_rows = max_gather_rows
         # Center the second-moment readout into a covariance (C·s = E[Φ(Φᵀs)] − Ψ(Ψᵀs)).
         # Required for the second moment to carry position: the nonlinear GCN gives Φ a
         # nonzero mean whose rank-1 outer product ΨΨᵀ otherwise dominates E[ΦΦᵀ].
@@ -198,10 +210,14 @@ class RandomGNNPositionalEncodings(nn.Module):
         # is bit-transparent (and R7 reproducibility is unaffected).
         Q = self._sample_probes(num_nodes, m, device, generator)
 
-        # chunk = how many probes fit under max_probe_rows; train (small N, small
-        # m_train) keeps chunk == m (single pass, unchanged), eval (large N, large
-        # m_test) splits so [chunk*N, d_model] stays bounded.
-        chunk = max(1, min(m, self.max_probe_rows // max(1, num_nodes)))
+        # chunk = how many probes fit under the node cap AND the edge (gather) cap;
+        # train (small N/E, small m_train) keeps chunk == m (single pass, unchanged),
+        # eval splits so both [chunk*N, d_model] and the [chunk*E, channels] message
+        # gather stay bounded. The edge cap only binds for E >> N (dense composite
+        # graphs); otherwise the node cap binds and chunk is unchanged.
+        num_edges = edge_index.shape[1]
+        chunk = max(1, min(m, self.max_probe_rows // max(1, num_nodes),
+                           self.max_gather_rows // max(1, num_edges)))
         pooled_sum = None
         for start in range(0, m, chunk):
             Qc = Q[:, start:start + chunk]
@@ -285,7 +301,9 @@ class RandomGNNPositionalEncodings(nn.Module):
             generator = torch.Generator(device=device)
             generator.manual_seed(self.fixed_seed_value)
         Q = self._sample_probes(num_nodes, m, device, generator)
-        chunk = max(1, min(m, self.max_probe_rows // max(1, num_nodes)))
+        num_edges = edge_index.shape[1]
+        chunk = max(1, min(m, self.max_probe_rows // max(1, num_nodes),
+                           self.max_gather_rows // max(1, num_edges)))
 
         def _chunk_apply(Qc, ei, _dummy=None):
             mc = Qc.shape[1]
