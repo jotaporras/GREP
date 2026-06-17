@@ -297,21 +297,17 @@ class RandomGNNPositionalEncodings(nn.Module):
             P = self._batched_gcn_forward(
                 Qc, ei, num_nodes, mc, edge_weight=edge_weight, device=device, pool=False
             )  # [mc, N, d]
-            # Accumulate the outer products and the DC mean in fp64: the centering
-            # E[ΦΦᵀ] − ΨΨᵀ subtracts a rank-1 DC term that dominates the small covariance,
-            # and with the β=1/F filter bound Φ is F-suppressed (~1e-4) — so in fp32 the
-            # cancellation loses all precision and the "covariance" goes indefinite
-            # (λ_min ≪ 0). fp64 preserves PSD. Only a single [N, d] slice is upcast at a
-            # time (no [mc, N, d] fp64 blow-up); cast back to signal.dtype on return.
-            s64 = s.double()
+            # fp32 outer products (the dominant matmul). [The PSD-stable fp64 path was
+            # only needed by the old Monte-Carlo c_bias covariance kernel, which is now
+            # ANALYTIC (_analytic_c_from_taps) — the remaining callers (GT H0 `C·seeded`
+            # scaled to ‖signal‖; c_per_layer `C_tok` scaled to ‖X‖) are not PSD-asserted
+            # and ran in fp32 fine. fp64 here cost ~30x on GPUs with throttled fp64.]
             out = None
-            psi_sum = None
             for si in range(P.shape[0]):
-                Ps = P[si].double()                          # [N, d] fp64 (transient)
-                contrib = Ps @ (Ps.transpose(0, 1) @ s64)    # [N, d] @ ([d, N] @ [N, d])
+                Ps = P[si]                                   # [N, d]
+                contrib = Ps @ (Ps.transpose(0, 1) @ s)      # [N, d] @ ([d, N] @ [N, d])
                 out = contrib if out is None else out + contrib
-                psi_sum = Ps if psi_sum is None else psi_sum + Ps
-            return out, psi_sum                              # (Σ_s Φ Φᵀ s, Σ_s Φ), fp64
+            return out, P.sum(dim=0)                          # (Σ_s Φ Φᵀ s, Σ_s Φ)
 
         acc = None
         psi_acc = None
@@ -333,9 +329,8 @@ class RandomGNNPositionalEncodings(nn.Module):
             # pure averaging). Subtracting it (Ψ = E_q[Φ], same raw probes) restores the
             # position-bearing covariance the proof guarantees. Ψ here is the un-normed
             # pooled Φ, matching the un-normed Φ in the second moment.
-            psi = psi_acc / m                                # E_q[Φ]  [N, d] (fp64)
-            s64 = s.to(psi.dtype)                             # fp64 centering (PSD-stable)
-            result = result - psi @ (psi.transpose(0, 1) @ s64)
+            psi = psi_acc / m                                # E_q[Φ]  [N, d]
+            result = result - psi @ (psi.transpose(0, 1) @ s)
         if not scale_to_signal:
             # Raw centered covariance application C·signal — no magnitude match, no
             # output gate. Used to materialize the C operator (e.g. C_tok) for the
