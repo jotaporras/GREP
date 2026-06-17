@@ -43,6 +43,7 @@ crosslink_mention_clique: true
 # R-PEARL sampling
 probe_distribution: gaussian
 m_test: 128
+max_gather_rows: 2000000
 fixed_seed_mode: false
 fixed_seed_value: 0
 pe_readout: second_moment
