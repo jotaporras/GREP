@@ -221,6 +221,13 @@ def _load_judge():
     if _JUDGE["loaded"]:
         return _JUDGE["gen"]
     _JUDGE["loaded"] = True
+    # Hard off-switch: GREP_JUDGE=0 skips the model load entirely (no GPU memory/
+    # power spike). Disables BOTH the acceptance judge and the path rescue, since
+    # both route through here. Mirrors GREP_PATH_RESCUE's on-by-default semantics.
+    if os.environ.get("GREP_JUDGE", "1").strip().lower() not in ("1", "true", "yes", "on"):
+        print("[path_validator] Gemma judge disabled (GREP_JUDGE=0); regex/NetworkX only.")
+        _JUDGE["gen"] = None
+        return None
     try:
         import torch
         from transformers import AutoModelForImageTextToText, AutoProcessor

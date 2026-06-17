@@ -22,7 +22,7 @@
 # 0,1,... or -1 to use ALL GPUs via device_map="auto"). A single index masks
 # CUDA_VISIBLE_DEVICES=$GPU; -1 leaves every GPU visible (no mask):
 #   [CUDA_VISIBLE_DEVICES=$GPU] uv run -m prism.training.train_v2 $CONFIG_PATH --device $GPU
-#   PRISM_DISABLE_SPINE_TOOLS=1 [CUDA_VISIBLE_DEVICES=$GPU] \
+#   PRISM_DISABLE_SPINE_TOOLS=1 GREP_JUDGE=0 [CUDA_VISIBLE_DEVICES=$GPU] \
 #     uv run -m prism.eval.scalability_evaluation \
 #       --checkpoint outputs/e7_architecture_improvements/$MODEL/ \
 #       --graphs data/gen/nav100_n30_gemma_data/split/test_graphs/ \
@@ -168,8 +168,12 @@ main() {
   echo ">>> resolved checkpoint: $CKPT_DIR/$MODEL"
 
   # --- 2. no-SPINE scalability eval on the test graphs ---
+  # GREP_JUDGE=0 turns off the Gemma 4 judge (acceptance + path rescue) so the
+  # judge model never loads on the eval GPU — avoids the train->eval load/power
+  # spike. Eval falls back to RegEx/NetworkX only (objective accuracy unchanged;
+  # the subjective/judge column is simply not produced).
   local -a EVAL_CMD=(
-    env PRISM_DISABLE_SPINE_TOOLS=1 ${CUDA_ENV[@]+"${CUDA_ENV[@]}"}
+    env PRISM_DISABLE_SPINE_TOOLS=1 GREP_JUDGE=0 ${CUDA_ENV[@]+"${CUDA_ENV[@]}"}
     uv run -m prism.eval.scalability_evaluation
     --checkpoint "$CKPT_DIR/$MODEL/"
     --graphs "$GRAPHS"
