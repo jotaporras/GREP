@@ -8,8 +8,12 @@ to the compact format the LLM consumes:
     keeps train and eval symmetric), replaced by a short compact-format system
     prompt (the ``<think>…</think>`` contract + a latent-connectivity note);
   * the scene graph becomes a compact ``Scene graph:`` block (bulleted node-name
-    lists + robot location, NO edges — the GNN supplies connectivity) and follows
-    that system prompt in the same leading ``system`` message, ABOVE the first task;
+    lists + robot location) and follows that system prompt in the same leading
+    ``system`` message, ABOVE the first task. Graph-augmented archs OMIT edges (the
+    GNN supplies connectivity) and use the latent-connectivity system prompt; the
+    plain-LLM baseline (``include_edges=True``) instead lists ``• Region Edges:`` /
+    ``• Object Edges:`` in the block and uses an edge-aware system prompt that points
+    at those edges (no GNN, no latent claim) — see the PLAIN-LLM COMPACT section;
   * tasks then stack as ``user``/``assistant`` pairs in the same conversation per
     graph; the assistant target wraps reasoning in
     ``<think>Relevant graph: …\\n\\nReasoning: …</think>`` followed by the bare plan.
@@ -40,7 +44,7 @@ from prism.data.compact_prompt import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = REPO_ROOT / "data" / "gen" / "nav100_n30_gemma_data"
+DATA_DIR = REPO_ROOT / "data_store" / "revised" / "gen" / "nav100_n30_gemma_data"
 DEFAULT_PLAN = DATA_DIR / "generated_plans" / "sample_000_000.json"
 DEFAULT_GRAPH = DATA_DIR / "populated_graphs" / "data_gen_000.json"
 SECOND_GRAPH = DATA_DIR / "populated_graphs" / "data_gen_001.json"
@@ -141,6 +145,32 @@ def main() -> None:
     assert sum(c["content"].count("Scene graph:") for c in compact) == 1, "ICL graph leaked"
     print("  -> ONE system message = compact prompt + the query 'Scene graph:'; SPINE system + ICL gone.")
     _show(compact, tokenizer, add_generation_prompt=False)
+
+    # --- 3b. PLAIN-LLM COMPACT: edges in the block + edge-aware system prompt ------
+    # The plain-LLM baseline has no GNN, so it consumes the SAME compact format but
+    # WITH connectivity written into the scene-graph block (`• Region Edges:` /
+    # `• Object Edges:`) and an edge-aware system prompt that points at those edges
+    # (no latent-space claim). `include_edges=True` is exactly what the training
+    # (data.py) and eval (InMemoryLLM.query_llm) paths pass for the `llm` arch, in
+    # all three settings (training, in-training eval, scalability eval). Same input
+    # `spine_convo` as above; the only change is include_edges.
+    compact_llm = spine_to_compact_messages(spine_convo, include_edges=True)
+    _rule("PLAIN-LLM COMPACT  (include_edges=True: edges in block + edge-aware system prompt)")
+    llm_sys = next(m["content"] for m in compact_llm if m["role"] == "system")
+    gnn_sys = next(m["content"] for m in compact if m["role"] == "system")
+    assert "• Region Edges:" in llm_sys and "• Object Edges:" in llm_sys, "edge bullets missing"
+    assert "latent" not in llm_sys, "plain-LLM prompt must not claim latent connectivity"
+    assert "latent space" in gnn_sys and "• Region Edges:" not in gnn_sys, "graph-aug path changed"
+    print("  Same compact pipeline as graph-aug (SPINE system + ICL dropped, graph hoisted),")
+    print("  but the block now carries the edges and the system prompt cites them:")
+    print("\n  -- intro paragraph, GRAPH-AUGMENTED (include_edges=False) --")
+    print("   " + gnn_sys.split("\n\n")[0])
+    print("\n  -- intro paragraph, PLAIN-LLM (include_edges=True) --")
+    print("   " + llm_sys.split("\n\n")[0])
+    print("\n  -- scene-graph block (plain-LLM): node bullets + Region/Object Edges --")
+    block = llm_sys.split("Scene graph:\n", 1)[1] if "Scene graph:\n" in llm_sys else llm_sys
+    print("   Scene graph:\n   " + block.replace("\n", "\n   "))
+    _show(compact_llm, tokenizer, add_generation_prompt=False)
 
     # --- 4. Multi-task over ONE graph: graph in system, tasks stacked -------------
     all_tasks = [t["task"] for t in tasks]

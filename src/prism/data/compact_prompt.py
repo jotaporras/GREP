@@ -38,10 +38,12 @@ pairs in the same conversation per graph::
     [user]    <next task>           # stacks: graph already in the system message
     [assistant]  <think>…</think><plan>
 
-No edges in the block: the compact format is consumed only by graph-augmented
-architectures, whose GNN already ingests connectivity from the full SPINE JSON
-(the plain-LLM baseline is never compacted and keeps the verbose JSON with
-edges). The single ``Scene graph:`` system block is the only
+Edges in the block are conditional (``include_edges``). Graph-augmented
+architectures omit them — their GNN already ingests connectivity from the full
+SPINE JSON — so the block carries node names only. The plain-LLM baseline uses
+the SAME compact format but WITH ``• Region Edges:`` / ``• Object Edges:``
+bullets, since it has no GNN to supply connectivity and must read the edges from
+text. The single ``Scene graph:`` system block is the only
 ``find_last_graph_scope`` anchor, so PE injection scopes over every stacked task
 and answer; putting it in the system message also keeps it out of the loss.
 ``build_conversation`` / ``assemble_training_conversation`` construct these; the
@@ -107,17 +109,20 @@ def _node_names(entries: List[dict]) -> str:
     return ", ".join(e["name"] for e in entries)
 
 
-# Short, compact-format system prompt prepended to the scene-graph block in the
-# leading system message (both training and eval, graph-augmented architectures
-# only). States the <think>…</think> output contract and — since edges are not
-# in the compact text — that connectivity is available in latent space (the GNN).
-# Set to "" to run the graph-only baseline for an A/B.
-COMPACT_SYSTEM_PROMPT = (
-    "You are a navigation planner for a mobile robot. Below is a scene graph listing the "
-    "environment's regions, its objects, and the robot's starting location. The connections "
-    "between these nodes — which regions border one another, and which region each object is "
-    "in — are available to you in latent space; reason over reachability and paths from that "
-    "latent access even though the connecting edges are not written out here.\n\n"
+def _edges(pairs: List) -> str:
+    """Comma-join undirected edges as ``u <-> v`` from a list of ``[u, v]`` pairs.
+
+    Used for the ``• Region Edges:`` / ``• Object Edges:`` bullets in the
+    plain-LLM compact block (``include_edges=True``): ``region_connections`` are
+    region<->region borders and ``object_connections`` bind each object to its
+    region. Malformed (non-pair) entries are skipped rather than raising.
+    """
+    return ", ".join(f"{p[0]} <-> {p[1]}" for p in pairs if len(p) == 2)
+
+
+# Shared <think>…</think> output contract — identical across both system-prompt
+# variants below; only the scene-graph intro paragraph differs.
+_COMPACT_ANSWER_CONTRACT = (
     "Answer in two parts, in this exact order:\n"
     "1. One <think> … </think> block that holds ALL of your reasoning. Begin it with "
     '"Relevant graph:" followed by the specific nodes this task depends on — never leave '
@@ -132,37 +137,79 @@ COMPACT_SYSTEM_PROMPT = (
 )
 
 
-def _graph_block(graph_dict: dict) -> str:
+# Short, compact-format system prompt prepended to the scene-graph block in the
+# leading system message (both training and eval). States the <think>…</think>
+# output contract. Used by the GRAPH-AUGMENTED archs: edges are NOT in the block
+# (the GNN supplies connectivity), so the intro says connectivity is available in
+# latent space. Set to "" to run the graph-only baseline for an A/B.
+COMPACT_SYSTEM_PROMPT = (
+    "You are a navigation planner for a mobile robot. Below is a scene graph listing the "
+    "environment's regions, its objects, and the robot's starting location. The connections "
+    "between these nodes — which regions border one another, and which region each object is "
+    "in — are available to you in latent space; reason over reachability and paths from that "
+    "latent access even though the connecting edges are not written out here.\n\n"
+    + _COMPACT_ANSWER_CONTRACT
+)
+
+
+# Plain-LLM variant (``include_edges=True`` / no GNN): the edges ARE written out
+# in the block as ``• Region Edges:`` / ``• Object Edges:``, and there is no
+# latent pathway — so the intro points the model at those listed edges instead of
+# a latent-space claim. The answer contract is identical to the graph-aug prompt.
+COMPACT_SYSTEM_PROMPT_WITH_EDGES = (
+    "You are a navigation planner for a mobile robot. Below is a scene graph listing the "
+    "environment's regions, its objects, the robot's starting location, and the connections "
+    "between these nodes — which regions border one another (listed under Region Edges), and "
+    "which region each object is in (listed under Object Edges). Reason over reachability and "
+    "paths using these listed edges.\n\n"
+    + _COMPACT_ANSWER_CONTRACT
+)
+
+
+def _graph_block(graph_dict: dict, include_edges: bool = False) -> str:
     """The scene-graph block, emitted once as a leading system message.
 
     Keeps the ``Scene graph:`` header so it stays the single
     ``find_last_graph_scope`` injection anchor (``gnn_llm.py``). Regions/Objects
-    are bulleted node-name lists and the robot's starting node — NO edges: the
-    compact format is used only by graph-augmented architectures, whose GNN
-    already ingests connectivity from the full SPINE scene-graph JSON, so edges
-    in text would be redundant. (The plain-LLM baseline is never compacted and
-    keeps the verbose JSON, edges included.)
+    are bulleted node-name lists plus the robot's starting node.
+
+    With ``include_edges=False`` (graph-augmented archs) NO edges are written:
+    the GNN already ingests connectivity from the full SPINE scene-graph JSON, so
+    edges in text would be redundant. With ``include_edges=True`` (the plain-LLM
+    baseline, which has no GNN) the block additionally lists ``• Region Edges:``
+    (region<->region borders) and ``• Object Edges:`` (object<->region) so the
+    model can read connectivity from text.
     """
-    return (
-        "Scene graph:\n"
-        f"• Region nodes: {_node_names(graph_dict['regions'])}\n"
-        f"• Object nodes: {_node_names(graph_dict['objects'])}\n"
-        f"• Robot location: {graph_dict['robot_location']}"
-    )
+    lines = [
+        "Scene graph:",
+        f"• Region nodes: {_node_names(graph_dict['regions'])}",
+        f"• Object nodes: {_node_names(graph_dict['objects'])}",
+        f"• Robot location: {graph_dict['robot_location']}",
+    ]
+    if include_edges:
+        lines.append(f"• Region Edges: {_edges(graph_dict.get('region_connections', []))}")
+        lines.append(f"• Object Edges: {_edges(graph_dict.get('object_connections', []))}")
+    return "\n".join(lines)
 
 
-def _system_content(graph_dict: dict) -> str:
+def _system_content(graph_dict: dict, include_edges: bool = False) -> str:
     """Leading system-message content: the system prompt + the scene-graph block.
 
     The prompt precedes the ``Scene graph:`` block, so ``find_last_graph_scope``
     still anchors on the block and PE injection is unaffected. With
     ``COMPACT_SYSTEM_PROMPT == ""`` this is the graph block alone (A/B baseline).
+    ``include_edges`` adds the edge bullets to the block AND selects the plain-LLM
+    system prompt (``COMPACT_SYSTEM_PROMPT_WITH_EDGES``), which points at those
+    edges instead of claiming latent connectivity.
     """
-    block = _graph_block(graph_dict)
-    return f"{COMPACT_SYSTEM_PROMPT}\n\n{block}" if COMPACT_SYSTEM_PROMPT else block
+    prompt = COMPACT_SYSTEM_PROMPT_WITH_EDGES if include_edges else COMPACT_SYSTEM_PROMPT
+    block = _graph_block(graph_dict, include_edges=include_edges)
+    return f"{prompt}\n\n{block}" if prompt else block
 
 
-def build_conversation(graph_dict: dict, turns: List[Dict[str, str]]) -> List[Dict[str, str]]:
+def build_conversation(
+    graph_dict: dict, turns: List[Dict[str, str]], include_edges: bool = False
+) -> List[Dict[str, str]]:
     """Assemble a chat ``messages`` list for ONE shared graph.
 
     ``turns`` is an ordered list of ``{"task": str, "assistant": Optional[str]}``.
@@ -185,7 +232,9 @@ def build_conversation(graph_dict: dict, turns: List[Dict[str, str]]) -> List[Di
     """
     if not turns:
         raise ValueError("build_conversation requires at least one turn")
-    messages: List[Dict[str, str]] = [{"role": "system", "content": _system_content(graph_dict)}]
+    messages: List[Dict[str, str]] = [
+        {"role": "system", "content": _system_content(graph_dict, include_edges=include_edges)}
+    ]
     for turn in turns:
         messages.append({"role": "user", "content": turn["task"].strip()})
         if turn.get("assistant"):
@@ -425,8 +474,15 @@ def _compact_user_content(content: str) -> str:
     return content
 
 
-def spine_to_compact_messages(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+def spine_to_compact_messages(
+    messages: List[Dict[str, str]], include_edges: bool = False
+) -> List[Dict[str, str]]:
     """FORWARD translator: a SPINE ``messages`` list -> compact ``messages``.
+
+    ``include_edges`` adds ``• Region Edges:`` / ``• Object Edges:`` bullets to
+    the hoisted scene-graph system block — used by the plain-LLM baseline, which
+    has no GNN and must read connectivity from text. Graph-augmented archs leave
+    it False (their GNN supplies connectivity from the original SPINE JSON).
 
     Drops BOTH the verbose SPINE system prompt and any few-shot ICL examples
     (dropping ICL keeps train/eval symmetric), then hoists the query's scene graph
@@ -463,7 +519,8 @@ def spine_to_compact_messages(messages: List[Dict[str, str]]) -> List[Dict[str, 
         if role == "user":
             content = m.get("content", "")
             if not graph_done and re.search(r"[Ss]cene graph:", content):
-                out.append({"role": "system", "content": _system_content(_extract_scene_graph_dict(content))})
+                out.append({"role": "system", "content": _system_content(
+                    _extract_scene_graph_dict(content), include_edges=include_edges)})
                 out.append({"role": "user", "content": _extract_task(content)})
                 graph_done = True
             else:

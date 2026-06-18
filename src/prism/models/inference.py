@@ -6,7 +6,6 @@ import torch
 
 from prism.data import compact_prompt
 from prism.data import utils
-from prism.data.data import remove_edge_list
 from prism.models.gnn_llm import (
     CompositeGraphLLM,
     GraphAugmentedLLM,
@@ -43,7 +42,12 @@ def _core_graph_model(model):
 class InMemoryLLM:
     """SPINE-compatible LLM client for plain (non-graph-augmented) models.
 
-    Tokenizes, generates, and decodes. No graph logic.
+    The text the LLM sees is the COMPACT translation (``spine_to_compact_messages``
+    with ``include_edges=True``): the verbose SPINE system prompt and ALL ICL
+    examples are dropped, and the scene graph becomes the compact node block plus
+    ``• Region Edges:`` / ``• Object Edges:`` bullets (there is no GNN, so the
+    edges must be in text). The compact generation is inverse-translated back to a
+    SPINE-JSON string. Same format as the graph client, minus the GNN pathway.
     """
 
     def __init__(self, model, tokenizer, device=None, strip_edges: bool = False):
@@ -75,24 +79,29 @@ class InMemoryLLM:
         return outputs[:, input_ids.shape[-1]:]
 
     def query_llm(self, msg: List[Dict], max_new_tokens: int = 2048):
-        if self.strip_edges:
-            msg = [
-                {**m, "content": remove_edge_list(m["content"])} if m["role"] == "user" else m
-                for m in msg
-            ]
+        # Plain-LLM baseline now consumes the SAME compact format as the graph
+        # archs, but WITH edge bullets in the scene-graph block (include_edges=True)
+        # since there is no GNN to supply connectivity — the LLM reads edges from
+        # text. The verbose SPINE system prompt + ICL are dropped by the translator.
+        llm_msg = compact_prompt.spine_to_compact_messages(msg, include_edges=True)
         input = self.tokenizer.apply_chat_template(
-            msg, tokenize=True, add_generation_prompt=True, return_tensors="pt"
+            llm_msg, tokenize=True, add_generation_prompt=True, return_tensors="pt"
         )
         input_ids = input["input_ids"].to(self.device)
         attention_mask = input["attention_mask"].to(self.device)
 
-        print(f"[spine-llm] client={type(self).__name__}, strip_edges={self.strip_edges}, prompt_tokens={input_ids.shape[1]}")
+        print(f"[spine-llm] client={type(self).__name__}, prompt_tokens={input_ids.shape[1]}")
 
         with torch.no_grad():
             outputs = self._generate_tokens(input_ids, attention_mask, msg, max_new_tokens)
 
-        planner_response = self._decode(outputs)
-        print(f"[spine-llm] raw_output (first 500 chars): {planner_response[:500]}")
+        compact_response = self._decode(outputs)
+        print(f"[spine-llm] raw_output (first 500 chars): {compact_response[:500]}")
+        # Inverse-translate the compact generation back to a SPINE-JSON string so
+        # SPINE's parser (`try_parse`) + grader consume it unchanged (mirrors the
+        # graph client). The model is now trained to emit the compact <think>…</think>
+        # plan form, so the raw output is compact, not SPINE JSON.
+        planner_response = compact_prompt.compact_output_to_spine_json(compact_response)
         return planner_response, True
 
 

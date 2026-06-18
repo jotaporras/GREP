@@ -22,8 +22,10 @@ def preprocess_dataset(
 
     Applies three transforms in order:
     1. Rename ``conversations`` → ``messages``.
-    2. Optionally strip edge lists from user messages (only for the ``llm``
-       architecture, where the collator won't do it at batch time).
+    2. Translate to the compact format via ``spine_to_compact_messages``: graph
+       archs get the node-only block (GNN supplies edges); the ``llm`` baseline
+       gets the same block WITH edge bullets (``include_edges=True``), since it
+       has no GNN. ``text_edge_list`` no longer gates the LLM text.
     3. Tokenize with the chat template, keeping ``conversations`` and
        ``messages`` columns for the collator, then filter out examples that
        have no assistant turn.
@@ -85,14 +87,18 @@ def preprocess_dataset(
             example["messages"] = compact_prompt.spine_to_compact_messages(example["conversations"])
             return example
         ds = ds.map(_translate_to_compact)
-    elif text_edge_list == "none":
-        def _strip_edges(example):
-            example["messages"] = [
-                {**m, "content": remove_edge_list(m["content"])} if m["role"] == "user" else m
-                for m in example["messages"]
-            ]
+    else:
+        # Plain-LLM baseline: the SAME compact format as the graph archs, but the
+        # scene-graph block carries the edge bullets (`include_edges=True`) since
+        # there is no GNN to supply connectivity — the LLM must read it from text.
+        # `text_edge_list` no longer gates the LLM text: edges are always present
+        # in the compact block.
+        def _translate_to_compact_with_edges(example):
+            example["messages"] = compact_prompt.spine_to_compact_messages(
+                example["conversations"], include_edges=True
+            )
             return example
-        ds = ds.map(_strip_edges)
+        ds = ds.map(_translate_to_compact_with_edges)
     ds = ds.map(_tokenize)
     ds = ds.filter(lambda e: any(m.get("role") == "assistant" for m in e["messages"]))
     return ds
