@@ -375,3 +375,47 @@ class RandomGNNPositionalEncodings(nn.Module):
         # Magnitude-match to the signal, then the learnable tanh(g) output gate.
         return result * (target / cur).to(result.dtype) * torch.tanh(self.output_gain).to(result.dtype)
 
+    def covariance_token_block(self, data, c):
+        """Sampled centered covariance ``C = E_q[ΦΦᵀ] − ΨΨᵀ`` and first-moment Gram
+        ``Ψ̃ = ΨΨᵀ``, returned as the TOKEN blocks ``[c, c]`` (the matrices, not C·s).
+
+        Probes run on the FULL composite graph (so token rows co-vary through the
+        crosslinks/scene — non-mention tokens inherit scene context via diffusion).
+        Same probe sampling / chunking / fixed-seed semantics as ``forward`` /
+        ``second_moment_apply``; gradient flows to the GCN. Returns ``(C_tok, Psi_tok)``.
+        """
+        try:
+            device = next(self.parameters()).device
+        except StopIteration:
+            device = data.x.device
+        ei = data.edge_index.to(device)
+        ew = getattr(data, "edge_weight", None)
+        if ew is not None:
+            ew = ew.to(device)
+        N = data.x.shape[0]
+        m = self.m_train if self.training else self.m_test
+        gen = None
+        if self.fixed_seed_mode:
+            gen = torch.Generator(device=device)
+            gen.manual_seed(self.fixed_seed_value)
+        Q = self._sample_probes(N, m, device, gen)
+        chunk = max(1, min(m, self.max_probe_rows // max(1, N),
+                           self.max_gather_rows // max(1, ei.shape[1])))
+        # Collect the per-probe token-row responses (chunked GCN keeps the edge-gather
+        # bounded), then form the covariance from CENTERED outer products. This is the
+        # same C = E[ΦΦᵀ]−ΨΨᵀ but computed as (1/m)Σ(Φ_s−Ψ)(Φ_s−Ψ)ᵀ — manifestly PSD with
+        # no catastrophic cancellation (the un-centered E[ΦΦᵀ]−ΨΨᵀ gives slightly-negative
+        # diagonal variances in fp32, which the unit-diagonal normalization then blows up).
+        Pt_chunks = []
+        for start in range(0, m, chunk):
+            Qc = Q[:, start:start + chunk]
+            P = self._batched_gcn_forward(Qc, ei, N, Qc.shape[1],
+                                          edge_weight=ew, device=device, pool=False)  # [mc,N,F]
+            Pt_chunks.append(P[:, :c, :])                           # token rows [mc, c, F]
+        Pt = torch.cat(Pt_chunks, dim=0)                           # [m, c, F]
+        psi = Pt.mean(dim=0)                                        # Ψ token rows [c, F]
+        Ct = Pt - psi.unsqueeze(0)                                 # centered [m, c, F]
+        C_tok = torch.einsum("mtf,muf->tu", Ct, Ct) / m            # PSD covariance [c, c]
+        Psi_tok = psi @ psi.transpose(0, 1)                        # ΨΨᵀ token block [c, c]
+        return C_tok, Psi_tok
+

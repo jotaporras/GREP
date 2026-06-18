@@ -205,16 +205,41 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
             # the prompt carries it; generated tokens ride on RoPE. Disarm afterwards.
             inputs_embeds = graph_model.prepare_generation(
                 input_ids, [pyg_graph], [injection_map], permutation=self.permutation)
+            hook_handle = None
             try:
+                # Decode-time composite-graph extension ("the brain grows"): arm the kernel
+                # caches from the prompt graph, then a forward PRE-hook extends the graph and
+                # computes the new token's kernel row BEFORE each decode attention runs.
+                # (A LogitsProcessor runs AFTER the forward, so it would lag the row by one
+                # token; the pre-hook reads the decode input_ids in time.)
+                if getattr(graph_model, "c_bias", False):
+                    c = input_ids.shape[1]
+                    aug = graph_model._composite_graph(
+                        pyg_graph, injection_map, c, inputs_embeds.device,
+                        permutation=self.permutation)
+                    nts = [(i, seq) for i, variants in enumerate(node_token_seqs)
+                           for seq in variants]
+                    graph_model.decode_setup(aug, nts, c, c + max_new_tokens,
+                                             device=inputs_embeds.device)
+
+                    def _extend_hook(module, args, kwargs):
+                        ids = kwargs.get("input_ids")
+                        if ids is not None and ids.dim() == 2 and ids.shape[1] == 1:
+                            graph_model.decode_extend(int(ids[0, -1]))
+                    hook_handle = graph_model.llm.register_forward_pre_hook(
+                        _extend_hook, with_kwargs=True)
                 return graph_model.llm.generate(
                     inputs_embeds=inputs_embeds, attention_mask=attention_mask,
                     max_new_tokens=max_new_tokens, use_cache=True, temperature=0.01, min_p=0.1,
                     pad_token_id=self.tokenizer.eos_token_id,
                 )
             finally:
+                if hook_handle is not None:
+                    hook_handle.remove()
+                graph_model.decode_disarm()
                 graph_model._pe_signal = None
                 graph_model._pe_C = None
-                graph_model._pe_S = None
+                graph_model._pe_Psi = None
                 graph_model._pe_c_row = None
                 graph_model._pe_taps = None
 

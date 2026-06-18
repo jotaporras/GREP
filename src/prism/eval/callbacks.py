@@ -518,6 +518,35 @@ class LoraWarmupCallback(TrainerCallback):
                   f"re-enabled {len(self._frozen_params)} LLM tensors")
 
 
+class LamCWarmupCallback(TrainerCallback):
+    """Linearly ramp the c_bias additive covariance gain λ_C from 0→1 over the first
+    ``warmup_steps`` optimizer steps (Design D). The dense sampled Ĉ has O(1) entries
+    everywhere, so at full λ_C from step 0 it swamps the ⟨q,k⟩ content logits and
+    attention starts near-uniform; ramping it in lets selection establish first, then
+    Ĉ supplies position. Sets ``inner._lam_c_warmup`` each step (read in the patched
+    attention as ``λ_C·_lam_c_warmup``); no-op when ``warmup_steps<=0``.
+    """
+
+    def __init__(self, warmup_steps: int):
+        self.warmup_steps = int(warmup_steps)
+
+    def _set(self, model, value: float):
+        inner = LoraWarmupCallback._unwrap_peft(model)
+        buf = getattr(inner, "_lam_c_warmup", None)
+        if buf is not None:
+            buf.fill_(value)
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        if self.warmup_steps > 0 and model is not None:
+            self._set(model, 0.0)
+            print(f"[train] λ_C warmup: ramping the covariance bias 0→1 over the first "
+                  f"{self.warmup_steps} steps (content-selection learns first)")
+
+    def on_step_begin(self, args, state, control, model=None, **kwargs):
+        if self.warmup_steps > 0 and model is not None:
+            self._set(model, min(1.0, state.global_step / self.warmup_steps))
+
+
 class MetricsTrackerCallback(TrainerCallback):
     """Custom callback that captures metrics for retrieval"""
 

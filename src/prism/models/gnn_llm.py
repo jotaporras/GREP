@@ -437,7 +437,7 @@ class CompositeGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         )
 
     def _fuse_embeddings(self, input_ids, graphs, injection_maps, permutation=None,
-                         return_token_pe=False, return_c_tok=False, return_s_tilde=False):
+                         return_token_pe=False, return_c_tok=False, return_cbias=False):
         """Build G per sequence and run M4→M6→M7, returning ``inputs_embeds`` [B, c, d].
 
         When ``return_token_pe`` is True, also returns the un-gated GT token-row
@@ -448,10 +448,10 @@ class CompositeGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         covariance ``C_tok`` stacked as ``[B, c, c]``, scaled to ``‖X‖`` — the
         per-layer relative-position operator (``c_per_layer``). See :meth:`_compute_c_tok`.
 
-        When ``return_s_tilde`` is True (Design D / c_bias), also returns the
-        token-lifted scene adjacency ``S̃`` [B, c, c] (see :meth:`_compute_s_tilde`).
-        (The c_bias positional kernel ``Ĉ`` is computed ANALYTICALLY from the R-PEARL
-        taps in :meth:`_analytic_c_tok`, not here — it is graph-independent.)
+        When ``return_cbias`` is True (Design D / c_bias), also returns the two
+        per-sequence [B, c, c] additive-bias kernels ``(Ĉ, Ψ̃)`` from
+        :meth:`_kernel_and_psi` — the covariance ``Ĉ`` (live per ``self.c_kernel``)
+        and the first-moment Gram ``Ψ̃=ΨΨᵀ``. Both are graph-DEPENDENT (per sequence).
         """
         X = self.llm.get_input_embeddings()(input_ids)  # [B, c, d]
         device = X.device
@@ -459,7 +459,8 @@ class CompositeGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         fused = []
         token_pe = [] if return_token_pe else None
         c_tok = [] if return_c_tok else None
-        s_til = [] if return_s_tilde else None
+        cb_C = [] if return_cbias else None
+        cb_P = [] if return_cbias else None
         for b in range(input_ids.shape[0]):
             aug = self._composite_graph(graphs[b], injection_maps[b], c, device, permutation=permutation)
             aug_data = Data(
@@ -476,8 +477,10 @@ class CompositeGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
                 token_pe.append(Ytok)
             if return_c_tok:
                 c_tok.append(self._compute_c_tok(aug, aug_data, X[b]))
-            if return_s_tilde:
-                s_til.append(self._compute_s_tilde(aug, injection_maps[b], c, device))
+            if return_cbias:
+                C_b, P_b = self._kernel_and_psi(aug, aug_data, c, device)
+                cb_C.append(C_b)
+                cb_P.append(P_b)
         # The GT runs in float32 (sparse sampled_addmm is fp32-only) and the gate
         # promotes the bf16 X to fp32, so cast inputs_embeds back to the LLM's dtype.
         # Training tolerated the fp32 mismatch under autocast; generate() has no
@@ -489,36 +492,44 @@ class CompositeGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             out.append(torch.stack(token_pe, dim=0))
         if return_c_tok:
             out.append(torch.stack(c_tok, dim=0))
-        if return_s_tilde:
-            out.append(torch.stack(s_til, dim=0))
+        if return_cbias:
+            out.append(torch.stack(cb_C, dim=0))
+            out.append(torch.stack(cb_P, dim=0))
         return out[0] if len(out) == 1 else tuple(out)
 
-    def _compute_s_tilde(self, aug, injection_map, c, device):
-        """Token-lifted 1-hop scene adjacency ``S̃ = M S_sc Mᵀ ∈ [c, c]`` (Design D).
+    @staticmethod
+    def _unit_diag(M, eps: float = 1e-30):
+        """Correlation-normalize a PSD [c,c] kernel to unit diagonal (bounded bias).
 
-        ``M[t, j] = 1`` when token ``t`` mentions scene node ``j`` (from the injection
-        map; each token maps to ≤ 1 node, so ``S̃[n,m] = S_sc[node(n), node(m)]``).
-        ``S_sc`` is the scene–scene block of the GSO. This is the *direct 1-hop* scene
-        affinity (the additive ``λ_S`` bias); ``C_tok`` already carries the diffused
-        multi-hop scene coupling. Zero rows/cols for non-graph tokens.
+        Scale-invariant: the diagonal floor is RELATIVE to the largest variance, so the
+        normalization reaches unit diagonal regardless of the absolute magnitude of the
+        R-PEARL response (β=1/F contraction makes the variances ~1e-10; an absolute floor
+        would under-normalize). Degenerate near-zero-variance tokens get a bounded (small-
+        coupling) row; PSD is preserved (congruence by a positive diagonal)."""
+        d = M.diagonal()
+        floor = d.max().clamp(min=eps) * 1e-6
+        d = d.clamp(min=floor).sqrt()
+        return M / d[:, None] / d[None, :]
+
+    def _kernel_and_psi(self, aug, aug_data, c, device):
+        """Design D per-sequence [c,c] additive-bias kernels ``(Ĉ, Ψ̃)``, unit-diagonal.
+
+          - ``c_kernel="sampled"``  : Ĉ = E_q[ΦΦᵀ]−ΨΨᵀ and Ψ̃ = ΨΨᵀ from ONE probe pass
+            on the FULL composite graph (captures the nonlinear R-PEARL response; non-
+            mention tokens inherit scene context through the graph diffusion);
+          - ``c_kernel="analytic"`` : Ĉ = H(S)H(S)* via the all-layer cascade taps and
+            matrix powers on S=[[S_c,B],[Bᵀ,S_sc]]; Ψ̃ = ΨΨᵀ from the first moment Ψ.
+
+        Both carry gradient to the R-PEARL filter.
         """
-        n_s = aug.num_scene_nodes
-        if n_s == 0:
-            return torch.zeros(c, c, device=device)
-        g = aug.gso.coalesce()
-        idx, val = g.indices(), g.values()
-        m = (idx[0] >= c) & (idx[1] >= c)                     # scene–scene block of S
-        S_sc = torch.zeros(n_s, n_s, device=device)
-        if bool(m.any()):
-            si = idx[:, m] - c
-            S_sc[si[0], si[1]] = val[m].to(S_sc.dtype)
-        M = torch.zeros(c, n_s, device=device)
-        for node_idx, spans in injection_map.items():
-            for s, e in spans:
-                e = min(e, c)
-                if s < e:
-                    M[s:e, node_idx] = 1.0
-        return M @ S_sc @ M.t()                               # [c, c]
+        pe = self.gt_model.pe_model
+        if self.c_kernel == "analytic":
+            C = self._analytic_c_from_gso(self._analytic_taps().to(device), aug.gso, c)
+            psi = pe(aug_data)[:c]                             # Ψ token rows [c, d]
+            Psi = psi @ psi.t()
+        else:                                                 # "sampled" (default)
+            C, Psi = pe.covariance_token_block(aug_data, c)
+        return self._unit_diag(C), self._unit_diag(Psi)
 
     def _compute_c_tok(self, aug, aug_data, X_b):
         """Materialize the composite token-block covariance ``C_tok`` [c, c] (c_per_layer).
@@ -580,18 +591,162 @@ class CompositeGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         idx = (kk[:, None] - kk[None, :]) % c                  # (t−u) mod c
         return c_row[idx], c_row                               # Ĉ [c,c] , c_row [c]
 
+    @staticmethod
+    def _analytic_c_from_gso(H, gso, c, eps: float = 1e-9):
+        """Full symmetric graph-covariance kernel ``Ĉ = H(S)H(S)*`` on the FULL
+        composite GSO ``S = [[S_c, B],[Bᵀ, S_sc]]`` (cycle ⊕ crosslinks ⊕ scene),
+        returning the token block ``[c, c]``.
+
+        Route (a) — real matrix powers (NOT the bare-cycle DFT). With taps
+        ``H`` ``[K+1, F]`` and tap Gram ``G_{kl}=⟨H_k,H_l⟩``::
+
+            Ĉ_full = Σ_{k,l=0}^{K} G_{kl} · Sᵏ (Sˡ)ᵀ            ( = H(S)H(S)* )
+
+        ``S`` is real, so this is real throughout (the directed/complex-spectrum view
+        is the same operator — see _analytic_c_from_taps — but the full S is
+        non-normal, so its eigenbasis is ill-conditioned; matrix powers are the
+        stable realization). Exactly **symmetric** (G is symmetric) and **PSD** by
+        construction (Σ_f H^{(f)}(S)H^{(f)}(S)ᵀ). Because the crosslinks make S
+        non-circulant, S² routes token→mention→scene→mention→token, so Ĉ couples
+        far-apart tokens that mention the same / graph-adjacent scene nodes —
+        long-range, graph-structured relative position (vs. the bare-cycle ±K band).
+        Gradient flows to ``H`` (G carries grad; S is a fixed graph constant).
+        Correlation-normalized to unit diagonal so it is a bounded additive bias.
+        """
+        K1 = H.shape[0]
+        S = (gso.to_dense() if gso.is_sparse else gso).to(torch.float32)
+        N = S.shape[0]
+        G = H.float() @ H.float().t()                          # [K1,K1] ⟨H_k,H_l⟩ (grad)
+        Spow = [torch.eye(N, device=S.device, dtype=S.dtype)]  # S^0..S^K
+        for _ in range(1, K1):
+            Spow.append(Spow[-1] @ S)
+        C_full = sum(G[k, l] * (Spow[k] @ Spow[l].t())
+                     for k in range(K1) for l in range(K1))     # H(S)H(S)*  [N,N]
+        Ct = C_full[:c, :c]                                    # token block
+        d = Ct.diagonal().clamp(min=eps).sqrt()
+        return Ct / d[:, None] / d[None, :]                    # unit-diagonal Ĉ [c,c]
+
     def _analytic_taps(self):
-        """The R-PEARL graph filter's OWN taps ``[K+1, F]`` (grad-carrying) — the same
-        weights that produce Ψ. Small (≈(K+1)·F), so they can be moved to each sharded
-        layer's device cheaply, keeping the tap gradient fully trainable on multi-GPU
-        while only this tiny tensor (not the [c,c] kernel) crosses device streams."""
-        conv0 = self.gt_model.pe_model.pe_gcn.convs[0]
-        return torch.stack([lin.weight.reshape(lin.weight.shape[0], -1).mean(-1)
-                            for lin in conv0.lins], dim=0)      # [K+1, F]
+        """The R-PEARL filter's EFFECTIVE taps ``[L·K+1, F]`` from ALL L GCN layers
+        (grad-carrying). By the GSP cascade theorem, stacked layers — each a degree-K
+        polynomial in the same S — compose into one degree-LK filter whose taps are the
+        discrete convolution of the per-layer tap sequences::
+
+            H(S) = Π_ℓ H^(ℓ)(S) = Σ_{k=0}^{LK} S^k H̄_k ,   H̄ = h^(1) * h^(2) * … * h^(L)
+
+        (channel-diagonal reduction: each layer's K+1 lins → [K+1, F] via mean over the
+        input dim). Small (≈(LK+1)·F) so it moves to sharded devices cheaply."""
+        convs = self.gt_model.pe_model.pe_gcn.convs
+        per_layer = [torch.stack([lin.weight.reshape(lin.weight.shape[0], -1).mean(-1)
+                                  for lin in conv.lins], dim=0)        # [K+1, F]
+                     for conv in convs]
+        bar = per_layer[0]                                            # cascade convolution
+        for h in per_layer[1:]:
+            out = bar.new_zeros(bar.shape[0] + h.shape[0] - 1, bar.shape[1])
+            for i in range(bar.shape[0]):
+                out[i:i + h.shape[0]] = out[i:i + h.shape[0]] + bar[i:i + 1] * h
+            bar = out
+        return bar                                                   # [L*K+1, F]
 
     def _analytic_c_tok(self, c, device):
         """Convenience: full analytic ``Ĉ`` on ``device`` (used by the debug callback)."""
         return self._analytic_c_from_taps(self._analytic_taps().to(device), c)
+
+    # ----- decode-time composite-graph extension ("the brain grows") -------------
+    # As each token generates, the composite graph grows: a cycle node + edge, plus a
+    # crosslink/clique when an exact node-name token-sequence completes. We cache the
+    # per-hop probe aggregates A_k=(Ŝᵏq) and the per-probe linearized R-PEARL embeddings
+    # Φ, and compute ONLY the new node's row Ĉ[new,·]=⟨Φ_new,Φ_u⟩/m − Ψ_new·Ψ_u (verified
+    # to cos≈0.97 vs full recompute; frozen-old-degree approximation). The new generated
+    # token thus gets long-range, graph-structured position to the prompt tokens it (and
+    # its mentioned/adjacent scene nodes) relate to. Caches are zero-allocated to max_seq.
+    def decode_setup(self, aug, node_token_seqs, c, max_seq, m_dec=16, device=None):
+        """Arm the decode-extension state from the prompt composite graph ``aug``."""
+        device = device or next(self.parameters()).device
+        Hbar = self._analytic_taps().to(device=device, dtype=torch.float32)   # [K1,F]
+        K1, F = Hbar.shape
+        gso = aug.gso.coalesce()
+        idx, val = gso.indices().to(device), gso.values().to(torch.float32).to(device)
+        N0 = aug.num_nodes
+        Nmax_ = max_seq + aug.num_scene_nodes
+        # frozen prompt-node degrees (rowsum of A+I); sized Nmax so generated nodes (which
+        # become neighbors of later tokens via the cycle/clique) have a degree slot.
+        deg = torch.zeros(Nmax_, device=device)
+        deg[:N0] = torch.zeros(N0, device=device).index_add_(0, idx[0], torch.ones_like(val))
+        # neighbor lists for the per-hop aggregate recursion
+        nbrs = [[] for _ in range(N0)]
+        for e in range(idx.shape[1]):
+            nbrs[int(idx[0, e])].append((int(idx[1, e]), float(val[e])))
+        Nmax = max_seq + aug.num_scene_nodes
+        torch.manual_seed(0)                                  # deterministic decode probes
+        q = torch.zeros(Nmax, m_dec, device=device)
+        q[:N0] = torch.randn(N0, m_dec, device=device)
+        # per-hop aggregates A_k = Ŝᵏ q on the prompt graph (dense-apply via the sparse GSO)
+        A = torch.zeros(K1, Nmax, m_dec, device=device)
+        A[0, :N0] = q[:N0]
+        S = torch.sparse_coo_tensor(idx, val, (N0, N0)).coalesce()
+        for k in range(1, K1):
+            A[k, :N0] = torch.sparse.mm(S, A[k - 1, :N0])
+        Phi = torch.zeros(Nmax, m_dec, F, device=device)
+        Phi[:N0] = torch.einsum("kf,knm->nmf", Hbar, A[:, :N0])
+        Psi = torch.zeros(Nmax, F, device=device)
+        Psi[:N0] = Phi[:N0].mean(1)
+        # token-node sequence order: cycle positions 0..c-1 (scene rows excluded from keys)
+        self._decode_state = dict(
+            Hbar=Hbar, A=A, Phi=Phi, Psi=Psi, deg=deg, nbrs=nbrs, m=m_dec, F=F, K1=K1,
+            c=c, N0=N0, n_scene=aug.num_scene_nodes, node_token_seqs=node_token_seqs,
+            token_nodes=list(range(c)),          # sequence-pos → node index (extends on decode)
+            mentions={}, gen_ids=[], next_node=N0, prev_node=c - 1)
+        self._pe_decode_row = None
+
+    def decode_extend(self, token_id):
+        """Append one generated token: extend the graph, compute its Φ row incrementally,
+        and stash the decode bias row ``Ĉ[new, :key_len]`` on ``self._pe_decode_row``."""
+        st = self._decode_state
+        dev = st["Hbar"].device
+        new = st["next_node"]
+        st["gen_ids"].append(int(token_id))
+        # --- exact node-name token-sequence match (suffix of the generated stream) ---
+        v = None
+        for node_idx, seq in st["node_token_seqs"]:
+            L = len(seq)
+            if L and len(st["gen_ids"]) >= L and st["gen_ids"][-L:] == list(seq):
+                v = node_idx; break
+        # --- new node's neighbors: cycle predecessor + (crosslink scene node + clique) ---
+        nb = [(st["prev_node"], 1.0)]
+        if v is not None:
+            scene_node = st["c"] + v
+            nb.append((scene_node, 1.0))
+            for p in st["mentions"].get(v, []):           # clique to prior mentions of v
+                nb.append((p, 1.0))
+            st["mentions"].setdefault(v, []).append(new)
+        deg_new = float(len(nb)) + 1.0                     # incident + self-loop
+        A, Phi, Psi, deg, Hbar = st["A"], st["Phi"], st["Psi"], st["deg"], st["Hbar"]
+        m, K1 = st["m"], st["K1"]
+        A[0, new] = torch.randn(m, device=dev)             # fresh probe for the new node
+        inv_new = deg_new ** -0.5
+        for k in range(1, K1):
+            acc = inv_new * inv_new * A[k - 1, new].clone()        # self-loop term
+            for (j, w) in nb:
+                acc = acc + (w * inv_new * float(deg[j].clamp(min=1).item()) ** -0.5) * A[k - 1, j]
+            A[k, new] = acc
+        Phi[new] = torch.einsum("kf,km->mf", Hbar, A[:, new])
+        Psi[new] = Phi[new].mean(0)
+        # degrees: register the new node (frozen-old approximation leaves neighbors as-is)
+        if new < deg.shape[0]:
+            deg[new] = deg_new
+        st["token_nodes"].append(new)
+        st["prev_node"] = new
+        st["next_node"] = new + 1
+        # --- decode bias row over the current key sequence (token nodes only) ---
+        cols = torch.tensor(st["token_nodes"], device=dev)
+        row = (torch.einsum("mf,umf->u", Phi[new], Phi[cols]) / m
+               - Psi[new] @ Psi[cols].t())                  # Ĉ[new, key positions]
+        self._pe_decode_row = row
+
+    def decode_disarm(self):
+        self._decode_state = None
+        self._pe_decode_row = None
 
     def forward(
         self,
@@ -651,19 +806,22 @@ class InjectedCompositeGraphLLM(CompositeGraphLLM):
 
     def __init__(self, *args, inject_v: bool = True,
                  disable_llm_rope: bool = True, c_per_layer: bool = False,
-                 c_bias: bool = False, use_scene_bias: bool = True, **kwargs):
+                 c_bias: bool = False, c_kernel: str = "sampled",
+                 use_scene_bias: bool = True, **kwargs):
         # RoPE OFF by default (disable_llm_rope=True): the injected code replaces RoPE.
         kwargs["disable_llm_rope"] = disable_llm_rope
         super().__init__(*args, **kwargs)
 
         # ``c_bias`` (Design D, docs/composite_graph_gt_rope_free_*): no RoPE, no rotary,
-        # no q/k transform. C enters the attention as an ADDITIVE logit bias and the
-        # values as a residual mix; S̃ (token-lifted scene adjacency) is an optional
-        # additive bias. Position is the ALiBi/T5-class relative bias c(t−u), extended
-        # to generated tokens via the analytic c(·) row. Selection (⟨q,k⟩) is preserved,
-        # so the c_per_layer collapse cannot occur.
+        # no q/k transform. C enters the attention as an ADDITIVE logit bias λ_C·Ĉ and the
+        # values as a residual mix; the R-PEARL first-moment Gram Ψ̃=ΨΨᵀ enters as a second
+        # additive bias λ_ψ·Ψ̃. ``c_kernel`` selects the live Ĉ:
+        #   "sampled"  : Ĉ = E_q[ΦΦᵀ]−ΨΨᵀ on the full composite graph (probe sampling);
+        #   "analytic" : Ĉ = H(S)H(S)* via all-layer cascade taps + matrix powers on S.
+        # Selection (⟨q,k⟩) is preserved, so the c_per_layer collapse cannot occur.
+        # (``use_scene_bias`` kept for back-compat with older checkpoints; S̃ is removed.)
         self.c_bias = c_bias
-        self.use_scene_bias = use_scene_bias and c_bias
+        self.c_kernel = c_kernel
 
         # ``c_per_layer``: instead of the additive code S=Y_tok in q/k/v, REPLACE the
         # post-RoPE query/key at every layer with the composite covariance operator
@@ -695,13 +853,17 @@ class InjectedCompositeGraphLLM(CompositeGraphLLM):
                 self.pe_v_proj = nn.Linear(hidden, n_kv * head_dim, bias=False, device=device)
 
         if c_bias:
-            # Design D gains (scalar, learnable). λ_C init 1.0 so the relative position
-            # bias is ON from step 0 (init 0 would reproduce the position-blind collapse);
-            # λ_S init 0.0 (scene bias ramps in — C already carries scene structure);
-            # λ_V init 0.1 (cold-start residual value mixing). Saved in gnn_weights.pt.
+            # Design D gains (scalar, learnable). λ_C init 1.0 so the covariance bias is
+            # ON from step 0; λ_ψ init 0.1 (R-PEARL first-moment Gram Ψ̃ enters the logits
+            # — through R-PEARL, thesis-consistent); λ_V init 0.1 (residual value mix).
+            # Saved in gnn_weights.pt.
             self.lam_c = nn.Parameter(torch.tensor(1.0, device=device))
-            self.lam_s = nn.Parameter(torch.tensor(0.0, device=device))
+            self.lam_psi = nn.Parameter(torch.tensor(0.1, device=device))
             self.lam_v = nn.Parameter(torch.tensor(0.1, device=device))
+            # λ_C warmup ramp ∈ [0,1], set each training step by LamCWarmupCallback.
+            # Non-persistent: defaults to 1.0 on load so eval/inference applies full λ_C.
+            self.register_buffer("_lam_c_warmup", torch.tensor(1.0, device=device),
+                                 persistent=False)
             # Additive bias needs a backend that adds a float `attention_mask` to the
             # scores before softmax. BOTH eager and sdpa do; only flash-attn can't. Use
             # SDPA (fused, memory-efficient) — eager materializes the full [B,H,c,c] score
@@ -732,15 +894,17 @@ class InjectedCompositeGraphLLM(CompositeGraphLLM):
         # Per-forward signals read by the patched attention forwards, set by
         # forward()/prepare_generation():
         #   _pe_signal    : additive code S=Y_tok ([B, seq, hidden]) — additive variant.
-        #   _pe_C         : composite token covariance C_tok ([B, seq, seq]) — c_per_layer / c_bias.
-        #   _pe_S         : token-lifted scene adjacency S̃ ([B, seq, seq]) — c_bias.
+        #   _pe_C         : composite token covariance Ĉ ([B, seq, seq]) — c_per_layer / c_bias.
+        #   _pe_Psi       : R-PEARL first-moment Gram Ψ̃=ΨΨᵀ ([B, seq, seq]) — c_bias.
         #   _pe_c_row     : analytic relative row c(·) ([B, seq]) for decode — c_bias.
         self._pe_signal = None
         self._pe_C = None
-        self._pe_S = None
+        self._pe_Psi = None
         self._pe_c_row = None
         self._pe_taps = None      # c_bias multi-GPU: grad-carrying taps, Ĉ recomputed per layer
         self._pe_cyc = None       # cycle length c for the analytic kernel
+        self._decode_state = None # decode-time graph-extension state (set by decode_setup)
+        self._pe_decode_row = None  # live decode bias row Ĉ[new, :key_len] (set per token)
         self._pe_inject_value = inject_v
         self._install_pe_injection()
 
@@ -861,26 +1025,34 @@ class InjectedCompositeGraphLLM(CompositeGraphLLM):
                 key_states, value_states = past_key_values.update(
                     key_states, value_states, attn.layer_idx)
 
-            # --- Design D (c_bias): fold the additive C/S̃ position+graph bias into the
-            # attention_mask (eager/sdpa add it to the logits before softmax). Built post-
-            # cache so the decode row spans all cached keys; selection ⟨q,k⟩ is untouched. ---
+            # --- Design D (c_bias): fold the additive λ_C·Ĉ + λ_ψ·Ψ̃ position+graph bias
+            # into the attention_mask (eager/sdpa add it to the logits before softmax).
+            # Built post-cache so the decode row spans all cached keys; ⟨q,k⟩ untouched. ---
             if model.c_bias:
                 key_len = key_states.shape[2]
                 dev = query_states.device
                 # gains follow this layer's (possibly sharded) device; .float() alone
                 # keeps them on the init device → mismatch under device_map=auto.
-                lam_c = model.lam_c.to(device=dev, dtype=torch.float32)
-                lam_s = model.lam_s.to(device=dev, dtype=torch.float32)
+                lam_c = (model.lam_c * model._lam_c_warmup).to(device=dev, dtype=torch.float32)
+                lam_psi = model.lam_psi.to(device=dev, dtype=torch.float32)
                 bias = None
                 if cb_C is not None:
-                    # PROMPT: λ_C·Ĉ [c,c] (+ optional λ_S·S̃) → [B,1,seq,seq]
+                    # PROMPT: λ_C·Ĉ + λ_ψ·Ψ̃ [c,c] → [B,1,seq,seq]
                     b = lam_c * cb_C.to(dev)[None]                          # [1,c,c]
-                    S = model._pe_S
-                    if S is not None and model.use_scene_bias:
-                        b = b + lam_s * S.to(device=dev, dtype=torch.float32)  # [B,c,c]
+                    Psi = model._pe_Psi
+                    if Psi is not None:
+                        b = b + lam_psi * Psi[0].to(device=dev, dtype=torch.float32)[None]
                     bias = b.unsqueeze(1)
+                elif query_states.shape[2] == 1 and model._pe_decode_row is not None:
+                    # DECODE (graph-extended): the live row Ĉ[new, :key_len] from the
+                    # composite graph GROWN over generated tokens (decode_extend). Pad/clip
+                    # to key_len (the new token attends all cached keys).
+                    row = model._pe_decode_row.to(device=dev, dtype=torch.float32)
+                    if row.shape[0] < key_len:
+                        row = torch.cat([row, row.new_zeros(key_len - row.shape[0])])
+                    bias = (lam_c * row[:key_len])[None, None, None, :]
                 elif cb_crow is not None and query_states.shape[2] == 1:
-                    # DECODE: extend position via analytic c(·), offset mod prompt-len.
+                    # DECODE fallback (no decode-extension armed): analytic c(·), offset mod c.
                     crow = cb_crow.to(dev)                                  # [c]
                     cyc = crow.shape[0]
                     off = (key_len - 1 - torch.arange(key_len, device=dev)) % cyc
@@ -933,36 +1105,28 @@ class InjectedCompositeGraphLLM(CompositeGraphLLM):
         The unused signal is cleared so a stale one can't leak across modes.
         """
         if self.c_bias:
-            # Design D: additive Ĉ/S̃ logit bias + residual Ĉ-value mix; no q/k transform.
-            # Ĉ is the ANALYTIC cycle second moment from the R-PEARL taps (deterministic,
-            # graph-independent → computed once, broadcast over the batch); S̃ is the
-            # graph-dependent scene bias.
-            inputs_embeds, s_til = self._fuse_embeddings(
-                input_ids, graphs, injection_maps, permutation=permutation,
-                return_s_tilde=True)
+            # Design D: additive λ_C·Ĉ + λ_ψ·Ψ̃ logit bias + residual λ_V·Ĉ value mix; no
+            # q/k transform. Ĉ (covariance, live per self.c_kernel) and Ψ̃=ΨΨᵀ are the
+            # per-sequence [B,c,c] kernels from the FULL composite graph S=[[S_c,B],[Bᵀ,S_sc]].
             B, c = input_ids.shape[0], input_ids.shape[1]
-            self._pe_S = s_til
             self._pe_signal = None
             self._pe_cyc = c
-            if self._llm_sharded:
-                # multi-GPU: arm the small grad-carrying TAPS; each layer recomputes Ĉ on
-                # its own device → the taps stay FULLY trainable and only this tiny tensor
-                # crosses device streams (not the [c,c] kernel). _pe_C/_pe_c_row stay None.
-                self._pe_taps = self._analytic_taps()
-                self._pe_C = None
-                self._pe_c_row = None
-            else:
-                # single GPU: precompute Ĉ once (full grad, no cross-device), reuse all layers.
-                C_hat, c_row = self._analytic_c_from_taps(self._analytic_taps().to(input_ids.device), c)
-                self._pe_C = C_hat.unsqueeze(0).expand(B, -1, -1)
-                self._pe_c_row = c_row.unsqueeze(0).expand(B, -1)
-                self._pe_taps = None
+            inputs_embeds, c_hat, psi_t = self._fuse_embeddings(
+                input_ids, graphs, injection_maps, permutation=permutation,
+                return_cbias=True)
+            self._pe_C = c_hat                                   # [B, c, c]
+            self._pe_Psi = psi_t                                 # [B, c, c]
+            self._pe_taps = None
+            # Decode fallback row (analytic c(·)); the graph-extension cache supersedes it
+            # once decode-time extension is armed (see _decode_state).
+            self._pe_c_row = self._analytic_c_row_from_taps(
+                self._analytic_taps().to(input_ids.device), c).unsqueeze(0).expand(B, -1)
         elif self.c_per_layer:
             inputs_embeds, c_tok = self._fuse_embeddings(
                 input_ids, graphs, injection_maps, permutation=permutation,
                 return_c_tok=True)
             self._pe_C = c_tok
-            self._pe_S = None
+            self._pe_Psi = None
             self._pe_c_row = None
             self._pe_signal = None
         else:
@@ -971,7 +1135,7 @@ class InjectedCompositeGraphLLM(CompositeGraphLLM):
                 return_token_pe=True)
             self._pe_signal = token_pe
             self._pe_C = None
-            self._pe_S = None
+            self._pe_Psi = None
             self._pe_c_row = None
         return inputs_embeds
 
@@ -991,7 +1155,7 @@ class InjectedCompositeGraphLLM(CompositeGraphLLM):
             if not getattr(self.llm, "is_gradient_checkpointing", False):
                 self._pe_signal = None
                 self._pe_C = None
-                self._pe_S = None
+                self._pe_Psi = None
                 self._pe_c_row = None
                 self._pe_taps = None
 

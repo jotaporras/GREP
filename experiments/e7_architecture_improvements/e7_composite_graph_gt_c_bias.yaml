@@ -15,7 +15,7 @@ epochs: 3
 r: 16
 debug: true
 dataset_proportion: 1.0
-max_seq_length: 8192
+max_seq_length: 2048
 text_edge_list: none
 # Graph Transformer + R-PEARL params
 d_model: 4096
@@ -23,14 +23,14 @@ gt_num_layers: 3
 gt_heads: 8
 pe_hidden_channels: 256
 pe_num_layers: 2
-num_samples: 96
+num_samples: 128
 dropout: 0.05
 k_pe: 2
 k_gt: 2
 eps: 1e-6
 use_layer_norm: true
 freeze_llm: false
-device: -1
+device: 0
 # Composite graph params
 cycle_directed: true
 cycle_weight: 1.0
@@ -48,24 +48,20 @@ fixed_seed_mode: false
 fixed_seed_value: 0
 pe_readout: second_moment
 pe_center_moment: true
-# Gated injection — interpolate (NOT none): Design D needs real X content for the
-# content match ⟨q,k⟩; with `none` the inputs are the untrained GT output (low variance
-# → flat q/k → uniform attention). interpolate keeps (1-gate)·X so selection works,
-# while the additive C-bias supplies position. (Attention-sharpness probe: none→0.92
-# entropy/soft, interpolate→0.58/structured.)
+# Gated injection
 injection_mode: interpolate
 gate_init: 0.3
 gate_per_dim: false
-structural_lr_mult: 5.0
+structural_lr_mult: 3.0
 lora_warmup_steps: 20
+lam_c_warmup_steps: 10
 # LLM
 disable_rope: true
-n_icl_examples: 2
 c_per_layer: false
 pe_qk_injection: false
-# Design D: RoPE-free C-in-attention (additive C/S̃ logit bias + residual C-values)
+# Design D: RoPE-free C-in-attention (additive Ĉ + λ_ψ·Ψ̃ logit bias + residual Ĉ-values)
 c_bias: true
-use_scene_bias: true
+c_kernel: sampled
 # Debug / viz
 log_fiedler: true
 log_scene_mass: true

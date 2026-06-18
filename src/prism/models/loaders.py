@@ -186,6 +186,7 @@ def graph_augmented_llm_from_pretrained(
                 c_per_layer=gnn_cfg.get("c_per_layer", False),
                 c_bias=gnn_cfg.get("c_bias", False),
                 use_scene_bias=gnn_cfg.get("use_scene_bias", True),
+                c_kernel=gnn_cfg.get("c_kernel", "sampled"),
                 **composite_kwargs,
             )
         else:
@@ -200,7 +201,8 @@ def graph_augmented_llm_from_pretrained(
                 model.pe_v_proj.load_state_dict(gnn_weights["pe_v_proj"])
         if getattr(model, "c_bias", False) and "c_bias_gains" in gnn_weights:
             for k, v in gnn_weights["c_bias_gains"].items():
-                getattr(model, k).data.copy_(v)
+                if hasattr(model, k):                  # skip retired gains (e.g. lam_s)
+                    getattr(model, k).data.copy_(v)
     else:
         pe_model = r_pearl.RandomGNNPositionalEncodings(
             pe_hidden_channels=gnn_cfg["pe_hidden_channels"],

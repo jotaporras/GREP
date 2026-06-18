@@ -158,7 +158,7 @@ class GraphSFTTrainer(SFTTrainer):
                         for p in mod.parameters():
                             p.requires_grad = True
             # c_bias (Design D): the scalar gains λ_C/λ_S/λ_V are non-LoRA params too.
-            for name in ("lam_c", "lam_s", "lam_v"):
+            for name in ("lam_c", "lam_psi", "lam_v"):
                 p = getattr(self.model, name, None)
                 if p is not None:
                     p.requires_grad = True
@@ -195,7 +195,7 @@ class GraphSFTTrainer(SFTTrainer):
                     if mod is not None:
                         structural += list(mod.parameters())
             # c_bias (Design D): the scalar gains are structural too.
-            for name in ("lam_c", "lam_s", "lam_v"):
+            for name in ("lam_c", "lam_psi", "lam_v"):
                 p = getattr(self.model, name, None)
                 if p is not None:
                     structural.append(p)
@@ -263,7 +263,7 @@ class GraphSFTTrainer(SFTTrainer):
             if getattr(self.model, "c_bias", False):
                 gnn_state['c_bias_gains'] = {
                     name: getattr(self.model, name).detach().cpu()
-                    for name in ("lam_c", "lam_s", "lam_v")
+                    for name in ("lam_c", "lam_psi", "lam_v")
                     if getattr(self.model, name, None) is not None
                 }
             torch.save(gnn_state, os.path.join(output_dir, "gnn_weights.pt"))
@@ -410,6 +410,9 @@ class TrainConfig:
     # ⟨q,k⟩ is preserved (no c_per_layer collapse). Scalar learnable gains λ_C,λ_S,λ_V.
     c_bias: bool = False
     use_scene_bias: bool = True
+    # Live c_bias covariance kernel: "sampled" (E_q[ΦΦᵀ]−ΨΨᵀ probe estimate) or
+    # "analytic" (all-layer H(S)H(S)* matrix powers). See InjectedCompositeGraphLLM.
+    c_kernel: str = "sampled"
     # β=1/F R-PEARL filter-norm invariant: when True the per-forward check RAISES on a
     # violation; default False = lenient (warn) in training (strict reserved for tests).
     strict_filter_norm: bool = False
@@ -419,6 +422,8 @@ class TrainConfig:
     # LLM/LoRA for the first N optimizer steps so the structural path learns first.
     structural_lr_mult: float = 1.0
     lora_warmup_steps: int = 0
+    # c_bias (Design D): ramp the additive covariance gain λ_C 0→1 over the first N steps.
+    lam_c_warmup_steps: int = 0
     # Prompt / debug-viz switches (carried for config fidelity)
     n_icl_examples: int = 2
     log_fiedler: bool = True
@@ -662,6 +667,7 @@ def train_model(config: TrainConfig, config_file: str = None):
             composite_kwargs["c_per_layer"] = config.c_per_layer
             composite_kwargs["c_bias"] = config.c_bias
             composite_kwargs["use_scene_bias"] = config.use_scene_bias
+            composite_kwargs["c_kernel"] = config.c_kernel
             model = gnn_llm.InjectedCompositeGraphLLM(
                 llm, gt_model, d_model=config.d_model, **composite_kwargs)
         else:
@@ -821,6 +827,7 @@ def train_model(config: TrainConfig, config_file: str = None):
                 "c_per_layer": config.c_per_layer,
                 "c_bias": config.c_bias,
                 "use_scene_bias": config.use_scene_bias,
+                "c_kernel": config.c_kernel,
                 "strict_filter_norm": config.strict_filter_norm}
                if config.architecture == "composite_graph_gt" else {}),
         }
@@ -877,6 +884,8 @@ def train_model(config: TrainConfig, config_file: str = None):
         # (GT/R-PEARL/gate) learns before the LLM content-fits the task.
         if config.lora_warmup_steps > 0:
             trainer.add_callback(callbacks.LoraWarmupCallback(config.lora_warmup_steps))
+        if getattr(config, "lam_c_warmup_steps", 0) > 0 and getattr(config, "c_bias", False):
+            trainer.add_callback(callbacks.LamCWarmupCallback(config.lam_c_warmup_steps))
 
     # Start training
     trainer.train()
