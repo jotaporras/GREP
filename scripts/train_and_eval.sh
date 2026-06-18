@@ -32,7 +32,7 @@ set -euo pipefail
 : "${TEST_GRAPHS:?set TEST_GRAPHS to a test_graphs directory}"
 
 PROJECT=${PROJECT:-GREP-PRISM}
-ENV_NAME=${ENV_NAME:-/vast/projects/aribeiro/alelab/jporras/envs/GREP-PRISM-v2}
+ENV_NAME=${ENV_NAME:-/vast/projects/aribeiro/alelab/jporras/envs/GREP-PRISM-v3}
 WANDB_RUN_NAME=${WANDB_RUN_NAME:-$SAVE_NAME}
 
 # Stable CWD (repo root). Under SLURM $0 is the spooled script — do not use it;
