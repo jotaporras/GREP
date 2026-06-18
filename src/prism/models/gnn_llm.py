@@ -498,18 +498,30 @@ class CompositeGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         return out[0] if len(out) == 1 else tuple(out)
 
     @staticmethod
-    def _unit_diag(M, eps: float = 1e-30):
-        """Correlation-normalize a PSD [c,c] kernel to unit diagonal (bounded bias).
+    def _unit_diag(M, eps: float = 1e-12):
+        """Correlation-normalize a PSD [c,c] kernel to ~unit diagonal — robust + fail-loud.
 
-        Scale-invariant: the diagonal floor is RELATIVE to the largest variance, so the
-        normalization reaches unit diagonal regardless of the absolute magnitude of the
-        R-PEARL response (β=1/F contraction makes the variances ~1e-10; an absolute floor
-        would under-normalize). Degenerate near-zero-variance tokens get a bounded (small-
-        coupling) row; PSD is preserved (congruence by a positive diagonal)."""
-        d = M.diagonal()
-        floor = d.max().clamp(min=eps) * 1e-6
+        Fixes the earlier blow-up (an absolute/max-relative floor of ~1e-30 could divide a
+        degenerate or fp-non-PSD kernel by ~0 → Inf → NaN logits → the silent loss→0 / acc→0
+        collapse). Now:
+          • fail LOUD if the kernel is already non-finite — that is an UPSTREAM GT/R-PEARL
+            divergence (lower structural_lr / inspect the GT), not a normalization issue;
+          • clamp the diagonal ≥ 0 (PSD ⇒ ≥0; kills fp-negative variances);
+          • floor RELATIVE TO THE MEAN variance (scale-invariant, but a near-zero-variance
+            token — e.g. Ψ̃'s non-graph rows where ‖Ψ_t‖²≈0 — gets a bounded small-coupling
+            row, not 1/√0);
+          • hard-clamp entries to [-1, 1] so the additive bias is provably bounded.
+        For a finite PSD input the result is finite and bounded by construction."""
+        if not torch.isfinite(M).all():
+            raise FloatingPointError(
+                "[c_bias] non-finite covariance kernel before normalization — UPSTREAM "
+                "GT/R-PEARL divergence (NaN/Inf), not a _unit_diag issue. Lower "
+                "structural_lr_mult / check the GT; failing loud instead of collapsing to 0.")
+        d = M.diagonal().clamp(min=0)
+        floor = d.mean().clamp(min=eps) * 1e-3
         d = d.clamp(min=floor).sqrt()
-        return M / d[:, None] / d[None, :]
+        out = M / d[:, None] / d[None, :]
+        return out.clamp(-1.0, 1.0)
 
     def _kernel_and_psi(self, aug, aug_data, c, device):
         """Design D per-sequence [c,c] additive-bias kernels ``(Ĉ, Ψ̃)``, unit-diagonal.
