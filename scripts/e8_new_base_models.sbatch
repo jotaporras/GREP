@@ -40,8 +40,9 @@ cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/..}"
 
 export PROJECT=${PROJECT:-GREP-PRISM}
 export ENTITY=${ENTITY:-alelab}
+export WANDB_ENTITY=${WANDB_ENTITY:-$ENTITY}
 export EXPERIMENT_TAG=${EXPERIMENT_TAG:-e8_new_base_models}
-export ENV_NAME=${ENV_NAME:-/vast/projects/aribeiro/alelab/jporras/envs/GREP-PRISM-v2}
+export ENV_NAME=${ENV_NAME:-/vast/projects/aribeiro/alelab/jporras/envs/GREP-PRISM-v3}
 export CHECKPOINT_DIR=${CHECKPOINT_DIR:-/vast/projects/aribeiro/alelab/jporras/GREP-PRISM/outputs/e8_new_base_models}
 
 # Held-out test graphs from the rsynced gemma dataset.

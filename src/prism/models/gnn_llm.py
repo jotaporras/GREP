@@ -81,8 +81,8 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             device = llm.device
         self.pe_model = pe_model.to(device)
         self.pe_proj = nn.Sequential(
-            spectral_norm(nn.Linear(d_model, llm.config.hidden_size, device=device)),
-            LipschitzNorm(llm.config.hidden_size, eps=eps, device=device),
+            spectral_norm(nn.Linear(d_model, llm.config.get_text_config().hidden_size, device=device)),
+            LipschitzNorm(llm.config.get_text_config().hidden_size, eps=eps, device=device),
         )
         # Learnable gate on the PE injection: g = tanh(pe_gain) ∈ (-1,1). Lets the
         # model regulate how strongly (and with which sign) Ψ enters RoPE(X) + g·Ψ.
