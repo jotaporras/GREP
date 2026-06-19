@@ -7,14 +7,12 @@ from collections import defaultdict
 
 import torch
 from torch import nn
-from torch.nn.utils.parametrizations import spectral_norm
 from torch_geometric.data import Batch, Data
 import transformers.masking_utils as masking_utils
 from transformers import AttentionInterface, PreTrainedModel
 
 from prism.models.composite_graph import build_composite_graph
 from prism.models.llama import disable_rope
-from prism.models.utils import LipschitzNorm
 
 
 # Name under which the graph-PE-injecting attention function is registered in
@@ -134,10 +132,11 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         except StopIteration:
             device = llm.device
         self.pe_model = pe_model.to(device)
-        self.pe_proj = nn.Sequential(
-            spectral_norm(nn.Linear(d_model, llm.config.get_text_config().hidden_size, device=device)),
-            LipschitzNorm(llm.config.get_text_config().hidden_size, eps=eps, device=device),
-        )
+        # Plain linear projection to the LLM hidden size — no spectral/Lipschitz
+        # normalization. The learnable ``pe_gain`` gate (below) sets the injection
+        # strength; the projection weights learn the rest.
+        self.pe_proj = nn.Linear(
+            d_model, llm.config.get_text_config().hidden_size, device=device)
         # Learnable gate on the PE injection: g = tanh(pe_gain) ∈ (-1,1). Lets the
         # model regulate how strongly (and with which sign) Ψ enters RoPE(X) + g·Ψ.
         # Init pe_gain = 1.0 → g ≈ 0.76, so Ψ is active from the first step (near the
@@ -266,12 +265,10 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         psi = torch.zeros(B, seq_len, hidden, device=embeddings.device, dtype=embeddings.dtype)
         for b in range(B):
             pe = self.pe_proj(self.pe_model(graphs[b], permutation=permutation))  # [n, hidden_size]
-            # Scale Ψ to the token-embedding magnitude, then apply the learnable gate.
-            # pe_proj ends in a LipschitzNorm, so Ψ exits at ~unit norm and would be
-            # drowned out; matching it to the mean token-embedding norm makes it a
-            # full-strength positional signal, and g = tanh(pe_gain) ∈ (-1,1)
-            # (init ≈ 0.76) gates it. Mirrored in inference.py so eval matches training.
-            pe = pe * embeddings[b].norm(dim=-1).mean().detach() * torch.tanh(self.pe_gain)
+            # Apply the learnable gate g = tanh(pe_gain) ∈ (-1, 1) (init ≈ 0.76). No
+            # ad-hoc magnitude matching to ‖X‖ — the projection + gate set the scale.
+            # Mirrored in inference.py so eval matches training.
+            pe = pe * torch.tanh(self.pe_gain)
             for node_idx, spans in injection_maps[b].items():
                 for start, end in spans:
                     end = min(end, seq_len)

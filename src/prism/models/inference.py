@@ -265,9 +265,9 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
             )
 
         # Base R-PEARL GraphAugmentedLLM (non-composite): apply RoPE(X) + Ψ exactly as
-        # training. build_pe_signal scales Ψ to the mean token-embedding norm, applies
-        # the learnable tanh gate, and places it at the scoped node-name spans; arming
-        # it on the model makes the patched attention layers add it post-RoPE. Injection
+        # training. build_pe_signal applies the learnable tanh gate and places Ψ at the
+        # scoped node-name spans; arming it on the model makes the patched attention
+        # layers add it post-RoPE. Injection
         # auto-skips cached single-token decode steps (seq mismatch), so only the prompt
         # tokens carry Ψ. Disarm afterwards so no stale signal leaks into a later call.
         psi = graph_model.build_pe_signal(

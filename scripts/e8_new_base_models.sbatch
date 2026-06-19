@@ -10,6 +10,16 @@
 
 # e8 new base models — train + cross-eval, one self-contained config per task.
 #
+# === MODIFIED RERUN (2026-06-19) ===========================================
+# Architecture refactor: removed the spectral-norm / Lipschitz-norm / β=1/F
+# filter-norm machinery and the ad-hoc magnitude-matching rescales from the
+# R-PEARL / GT / injection path (norms are now plain LayerNorm; PE strength is
+# set by learnable tanh gates only). This rerun covers the GRAPH archs only —
+# idx 1-4 (rpearl_llm{,_no_edges}, rpearl_gt_llm{,_no_edges}); the plain LLM
+# baseline (idx 0) is unaffected by the refactor and is not rerun.
+#   Submit:  sbatch --array=1-4 scripts/e8_new_base_models.sbatch
+# ===========================================================================
+#
 # Five Gemma-base configs under experiments/e8_new_base_models/. Each yaml is
 # fully self-contained (data, base_model, hyperparams); this script only selects
 # the config, assigns a UNIQUE save_name / wandb run name, and hands off to

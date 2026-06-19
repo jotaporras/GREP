@@ -1,11 +1,9 @@
 import torch
 from torch import nn
-from torch.nn.utils.parametrizations import spectral_norm
 from torch.utils.checkpoint import checkpoint
 from torch_geometric.data import Data
 
 from prism.models import gcn
-from prism.models.utils import LipschitzNorm
 
 
 class RandomGNNPositionalEncodings(nn.Module):
@@ -19,8 +17,9 @@ class RandomGNNPositionalEncodings(nn.Module):
         num_samples (int): Probe count M at train time (m_train).
         dropout (float): Dropout rate of the GCN associated.
         k (int): Convolution depth of the GCN.
-        use_layer_norm (bool): Whether to use Lipschitz layer normalization
-        eps (float): The Lipschitz constant for layer normalization
+        use_layer_norm (bool): Retained for config back-compat; the readout is
+            always a plain LayerNorm now.
+        eps (float): Retained for config back-compat (unused).
         probe_distribution (str): "gaussian" (N(0,I)) or "rademacher" (±1). Both
             satisfy E[q]=0 and unit second moment (R7).
         m_test (int): Probe count M at eval/test. Larger ⇒ lower-variance Monte
@@ -64,21 +63,16 @@ class RandomGNNPositionalEncodings(nn.Module):
         # Create a GCN that takes 1-dimensional random features
         self.pe_gcn = gcn.GCN(
             1, pe_hidden_channels, pe_num_layers,
-            skip_connection=True, dropout=dropout, k=k, eps=eps
+            skip_connection=True, dropout=dropout, k=k
         )
         # Add a final projection to ensure output is d_model dimensions
-        self.output_projection = spectral_norm(nn.Linear(pe_hidden_channels, d_model))
+        self.output_projection = nn.Linear(pe_hidden_channels, d_model)
 
-        # 1/√F scaling to satisfy PEARL Assumption 4.2 (β = 1/F) after spectral norm.
-        # Spectral norm constrains ‖W‖_op ≤ 1; this additional scaling brings the
-        # effective operator norm closer to 1/F as required by Theorem 4.3.
-        self.register_buffer('_dim_scale', torch.tensor(d_model ** -0.5))
         self.dropout = nn.Dropout(dropout)
+        # ``use_layer_norm`` retained for config/back-compat; the readout is always a
+        # plain LayerNorm now (the old Lipschitz/BatchNorm variants are gone).
         self.use_layer_norm = use_layer_norm
-        if self.use_layer_norm:
-            self.norm = LipschitzNorm(d_model, eps=eps)
-        else:
-            self.norm = nn.BatchNorm1d(d_model)
+        self.norm = nn.LayerNorm(d_model)
         # Learnable tanh(g) gate on the R-PEARL output (first moment Ψ in forward() and
         # the second moment C·signal in second_moment_apply()). g = tanh(output_gain)
         # ∈ (-1, 1); init output_gain=1 → g ≈ 0.76. Lets the model scale the positional
@@ -166,7 +160,7 @@ class RandomGNNPositionalEncodings(nn.Module):
         # Single batched GCN forward pass over all m copies.
         pe_all = self.pe_gcn(batch_data)
         pe_all = self.dropout(pe_all)
-        pe_all = self.output_projection(pe_all) * self._dim_scale
+        pe_all = self.output_projection(pe_all)
 
         # Reshape [m*N, d_model] -> [m, N, d_model].
         pe_all = pe_all.view(m, num_nodes, -1)
@@ -279,7 +273,7 @@ class RandomGNNPositionalEncodings(nn.Module):
                 explicitly (e.g. to ``‖X‖``).
 
         Returns:
-            ``C·signal`` in [N, d_model], LipschitzNorm-normalized like ``forward``.
+            ``C·signal`` in [N, d_model], gated by ``tanh(output_gain)``.
         """
         try:
             device = next(self.parameters()).device
@@ -356,24 +350,9 @@ class RandomGNNPositionalEncodings(nn.Module):
             # gate is deliberately skipped here: a tanh(g)→0 would zero the operator,
             # which under a q←C·q replacement would collapse attention.
             return result.to(signal.dtype)
-        # Scale C·signal to the SIGNAL's magnitude rather than to unit norm. A unit
-        # LipschitzNorm here would leave C·signal at ~4% of H0 = signal + C·signal
-        # (token rows of `signal` are X at ~‖X‖), drowning out the relative-position
-        # operator that — with RoPE off — is the model's only source of token order.
-        # Matching the mean row-norm of C·signal to that of `signal` gives the two H0
-        # terms comparable strength via a single global scalar (per-row structure
-        # preserved, transferable). self.norm (LipschitzNorm) is kept as a utility:
-        # loads in old checkpoints and is the toggle point for unit-norm output.
-        # Floor is a true div-by-zero guard, NOT a magnitude floor: the centered
-        # covariance is naturally tiny (~1e-8 — the ΨΨᵀ DC term is subtracted, leaving
-        # only the small position-bearing residual), so a 1e-6 floor would clamp `cur`
-        # above the real norm and cap result*(target/cur) at a few % of ‖signal‖,
-        # throttling the relative-position operator in H0 = signal + C·signal. fp32
-        # carries the small value with full precision, so amplifying to ‖signal‖ is safe.
-        cur = result.float().norm(dim=-1).mean().clamp(min=1e-12)
-        target = s.float().norm(dim=-1).mean()
-        # Magnitude-match to the signal, then the learnable tanh(g) output gate.
-        return result * (target / cur).to(result.dtype) * torch.tanh(self.output_gain).to(result.dtype)
+        # Learnable tanh(g) output gate; the model dials the relative-position
+        # operator's strength itself (no ad-hoc magnitude matching to ‖signal‖).
+        return result * torch.tanh(self.output_gain).to(result.dtype)
 
     def covariance_token_block(self, data, c):
         """Sampled centered covariance ``C = E_q[ΦΦᵀ] − ΨΨᵀ`` and first-moment Gram

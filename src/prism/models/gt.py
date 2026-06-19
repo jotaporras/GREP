@@ -3,25 +3,12 @@ import warnings
 
 import torch
 from torch import nn, Tensor
-from torch.nn.utils.parametrizations import spectral_norm
 from torch.utils.checkpoint import checkpoint
 from torch_geometric.data import Data
 from torch_geometric.utils import add_self_loops, coalesce, softmax
 
-
-def _maybe_spectral_norm(linear: nn.Module, enabled: bool) -> nn.Module:
-    """Wrap ``linear`` in spectral norm when ``enabled``, else return it as-is.
-
-    In the M6 fusion path the GT node features carry the LLM token embeddings X
-    (semantic content). Per the spec, that path must NOT be spectrally normalized
-    — only PE-side operators are — so the Q/K/V/O and FFN linears are left bare
-    when token embeddings are fused. In the legacy PE-generator path (no token
-    embeddings) spectral norm stays on to preserve the transferability guarantees.
-    """
-    return spectral_norm(linear) if enabled else linear
-
 from prism.models.r_pearl import RandomGNNPositionalEncodings
-from prism.models.utils import LipschitzNorm, SparseCSRDropout
+from prism.models.utils import SparseCSRDropout
 
 warnings.filterwarnings("ignore", ".*Sparse CSR tensor support is in beta state.*")
 
@@ -31,25 +18,18 @@ class SparseGraphAttention(nn.Module):
     Single-layer sparse graph transformer attention (Eq. 13 of Porras-Valenzuela).
 
     Computes scaled dot-product attention restricted to k-hop neighborhoods.
-    Q, K, V projections are spectrally normed to enforce Assumption 2.
 
     Uses manual gather/scatter instead of PyG MessagePassing.propagate to
     avoid JIT-compiled propagate + autocast bf16 scatter kernel interactions
     that trigger CUDA device-side assertions on some GPU/driver combinations.
 
-    Q, K, V projections are spectrally normed (to enforce Assumption 2) only when
-    ``spectral_norm_linears`` is set; in the M6 fusion path it is disabled so the
-    X-carrying path is not distorted.
-
     Args:
         d_model (int): Input/output feature dimension
         heads (int): Number of attention heads
         dropout (float): Attention weight dropout
-        spectral_norm_linears (bool): Spectrally normalize Q/K/V/O (default True).
     """
 
-    def __init__(self, d_model: int, heads: int = 4, dropout: float = 0.1,
-                 spectral_norm_linears: bool = True):
+    def __init__(self, d_model: int, heads: int = 4, dropout: float = 0.1):
         super().__init__()
 
         # Store preliminary information.
@@ -57,15 +37,10 @@ class SparseGraphAttention(nn.Module):
         self.head_dim = d_model // heads
         self.d_model = d_model
 
-        # Create Lipschitz constants for the Q, K, and V matrices.
-        self.c_q = nn.Parameter(torch.tensor(1.0))
-        self.c_k = nn.Parameter(torch.tensor(1.0))
-        self.c_v = nn.Parameter(torch.tensor(1.0))
-
         # Instantiate this attention layer's query, key, and value matrices.
-        self.W_Q = _maybe_spectral_norm(nn.Linear(d_model, d_model, bias=False), spectral_norm_linears)
-        self.W_K = _maybe_spectral_norm(nn.Linear(d_model, d_model, bias=False), spectral_norm_linears)
-        self.W_V = _maybe_spectral_norm(nn.Linear(d_model, d_model, bias=False), spectral_norm_linears)
+        self.W_Q = nn.Linear(d_model, d_model, bias=False)
+        self.W_K = nn.Linear(d_model, d_model, bias=False)
+        self.W_V = nn.Linear(d_model, d_model, bias=False)
 
         # Register a scale factor for the attention scores.
         self.register_buffer("scale", torch.tensor(self.head_dim, dtype=torch.float).rsqrt())
@@ -73,18 +48,15 @@ class SparseGraphAttention(nn.Module):
         # Register dropout and the output linear map.
         self.dropout: nn.Module = nn.Dropout(dropout)
         self.attn_dropout: nn.Module = SparseCSRDropout(dropout)
-        self.W_O = _maybe_spectral_norm(nn.Linear(d_model, d_model, bias=False), spectral_norm_linears)
+        self.W_O = nn.Linear(d_model, d_model, bias=False)
 
     def forward(self, x: Tensor, edge_index: Tensor) -> Tensor:
         N = x.shape[0]
 
         # Gather the query, key, and value projections for input signal x.
-        q = (self.W_Q(x) * self.c_q.clamp(0, 1)).view(
-            N, self.heads, self.head_dim).permute(1, 0, 2)
-        k = (self.W_K(x) * self.c_k.clamp(0, 1)).view(
-            N, self.heads, self.head_dim).permute(1, 0, 2)
-        v = (self.W_V(x) * self.c_v.clamp(0, 1)).view(
-            N, self.heads, self.head_dim).permute(1, 0, 2)
+        q = self.W_Q(x).view(N, self.heads, self.head_dim).permute(1, 0, 2)
+        k = self.W_K(x).view(N, self.heads, self.head_dim).permute(1, 0, 2)
+        v = self.W_V(x).view(N, self.heads, self.head_dim).permute(1, 0, 2)
 
         values = torch.ones(edge_index.shape[1], device=x.device, dtype=x.dtype)
         A = torch.sparse_coo_tensor(
@@ -226,34 +198,27 @@ class SparseTransformerBlock(nn.Module):
         d_model (int): Feature dimension.
         heads (int): Number of attention heads.
         dropout (float): Dropout rate.
-        eps (float): Lipschitz normalization epsilon.
     """
 
-    def __init__(self, d_model: int, heads: int = 4, dropout: float = 0.1, use_layer_norm: bool = False, eps: float = 1e-8,
-                 spectral_norm_linears: bool = True, normalize: bool = True):
+    def __init__(self, d_model: int, heads: int = 4, dropout: float = 0.1,
+                 normalize: bool = True):
         super().__init__()
 
-        # Set up Attention, Dropout, Feed-Forward Network, and
-        # Lipschitz Normalizer layers of Transformer Block.
-        self.attn = SparseGraphAttention(d_model, heads=heads, dropout=dropout,
-                                         spectral_norm_linears=spectral_norm_linears)
+        # Set up Attention, Dropout, Feed-Forward Network, and LayerNorm layers.
+        self.attn = SparseGraphAttention(d_model, heads=heads, dropout=dropout)
         self.dropout: nn.Module = nn.Dropout(dropout)
         self.ffn = nn.Sequential(
-            _maybe_spectral_norm(nn.Linear(d_model, d_model), spectral_norm_linears),
+            nn.Linear(d_model, d_model),
             nn.LeakyReLU(),
-            _maybe_spectral_norm(nn.Linear(d_model, d_model), spectral_norm_linears),
+            nn.Linear(d_model, d_model),
         )
-        # normalize=False keeps the block magnitude-preserving: the two LipschitzNorms
+        # normalize=False keeps the block magnitude-preserving: the two LayerNorms
         # are skipped and the residual adds carry through. Used for the final block.
         self.normalize = normalize
         self.norms = nn.ModuleList([])
         if normalize:
-            if use_layer_norm:
-                self.norms.append(LipschitzNorm(d_model, eps=eps))
-                self.norms.append(LipschitzNorm(d_model, eps=eps))
-            else:
-                self.norms.append(nn.BatchNorm1d(d_model))
-                self.norms.append(nn.BatchNorm1d(d_model))
+            self.norms.append(nn.LayerNorm(d_model))
+            self.norms.append(nn.LayerNorm(d_model))
 
 
     def forward(self, x: Tensor, edge_index: Tensor) -> Tensor:
@@ -295,8 +260,8 @@ class GraphTransformer(nn.Module):
         dropout (float): Dropout rate.
         k_pe (int): TAGConv polynomial order for R-PEARL.
         k_gt (int): Hop radius for sparse attention neighborhoods.
-        eps (float): Global Lipschitz epsilon.
-        use_layer_norm (bool): LipschitzNorm vs BatchNorm.
+        eps (float): Retained for config back-compat (unused).
+        use_layer_norm (bool): Retained for config back-compat; norms are always LayerNorm.
     """
 
     def __init__(self, num_layers: int, pe_hidden_channels: int,
@@ -306,7 +271,7 @@ class GraphTransformer(nn.Module):
                  probe_distribution: str = "gaussian", m_test: int = None,
                  max_gather_rows: int = 2_000_000,
                  fixed_seed_mode: bool = False, fixed_seed_value: int = 0,
-                 spectral_norm_linears: bool = True, pe_readout: str = "mean",
+                 pe_readout: str = "mean",
                  center_second_moment: bool = True):
         super().__init__()
         if pe_readout not in ("mean", "second_moment"):
@@ -328,10 +293,7 @@ class GraphTransformer(nn.Module):
         #                     RandomGNNPositionalEncodings.second_moment_apply.
         self.pe_readout = pe_readout
 
-        # Set up R-PEARL Positional Encoder, Transformer Blocks, and Output Lipschitz Normalizer.
-        # spectral_norm_linears is disabled by the M6 fusion path (token embeddings
-        # fused) so the X-carrying attention/FFN linears are not spectrally normalized;
-        # the PE-side R-PEARL projection keeps its own spectral norm regardless.
+        # Set up R-PEARL Positional Encoder and Transformer Blocks.
         self.pe_model = RandomGNNPositionalEncodings(
             pe_hidden_channels=pe_hidden_channels, pe_num_layers=pe_num_layers, d_model=d_model,
             num_samples=num_samples, dropout=dropout, k=k_pe, eps=eps, use_layer_norm=use_layer_norm,
@@ -340,27 +302,19 @@ class GraphTransformer(nn.Module):
             fixed_seed_mode=fixed_seed_mode, fixed_seed_value=fixed_seed_value,
             center_second_moment=center_second_moment,
         )
-        # Blocks 0..L-2 keep their LipschitzNorms (stability through depth); the final
-        # block is norm-free (normalize=False) so the output magnitude survives for the
-        # embedding-scale rescale in forward() — under injection_mode="none" the GT
-        # output is the LLM's inputs_embeds and must not be on the unit sphere.
+        # Blocks 0..L-2 keep their LayerNorms (stability through depth); the final
+        # block is norm-free (normalize=False) so the output magnitude survives for
+        # the learnable output gate below.
         self.blocks = nn.ModuleList([
             SparseTransformerBlock(
-                d_model, heads=heads, dropout=dropout, use_layer_norm=use_layer_norm, eps=eps,
-                spectral_norm_linears=spectral_norm_linears,
+                d_model, heads=heads, dropout=dropout,
                 normalize=(i < num_layers - 1),
             ) for i in range(num_layers)
         ])
-        # Normalization utility, kept available: loads in old checkpoints and is the
-        # toggle point if a bounded unit-norm output is ever wanted again. Currently
-        # bypassed in forward() in favor of the embedding-scale rescale.
-        self.output_norm = LipschitzNorm(d_model, eps=eps)
-        # Learnable tanh(g) gate replacing the removed output LipschitzNorm: the GT
-        # output is scaled by the embedding-scale rescale AND by g = tanh(output_gain)
-        # ∈ (-1, 1). Lets the model dial the structural output's magnitude up toward
-        # ±‖X‖ or down toward 0 (recovering the base LLM) instead of it being pinned
-        # at full embedding scale. Init output_gain=1.0 → g ≈ 0.76 (active, in tanh's
-        # responsive region); a single scalar, transferable, saved with gt_model.
+        # Learnable tanh(g) gate on the GT output: g = tanh(output_gain) ∈ (-1, 1).
+        # Lets the model dial the structural output up or down (toward 0 recovers the
+        # base LLM) instead of pinning it to a fixed scale. Init output_gain=1.0 →
+        # g ≈ 0.76. A single scalar, transferable, saved with gt_model.
         self.output_gain = nn.Parameter(torch.tensor(1.0))
 
     @torch.no_grad()
@@ -447,17 +401,7 @@ class GraphTransformer(nn.Module):
                 seeded = x_full.clone()
                 if is_token is not None:
                     # scene rows ← first-moment Ψ; token rows stay the verbal embeddings X.
-                    # Match Ψ_scene's magnitude to the token-embedding scale: Ψ exits
-                    # R-PEARL at ~unit norm (LipschitzNorm) while X is at ~‖X‖ (≈24 for
-                    # Llama). Un-scaled, the scene graph contributes only ~7% to the
-                    # token positional encoding through C·seeded (token content + the
-                    # cycle dominate ~14:1), so the graph-reasoning signal is nearly
-                    # lost; scaling Ψ_scene to the mean token norm restores it to full
-                    # strength (~89%). Transferable scalar, structure-preserving.
-                    psi_scene = psi[~is_token]
-                    tok_scale = token_embeddings.float().norm(dim=-1).mean()
-                    psi_scale = psi_scene.float().norm(dim=-1).mean().clamp(min=self.eps)
-                    seeded[~is_token] = (psi_scene * (tok_scale / psi_scale)).to(seeded.dtype)
+                    seeded[~is_token] = psi[~is_token].to(seeded.dtype)
                 cx = self.pe_model.second_moment_apply(pe_data, seeded)  # C·seeded
                 x = seeded + cx.to(seeded.dtype)          # H0 = seeded + C·seeded
             else:
@@ -505,17 +449,9 @@ class GraphTransformer(nn.Module):
                     x = checkpoint(block, x, khop_edge_index, use_reentrant=False)
                 else:
                     x = block(x, khop_edge_index)
-            # Embedding-scale rescale: multiply Y by the single scalar (mean input-
-            # embedding row-norm)/(mean GT token-row norm). Pins the overall magnitude
-            # to the embedding manifold (Y is the LLM's inputs_embeds under "none")
-            # while preserving relative per-row magnitudes — a global scale, not a
-            # per-row normalization. Transferable; a no-op when token_embeddings is None.
+            # Learnable tanh(g) output gate; the model dials the structural output's
+            # magnitude itself (no ad-hoc embedding-scale matching). No-op shape-wise
+            # when token_embeddings is None.
             if token_embeddings is not None:
-                tok = x if is_token is None else x[is_token]
-                cur = tok.float().norm(dim=-1).mean().clamp(min=self.eps)
-                target = token_embeddings.float().norm(dim=-1).mean()
-                # Embedding-scale rescale, then the learnable tanh(g) magnitude gate
-                # (replaces the removed output norm; g can attenuate the structural
-                # output toward 0 or push it to full ±‖X‖ scale).
-                x = x * (target / cur).to(x.dtype) * torch.tanh(self.output_gain).to(x.dtype)
+                x = x * torch.tanh(self.output_gain).to(x.dtype)
         return x

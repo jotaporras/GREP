@@ -155,11 +155,9 @@ def graph_augmented_llm_from_pretrained(
             max_gather_rows=gnn_cfg.get("max_gather_rows", 2_000_000),
             fixed_seed_mode=gnn_cfg.get("fixed_seed_mode", False),
             fixed_seed_value=gnn_cfg.get("fixed_seed_value", 0),
-            spectral_norm_linears=False,  # M6 fusion path (token embeddings fused)
             pe_readout=gnn_cfg.get("pe_readout", "mean"),
             center_second_moment=gnn_cfg.get("pe_center_moment", True),
         )
-        gt_model.pe_model.pe_gcn.strict_filter_norm = gnn_cfg.get("strict_filter_norm", False)
         composite_kwargs = dict(
             gate_init=gnn_cfg.get("gate_init", 0.0),
             gate_per_dim=gnn_cfg.get("gate_per_dim", False),

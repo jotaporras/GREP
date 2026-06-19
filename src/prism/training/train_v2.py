@@ -413,9 +413,6 @@ class TrainConfig:
     # Live c_bias covariance kernel: "sampled" (E_q[ΦΦᵀ]−ΨΨᵀ probe estimate) or
     # "analytic" (all-layer H(S)H(S)* matrix powers). See InjectedCompositeGraphLLM.
     c_kernel: str = "sampled"
-    # β=1/F R-PEARL filter-norm invariant: when True the per-forward check RAISES on a
-    # violation; default False = lenient (warn) in training (strict reserved for tests).
-    strict_filter_norm: bool = False
     # Structural-path optimization (R6): the GT + R-PEARL + gate train at
     # structural_lr_mult × the base LR (they otherwise get gradients orders of
     # magnitude below LoRA and never open the gate); lora_warmup_steps freezes the
@@ -640,9 +637,6 @@ def train_model(config: TrainConfig, config_file: str = None):
             max_gather_rows=config.max_gather_rows,
             fixed_seed_mode=config.fixed_seed_mode,
             fixed_seed_value=config.fixed_seed_value,
-            # Token embeddings are fused (M6) -> the X-carrying GT path is not
-            # spectrally normalized (only the PE-side R-PEARL projection is).
-            spectral_norm_linears=False,
             pe_readout=config.pe_readout,
             center_second_moment=config.pe_center_moment,
         )
@@ -673,8 +667,6 @@ def train_model(config: TrainConfig, config_file: str = None):
         else:
             model = gnn_llm.CompositeGraphLLM(
                 llm, gt_model, d_model=config.d_model, **composite_kwargs)
-        # β=1/F R-PEARL filter-norm fail-loud strictness (default lenient/warn in training).
-        gt_model.pe_model.pe_gcn.strict_filter_norm = config.strict_filter_norm
         collator = data.SpineDataCollator(tokenizer, mlm=False)
 
         if config.freeze_llm:
@@ -827,8 +819,7 @@ def train_model(config: TrainConfig, config_file: str = None):
                 "c_per_layer": config.c_per_layer,
                 "c_bias": config.c_bias,
                 "use_scene_bias": config.use_scene_bias,
-                "c_kernel": config.c_kernel,
-                "strict_filter_norm": config.strict_filter_norm}
+                "c_kernel": config.c_kernel}
                if config.architecture == "composite_graph_gt" else {}),
         }
         trainer = GraphSFTTrainer(

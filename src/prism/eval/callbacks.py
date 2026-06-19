@@ -245,7 +245,6 @@ class GradientDebugCallback(TrainerCallback):
             self._captured_grad_norms["gt"] = self._grad_norm(gt.parameters())
             self._captured_grad_norms["rpearl"] = self._grad_norm(gt.pe_model.parameters())
             self._captured_grad_norms["gt_blocks"] = self._grad_norm(gt.blocks.parameters())
-            self._captured_grad_norms["gt_output_norm"] = self._grad_norm(gt.output_norm.parameters())
             self._captured_grad_norms["gate"] = self._grad_norm([inner.injection.gate])
             return
 
@@ -256,7 +255,6 @@ class GradientDebugCallback(TrainerCallback):
         if hasattr(inner.pe_model, "blocks"):
             self._captured_grad_norms["rpearl"] = self._grad_norm(inner.pe_model.pe_model.parameters())
             self._captured_grad_norms["gt_blocks"] = self._grad_norm(inner.pe_model.blocks.parameters())
-            self._captured_grad_norms["gt_output_norm"] = self._grad_norm(inner.pe_model.output_norm.parameters())
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
         if model is not None and self._supported(self._unwrap_peft(model)):
@@ -264,28 +262,9 @@ class GradientDebugCallback(TrainerCallback):
 
     @staticmethod
     def _filter_norm_metrics(inner):
-        """STEP 3: log MEASURED ‖H(S)‖₂ (power iteration on the actual S̄) per R-PEARL
-        filter vs target 1/F, the ratio, and the c_bias Ĉ scale. Fail-loud: re-run the
-        bound check (``gcn.strict_filter_norm`` raises; lenient warns)."""
+        """Log the c_bias Ĉ scale (composite_graph_gt only). The old β=1/F R-PEARL
+        filter-norm diagnostics are gone with the spectral-norm machinery."""
         out = {}
-        gcn = getattr(getattr(getattr(inner, "gt_model", None), "pe_model", None), "pe_gcn", None)
-        if gcn is not None and getattr(gcn, "_last_graph", None) is not None:
-            ei, ew, n = gcn._last_graph
-            try:
-                report = gcn.filter_norm_report(ei, ew, n)        # true ‖H(S)‖₂ on S̄
-                worst = 0.0
-                for idx, d in report.items():
-                    out[f"grep/filter_norm/layer{idx}_measured"] = d["measured"]
-                    out[f"grep/filter_norm/layer{idx}_target"] = d["target"]
-                    out[f"grep/filter_norm/layer{idx}_ratio"] = d["ratio"]
-                    worst = max(worst, d["ratio"])
-                out["grep/filter_norm/worst_ratio"] = worst       # ≤ 1 + tol if invariant holds
-                gcn.assert_filter_bounds(strict=getattr(gcn, "strict_filter_norm", False),
-                                         report=report)
-            except Exception as e:  # never let a diagnostic kill training (unless strict raised)
-                if isinstance(e, AssertionError):
-                    raise
-                warnings.warn(f"[filter_norm] measurement skipped: {e}")
         if getattr(inner, "c_bias", False):
             try:
                 # analytic Ĉ from the R-PEARL taps (deterministic; c_bias positional kernel).
@@ -318,7 +297,6 @@ class GradientDebugCallback(TrainerCallback):
                 "debug/grad_norm_gt": g.get("gt", 0.0),
                 "debug/grad_norm_rpearl": g.get("rpearl", 0.0),
                 "debug/grad_norm_gt_blocks": g.get("gt_blocks", 0.0),
-                "debug/grad_norm_gt_output_norm": g.get("gt_output_norm", 0.0),
                 "debug/grad_norm_gate": g.get("gate", 0.0),
                 "debug/gt_output_norm": self._pe_norm,
                 "debug/gt_has_nan": int(self._pe_has_nan),
@@ -331,7 +309,7 @@ class GradientDebugCallback(TrainerCallback):
                 "debug/rpearl_output_gain": float(inner.gt_model.pe_model.output_gain.detach().tanh().item()),
                 "debug/lr": lr,
             }
-            # β=1/F R-PEARL filter-norm invariant (measured, fail-loud) + c_bias Ĉ scale.
+            # c_bias Ĉ scale (composite_graph_gt only).
             metrics.update(self._filter_norm_metrics(inner))
         else:
             # GraphAugmentedLLM (rpearl_llm / rpearl_gt_llm).
@@ -351,7 +329,6 @@ class GradientDebugCallback(TrainerCallback):
             if hasattr(inner.pe_model, "blocks"):
                 metrics["debug/grad_norm_rpearl"] = g.get("rpearl", 0.0)
                 metrics["debug/grad_norm_gt_blocks"] = g.get("gt_blocks", 0.0)
-                metrics["debug/grad_norm_gt_output_norm"] = g.get("gt_output_norm", 0.0)
 
         if wandb.run is not None:
             wandb.log(metrics, step=state.global_step)
