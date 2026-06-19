@@ -457,3 +457,74 @@ class GraphTransformer(nn.Module):
             if token_embeddings is not None:
                 x = x * torch.tanh(self.output_gain).to(x.dtype)
         return x
+
+
+class SemanticGraphTransformer(nn.Module):
+    """Graph Transformer over semantic node features — NO R-PEARL, no random probes.
+
+    The node features (e.g. the mean LLM word-embedding of each node's name, supplied as
+    ``data.x`` [N, node_feature_dim] by ``GraphAugmentedLLM.build_pe_signal``) are projected
+    to ``d_model`` and refined by stacked sparse k-hop attention blocks. Output is [N, d_model],
+    gated by ``tanh(output_gain)``. A drop-in ``pe_model`` for ``GraphAugmentedLLM`` (the
+    ``gt_llm`` architecture); it REQUIRES semantic node features (there is no probe fallback).
+
+    Args:
+        node_feature_dim (int): input feature width (the LLM text hidden size).
+        d_model (int): transformer working dimension.
+        num_layers (int): number of sparse transformer blocks.
+        heads (int): attention heads.
+        dropout (float): dropout.
+        k_gt (int): hop radius for the sparse attention neighborhoods.
+    """
+
+    def __init__(self, node_feature_dim: int, d_model: int, num_layers: int,
+                 heads: int = 4, dropout: float = 0.1, k_gt: int = 3):
+        super().__init__()
+        self.k_hops = k_gt
+        self.d_model = d_model
+        self.input_proj = nn.Linear(node_feature_dim, d_model)
+        # Blocks 0..L-2 normalize (LayerNorm); the final block is norm-free so the output
+        # magnitude survives for the learnable output gate (mirrors GraphTransformer).
+        self.blocks = nn.ModuleList([
+            SparseTransformerBlock(d_model, heads=heads, dropout=dropout,
+                                   normalize=(i < num_layers - 1))
+            for i in range(num_layers)
+        ])
+        self.output_gain = nn.Parameter(torch.tensor(1.0))
+
+    @torch.no_grad()
+    def _expand_edge_index(self, edge_index: Tensor, num_nodes: int) -> Tensor:
+        """≤k-hop neighborhood via sparse (A+I)^k (binarized each step)."""
+        edge_idx_self, _ = add_self_loops(edge_index, num_nodes=num_nodes)
+        values = torch.ones(edge_idx_self.shape[1], device=edge_idx_self.device)
+        adj = torch.sparse_coo_tensor(edge_idx_self, values, (num_nodes, num_nodes)).coalesce()
+        reachable = adj
+        for _ in range(self.k_hops - 1):
+            reachable = torch.sparse.mm(reachable, adj).coalesce()
+            reachable = torch.sparse_coo_tensor(
+                reachable.indices(),
+                torch.ones(reachable._nnz(), device=reachable.device),
+                reachable.shape,
+            ).coalesce()
+        return coalesce(reachable.indices(), num_nodes=num_nodes)
+
+    def forward(self, data, permutation=None) -> Tensor:
+        if permutation is not None:
+            raise NotImplementedError(
+                "permutation-equivariance eval is not supported for SemanticGraphTransformer "
+                "(node features would also need permuting); pass permutation=None."
+            )
+        try:
+            device = next(self.parameters()).device
+        except StopIteration:
+            device = data.x.device
+        x = data.x.to(device=device, dtype=torch.float32)          # [N, node_feature_dim]
+        edge_index = data.edge_index.to(device)
+        x = self.input_proj(x)                                     # [N, d_model]
+        khop_edge_index = self._expand_edge_index(edge_index, x.size(0))
+        for block in self.blocks:
+            if self.training and torch.is_grad_enabled():
+                x = checkpoint(block, x, khop_edge_index, use_reentrant=False)
+            else:
+                x = block(x, khop_edge_index)
+        return x * torch.tanh(self.output_gain).to(x.dtype)

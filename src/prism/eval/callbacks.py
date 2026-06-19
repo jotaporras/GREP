@@ -253,8 +253,11 @@ class GradientDebugCallback(TrainerCallback):
         self._captured_grad_norms["pe_proj"] = self._grad_norm(inner.pe_proj.parameters())
         self._captured_grad_norms["pe_gain"] = self._grad_norm([inner.pe_gain])
         if hasattr(inner.pe_model, "blocks"):
-            self._captured_grad_norms["rpearl"] = self._grad_norm(inner.pe_model.pe_model.parameters())
             self._captured_grad_norms["gt_blocks"] = self._grad_norm(inner.pe_model.blocks.parameters())
+            # rpearl_gt_llm wraps an R-PEARL inside the GT; gt_llm (SemanticGraphTransformer)
+            # has no inner pe_model — guard so the debug callback doesn't crash.
+            if hasattr(inner.pe_model, "pe_model"):
+                self._captured_grad_norms["rpearl"] = self._grad_norm(inner.pe_model.pe_model.parameters())
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
         if model is not None and self._supported(self._unwrap_peft(model)):
@@ -325,10 +328,11 @@ class GradientDebugCallback(TrainerCallback):
                 "debug/pe_gain": inner.pe_gain.item(),
                 "debug/grad_norm_pe_gain": g.get("pe_gain", 0.0),
             }
-            # rpearl_gt_llm: split gradient norms by GT sub-component.
+            # rpearl_gt_llm / gt_llm: split gradient norms by GT sub-component.
             if hasattr(inner.pe_model, "blocks"):
-                metrics["debug/grad_norm_rpearl"] = g.get("rpearl", 0.0)
                 metrics["debug/grad_norm_gt_blocks"] = g.get("gt_blocks", 0.0)
+                if hasattr(inner.pe_model, "pe_model"):  # only rpearl_gt_llm has inner R-PEARL
+                    metrics["debug/grad_norm_rpearl"] = g.get("rpearl", 0.0)
 
         if wandb.run is not None:
             wandb.log(metrics, step=state.global_step)

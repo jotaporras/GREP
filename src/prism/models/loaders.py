@@ -148,6 +148,30 @@ def graph_augmented_llm_from_pretrained(
             model.pe_gain.data.copy_(gnn_weights["pe_gain"])
         if model.pe_norm is not None and "pe_norm" in gnn_weights:
             model.pe_norm.load_state_dict(gnn_weights["pe_norm"])
+    elif architecture == "gt_llm":
+        # Pure Graph Transformer over semantic node features (no R-PEARL). Saved via the
+        # generic non-composite path: key 'pe_model' holds the SemanticGraphTransformer.
+        pe_model = gt_module.SemanticGraphTransformer(
+            node_feature_dim=llm.config.get_text_config().hidden_size,
+            d_model=gnn_cfg["d_model"],
+            num_layers=gnn_cfg["gt_num_layers"],
+            heads=gnn_cfg["gt_heads"],
+            dropout=gnn_cfg["dropout"],
+            k_gt=gnn_cfg["k_gt"],
+        )
+        model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=gnn_cfg["d_model"],
+                                          eps=gnn_cfg["eps"],
+                                          pe_gain_init=gnn_cfg.get("pe_gain_init", 1.0),
+                                          disable_graph_token_rope=gnn_cfg.get("disable_graph_token_rope", False),
+                                          use_pe_norm=gnn_cfg.get("use_pe_norm", False),
+                                          pe_node_features=gnn_cfg.get("pe_node_features", "word_embeddings"))
+        gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
+        model.pe_model.load_state_dict(gnn_weights["pe_model"], strict=False)
+        model.pe_proj.load_state_dict(gnn_weights["pe_proj"])
+        if "pe_gain" in gnn_weights:
+            model.pe_gain.data.copy_(gnn_weights["pe_gain"])
+        if model.pe_norm is not None and "pe_norm" in gnn_weights:
+            model.pe_norm.load_state_dict(gnn_weights["pe_norm"])
     elif architecture == "composite_graph_gt":
         # M9 composite-graph assembly: Graph Transformer (R-PEARL inside) + M7 gate
         # over a RoPE-disabled LLM. Rebuild from gnn_config and load the saved weights.

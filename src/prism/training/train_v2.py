@@ -652,6 +652,31 @@ def train_model(config: TrainConfig, config_file: str = None):
 
         if config.freeze_llm:
             model.llm.requires_grad_(False)
+    elif config.architecture == "gt_llm":
+        # Pure Graph Transformer over semantic node features — NO R-PEARL / no probes.
+        # Requires word-embedding node features (the GT has no random-probe fallback).
+        if config.pe_node_features != "word_embeddings":
+            raise ValueError(
+                "architecture 'gt_llm' requires pe_node_features='word_embeddings' "
+                f"(got {config.pe_node_features!r}); the GT has no random-probe input."
+            )
+        pe_model = gt_module.SemanticGraphTransformer(
+            node_feature_dim=_text_hidden,
+            d_model=config.d_model,
+            num_layers=config.gt_num_layers,
+            heads=config.gt_heads,
+            dropout=config.dropout,
+            k_gt=config.k_gt,
+        )
+        model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=config.d_model,
+                                          eps=config.eps, pe_gain_init=config.pe_gain_init,
+                                          disable_graph_token_rope=config.disable_graph_token_rope,
+                                          use_pe_norm=config.use_pe_norm,
+                                          pe_node_features=config.pe_node_features)
+        collator = data.SpineDataCollator(tokenizer, mlm=False)
+
+        if config.freeze_llm:
+            model.llm.requires_grad_(False)
     elif config.architecture == "composite_graph_gt":
         # Composite-graph pipeline (M4-M8): one graph (cycle + scene + cross-links)
         # per sequence; R-PEARL + GT refine it; the gate injects Y[V_Tx] into the
@@ -839,7 +864,7 @@ def train_model(config: TrainConfig, config_file: str = None):
             "pe_node_features": config.pe_node_features,
             **({"k_gt": config.k_gt, "gt_num_layers": config.gt_num_layers,
                 "gt_heads": config.gt_heads}
-               if config.architecture in ("rpearl_gt_llm", "composite_graph_gt") else {}),
+               if config.architecture in ("rpearl_gt_llm", "gt_llm", "composite_graph_gt") else {}),
             # Composite-graph rebuild params (read back by loaders for eval).
             **({"k_gt": config.k_gt, "gt_num_layers": config.gt_num_layers,
                 "gt_heads": config.gt_heads,
