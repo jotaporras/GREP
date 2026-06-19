@@ -1,13 +1,13 @@
-name: e8
-architecture: llm
+name: e9
+architecture: rpearl_llm
 wandb_project: GREP-PRISM
-wandb_run_name: e8_llm_new_base_models
+wandb_run_name: e9_rpearl_llm
 wandb_tag: e8_new_base_models
-checkpoint_dir: outputs/e8_new_base_models
+checkpoint_dir: outputs/e9_gemma31b
 data: data/revised/gen/nav100_n30_gemma_data/split/formatted_all_new__train.json
 val_data: data/revised/gen/nav100_n30_gemma_data/split/formatted_all_new__val.json
 eval_data: data/revised/gen/nav100_n30_gemma_data/split/test_graphs/data_gen_023.json
-base_model: google/gemma-4-12B-it
+base_model: google/gemma-4-31B-it
 bit4: true
 per_device_train_batch_size: 1
 learning_rate: 0.0002
@@ -17,4 +17,14 @@ debug: true
 dataset_proportion: 1.0
 max_seq_length: 8192
 text_edge_list: present
+# R-PEARL GNN params
+d_model: 1024
+pe_hidden_channels: 256
+pe_num_layers: 2
+num_samples: 40
+dropout: 0.1
+k_pe: 2
+eps: 1e-6
+use_layer_norm: true
+freeze_llm: false
 device: -1
