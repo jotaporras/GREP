@@ -34,6 +34,7 @@
 #   5    e8_rpearl_llm_gt_pegain0       rpearl_gt_llm   present (pe_gain_init=0 cold-start sanity)
 #   6    e8_rpearl_llm_gt_norope_graph  rpearl_gt_llm   present (idx5 + RoPE off for graph tokens)
 #   7    e8_rpearl_llm_gt_norope_pegain005 rpearl_gt_llm present (idx6 + pe_gain_init=0.05, Ψ on)
+#   8    e8_rpearl_llm_gt_frozen_pe1    rpearl_gt_llm   present (LLM frozen, pe_gain=1.0 — PE-only probe)
 #
 # Unique save_names are required: the committed yamls all share name: e8 and the
 # rpearl_*/_no_edges pairs share an architecture, so train_v2 auto-naming would
@@ -71,6 +72,7 @@ CONFIGS=(
     "$CFG_DIR/e8_rpearl_llm_gt_pegain0.yaml"
     "$CFG_DIR/e8_rpearl_llm_gt_norope_graph.yaml"
     "$CFG_DIR/e8_rpearl_llm_gt_norope_pegain005.yaml"
+    "$CFG_DIR/e8_rpearl_llm_gt_frozen_pe1.yaml"
 )
 SAVE_NAMES=(
     e8_llm
@@ -81,6 +83,7 @@ SAVE_NAMES=(
     e8_rpearl_llm_gt_pegain0
     e8_rpearl_llm_gt_norope_graph
     e8_rpearl_llm_gt_norope_pegain005
+    e8_rpearl_llm_gt_frozen_pe1
 )
 
 TASK_ID=${SLURM_ARRAY_TASK_ID:-${1:-${TASK_ID:-0}}}
