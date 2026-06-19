@@ -18,12 +18,13 @@ dataset_proportion: 1.0
 max_seq_length: 8192
 text_edge_list: none
 # gt_llm_no_edges GT-WIDTH sweep at L=5, d_model=4096 (vs idx 18 = L5/d1024). Pure semantic
-# Graph Transformer over word-embedding node features — NO R-PEARL. Only d_model changes
-# across the d1024/d2048/d3072/d4096 sweep; depth (L=5), heads=8, k_gt=1, no edge list,
-# RMSNorm and cold-start are held fixed. head_dim = d_model/8. ~519M trainable GT params.
+# Graph Transformer over word-embedding node features — NO R-PEARL. head_dim is held at 128
+# (heads scale with width: Llama/GPT convention) so the sweep varies ONLY total width; depth
+# (L=5), k_gt=1, no edge list, RMSNorm and cold-start are fixed. head_dim = 4096/32 = 128.
+# ~519M trainable GT params.
 d_model: 4096
 gt_num_layers: 5
-gt_heads: 8
+gt_heads: 32
 k_gt: 1
 dropout: 0.1
 freeze_llm: false
