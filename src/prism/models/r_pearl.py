@@ -50,6 +50,7 @@ class RandomGNNPositionalEncodings(nn.Module):
         max_probe_rows: int = 65536,
         max_gather_rows: int = 2_000_000,
         center_second_moment: bool = True,
+        node_feature_dim: int = None,
     ):
         super().__init__()
         if probe_distribution not in ("gaussian", "rademacher"):
@@ -63,9 +64,15 @@ class RandomGNNPositionalEncodings(nn.Module):
                 f"pe_num_layers * k = {pe_num_layers}*{k} = {pe_num_layers * k} < 3: "
                 f"limited multi-hop reach (intentional for minimal/local PE probes)."
             )
-        # Create a GCN that takes 1-dimensional random features
+        # Input-feature mode. node_feature_dim is None => the original PEARL random-probe
+        # encoder: 1-D random features sampled per forward, averaged over m probes. When
+        # set (= the LLM embedding dim), forward() instead runs ONE deterministic GCN pass
+        # over the caller-supplied per-node features in ``data.x`` (e.g. mean word-embedding
+        # per node) — no probes, no Monte-Carlo averaging.
+        self.node_feature_dim = node_feature_dim
+        in_channels = 1 if node_feature_dim is None else node_feature_dim
         self.pe_gcn = gcn.GCN(
-            1, pe_hidden_channels, pe_num_layers,
+            in_channels, pe_hidden_channels, pe_num_layers,
             skip_connection=True, dropout=dropout, k=k
         )
         # Add a final projection to ensure output is d_model dimensions
@@ -174,7 +181,39 @@ class RandomGNNPositionalEncodings(nn.Module):
         pooled_pe = pe_all.mean(dim=0)
         return pooled_pe
 
+    def _deterministic_forward(self, data, permutation=None):
+        """Single GCN pass over caller-supplied semantic node features ``data.x``.
+
+        Used when ``node_feature_dim`` is set: ``data.x`` is [N, node_feature_dim] (e.g.
+        the mean word-embedding of each node's name). No random probes, no m-averaging —
+        one deterministic forward. Mirrors the random path's post-GCN steps (projection,
+        LayerNorm, tanh gate). The scene graph is small (N ~ tens), so no chunking /
+        gradient-checkpointing is needed.
+        """
+        try:
+            device = next(self.parameters()).device
+        except StopIteration:
+            device = data.x.device
+        if permutation is not None:
+            raise NotImplementedError(
+                "permutation-equivariance eval is not supported with semantic node "
+                "features (data.x would also need permuting); pass permutation=None."
+            )
+        x = data.x.to(device=device, dtype=torch.float32)
+        edge_index = data.edge_index.to(device)
+        edge_weight = getattr(data, "edge_weight", None)
+        if edge_weight is not None:
+            edge_weight = edge_weight.to(device)
+        g = Data(x=x, edge_index=edge_index, num_nodes=x.shape[0])
+        if edge_weight is not None:
+            g.edge_weight = edge_weight
+        out = self.output_projection(self.dropout(self.pe_gcn(g)))   # [N, d_model]
+        out = self.norm(out)
+        return out * torch.tanh(self.output_gain).to(out.dtype)
+
     def forward(self, data, permutation=None):
+        if self.node_feature_dim is not None:
+            return self._deterministic_forward(data, permutation=permutation)
         # Move input data to the model's device.
         try:
             device = next(self.parameters()).device
@@ -278,6 +317,11 @@ class RandomGNNPositionalEncodings(nn.Module):
         Returns:
             ``C·signal`` in [N, d_model], gated by ``tanh(output_gain)``.
         """
+        if self.node_feature_dim is not None:
+            raise NotImplementedError(
+                "second_moment_apply is a random-probe readout and is incompatible with "
+                "semantic node features (node_feature_dim set); use pe_readout='mean'."
+            )
         try:
             device = next(self.parameters()).device
         except StopIteration:
@@ -366,6 +410,11 @@ class RandomGNNPositionalEncodings(nn.Module):
         Same probe sampling / chunking / fixed-seed semantics as ``forward`` /
         ``second_moment_apply``; gradient flows to the GCN. Returns ``(C_tok, Psi_tok)``.
         """
+        if self.node_feature_dim is not None:
+            raise NotImplementedError(
+                "covariance_token_block is a random-probe readout and is incompatible "
+                "with semantic node features (node_feature_dim set)."
+            )
         try:
             device = next(self.parameters()).device
         except StopIteration:

@@ -115,6 +115,11 @@ def graph_augmented_llm_from_pretrained(
 
     architecture = gnn_cfg.get("architecture", "rpearl_llm")
 
+    # Semantic-feature mode: GNN input width = LLM text hidden size.
+    pe_node_features = gnn_cfg.get("pe_node_features", "random")
+    node_feature_dim = (llm.config.get_text_config().hidden_size
+                        if pe_node_features == "word_embeddings" else None)
+
     if architecture == "rpearl_gt_llm":
         pe_model = gt_module.GraphTransformer(
             num_layers=gnn_cfg["gt_num_layers"],
@@ -128,12 +133,14 @@ def graph_augmented_llm_from_pretrained(
             k_gt=gnn_cfg["k_gt"],
             eps=gnn_cfg["eps"],
             use_layer_norm=gnn_cfg["use_layer_norm"],
+            node_feature_dim=node_feature_dim,
         )
         model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=gnn_cfg["d_model"],
                                           eps=gnn_cfg["eps"],
                                           pe_gain_init=gnn_cfg.get("pe_gain_init", 1.0),
                                           disable_graph_token_rope=gnn_cfg.get("disable_graph_token_rope", False),
-                                          use_pe_norm=gnn_cfg.get("use_pe_norm", False))
+                                          use_pe_norm=gnn_cfg.get("use_pe_norm", False),
+                                          pe_node_features=pe_node_features)
         gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
         model.pe_model.load_state_dict(gnn_weights["gt_model"], strict=False)
         model.pe_proj.load_state_dict(gnn_weights["pe_proj"])
@@ -217,12 +224,14 @@ def graph_augmented_llm_from_pretrained(
             k=gnn_cfg["k_pe"],
             eps=gnn_cfg["eps"],
             use_layer_norm=gnn_cfg["use_layer_norm"],
+            node_feature_dim=node_feature_dim,
         )
         model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=gnn_cfg["d_model"],
                                           eps=gnn_cfg["eps"],
                                           pe_gain_init=gnn_cfg.get("pe_gain_init", 1.0),
                                           disable_graph_token_rope=gnn_cfg.get("disable_graph_token_rope", False),
-                                          use_pe_norm=gnn_cfg.get("use_pe_norm", False))
+                                          use_pe_norm=gnn_cfg.get("use_pe_norm", False),
+                                          pe_node_features=pe_node_features)
         gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
         model.pe_model.load_state_dict(gnn_weights["pe_model"], strict=False)
         model.pe_proj.load_state_dict(gnn_weights["pe_proj"])

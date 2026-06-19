@@ -112,7 +112,8 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
 
     def __init__(self, llm: nn.Module, pe_model: nn.Module,
                  d_model: int, eps: float = 1e-8, pe_gain_init: float = 1.0,
-                 disable_graph_token_rope: bool = False, use_pe_norm: bool = True):
+                 disable_graph_token_rope: bool = False, use_pe_norm: bool = True,
+                 pe_node_features: str = "random"):
         # GraphAugmentedLLM is not a registered HF architecture, so
         # PreTrainedModel rejects SDPA/flash-attn.  Force "eager" on the
         # wrapper config — the inner self.llm keeps its own attn impl.
@@ -168,6 +169,16 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         # the identity there — node names carry no sequential rotation; their position is
         # meant to come from Ψ. See _graph_token_position_ids / forward.
         self._disable_graph_token_rope: bool = bool(disable_graph_token_rope)
+
+        # R-PEARL input features. "random" => the GNN samples its own random probes
+        # (data.x ignored). "word_embeddings" => build_pe_signal computes a per-node
+        # feature (mean word-embedding of the node's name tokens) and feeds it as the
+        # GNN's data.x; the pe_model must be built with node_feature_dim = hidden size.
+        if pe_node_features not in ("random", "word_embeddings"):
+            raise ValueError(
+                f"pe_node_features must be 'random' or 'word_embeddings', got {pe_node_features!r}"
+            )
+        self._pe_node_features: str = pe_node_features
 
         # Per-forward graph signal Ψ ([B, seq, hidden]); read by the patched
         # attention forwards and set by _augment_embeddings / inference.
@@ -288,7 +299,32 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         B, seq_len, hidden = embeddings.shape
         psi = torch.zeros(B, seq_len, hidden, device=embeddings.device, dtype=embeddings.dtype)
         for b in range(B):
-            pe = self.pe_proj(self.pe_model(graphs[b], permutation=permutation))  # [n, hidden_size]
+            g = graphs[b]
+            if self._pe_node_features == "word_embeddings":
+                # Per-node feature = mean word-embedding of the node's name tokens, taken
+                # from the node's mention spans in this prompt. Fail loud if any graph node
+                # has no mention (every example lists all nodes, so coverage is required).
+                N = g.num_nodes
+                feats = torch.zeros(N, hidden, device=embeddings.device, dtype=torch.float32)
+                covered = [False] * N
+                for node_idx, spans in injection_maps[b].items():
+                    rows = [embeddings[b, start:min(end, seq_len)]
+                            for start, end in spans if start < min(end, seq_len)]
+                    if rows:
+                        feats[node_idx] = torch.cat(rows, dim=0).float().mean(dim=0)
+                        covered[node_idx] = True
+                missing = [i for i in range(N) if not covered[i]]
+                if missing:
+                    names = getattr(g, "node_names", None)
+                    raise ValueError(
+                        "pe_node_features='word_embeddings' requires every graph node to be "
+                        f"mentioned in the prompt, but these have no span: "
+                        f"{[(i, names[i] if names else '?') for i in missing]}"
+                    )
+                # Detach: features come from the (frozen) embedding table; gradient still
+                # flows to the GNN/pe_proj/pe_gain downstream.
+                g.x = feats.detach()
+            pe = self.pe_proj(self.pe_model(g, permutation=permutation))  # [n, hidden_size]
             # Calibrated RMSNorm rescales Ψ to the base model's token-embedding scale
             # (see __init__); skipped for checkpoints trained without it (use_pe_norm=False).
             if self.pe_norm is not None:

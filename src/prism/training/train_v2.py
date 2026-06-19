@@ -396,6 +396,10 @@ class TrainConfig:
     # model's token-embedding scale before injection (magnitude calibration, VLM
     # modality-connector best practice). Replaces the deleted spectral/Lipschitz norms.
     use_pe_norm: bool = True
+    # rpearl_llm / rpearl_gt_llm: R-PEARL input features. "random" => PEARL random probes
+    # (1-D, averaged over m). "word_embeddings" => deterministic per-node feature = mean
+    # word-embedding of the node's name tokens; the GNN runs one pass (no probes).
+    pe_node_features: str = "random"
     # rpearl_llm / rpearl_gt_llm: give graph (node-name) token spans position_id 0 so
     # RoPE is the identity there (no sequential rotation on node names); their position
     # is meant to come from the graph signal Ψ instead. Causality is unaffected (HF
@@ -597,6 +601,10 @@ def train_model(config: TrainConfig, config_file: str = None):
     _ensure_pad_tokens(tokenizer, llm)
     tokenizer.padding_side = "right" # ty: ignore[invalid-assignment]
 
+    # Semantic-feature mode: the GNN takes the LLM text hidden size as input width.
+    _text_hidden = llm.config.get_text_config().hidden_size
+    _node_feature_dim = _text_hidden if config.pe_node_features == "word_embeddings" else None
+
     if config.architecture == "rpearl_llm":
         # R-PEARL only: GCN positional encodings, no GT attention blocks.
         pe_model = r_pearl_module.RandomGNNPositionalEncodings(
@@ -608,11 +616,13 @@ def train_model(config: TrainConfig, config_file: str = None):
             k=config.k_pe,
             eps=config.eps,
             use_layer_norm=config.use_layer_norm,
+            node_feature_dim=_node_feature_dim,
         )
         model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=config.d_model,
                                           eps=config.eps, pe_gain_init=config.pe_gain_init,
                                           disable_graph_token_rope=config.disable_graph_token_rope,
-                                          use_pe_norm=config.use_pe_norm)
+                                          use_pe_norm=config.use_pe_norm,
+                                          pe_node_features=config.pe_node_features)
         collator = data.SpineDataCollator(tokenizer, mlm=False)
 
         if config.freeze_llm:
@@ -631,11 +641,13 @@ def train_model(config: TrainConfig, config_file: str = None):
             k_gt=config.k_gt,
             eps=config.eps,
             use_layer_norm=config.use_layer_norm,
+            node_feature_dim=_node_feature_dim,
         )
         model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=config.d_model,
                                           eps=config.eps, pe_gain_init=config.pe_gain_init,
                                           disable_graph_token_rope=config.disable_graph_token_rope,
-                                          use_pe_norm=config.use_pe_norm)
+                                          use_pe_norm=config.use_pe_norm,
+                                          pe_node_features=config.pe_node_features)
         collator = data.SpineDataCollator(tokenizer, mlm=False)
 
         if config.freeze_llm:
@@ -824,6 +836,7 @@ def train_model(config: TrainConfig, config_file: str = None):
             "eps": config.eps,
             "pe_gain_init": config.pe_gain_init,
             "use_pe_norm": config.use_pe_norm,
+            "pe_node_features": config.pe_node_features,
             **({"k_gt": config.k_gt, "gt_num_layers": config.gt_num_layers,
                 "gt_heads": config.gt_heads}
                if config.architecture in ("rpearl_gt_llm", "composite_graph_gt") else {}),

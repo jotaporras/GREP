@@ -272,7 +272,8 @@ class GraphTransformer(nn.Module):
                  max_gather_rows: int = 2_000_000,
                  fixed_seed_mode: bool = False, fixed_seed_value: int = 0,
                  pe_readout: str = "mean",
-                 center_second_moment: bool = True):
+                 center_second_moment: bool = True,
+                 node_feature_dim: int = None):
         super().__init__()
         if pe_readout not in ("mean", "second_moment"):
             raise ValueError(
@@ -301,6 +302,7 @@ class GraphTransformer(nn.Module):
             max_gather_rows=max_gather_rows,
             fixed_seed_mode=fixed_seed_mode, fixed_seed_value=fixed_seed_value,
             center_second_moment=center_second_moment,
+            node_feature_dim=node_feature_dim,
         )
         # Blocks 0..L-2 keep their LayerNorms (stability through depth); the final
         # block is norm-free (normalize=False) so the output magnitude survives for
