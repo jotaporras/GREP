@@ -30,4 +30,4 @@ freeze_llm: false
 device: -1
 pe_node_features: word_embeddings   # required by gt_llm (the GT has no probe fallback)
 use_pe_norm: true
-pe_gain_init: 0.0
+pe_gain_init: 0.5
