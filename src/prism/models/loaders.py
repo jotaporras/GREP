@@ -132,12 +132,15 @@ def graph_augmented_llm_from_pretrained(
         model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=gnn_cfg["d_model"],
                                           eps=gnn_cfg["eps"],
                                           pe_gain_init=gnn_cfg.get("pe_gain_init", 1.0),
-                                          disable_graph_token_rope=gnn_cfg.get("disable_graph_token_rope", False))
+                                          disable_graph_token_rope=gnn_cfg.get("disable_graph_token_rope", False),
+                                          use_pe_norm=gnn_cfg.get("use_pe_norm", False))
         gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
         model.pe_model.load_state_dict(gnn_weights["gt_model"], strict=False)
         model.pe_proj.load_state_dict(gnn_weights["pe_proj"])
         if "pe_gain" in gnn_weights:
             model.pe_gain.data.copy_(gnn_weights["pe_gain"])
+        if model.pe_norm is not None and "pe_norm" in gnn_weights:
+            model.pe_norm.load_state_dict(gnn_weights["pe_norm"])
     elif architecture == "composite_graph_gt":
         # M9 composite-graph assembly: Graph Transformer (R-PEARL inside) + M7 gate
         # over a RoPE-disabled LLM. Rebuild from gnn_config and load the saved weights.
@@ -218,12 +221,15 @@ def graph_augmented_llm_from_pretrained(
         model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=gnn_cfg["d_model"],
                                           eps=gnn_cfg["eps"],
                                           pe_gain_init=gnn_cfg.get("pe_gain_init", 1.0),
-                                          disable_graph_token_rope=gnn_cfg.get("disable_graph_token_rope", False))
+                                          disable_graph_token_rope=gnn_cfg.get("disable_graph_token_rope", False),
+                                          use_pe_norm=gnn_cfg.get("use_pe_norm", False))
         gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
         model.pe_model.load_state_dict(gnn_weights["pe_model"], strict=False)
         model.pe_proj.load_state_dict(gnn_weights["pe_proj"])
         if "pe_gain" in gnn_weights:
             model.pe_gain.data.copy_(gnn_weights["pe_gain"])
+        if model.pe_norm is not None and "pe_norm" in gnn_weights:
+            model.pe_norm.load_state_dict(gnn_weights["pe_norm"])
 
     model.eval()
     return model, tokenizer

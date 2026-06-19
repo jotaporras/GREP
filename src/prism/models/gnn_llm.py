@@ -112,7 +112,7 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
 
     def __init__(self, llm: nn.Module, pe_model: nn.Module,
                  d_model: int, eps: float = 1e-8, pe_gain_init: float = 1.0,
-                 disable_graph_token_rope: bool = False):
+                 disable_graph_token_rope: bool = False, use_pe_norm: bool = True):
         # GraphAugmentedLLM is not a registered HF architecture, so
         # PreTrainedModel rejects SDPA/flash-attn.  Force "eager" on the
         # wrapper config — the inner self.llm keeps its own attn impl.
@@ -145,6 +145,24 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         # path is multiplied by tanh(pe_gain)=0, its parameters get zero gradient
         # until the gate itself moves — a true cold-start.
         self.pe_gain = nn.Parameter(torch.tensor(float(pe_gain_init), device=device))
+        # Calibrated RMSNorm on the projected Ψ (VLM modality-connector best practice:
+        # MoCa 2410.07167, 2512.08374, 2503.17349). A fresh pe_proj has an uncalibrated
+        # output scale; injecting that raw into a frozen LLM's residual/attention stream
+        # is the magnitude-mismatch that drives divergence. We RMS-normalize Ψ and rescale
+        # it to the base model's own mean token-embedding RMS, so Ψ enters at text scale.
+        # The norm sets the SCALE; pe_gain (gate) sets the RAMP — separate jobs. Loaded
+        # checkpoints overwrite this weight; the init only matters for fresh training.
+        if use_pe_norm:
+            H = llm.config.get_text_config().hidden_size
+            self.pe_norm = nn.RMSNorm(H, device=device)
+            with torch.no_grad():
+                emb = llm.get_input_embeddings().weight
+                r_text = (emb.norm(dim=-1).float().mean() / (H ** 0.5)).item()
+                if not (r_text > 0):  # guard meta/empty/degenerate embeddings
+                    r_text = 1.0
+                self.pe_norm.weight.fill_(r_text)
+        else:
+            self.pe_norm = None
 
         # When True, graph (node-name) token spans are assigned position_id 0 so RoPE is
         # the identity there — node names carry no sequential rotation; their position is
@@ -271,9 +289,13 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         psi = torch.zeros(B, seq_len, hidden, device=embeddings.device, dtype=embeddings.dtype)
         for b in range(B):
             pe = self.pe_proj(self.pe_model(graphs[b], permutation=permutation))  # [n, hidden_size]
-            # Apply the learnable gate g = tanh(pe_gain) ∈ (-1, 1) (init ≈ 0.76). No
-            # ad-hoc magnitude matching to ‖X‖ — the projection + gate set the scale.
-            # Mirrored in inference.py so eval matches training.
+            # Calibrated RMSNorm rescales Ψ to the base model's token-embedding scale
+            # (see __init__); skipped for checkpoints trained without it (use_pe_norm=False).
+            if self.pe_norm is not None:
+                pe = self.pe_norm(pe)
+            # Apply the learnable gate g = tanh(pe_gain) ∈ (-1, 1). The norm sets the
+            # scale, the gate sets the (signed) ramp. inference.py calls this method
+            # directly, so eval matches training.
             pe = pe * torch.tanh(self.pe_gain)
             for node_idx, spans in injection_maps[b].items():
                 for start, end in spans:

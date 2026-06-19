@@ -276,6 +276,8 @@ class GraphSFTTrainer(SFTTrainer):
                 'gt_model': self.model.pe_model.state_dict(),
                 'pe_proj': self.model.pe_proj.state_dict(),
                 'pe_gain': self.model.pe_gain.data,
+                **({'pe_norm': self.model.pe_norm.state_dict()}
+                   if self.model.pe_norm is not None else {}),
             }, os.path.join(output_dir, "gnn_weights.pt"))
             # Also save the inner R-PEARL separately for analysis / reuse.
             torch.save({
@@ -286,6 +288,8 @@ class GraphSFTTrainer(SFTTrainer):
                 'pe_model': self.model.pe_model.state_dict(),
                 'pe_proj': self.model.pe_proj.state_dict(),
                 'pe_gain': self.model.pe_gain.data,
+                **({'pe_norm': self.model.pe_norm.state_dict()}
+                   if self.model.pe_norm is not None else {}),
             }, os.path.join(output_dir, "gnn_weights.pt"))
         if any(p.requires_grad for p in self.model.llm.parameters()):
             super().save_model(output_dir, _internal_call)
@@ -384,8 +388,14 @@ class TrainConfig:
     pe_center_moment: bool = True
     # Initial value of the rpearl_llm / rpearl_gt_llm injection gate pe_gain
     # (g = tanh(pe_gain)). 1.0 → active from step 0; 0.0 → Ψ off at init / cold-start
-    # (forward == base LLM, structural path frozen until the gate moves).
-    pe_gain_init: float = 1.0
+    # (forward == base LLM, structural path frozen until the gate moves). Default is
+    # cold-start: with the calibrated pe_norm setting the injection SCALE, the gate's
+    # only job is to RAMP Ψ in from zero (Flamingo / LLaMA-Adapter zero-init gating).
+    pe_gain_init: float = 0.0
+    # rpearl_llm / rpearl_gt_llm: RMS-normalize and rescale the projected Ψ to the base
+    # model's token-embedding scale before injection (magnitude calibration, VLM
+    # modality-connector best practice). Replaces the deleted spectral/Lipschitz norms.
+    use_pe_norm: bool = True
     # rpearl_llm / rpearl_gt_llm: give graph (node-name) token spans position_id 0 so
     # RoPE is the identity there (no sequential rotation on node names); their position
     # is meant to come from the graph signal Ψ instead. Causality is unaffected (HF
@@ -601,7 +611,8 @@ def train_model(config: TrainConfig, config_file: str = None):
         )
         model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=config.d_model,
                                           eps=config.eps, pe_gain_init=config.pe_gain_init,
-                                          disable_graph_token_rope=config.disable_graph_token_rope)
+                                          disable_graph_token_rope=config.disable_graph_token_rope,
+                                          use_pe_norm=config.use_pe_norm)
         collator = data.SpineDataCollator(tokenizer, mlm=False)
 
         if config.freeze_llm:
@@ -623,7 +634,8 @@ def train_model(config: TrainConfig, config_file: str = None):
         )
         model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=config.d_model,
                                           eps=config.eps, pe_gain_init=config.pe_gain_init,
-                                          disable_graph_token_rope=config.disable_graph_token_rope)
+                                          disable_graph_token_rope=config.disable_graph_token_rope,
+                                          use_pe_norm=config.use_pe_norm)
         collator = data.SpineDataCollator(tokenizer, mlm=False)
 
         if config.freeze_llm:
@@ -811,6 +823,7 @@ def train_model(config: TrainConfig, config_file: str = None):
             "text_edge_list": config.text_edge_list,
             "eps": config.eps,
             "pe_gain_init": config.pe_gain_init,
+            "use_pe_norm": config.use_pe_norm,
             **({"k_gt": config.k_gt, "gt_num_layers": config.gt_num_layers,
                 "gt_heads": config.gt_heads}
                if config.architecture in ("rpearl_gt_llm", "composite_graph_gt") else {}),
