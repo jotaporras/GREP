@@ -1,0 +1,34 @@
+name: e8
+architecture: gt_llm
+wandb_project: GREP-PRISM
+wandb_run_name: e8_gt_llm_no_edges
+wandb_tag: e8_new_base_models
+checkpoint_dir: outputs/e8_new_base_models
+data: data/revised/gen/nav100_n30_gemma_data/split/formatted_all_new__train.json
+val_data: data/revised/gen/nav100_n30_gemma_data/split/formatted_all_new__val.json
+eval_data: data/revised/gen/nav100_n30_gemma_data/split/test_graphs/data_gen_023.json
+base_model: google/gemma-4-12B-it
+bit4: true
+per_device_train_batch_size: 1
+learning_rate: 0.0002
+epochs: 2
+r: 16
+debug: true
+dataset_proportion: 1.0
+max_seq_length: 8192
+text_edge_list: none
+# Pure Graph Transformer PE over word-embedding node features — NO R-PEARL, no probes.
+# Node feature = mean LLM word-embedding of each node's name; projected to d_model and
+# refined by k-hop sparse attention blocks. Unfrozen + RMSNorm + cold-start (like idx 11),
+# minus the R-PEARL GCN. This variant drops the textual edge list from the prompt so the
+# graph structure reaches the LLM ONLY through the injected GT positional code.
+d_model: 1024
+gt_num_layers: 2
+gt_heads: 8
+k_gt: 1
+dropout: 0.1
+freeze_llm: false
+device: -1
+pe_node_features: word_embeddings   # required by gt_llm (the GT has no probe fallback)
+use_pe_norm: true
+pe_gain_init: 0.0
