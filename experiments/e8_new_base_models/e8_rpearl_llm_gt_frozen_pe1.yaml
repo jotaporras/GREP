@@ -8,7 +8,12 @@ data: data/revised/gen/nav100_n30_gemma_data/split/formatted_all_new__train.json
 val_data: data/revised/gen/nav100_n30_gemma_data/split/formatted_all_new__val.json
 eval_data: data/revised/gen/nav100_n30_gemma_data/split/test_graphs/data_gen_023.json
 base_model: google/gemma-4-12B-it
-bit4: true
+# bit4 disabled for this probe: with freeze_llm=true there is no LoRA adapter, and HF's
+# Trainer refuses to train a purely-quantized model ("cannot fine-tune purely quantized
+# models ... attach trainable adapters"). Our trainable params are the structural PE path
+# (outside the LLM), which the guard doesn't see. A frozen 12B in bf16 (~24GB) fits the
+# B200 easily and avoids quant noise in the frozen base.
+bit4: false
 per_device_train_batch_size: 1
 learning_rate: 0.0002
 epochs: 2
