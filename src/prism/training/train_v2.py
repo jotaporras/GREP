@@ -168,6 +168,11 @@ class GraphSFTTrainer(SFTTrainer):
             for p in self.model.pe_proj.parameters():
                 p.requires_grad = True
             self.model.pe_gain.requires_grad = True
+            # pe_norm (learnable RMSNorm) is a non-LoRA module PEFT freezes; re-enable so
+            # the magnitude calibration can adapt (norm sets scale, gate sets ramp).
+            if getattr(self.model, "pe_norm", None) is not None:
+                for p in self.model.pe_norm.parameters():
+                    p.requires_grad = True
 
     def create_optimizer(self):
         """Two learning-rate groups: the structural path (GT + R-PEARL + gate)
@@ -498,7 +503,7 @@ def _run_post_train_cross_eval(model, tokenizer, config: "TrainConfig", output_d
 
     samples_by_graph, graph_file_by_name = loading.load_samples_by_graph(target)
 
-    is_gnn = config.architecture in ("rpearl_llm", "rpearl_gt_llm", "composite_graph_gt")
+    is_gnn = config.architecture in ("rpearl_llm", "rpearl_gt_llm", "gt_llm", "composite_graph_gt")
     architecture = "graph-augmented" if is_gnn else "llm"
     out_dir = os.path.join(output_dir, "eval_logs", "cross_eval")
     os.makedirs(out_dir, exist_ok=True)
@@ -846,7 +851,7 @@ def train_model(config: TrainConfig, config_file: str = None):
         do_eval=True,
     )
 
-    if config.architecture in ("rpearl_llm", "rpearl_gt_llm", "composite_graph_gt"):
+    if config.architecture in ("rpearl_llm", "rpearl_gt_llm", "gt_llm", "composite_graph_gt"):
         gnn_config = {
             "architecture": config.architecture,
             "base_model": config.base_model,
@@ -923,7 +928,7 @@ def train_model(config: TrainConfig, config_file: str = None):
         eval_epoch_interval=1.0,
     ))
 
-    if config.architecture in ("rpearl_llm", "rpearl_gt_llm"):
+    if config.architecture in ("rpearl_llm", "rpearl_gt_llm", "gt_llm"):
         trainer.add_callback(callbacks.GradientDebugCallback())
     elif config.architecture == "composite_graph_gt":
         # Gradient / magnitude view: per-component grad norms (R-PEARL, GT blocks,
