@@ -129,7 +129,9 @@ def graph_augmented_llm_from_pretrained(
             eps=gnn_cfg["eps"],
             use_layer_norm=gnn_cfg["use_layer_norm"],
         )
-        model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=gnn_cfg["d_model"], eps=gnn_cfg["eps"])
+        model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=gnn_cfg["d_model"],
+                                          eps=gnn_cfg["eps"],
+                                          pe_gain_init=gnn_cfg.get("pe_gain_init", 1.0))
         gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
         model.pe_model.load_state_dict(gnn_weights["gt_model"], strict=False)
         model.pe_proj.load_state_dict(gnn_weights["pe_proj"])
@@ -212,7 +214,9 @@ def graph_augmented_llm_from_pretrained(
             eps=gnn_cfg["eps"],
             use_layer_norm=gnn_cfg["use_layer_norm"],
         )
-        model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=gnn_cfg["d_model"], eps=gnn_cfg["eps"])
+        model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=gnn_cfg["d_model"],
+                                          eps=gnn_cfg["eps"],
+                                          pe_gain_init=gnn_cfg.get("pe_gain_init", 1.0))
         gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
         model.pe_model.load_state_dict(gnn_weights["pe_model"], strict=False)
         model.pe_proj.load_state_dict(gnn_weights["pe_proj"])

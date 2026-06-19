@@ -382,7 +382,11 @@ class TrainConfig:
     # for "second_moment" to carry position: the nonlinear GCN gives Φ a nonzero mean
     # whose rank-1 ΨΨᵀ otherwise dominates E[ΦΦᵀ] and collapses C to pure averaging.
     pe_center_moment: bool = True
-    # Gated injection
+    # Initial value of the rpearl_llm / rpearl_gt_llm injection gate pe_gain
+    # (g = tanh(pe_gain)). 1.0 → active from step 0; 0.0 → Ψ off at init / cold-start
+    # (forward == base LLM, structural path frozen until the gate moves).
+    pe_gain_init: float = 1.0
+    # Gated injection (composite_graph_gt only)
     injection_mode: str = "interpolate"
     gate_init: float = 0.0
     gate_per_dim: bool = False
@@ -590,7 +594,8 @@ def train_model(config: TrainConfig, config_file: str = None):
             eps=config.eps,
             use_layer_norm=config.use_layer_norm,
         )
-        model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=config.d_model, eps=config.eps)
+        model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=config.d_model,
+                                          eps=config.eps, pe_gain_init=config.pe_gain_init)
         collator = data.SpineDataCollator(tokenizer, mlm=False)
 
         if config.freeze_llm:
@@ -610,7 +615,8 @@ def train_model(config: TrainConfig, config_file: str = None):
             eps=config.eps,
             use_layer_norm=config.use_layer_norm,
         )
-        model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=config.d_model, eps=config.eps)
+        model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=config.d_model,
+                                          eps=config.eps, pe_gain_init=config.pe_gain_init)
         collator = data.SpineDataCollator(tokenizer, mlm=False)
 
         if config.freeze_llm:
@@ -797,6 +803,7 @@ def train_model(config: TrainConfig, config_file: str = None):
             "use_layer_norm": config.use_layer_norm,
             "text_edge_list": config.text_edge_list,
             "eps": config.eps,
+            "pe_gain_init": config.pe_gain_init,
             **({"k_gt": config.k_gt, "gt_num_layers": config.gt_num_layers,
                 "gt_heads": config.gt_heads}
                if config.architecture in ("rpearl_gt_llm", "composite_graph_gt") else {}),

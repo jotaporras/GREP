@@ -31,6 +31,7 @@
 #   2    e8_rpearl_llm_no_edges         rpearl_llm      none
 #   3    e8_rpearl_llm_gt               rpearl_gt_llm   present
 #   4    e8_rpearl_llm_gt_no_edges      rpearl_gt_llm   none
+#   5    e8_rpearl_llm_gt_pegain0       rpearl_gt_llm   present (pe_gain_init=0 cold-start sanity)
 #
 # Unique save_names are required: the committed yamls all share name: e8 and the
 # rpearl_*/_no_edges pairs share an architecture, so train_v2 auto-naming would
@@ -65,6 +66,7 @@ CONFIGS=(
     "$CFG_DIR/e8_rpearl_llm_no_edges.yaml"
     "$CFG_DIR/e8_rpearl_llm_gt.yaml"
     "$CFG_DIR/e8_rpearl_llm_gt_no_edges.yaml"
+    "$CFG_DIR/e8_rpearl_llm_gt_pegain0.yaml"
 )
 SAVE_NAMES=(
     e8_llm
@@ -72,6 +74,7 @@ SAVE_NAMES=(
     e8_rpearl_llm_no_edges
     e8_rpearl_llm_gt
     e8_rpearl_llm_gt_no_edges
+    e8_rpearl_llm_gt_pegain0
 )
 
 TASK_ID=${SLURM_ARRAY_TASK_ID:-${1:-${TASK_ID:-0}}}

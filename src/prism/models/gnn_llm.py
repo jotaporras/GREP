@@ -111,7 +111,7 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
     """
 
     def __init__(self, llm: nn.Module, pe_model: nn.Module,
-                 d_model: int, eps: float = 1e-8):
+                 d_model: int, eps: float = 1e-8, pe_gain_init: float = 1.0):
         # GraphAugmentedLLM is not a registered HF architecture, so
         # PreTrainedModel rejects SDPA/flash-attn.  Force "eager" on the
         # wrapper config — the inner self.llm keeps its own attn impl.
@@ -139,11 +139,11 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             d_model, llm.config.get_text_config().hidden_size, device=device)
         # Learnable gate on the PE injection: g = tanh(pe_gain) ∈ (-1,1). Lets the
         # model regulate how strongly (and with which sign) Ψ enters RoPE(X) + g·Ψ.
-        # Init pe_gain = 1.0 → g ≈ 0.76, so Ψ is active from the first step (near the
-        # token-embedding scale) and the optimizer can scale it down toward 0 or up
-        # toward ±‖X‖. The init is deliberately nonzero: pe_gain=0 would give
-        # tanh(0)=0 and switch the positional signal off entirely at the start.
-        self.pe_gain = nn.Parameter(torch.tensor(1.0, device=device))
+        # pe_gain_init=1.0 → g ≈ 0.76 (active from step 0). pe_gain_init=0.0 → g=0:
+        # Ψ is fully off at init (forward == base LLM) and, because the structural
+        # path is multiplied by tanh(pe_gain)=0, its parameters get zero gradient
+        # until the gate itself moves — a true cold-start.
+        self.pe_gain = nn.Parameter(torch.tensor(float(pe_gain_init), device=device))
 
         # Per-forward graph signal Ψ ([B, seq, hidden]); read by the patched
         # attention forwards and set by _augment_embeddings / inference.
