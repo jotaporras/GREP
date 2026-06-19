@@ -45,6 +45,9 @@
 #   16   e8_gt_llm_no_edges_L3          gt_llm          none    (gt_llm_no_edges GT-depth sweep, L=3; idx14 is L=2)
 #   17   e8_gt_llm_no_edges_L4          gt_llm          none    (gt_llm_no_edges GT-depth sweep, L=4)
 #   18   e8_gt_llm_no_edges_L5          gt_llm          none    (gt_llm_no_edges GT-depth sweep, L=5)
+#   19   e8_gt_llm_no_edges_L5_d2048    gt_llm          none    (L5 GT-WIDTH sweep, d_model=2048; idx18 is d=1024)
+#   20   e8_gt_llm_no_edges_L5_d3072    gt_llm          none    (L5 GT-WIDTH sweep, d_model=3072)
+#   21   e8_gt_llm_no_edges_L5_d4096    gt_llm          none    (L5 GT-WIDTH sweep, d_model=4096, ~519M GT params)
 #
 # Unique save_names are required: the committed yamls all share name: e8 and the
 # rpearl_*/_no_edges pairs share an architecture, so train_v2 auto-naming would
@@ -93,6 +96,9 @@ CONFIGS=(
     "$CFG_DIR/e8_gt_llm_no_edges_L3.yaml"
     "$CFG_DIR/e8_gt_llm_no_edges_L4.yaml"
     "$CFG_DIR/e8_gt_llm_no_edges_L5.yaml"
+    "$CFG_DIR/e8_gt_llm_no_edges_L5_d2048.yaml"
+    "$CFG_DIR/e8_gt_llm_no_edges_L5_d3072.yaml"
+    "$CFG_DIR/e8_gt_llm_no_edges_L5_d4096.yaml"
 )
 SAVE_NAMES=(
     e8_llm
@@ -114,6 +120,9 @@ SAVE_NAMES=(
     e8_gt_llm_no_edges_L3
     e8_gt_llm_no_edges_L4
     e8_gt_llm_no_edges_L5
+    e8_gt_llm_no_edges_L5_d2048
+    e8_gt_llm_no_edges_L5_d3072
+    e8_gt_llm_no_edges_L5_d4096
 )
 
 TASK_ID=${SLURM_ARRAY_TASK_ID:-${1:-${TASK_ID:-0}}}
