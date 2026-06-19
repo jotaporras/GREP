@@ -881,10 +881,11 @@ def _aggregate_path_metrics(sample_results: List[dict]) -> dict:
 def _is_graph_augmented(model) -> bool:
     """True if `model` is (or wraps) a graph-augmented LLM, including under PEFT.
 
-    Covers both the legacy `GraphAugmentedLLM` (PE injection) and the M9
-    `CompositeGraphLLM` (composite-graph fusion).
+    Covers the legacy `GraphAugmentedLLM` (PE injection), the parameter-free
+    `GraphMaskLLM` (structural attention mask), and the M9 `CompositeGraphLLM`
+    (composite-graph fusion).
     """
-    graph_types = (gnn_llm.GraphAugmentedLLM, gnn_llm.CompositeGraphLLM)
+    graph_types = (gnn_llm.GraphAugmentedLLM, gnn_llm.GraphMaskLLM, gnn_llm.CompositeGraphLLM)
     if isinstance(model, graph_types):
         return True
     inner = getattr(getattr(model, "base_model", None), "model", None)

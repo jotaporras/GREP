@@ -172,6 +172,14 @@ def graph_augmented_llm_from_pretrained(
             model.pe_gain.data.copy_(gnn_weights["pe_gain"])
         if model.pe_norm is not None and "pe_norm" in gnn_weights:
             model.pe_norm.load_state_dict(gnn_weights["pe_norm"])
+    elif architecture == "graph_mask_llm":
+        # Parameter-free structural attention mask: rebuild from gnn_config, no weights
+        # to load (the LoRA adapter was already merged into `llm` above).
+        model = gnn_llm.GraphMaskLLM(
+            llm,
+            k_hops=gnn_cfg.get("mask_k_hops", 1),
+            symmetrize=gnn_cfg.get("mask_symmetrize", True),
+        )
     elif architecture == "composite_graph_gt":
         # M9 composite-graph assembly: Graph Transformer (R-PEARL inside) + M7 gate
         # over a RoPE-disabled LLM. Rebuild from gnn_config and load the saved weights.

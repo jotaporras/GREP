@@ -1,0 +1,29 @@
+name: e8
+architecture: graph_mask_llm
+wandb_project: GREP-PRISM
+wandb_run_name: e8_graph_mask_llm
+wandb_tag: e8_new_base_models
+checkpoint_dir: outputs/e8_new_base_models
+data: data/revised/gen/nav100_n30_gemma_data/split/formatted_all_new__train.json
+val_data: data/revised/gen/nav100_n30_gemma_data/split/formatted_all_new__val.json
+eval_data: data/revised/gen/nav100_n30_gemma_data/split/test_graphs/data_gen_023.json
+base_model: google/gemma-4-12B-it
+bit4: true
+per_device_train_batch_size: 1
+learning_rate: 0.0002
+epochs: 2
+r: 16
+debug: true
+dataset_proportion: 1.0
+max_seq_length: 8192
+text_edge_list: present
+# Structural attention mask — NO graph PE, NO GNN, parameter-free. The ONLY change vs
+# the plain LLM baseline is the attention MASK: two NODE tokens may attend to each other
+# only if their nodes share an edge (k=1) — otherwise a_ij = 0 (additive -inf). Non-node
+# tokens keep normal causal attention. The scene-graph block is node-only (is_graph_arch),
+# so connectivity reaches the model ONLY through the mask, not the prompt text — a clean
+# test of whether structural masking can substitute for the textual edge list.
+mask_k_hops: 1            # direct edges only ("share an edge")
+mask_symmetrize: true     # undirected adjacency, mirroring what the GNN/GT consume
+freeze_llm: false         # unfrozen + LoRA (only trainable params; mask is parameter-free)
+device: -1

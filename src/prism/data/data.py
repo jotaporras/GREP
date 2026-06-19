@@ -74,7 +74,7 @@ def preprocess_dataset(
     
     ds = ds.map(lambda e: {"messages": e["conversations"]})
 
-    is_graph_arch = architecture in ("rpearl_llm", "rpearl_gt_llm", "gt_llm", "composite_graph_gt")
+    is_graph_arch = architecture in ("rpearl_llm", "rpearl_gt_llm", "gt_llm", "graph_mask_llm", "composite_graph_gt")
     if is_graph_arch:
         # Parse the GNN's scene graph from the ORIGINAL messages first, so the
         # compact translation below (which only rewrites the LLM-facing text)

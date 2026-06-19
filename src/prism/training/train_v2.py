@@ -162,6 +162,10 @@ class GraphSFTTrainer(SFTTrainer):
                 p = getattr(self.model, name, None)
                 if p is not None:
                     p.requires_grad = True
+        elif gnn_config.get("architecture") == "graph_mask_llm":
+            # Parameter-free structural mask: no graph encoder, gate, or projection to
+            # re-enable — only the LoRA adapters (handled by PEFT) train.
+            pass
         else:
             for p in self.model.pe_model.parameters():
                 p.requires_grad = True
@@ -186,7 +190,10 @@ class GraphSFTTrainer(SFTTrainer):
         stock optimizer when the multiplier is 1.0 (no behavior change).
         """
         mult = float(self.gnn_config.get("structural_lr_mult", 1.0))
-        if self.optimizer is not None or mult == 1.0:
+        # graph_mask_llm has no structural params (parameter-free mask) — there is no
+        # two-LR split to make, so always use the stock single-LR optimizer.
+        if (self.optimizer is not None or mult == 1.0
+                or self.gnn_config.get("architecture") == "graph_mask_llm"):
             return super().create_optimizer()
 
         opt_model = self.model
@@ -275,6 +282,10 @@ class GraphSFTTrainer(SFTTrainer):
             torch.save({
                 'rpearl': self.model.gt_model.pe_model.state_dict(),
             }, os.path.join(output_dir, "rpearl_weights.pt"))
+        elif self.gnn_config.get("architecture") == "graph_mask_llm":
+            # Parameter-free: nothing to persist beyond gnn_config.json (written above)
+            # and the LoRA adapter (saved below). The mask is rebuilt from the config.
+            pass
         elif self.gnn_config.get("architecture") == "rpearl_gt_llm":
             # Full GT: save the whole GraphTransformer (includes R-PEARL inside) + projection head.
             torch.save({
@@ -358,7 +369,7 @@ class TrainConfig:
     k_pe: int = 3
     use_layer_norm: bool = True
     freeze_llm: bool = False
-    architecture: str = "rpearl_llm"  # "rpearl_llm", "rpearl_gt_llm", "composite_graph_gt", or "llm"
+    architecture: str = "rpearl_llm"  # "rpearl_llm", "rpearl_gt_llm", "gt_llm", "graph_mask_llm", "composite_graph_gt", or "llm"
     # GT-specific params (used when architecture == "rpearl_gt_llm" / "composite_graph_gt")
     gt_num_layers: int = 3
     gt_heads: int = 8
@@ -410,6 +421,13 @@ class TrainConfig:
     # is meant to come from the graph signal Ψ instead. Causality is unaffected (HF
     # builds the causal mask from cache_position, not position_ids).
     disable_graph_token_rope: bool = False
+    # graph_mask_llm: structural-attention-mask architecture (NO PE / NO GNN, parameter-
+    # free). Node tokens may attend only within `mask_k_hops` graph hops (1 = direct
+    # edges, matching "share an edge"); `mask_symmetrize` ORs the adjacency with its
+    # transpose (the scene graph is already undirected, so this mirrors what the GNN/GT
+    # consume). Everything else is the plain LLM baseline.
+    mask_k_hops: int = 1
+    mask_symmetrize: bool = True
     # Gated injection (composite_graph_gt only)
     injection_mode: str = "interpolate"
     gate_init: float = 0.0
@@ -503,7 +521,7 @@ def _run_post_train_cross_eval(model, tokenizer, config: "TrainConfig", output_d
 
     samples_by_graph, graph_file_by_name = loading.load_samples_by_graph(target)
 
-    is_gnn = config.architecture in ("rpearl_llm", "rpearl_gt_llm", "gt_llm", "composite_graph_gt")
+    is_gnn = config.architecture in ("rpearl_llm", "rpearl_gt_llm", "gt_llm", "graph_mask_llm", "composite_graph_gt")
     architecture = "graph-augmented" if is_gnn else "llm"
     out_dir = os.path.join(output_dir, "eval_logs", "cross_eval")
     os.makedirs(out_dir, exist_ok=True)
@@ -682,6 +700,17 @@ def train_model(config: TrainConfig, config_file: str = None):
 
         if config.freeze_llm:
             model.llm.requires_grad_(False)
+    elif config.architecture == "graph_mask_llm":
+        # Structural attention mask — NO PE, NO GNN, parameter-free. The only change vs
+        # the plain LLM is that node tokens attend only along graph edges (the mask is
+        # built per forward from the scene graph + injection map). Reuses SpineDataCollator
+        # so graphs + injection_maps reach the model forward.
+        model = gnn_llm.GraphMaskLLM(
+            llm, k_hops=config.mask_k_hops, symmetrize=config.mask_symmetrize)
+        collator = data.SpineDataCollator(tokenizer, mlm=False)
+
+        if config.freeze_llm:
+            model.llm.requires_grad_(False)
     elif config.architecture == "composite_graph_gt":
         # Composite-graph pipeline (M4-M8): one graph (cycle + scene + cross-links)
         # per sequence; R-PEARL + GT refine it; the gate injects Y[V_Tx] into the
@@ -745,7 +774,7 @@ def train_model(config: TrainConfig, config_file: str = None):
         model = llm
         collator = None
     else:
-        raise ValueError(f"Unknown architecture: {config.architecture!r}. Choose 'rpearl_llm', 'rpearl_gt_llm', 'composite_graph_gt', or 'llm'.")
+        raise ValueError(f"Unknown architecture: {config.architecture!r}. Choose 'rpearl_llm', 'rpearl_gt_llm', 'gt_llm', 'graph_mask_llm', 'composite_graph_gt', or 'llm'.")
 
     # Load & optionally downsample data
     full_dataset = datasets.load_dataset("json", data_files=[config.data], split="train")
@@ -851,7 +880,7 @@ def train_model(config: TrainConfig, config_file: str = None):
         do_eval=True,
     )
 
-    if config.architecture in ("rpearl_llm", "rpearl_gt_llm", "gt_llm", "composite_graph_gt"):
+    if config.architecture in ("rpearl_llm", "rpearl_gt_llm", "gt_llm", "graph_mask_llm", "composite_graph_gt"):
         gnn_config = {
             "architecture": config.architecture,
             "base_model": config.base_model,
@@ -870,6 +899,9 @@ def train_model(config: TrainConfig, config_file: str = None):
             **({"k_gt": config.k_gt, "gt_num_layers": config.gt_num_layers,
                 "gt_heads": config.gt_heads}
                if config.architecture in ("rpearl_gt_llm", "gt_llm", "composite_graph_gt") else {}),
+            # graph_mask_llm rebuild params (read back by loaders for eval).
+            **({"mask_k_hops": config.mask_k_hops, "mask_symmetrize": config.mask_symmetrize}
+               if config.architecture == "graph_mask_llm" else {}),
             # Composite-graph rebuild params (read back by loaders for eval).
             **({"k_gt": config.k_gt, "gt_num_layers": config.gt_num_layers,
                 "gt_heads": config.gt_heads,

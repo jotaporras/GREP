@@ -60,6 +60,266 @@ def _prism_pe_attention_forward(module, query, key, value, attention_mask,
 AttentionInterface.register(_PRISM_PE_IMPL, _prism_pe_attention_forward)
 
 
+# Name under which the structural-adjacency-mask attention function is registered.
+# ``GraphMaskLLM`` points every decoder layer's ``config._attn_implementation`` here
+# so attention dispatches through ``_graph_mask_attention_forward`` (see
+# ``_install_graph_mask``). Unlike ``prism_pe`` it touches NOTHING in q/k/v — it only
+# ADDS a graph-adjacency bias to the attention mask.
+_GRAPH_MASK_IMPL = "prism_graph_mask"
+
+
+def _graph_mask_attention_forward(module, query, key, value, attention_mask,
+                                  scaling=None, dropout=0.0, **kwargs):
+    """Attention fn that folds a graph-adjacency mask into ``attention_mask``.
+
+    Registered as ``"prism_graph_mask"``. The wrapper (``GraphMaskLLM``) arms a
+    per-forward additive bias ``self._struct_bias`` of shape ``[B, 1, seq, seq]``
+    that is 0 where attention is allowed and ``finfo.min`` where two NODE tokens are
+    NOT adjacent in the scene graph. We ADD it to the model's own causal/sliding mask
+    and delegate to the LLM's native attention impl — q/k/v are untouched (no
+    positional encoding at all). On cached single-token decode steps the bias length
+    no longer matches the query length, so we fall through to stock attention:
+    generated tokens are non-graph and need no structural masking (this is exactly
+    the train/decode-symmetric behaviour, with no injection to skip).
+    """
+    model = getattr(module, "_graph_mask_model", None)
+    bias = None if model is None else model._struct_bias
+    q_len = query.shape[-2]
+    k_len = key.shape[-2]
+    if bias is not None and q_len == bias.shape[-2] and k_len == bias.shape[-1]:
+        bias = bias.to(device=query.device, dtype=query.dtype)
+        if attention_mask is None:
+            # SDPA's is_causal fast path passes no mask (full-attention layer, no
+            # padding); supplying an explicit mask disables it, so fold the causal
+            # triangle into the structural bias. Sliding-window layers always pass an
+            # explicit mask (they can't use is_causal), so they hit the else branch
+            # and keep their band — only the structural −inf is added on top.
+            neg = torch.finfo(query.dtype).min
+            causal = torch.triu(
+                torch.full((q_len, k_len), neg, device=query.device, dtype=query.dtype),
+                diagonal=1)
+            attention_mask = bias + causal[None, None]
+        else:
+            am = attention_mask[..., :k_len].to(device=query.device, dtype=query.dtype)
+            attention_mask = am + bias
+    return module._graph_mask_orig_attn_fn(
+        module, query, key, value, attention_mask,
+        scaling=scaling, dropout=dropout, **kwargs)
+
+
+AttentionInterface.register(_GRAPH_MASK_IMPL, _graph_mask_attention_forward)
+
+
+class GraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
+    """LLM whose attention mask is forced to mirror the scene-graph adjacency.
+
+    NO positional encoding, NO GNN, NO learnable graph parameters. The ONLY change
+    vs the plain ``llm`` baseline is the attention MASK: two token positions that
+    BOTH belong to graph nodes may attend to each other only if those nodes share an
+    edge (within ``k_hops``) — or are the same node. Non-node tokens keep normal
+    causal attention. A parameter-free structural inductive bias (``a_ij = 0`` for
+    node tokens i,j whose nodes are non-adjacent).
+
+    Adjacency mirrors exactly what the R-PEARL GNN / GT consume: the scene graph is
+    UNDIRECTED (``scene_graph_dict_to_pyg`` builds an ``nx.Graph`` and
+    ``from_networkx`` materialises both directions), so edges are symmetric;
+    self-loops keep a node's own (possibly repeated) mentions mutually visible.
+
+    The mask is supplied per forward via ``self._struct_bias`` (``[B, 1, seq, seq]``,
+    0 = allowed, ``finfo.min`` = blocked) and ADDED to the model's own causal/sliding
+    mask inside every attention layer (see ``_install_graph_mask`` /
+    ``_graph_mask_attention_forward``). Folding into the mask — not the embeddings —
+    leaves RoPE, q/k-norm, sliding window and KV-sharing untouched and works across
+    model families (Llama, Qwen2, gemma-4). Cached decode steps skip the fold
+    (generated tokens are non-graph), so there is no train/decode mismatch.
+
+    Args:
+        llm (nn.Module): base causal LLM to wrap.
+        k_hops (int): attention allowed within this many graph hops (1 = direct edges
+            only, matching "share an edge"); ``(A+I)^k`` for k>1.
+        symmetrize (bool): OR the adjacency with its transpose (undirected). The
+            scene graph is already undirected, so this is belt-and-suspenders.
+    """
+
+    def __init__(self, llm: nn.Module, k_hops: int = 1, symmetrize: bool = True):
+        # Not a registered HF architecture: force "eager" on the WRAPPER config so
+        # PreTrainedModel doesn't reject SDPA/flash or MoE validation. The inner
+        # self.llm keeps its own attn impl (we only swap the attention *function*).
+        config = copy.copy(llm.config)
+        config._attn_implementation = "eager"  # ty: ignore[invalid-assignment]
+        config._experts_implementation = "eager"  # ty: ignore[invalid-assignment]
+        super().__init__(config)
+        self.llm = llm
+        self._mask_k_hops = int(k_hops)
+        if self._mask_k_hops < 1:
+            raise ValueError(f"k_hops must be >= 1, got {k_hops}")
+        self._mask_symmetrize = bool(symmetrize)
+        # Per-forward additive attention bias [B, 1, seq, seq]; read by the patched
+        # attention layers, set in forward / inference, disarmed afterwards.
+        self._struct_bias: torch.Tensor | None = None
+        self._install_graph_mask()
+
+    def _decoder_layers(self):
+        """Return the LLM's decoder layer list (Llama/Qwen2: ``<CausalLM>.model.layers``)."""
+        base = getattr(self.llm, "model", None)
+        if base is not None and hasattr(base, "layers"):
+            return base.layers
+        return self.llm.get_decoder().layers
+
+    def _install_graph_mask(self) -> None:
+        """Route every self-attention layer through the ``prism_graph_mask`` fn.
+
+        Mirrors ``GraphAugmentedLLM._install_pe_injection``: capture each layer's
+        original attention impl/fn, register the matching causal/sliding mask fn for
+        our impl name (so HF still builds the right base mask the delegated fn
+        expects), set a back-reference to this wrapper, and point
+        ``config._attn_implementation`` at our fn. Set on instances (not the class)
+        so it survives PEFT, which swaps leaf Linears in place. No bias-free check is
+        needed (we never project Ψ — q/k/v are untouched).
+        """
+        layers = self._decoder_layers()
+        if len(layers) == 0:
+            return
+        first_attn = layers[0].self_attn
+        mod = importlib.import_module(type(first_attn).__module__)
+        if not hasattr(self, "_graph_mask_orig_attn_impl"):
+            impl = first_attn.config._attn_implementation
+            self._graph_mask_orig_attn_impl = "eager" if impl == _GRAPH_MASK_IMPL else impl
+        attn_fns = mod.ALL_ATTENTION_FUNCTIONS
+        if hasattr(attn_fns, "get_interface"):
+            orig_attn_fn = attn_fns.get_interface(
+                self._graph_mask_orig_attn_impl, mod.eager_attention_forward)
+        else:
+            orig_attn_fn = (
+                mod.eager_attention_forward
+                if self._graph_mask_orig_attn_impl == "eager"
+                else attn_fns[self._graph_mask_orig_attn_impl]
+            )
+        # HF builds the causal/sliding mask from the impl *name*; register ours to
+        # mirror the original impl's so the model still hands the delegated fn the
+        # exact mask it expects (gemma-4's full + sliding masks alike). We then ADD
+        # the structural bias on top inside _graph_mask_attention_forward.
+        mask_fns = getattr(masking_utils, "ALL_MASK_ATTENTION_FUNCTIONS", None)
+        if mask_fns is not None and self._graph_mask_orig_attn_impl in mask_fns._global_mapping:
+            masking_utils.AttentionMaskInterface.register(
+                _GRAPH_MASK_IMPL, mask_fns._global_mapping[self._graph_mask_orig_attn_impl])
+
+        for layer in layers:
+            attn = layer.self_attn
+            # Bypass nn.Module.__setattr__ for the wrapper back-reference (assigning an
+            # nn.Module would register a submodule cycle and double-count parameters).
+            object.__setattr__(attn, "_graph_mask_model", self)
+            attn._graph_mask_orig_attn_fn = orig_attn_fn
+            attn.config._attn_implementation = _GRAPH_MASK_IMPL
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        self.llm.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
+
+    def gradient_checkpointing_disable(self):
+        self.llm.gradient_checkpointing_disable()
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)  # defer to nn.Module first
+        except AttributeError:
+            return getattr(self.llm, name)
+
+    def _node_adjacency(self, g, device) -> torch.Tensor:
+        """Boolean ``[N, N]`` node adjacency — True where two nodes may attend.
+
+        Built from ``edge_index`` with self-loops (a node always sees itself and its
+        own repeated mentions), optional symmetrization, and ``(A+I)^k`` reachability
+        for ``k_hops > 1``. Mirrors the undirected adjacency the GNN/GT consume.
+        """
+        N = g.num_nodes
+        adj = torch.zeros(N, N, dtype=torch.bool, device=device)
+        ei = getattr(g, "edge_index", None)
+        if ei is not None and ei.numel() > 0:
+            ei = ei.to(device)
+            adj[ei[0], ei[1]] = True
+            if self._mask_symmetrize:
+                adj = adj | adj.t()
+        adj.fill_diagonal_(True)  # self-loops: same node (and its repeats) always visible
+        if self._mask_k_hops > 1:
+            reach = adj.clone()
+            f_adj = adj.float()
+            power = adj.clone()
+            for _ in range(self._mask_k_hops - 1):
+                power = (power.float() @ f_adj) > 0
+                reach = reach | power
+            adj = reach
+        return adj
+
+    def build_structural_mask(self, seq_len, graphs, injection_maps, device, dtype=None):
+        """Additive attention bias ``[B, 1, seq, seq]`` — 0 allowed, ``finfo.min`` blocked.
+
+        ``bias[b,0,i,j] = finfo.min`` iff tokens i and j BOTH belong to graph nodes
+        AND those nodes are non-adjacent (within ``k_hops``). Every other entry
+        (node↔non-node, non-node↔non-node, same node, adjacent) stays 0. Because it
+        is ADDED to the model's causal/sliding mask, blocking only ever removes
+        already-causal pairs. Each node-token row keeps BOS (a non-node) and its own
+        diagonal, so no row is fully masked (no softmax NaN).
+        """
+        if dtype is None:
+            dtype = self.llm.get_input_embeddings().weight.dtype
+        B = len(injection_maps)
+        neg = torch.finfo(dtype).min
+        bias = torch.zeros(B, 1, seq_len, seq_len, device=device, dtype=dtype)
+        for b in range(B):
+            g = graphs[b]
+            # token position -> node id (-1 for non-node tokens). Spans are disjoint
+            # (build_injection_map dedups longest-first), so each token maps to one node.
+            tok2node = torch.full((seq_len,), -1, dtype=torch.long, device=device)
+            for node_idx, spans in injection_maps[b].items():
+                for start, end in spans:
+                    end = min(end, seq_len)
+                    if start < end:
+                        tok2node[start:end] = node_idx
+            node_pos = (tok2node >= 0).nonzero(as_tuple=True)[0]
+            if node_pos.numel() == 0:
+                continue
+            adj = self._node_adjacency(g, device)        # [N, N] bool
+            nid = tok2node[node_pos]                      # node id for each node-token
+            allowed = adj[nid][:, nid]                    # [P, P] bool over node-token pairs
+            blocked = ~allowed
+            if blocked.any():
+                bi, bj = blocked.nonzero(as_tuple=True)
+                bias[b, 0, node_pos[bi], node_pos[bj]] = neg
+        return bias
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        labels: torch.Tensor | None = None,
+        graphs: Batch | None = None,
+        injection_maps: list[dict[int, list[tuple[int, int]]]] | None = None,
+        **kwargs,
+    ):
+        kwargs.pop("inputs_embeds", None)
+        kwargs.pop("input_ids", None)
+        # Arm the structural bias for the patched attention layers. No graph (e.g. a
+        # non-graph batch) ⇒ plain causal LLM.
+        if graphs is not None and injection_maps is not None and input_ids is not None:
+            self._struct_bias = self.build_structural_mask(
+                input_ids.shape[1], graphs, injection_maps, input_ids.device)
+        else:
+            self._struct_bias = None
+        try:
+            return self.llm(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                **kwargs,
+            )
+        finally:
+            # Disarm so a later forward can't reuse a stale mask — except under
+            # gradient checkpointing, where backward recomputes the attention forwards
+            # and must see the same bias (every forward rebuilds it anyway).
+            if not getattr(self.llm, "is_gradient_checkpointing", False):
+                self._struct_bias = None
+
+
 class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
     """
     Graph-Augmented LLM (GREP-PRISM).

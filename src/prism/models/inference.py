@@ -9,6 +9,7 @@ from prism.data import utils
 from prism.models.gnn_llm import (
     CompositeGraphLLM,
     GraphAugmentedLLM,
+    GraphMaskLLM,
     InjectedCompositeGraphLLM,
     build_injection_map,
     find_last_graph_scope,
@@ -28,7 +29,7 @@ def _core_graph_model(model):
     """
     inner = model
     for _ in range(5):
-        if isinstance(inner, (CompositeGraphLLM, GraphAugmentedLLM)):
+        if isinstance(inner, (CompositeGraphLLM, GraphAugmentedLLM, GraphMaskLLM)):
             return inner
         nxt = getattr(inner, "base_model", None)
         if nxt is None or nxt is inner:
@@ -206,6 +207,22 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
         print(f"[spine-llm] injection scope_start={scope_start} / {len(input_ids_list)} tokens")
 
         injection_map = build_injection_map(input_ids_list, node_token_seqs, scope_start=scope_start)
+
+        if isinstance(graph_model, GraphMaskLLM):
+            # Parameter-free structural mask: build the [1, 1, seq, seq] additive adjacency
+            # bias, arm it on the wrapper (the patched attention reads it during prefill;
+            # cached decode steps skip via the shape guard), and generate from input_ids.
+            graph_model._struct_bias = graph_model.build_structural_mask(
+                input_ids.shape[1], [pyg_graph], [injection_map], input_ids.device)
+            try:
+                outputs = graph_model.llm.generate(
+                    input_ids=input_ids, attention_mask=attention_mask,
+                    max_new_tokens=max_new_tokens, use_cache=True, temperature=0.01, min_p=0.1,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                )
+                return outputs[:, input_ids.shape[-1]:]
+            finally:
+                graph_model._struct_bias = None
 
         if isinstance(graph_model, InjectedCompositeGraphLLM):
             # e-u-aligned variant: the GT code is added post-RoPE into q/k/v inside
