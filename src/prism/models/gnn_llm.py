@@ -65,6 +65,11 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         # wrapper config — the inner self.llm keeps its own attn impl.
         config = copy.copy(llm.config)
         config._attn_implementation = "eager" # ty: ignore[invalid-assignment]
+        # Likewise, the wrapper is not a registered MoE class, so PreTrainedModel
+        # can't validate "grouped_mm" experts against it (it greps this file for
+        # @use_experts_implementation and raises when absent). Force "eager" on the
+        # wrapper config — the inner self.llm keeps its own experts impl.
+        config._experts_implementation = "eager" # ty: ignore[invalid-assignment]
         super().__init__(config)
         self.llm = llm
 
