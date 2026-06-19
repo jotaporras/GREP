@@ -39,6 +39,8 @@
 #   10   e8_rpearl_llm_gt_rmsnorm       rpearl_gt_llm   present (calibrated RMSNorm Ψ + zero-init gate, LLM unfrozen/LoRA)
 #   11   e8_rpearl_llm_gt_semantic      rpearl_gt_llm   present (idx10 + semantic node features: mean word-embedding, 1 GNN pass)
 #   12   e8_gt_llm                      gt_llm          present (pure GT over word-embeddings, NO R-PEARL)
+#   13   e8_graph_mask_llm              graph_mask_llm  present (NO PE/GNN: attention mask forced to mirror adjacency, k=1)
+#   14   e8_gt_llm_no_edges             gt_llm          none    (idx12 + no edge list, pe_gain_init=0 cold-start)
 #
 # Unique save_names are required: the committed yamls all share name: e8 and the
 # rpearl_*/_no_edges pairs share an architecture, so train_v2 auto-naming would
@@ -81,6 +83,8 @@ CONFIGS=(
     "$CFG_DIR/e8_rpearl_llm_gt_rmsnorm.yaml"
     "$CFG_DIR/e8_rpearl_llm_gt_semantic.yaml"
     "$CFG_DIR/e8_gt_llm.yaml"
+    "$CFG_DIR/e8_graph_mask_llm.yaml"
+    "$CFG_DIR/e8_gt_llm_no_edges.yaml"
 )
 SAVE_NAMES=(
     e8_llm
@@ -96,6 +100,8 @@ SAVE_NAMES=(
     e8_rpearl_llm_gt_rmsnorm
     e8_rpearl_llm_gt_semantic
     e8_gt_llm
+    e8_graph_mask_llm
+    e8_gt_llm_no_edges
 )
 
 TASK_ID=${SLURM_ARRAY_TASK_ID:-${1:-${TASK_ID:-0}}}
