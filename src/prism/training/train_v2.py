@@ -386,6 +386,11 @@ class TrainConfig:
     # (g = tanh(pe_gain)). 1.0 → active from step 0; 0.0 → Ψ off at init / cold-start
     # (forward == base LLM, structural path frozen until the gate moves).
     pe_gain_init: float = 1.0
+    # rpearl_llm / rpearl_gt_llm: give graph (node-name) token spans position_id 0 so
+    # RoPE is the identity there (no sequential rotation on node names); their position
+    # is meant to come from the graph signal Ψ instead. Causality is unaffected (HF
+    # builds the causal mask from cache_position, not position_ids).
+    disable_graph_token_rope: bool = False
     # Gated injection (composite_graph_gt only)
     injection_mode: str = "interpolate"
     gate_init: float = 0.0
@@ -595,7 +600,8 @@ def train_model(config: TrainConfig, config_file: str = None):
             use_layer_norm=config.use_layer_norm,
         )
         model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=config.d_model,
-                                          eps=config.eps, pe_gain_init=config.pe_gain_init)
+                                          eps=config.eps, pe_gain_init=config.pe_gain_init,
+                                          disable_graph_token_rope=config.disable_graph_token_rope)
         collator = data.SpineDataCollator(tokenizer, mlm=False)
 
         if config.freeze_llm:
@@ -616,7 +622,8 @@ def train_model(config: TrainConfig, config_file: str = None):
             use_layer_norm=config.use_layer_norm,
         )
         model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=config.d_model,
-                                          eps=config.eps, pe_gain_init=config.pe_gain_init)
+                                          eps=config.eps, pe_gain_init=config.pe_gain_init,
+                                          disable_graph_token_rope=config.disable_graph_token_rope)
         collator = data.SpineDataCollator(tokenizer, mlm=False)
 
         if config.freeze_llm:

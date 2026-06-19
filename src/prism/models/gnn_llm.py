@@ -111,7 +111,8 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
     """
 
     def __init__(self, llm: nn.Module, pe_model: nn.Module,
-                 d_model: int, eps: float = 1e-8, pe_gain_init: float = 1.0):
+                 d_model: int, eps: float = 1e-8, pe_gain_init: float = 1.0,
+                 disable_graph_token_rope: bool = False):
         # GraphAugmentedLLM is not a registered HF architecture, so
         # PreTrainedModel rejects SDPA/flash-attn.  Force "eager" on the
         # wrapper config — the inner self.llm keeps its own attn impl.
@@ -144,6 +145,11 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         # path is multiplied by tanh(pe_gain)=0, its parameters get zero gradient
         # until the gate itself moves — a true cold-start.
         self.pe_gain = nn.Parameter(torch.tensor(float(pe_gain_init), device=device))
+
+        # When True, graph (node-name) token spans are assigned position_id 0 so RoPE is
+        # the identity there — node names carry no sequential rotation; their position is
+        # meant to come from Ψ. See _graph_token_position_ids / forward.
+        self._disable_graph_token_rope: bool = bool(disable_graph_token_rope)
 
         # Per-forward graph signal Ψ ([B, seq, hidden]); read by the patched
         # attention forwards and set by _augment_embeddings / inference.
@@ -276,6 +282,28 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
                         psi[b, start:end] = psi[b, start:end] + pe[node_idx].to(psi.dtype)
         return psi
 
+    def graph_token_position_ids(
+        self,
+        injection_maps: list[dict[int, list[tuple[int, int]]]],
+        seq_len: int,
+        device,
+    ) -> torch.Tensor:
+        """position_ids ([B, seq]) with graph-token spans set to 0 (identity RoPE).
+
+        Non-graph tokens keep their natural ``arange`` index. Causality is unaffected
+        (HF derives the causal mask from cache_position, not position_ids). Returned
+        only when ``_disable_graph_token_rope`` is set; callers pass it to the LLM.
+        """
+        B = len(injection_maps)
+        pos = torch.arange(seq_len, device=device).unsqueeze(0).repeat(B, 1)
+        for b in range(B):
+            for spans in injection_maps[b].values():
+                for start, end in spans:
+                    end = min(end, seq_len)
+                    if start < end:
+                        pos[b, start:end] = 0
+        return pos
+
     def _augment_embeddings(
         self,
         input_ids: torch.Tensor,
@@ -311,6 +339,13 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
 
         kwargs.pop("inputs_embeds", None)
         kwargs.pop("input_ids", None)
+
+        # Identity-RoPE the graph-token spans (position_id 0) when requested, unless the
+        # caller already supplied position_ids.
+        if (self._disable_graph_token_rope and injection_maps is not None
+                and kwargs.get("position_ids") is None):
+            kwargs["position_ids"] = self.graph_token_position_ids(
+                injection_maps, embeddings.shape[1], embeddings.device)
 
         try:
             return self.llm(

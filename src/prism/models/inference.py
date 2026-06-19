@@ -273,11 +273,17 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
         psi = graph_model.build_pe_signal(
             embeddings, [pyg_graph], [injection_map], permutation=self.permutation)
         graph_model._pe_signal = psi
+        gen_kwargs = {}
+        # Mirror training: identity-RoPE the prompt's graph-token spans (position_id 0).
+        # Generated tokens are non-graph, so generate() extends with natural positions.
+        if getattr(graph_model, "_disable_graph_token_rope", False):
+            gen_kwargs["position_ids"] = graph_model.graph_token_position_ids(
+                [injection_map], embeddings.shape[1], embeddings.device)
         try:
             return graph_model.llm.generate(
                 inputs_embeds=embeddings, attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens, use_cache=True, temperature=0.01, min_p=0.1,
-                pad_token_id=self.tokenizer.eos_token_id,
+                pad_token_id=self.tokenizer.eos_token_id, **gen_kwargs,
             )
         finally:
             graph_model._pe_signal = None
