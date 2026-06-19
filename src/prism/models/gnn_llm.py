@@ -9,11 +9,57 @@ import torch
 from torch import nn
 from torch.nn.utils.parametrizations import spectral_norm
 from torch_geometric.data import Batch, Data
-from transformers import PreTrainedModel
+import transformers.masking_utils as masking_utils
+from transformers import AttentionInterface, PreTrainedModel
 
 from prism.models.composite_graph import build_composite_graph
 from prism.models.llama import disable_rope
 from prism.models.utils import LipschitzNorm
+
+
+# Name under which the graph-PE-injecting attention function is registered in
+# transformers' global ``ALL_ATTENTION_FUNCTIONS``. ``GraphAugmentedLLM`` points
+# the wrapped LLM's ``config._attn_implementation`` at this so every decoder layer
+# dispatches through ``_prism_pe_attention_forward`` (see ``_install_pe_injection``).
+_PRISM_PE_IMPL = "prism_pe"
+
+
+def _prism_pe_attention_forward(module, query, key, value, attention_mask,
+                                scaling=None, dropout=0.0, **kwargs):
+    """Attention fn that injects the graph signal Ψ into the *post-RoPE* q/k/v.
+
+    Registered as the ``"prism_pe"`` attention implementation. Every HF decoder
+    calls its attention interface as ``fn(module, q, k, v, attn_mask, scaling=…,
+    **kwargs)`` with q/k already q/k-normed, rotary-embedded and shaped
+    ``[B, H, S, head_dim]``. We add the *unrotated* ``W_q·Ψ`` / ``W_k·Ψ`` (and
+    ``W_v·Ψ``) here, then delegate to the LLM's original attention impl.
+
+    Because every model family (Llama, Qwen2, gemma-4, …) hands the interface
+    the same post-RoPE ``[B, H, S, d]`` tensors, this single function works
+    across architectures — each model keeps its own q/k-norm, RoPE convention,
+    scaling, sliding window and KV-sharing. With Ψ absent (or zero) the output is
+    identical to stock attention.
+    """
+    model = getattr(module, "_prism_pe_model", None)
+    psi = None if model is None else model._pe_signal
+    # Inject only on the prompt forward whose Ψ length matches the query length;
+    # cached single-token decode steps (S mismatch) fall through to stock attn.
+    if psi is not None and psi.shape[0] == query.shape[0] and psi.shape[1] == query.shape[-2]:
+        psi = psi.to(query.dtype)
+        b, s, hd = psi.shape[0], psi.shape[1], module.head_dim
+        query = query + module.q_proj(psi).view(b, s, -1, hd).transpose(1, 2)
+        # KV-shared layers (e.g. gemma-4) reuse k/v from an earlier layer that
+        # already carries Ψ; re-injecting here would double-count, so skip k/v.
+        if not getattr(module, "is_kv_shared_layer", False):
+            key = key + module.k_proj(psi).view(b, s, -1, hd).transpose(1, 2)
+            if getattr(model, "_pe_inject_value", True) and getattr(module, "v_proj", None) is not None:
+                value = value + module.v_proj(psi).view(b, s, -1, hd).transpose(1, 2)
+    return module._prism_orig_attn_fn(
+        module, query, key, value, attention_mask,
+        scaling=scaling, dropout=dropout, **kwargs)
+
+
+AttentionInterface.register(_PRISM_PE_IMPL, _prism_pe_attention_forward)
 
 
 class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
@@ -38,8 +84,13 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         ``W_q``/``W_k`` don't commute with the per-head rotation, and one residual
         vector can't satisfy the q- and k-constraints at once.)
 
-        Instead we patch each attention layer's forward (``_install_pe_injection``)
-        to add Ψ *after* RoPE, in the projected query/key/value space::
+        Instead of touching the residual stream, we register a custom attention
+        implementation (``"prism_pe"``, see ``_install_pe_injection``) and point the
+        wrapped LLM's ``config._attn_implementation`` at it. The LLM runs its own
+        native attention forward — its q/k-norm, RoPE convention, scaling, sliding
+        window and KV-sharing all untouched — and where it hands the already-rotated
+        ``[B, H, S, d]`` query/key/value to its attention function we add the
+        *unrotated* graph term::
 
             q = RoPE(W_q · h) + W_q · Ψ
             k = RoPE(W_k · h) + W_k · Ψ
@@ -47,9 +98,12 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
 
         Ψ is projected through that layer's own (LoRA-adapted) q/k/v_proj, so the
         graph signal enters the query/key dot product *unrotated* — exact
-        ``RoPE(X) + Ψ`` — at all layers. Ψ is supplied per forward via
-        ``self._pe_signal`` (``[B, seq, hidden]``); injection is skipped on cached
-        single-token decode steps (seq mismatch), so only prompt tokens carry it.
+        ``RoPE(X) + Ψ`` — at all layers. Routing through the attention *function*
+        (rather than reimplementing each model family's forward) keeps this
+        architecture-agnostic across Llama, Qwen2, gemma-4, …. Ψ is supplied per
+        forward via ``self._pe_signal`` (``[B, seq, hidden]``); injection is skipped
+        on cached single-token decode steps (seq mismatch), so only prompt tokens
+        carry it.
 
     Args:
         llm (nn.Module): LLM to perform classical planning
@@ -107,71 +161,74 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         return self.llm.get_decoder().layers
 
     def _install_pe_injection(self) -> None:
-        """Patch every self-attention layer so Ψ is added *after* RoPE (RoPE(X)+Ψ).
+        """Route every self-attention layer through the ``prism_pe`` attention fn.
 
-        Each attention module's ``forward`` is replaced with a faithful copy of the
-        HF implementation that additionally injects ``W_q·Ψ`` / ``W_k·Ψ`` into the
-        post-rotary query/key (and ``W_v·Ψ`` into the value path when
-        ``_pe_inject_value``). Ψ is projected through the same (LoRA-adapted)
-        projections as the content stream, so the graph code enters the q·k score
-        unrotated at all layers. Patching instance methods (not the class) keeps it
-        scoped to this LLM and survives PEFT, which swaps leaf Linears in place.
+        Rather than reimplementing each model family's attention ``forward`` (which
+        is Llama-specific and breaks on e.g. gemma-4's q/k-norm, single-tensor RoPE,
+        sliding window and KV-sharing), we let the LLM run its native forward and
+        only swap the *attention function* it dispatches to, via
+        ``config._attn_implementation``. Each attention module records its original
+        attention impl (so ``prism_pe`` can delegate to it after adding Ψ) plus a
+        back-reference to this wrapper (so it can read ``self._pe_signal``). Set on
+        instances (not the class) so it stays scoped to this LLM and survives PEFT,
+        which swaps leaf Linears in place.
         """
-        for layer in self._decoder_layers():
-            attn = layer.self_attn
-            attn.forward = self._make_injected_attention_forward(attn)
-
-    def _make_injected_attention_forward(self, attn):
-        # Resolve the model-family helpers from the module that defines this
-        # attention class (works for Llama, Qwen2, … which share this layout).
-        mod = importlib.import_module(type(attn).__module__)
-        apply_rotary_pos_emb = mod.apply_rotary_pos_emb
+        layers = self._decoder_layers()
+        if len(layers) == 0:
+            return
+        first_attn = layers[0].self_attn
+        mod = importlib.import_module(type(first_attn).__module__)
+        # Invariant: only graph tokens may be modified. Ψ is zero at every non-graph
+        # token, so the injected ``W·Ψ`` vanishes there — but ONLY if the q/k/v
+        # projections are bias-free (``proj(0)=0``). A bias would add ``b`` to every
+        # token, perturbing non-graph positions too. All supported LLMs (Llama/Qwen2/
+        # gemma-4) use bias-free attention; fail loud if a future base model doesn't.
+        for _name in ("q_proj", "k_proj", "v_proj"):
+            _proj = getattr(first_attn, _name, None)
+            if _proj is not None and getattr(_proj, "bias", None) is not None:
+                raise ValueError(
+                    f"{type(first_attn).__name__}.{_name} has a bias; prism_pe injection "
+                    "assumes bias-free attention projections so non-graph tokens stay "
+                    "untouched (Ψ=0 ⇒ W·Ψ=0). This base model needs a bias-aware injection."
+                )
+        # Capture the LLM's real attention impl ONCE, before mutating any config:
+        # configs are typically shared across layers, so a per-layer read after the
+        # first mutation would already see "prism_pe". Persisted for idempotent
+        # re-install (e.g. if called again after a config reload).
+        if not hasattr(self, "_prism_orig_attn_impl"):
+            impl = first_attn.config._attn_implementation
+            self._prism_orig_attn_impl = "eager" if impl == _PRISM_PE_IMPL else impl
+        # Resolve the original attention fn to delegate to. transformers ≥5.12 uses
+        # ``get_interface(impl, default)``; older versions subscript the registry and
+        # special-case eager — support both so the Llama path keeps working on 5.0.x.
         attn_fns = mod.ALL_ATTENTION_FUNCTIONS
-        eager = mod.eager_attention_forward
-        model = self  # captured for the per-forward Ψ signal
-
-        def forward(hidden_states, position_embeddings=None, attention_mask=None,
-                    past_key_values=None, **kwargs):
-            input_shape = hidden_states.shape[:-1]
-            hidden_shape = (*input_shape, -1, attn.head_dim)
-
-            query_states = attn.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-            key_states = attn.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-            value_states = attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
-            cos, sin = position_embeddings
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-            # --- RoPE(X) + Ψ : add the graph signal AFTER the rotation ---------
-            psi = model._pe_signal
-            if (psi is not None and psi.shape[0] == hidden_states.shape[0]
-                    and psi.shape[1] == hidden_states.shape[1]):
-                psi = psi.to(query_states.dtype)
-                query_states = query_states + attn.q_proj(psi).view(hidden_shape).transpose(1, 2)
-                key_states = key_states + attn.k_proj(psi).view(hidden_shape).transpose(1, 2)
-                if model._pe_inject_value:
-                    value_states = value_states + attn.v_proj(psi).view(hidden_shape).transpose(1, 2)
-            # ------------------------------------------------------------------
-
-            if past_key_values is not None:
-                key_states, value_states = past_key_values.update(
-                    key_states, value_states, attn.layer_idx)
-
-            attn_impl = attn.config._attn_implementation
-            attention_interface = (
-                eager if attn_impl == "eager" else attn_fns[attn_impl]
+        if hasattr(attn_fns, "get_interface"):
+            orig_attn_fn = attn_fns.get_interface(
+                self._prism_orig_attn_impl, mod.eager_attention_forward)
+        else:
+            orig_attn_fn = (
+                mod.eager_attention_forward
+                if self._prism_orig_attn_impl == "eager"
+                else attn_fns[self._prism_orig_attn_impl]
             )
-            attn_output, attn_weights = attention_interface(
-                attn, query_states, key_states, value_states, attention_mask,
-                dropout=0.0 if not attn.training else attn.attention_dropout,
-                scaling=attn.scaling, **kwargs,
-            )
+        # HF builds the causal/sliding mask from the impl *name*: ``create_causal_mask``
+        # returns None for any impl not in the mask registry, which would silently
+        # disable causal masking under "prism_pe". Register prism_pe's mask to mirror
+        # the original impl's, so the model builds exactly the mask the delegated
+        # attention fn expects (covers gemma-4's causal and sliding masks alike).
+        mask_fns = getattr(masking_utils, "ALL_MASK_ATTENTION_FUNCTIONS", None)
+        if mask_fns is not None and self._prism_orig_attn_impl in mask_fns._global_mapping:
+            masking_utils.AttentionMaskInterface.register(
+                _PRISM_PE_IMPL, mask_fns._global_mapping[self._prism_orig_attn_impl])
 
-            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-            attn_output = attn.o_proj(attn_output)
-            return attn_output, attn_weights
-
-        return forward
+        for layer in layers:
+            attn = layer.self_attn
+            # Bypass nn.Module.__setattr__ for the wrapper back-reference: assigning
+            # an nn.Module as an attribute would register it as a submodule and form
+            # a cycle (attn → wrapper → llm → attn), double-counting parameters.
+            object.__setattr__(attn, "_prism_pe_model", self)
+            attn._prism_orig_attn_fn = orig_attn_fn
+            attn.config._attn_implementation = _PRISM_PE_IMPL
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         self.llm.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)

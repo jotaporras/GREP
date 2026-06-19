@@ -8,6 +8,9 @@ data: data/revised/gen/nav100_n30_gemma_data/split/formatted_all_new__train.json
 val_data: data/revised/gen/nav100_n30_gemma_data/split/formatted_all_new__val.json
 eval_data: data/revised/gen/nav100_n30_gemma_data/split/test_graphs/data_gen_023.json
 base_model: google/gemma-4-31B-it
+# gemma-4-31B loads as multimodal Gemma4ForConditionalGeneration; restrict LoRA to the
+# text decoder so PEFT never visits the vision tower's Gemma4ClippableLinear (peft#3129).
+target_modules: '.*language_model.*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)'
 bit4: true
 per_device_train_batch_size: 1
 learning_rate: 0.0002
