@@ -1,0 +1,31 @@
+name: e8
+architecture: graph_mask_llm
+wandb_project: GREP-PRISM
+wandb_run_name: e8_graph_mask_llm_no_edges
+wandb_tag: e8_new_base_models
+checkpoint_dir: outputs/e8_new_base_models
+data: data/revised/gen/nav100_n30_gemma_data/split/formatted_all_new__train.json
+val_data: data/revised/gen/nav100_n30_gemma_data/split/formatted_all_new__val.json
+eval_data: data/revised/gen/nav100_n30_gemma_data/split/test_graphs/data_gen_023.json
+base_model: google/gemma-4-12B-it
+bit4: true
+per_device_train_batch_size: 1
+learning_rate: 0.0002
+epochs: 2
+r: 16
+debug: true
+dataset_proportion: 1.0
+max_seq_length: 8192
+text_edge_list: present
+# "No-edges" ABLATION of graph_mask_llm (sibling of e8_graph_mask_llm). The structural
+# mask is built from self-loops ONLY (mask_use_edges=false): every node token is blocked
+# from attending to any OTHER node token. Because the graph-arch prompt is already
+# node-only (verified: no textual edge list — the system prompt even states the edges are
+# "not written out here"), this run gives the model NO connectivity information at all.
+# It is the floor control: the gap vs e8_graph_mask_llm isolates the value of the actual
+# edge structure in the mask (vs merely isolating node mentions from one another).
+mask_k_hops: 1
+mask_symmetrize: true
+mask_use_edges: false     # <-- the only change vs e8_graph_mask_llm: edgeless mask
+freeze_llm: false
+device: -1

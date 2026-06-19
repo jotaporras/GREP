@@ -128,6 +128,28 @@ def test_repeated_node_mentions_attend_each_other():
     assert bias[5, 1] == 0  # second mention attends first (same node)
 
 
+def test_use_edges_false_blocks_all_cross_node():
+    """Edgeless ablation: with use_edges=False the adjacency is self-loops only, so
+    EVERY node token is blocked from attending to any OTHER node token (even adjacent)."""
+    wrap = _wrap()  # default use_edges=True
+    abl = GraphMaskLLM(_tiny_llm(), k_hops=1, symmetrize=True, use_edges=False).eval()
+    seq = 8
+    imap = [{0: [(1, 2)], 1: [(3, 4)], 2: [(5, 6)]}]
+    g = _graph(3, edges=[(0, 1), (1, 2)])  # has real edges
+
+    full = wrap.build_structural_mask(seq, [g], imap, torch.device("cpu"), dtype=torch.float32)[0, 0]
+    none = abl.build_structural_mask(seq, [g], imap, torch.device("cpu"), dtype=torch.float32)[0, 0]
+    # With edges: node1@3 attends node0@1 (adjacent) -> allowed.
+    assert full[3, 1] == 0
+    # Edgeless: that same adjacent pair is now blocked.
+    assert none[3, 1] == NEG
+    # Edgeless adjacency is pure identity: self-loop allowed, all other node pairs blocked.
+    adj = abl._node_adjacency(g, torch.device("cpu"))
+    assert bool(adj.diag().all()) and adj.sum() == 3  # only the 3 diagonal entries
+    # Self and non-node still reachable (no fully-masked row).
+    assert none[3, 3] == 0 and none[3, 0] == 0
+
+
 def test_forward_runs_and_mask_changes_logits():
     """End-to-end: forward with graphs differs from plain causal, and disarms after."""
     torch.manual_seed(0)

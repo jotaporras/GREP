@@ -179,6 +179,7 @@ def graph_augmented_llm_from_pretrained(
             llm,
             k_hops=gnn_cfg.get("mask_k_hops", 1),
             symmetrize=gnn_cfg.get("mask_symmetrize", True),
+            use_edges=gnn_cfg.get("mask_use_edges", True),
         )
     elif architecture == "composite_graph_gt":
         # M9 composite-graph assembly: Graph Transformer (R-PEARL inside) + M7 gate

@@ -428,6 +428,11 @@ class TrainConfig:
     # consume). Everything else is the plain LLM baseline.
     mask_k_hops: int = 1
     mask_symmetrize: bool = True
+    # graph_mask_llm "no-edges" ablation: when False the mask is built from self-loops
+    # only (every node token blocked from attending OTHER node tokens). The prompt is
+    # already node-only for graph archs, so this leaves the model with NO connectivity
+    # info — the floor control for whether the edge structure in the mask matters.
+    mask_use_edges: bool = True
     # Gated injection (composite_graph_gt only)
     injection_mode: str = "interpolate"
     gate_init: float = 0.0
@@ -706,7 +711,8 @@ def train_model(config: TrainConfig, config_file: str = None):
         # built per forward from the scene graph + injection map). Reuses SpineDataCollator
         # so graphs + injection_maps reach the model forward.
         model = gnn_llm.GraphMaskLLM(
-            llm, k_hops=config.mask_k_hops, symmetrize=config.mask_symmetrize)
+            llm, k_hops=config.mask_k_hops, symmetrize=config.mask_symmetrize,
+            use_edges=config.mask_use_edges)
         collator = data.SpineDataCollator(tokenizer, mlm=False)
 
         if config.freeze_llm:
@@ -900,7 +906,8 @@ def train_model(config: TrainConfig, config_file: str = None):
                 "gt_heads": config.gt_heads}
                if config.architecture in ("rpearl_gt_llm", "gt_llm", "composite_graph_gt") else {}),
             # graph_mask_llm rebuild params (read back by loaders for eval).
-            **({"mask_k_hops": config.mask_k_hops, "mask_symmetrize": config.mask_symmetrize}
+            **({"mask_k_hops": config.mask_k_hops, "mask_symmetrize": config.mask_symmetrize,
+                "mask_use_edges": config.mask_use_edges}
                if config.architecture == "graph_mask_llm" else {}),
             # Composite-graph rebuild params (read back by loaders for eval).
             **({"k_gt": config.k_gt, "gt_num_layers": config.gt_num_layers,

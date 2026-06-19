@@ -139,9 +139,16 @@ class GraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             only, matching "share an edge"); ``(A+I)^k`` for k>1.
         symmetrize (bool): OR the adjacency with its transpose (undirected). The
             scene graph is already undirected, so this is belt-and-suspenders.
+        use_edges (bool): when False, IGNORE ``edge_index`` and build the adjacency
+            from self-loops only — every node token is blocked from attending to any
+            OTHER node token. The "no-edges" ablation: the prompt is already node-only
+            (no textual edge list), so this leaves the model with NO connectivity
+            information at all, isolating whether the edge STRUCTURE in the mask
+            matters vs merely isolating node mentions from each other.
     """
 
-    def __init__(self, llm: nn.Module, k_hops: int = 1, symmetrize: bool = True):
+    def __init__(self, llm: nn.Module, k_hops: int = 1, symmetrize: bool = True,
+                 use_edges: bool = True):
         # Not a registered HF architecture: force "eager" on the WRAPPER config so
         # PreTrainedModel doesn't reject SDPA/flash or MoE validation. The inner
         # self.llm keeps its own attn impl (we only swap the attention *function*).
@@ -154,6 +161,7 @@ class GraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         if self._mask_k_hops < 1:
             raise ValueError(f"k_hops must be >= 1, got {k_hops}")
         self._mask_symmetrize = bool(symmetrize)
+        self._mask_use_edges = bool(use_edges)
         # Per-forward additive attention bias [B, 1, seq, seq]; read by the patched
         # attention layers, set in forward / inference, disarmed afterwards.
         self._struct_bias: torch.Tensor | None = None
@@ -234,13 +242,15 @@ class GraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         N = g.num_nodes
         adj = torch.zeros(N, N, dtype=torch.bool, device=device)
         ei = getattr(g, "edge_index", None)
-        if ei is not None and ei.numel() > 0:
+        # use_edges=False ⇒ edgeless ablation: skip edge_index entirely, leaving only
+        # the self-loops below, so all node↔(other-node) attention is blocked.
+        if self._mask_use_edges and ei is not None and ei.numel() > 0:
             ei = ei.to(device)
             adj[ei[0], ei[1]] = True
             if self._mask_symmetrize:
                 adj = adj | adj.t()
         adj.fill_diagonal_(True)  # self-loops: same node (and its repeats) always visible
-        if self._mask_k_hops > 1:
+        if self._mask_use_edges and self._mask_k_hops > 1:
             reach = adj.clone()
             f_adj = adj.float()
             power = adj.clone()

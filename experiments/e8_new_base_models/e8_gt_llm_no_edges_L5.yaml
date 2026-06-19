@@ -1,0 +1,33 @@
+name: e8
+architecture: gt_llm
+wandb_project: GREP-PRISM
+wandb_run_name: e8_gt_llm_no_edges_L5
+wandb_tag: e8_new_base_models
+checkpoint_dir: outputs/e8_new_base_models
+data: data/revised/gen/nav100_n30_gemma_data/split/formatted_all_new__train.json
+val_data: data/revised/gen/nav100_n30_gemma_data/split/formatted_all_new__val.json
+eval_data: data/revised/gen/nav100_n30_gemma_data/split/test_graphs/data_gen_023.json
+base_model: google/gemma-4-12B-it
+bit4: true
+per_device_train_batch_size: 1
+learning_rate: 0.0002
+epochs: 2
+r: 16
+debug: true
+dataset_proportion: 1.0
+max_seq_length: 8192
+text_edge_list: none
+# gt_llm_no_edges GT-DEPTH sweep, L=5 (vs idx 14 = L=2). Pure semantic Graph Transformer
+# over word-embedding node features — NO R-PEARL, no probes. Only gt_num_layers changes
+# across the L2/L3/L4/L5 sweep; everything else (no edge list, k_gt=1, RMSNorm, cold-start)
+# is held fixed.
+d_model: 1024
+gt_num_layers: 5
+gt_heads: 8
+k_gt: 1
+dropout: 0.1
+freeze_llm: false
+device: -1
+pe_node_features: word_embeddings   # required by gt_llm (the GT has no probe fallback)
+use_pe_norm: true
+pe_gain_init: 0.0

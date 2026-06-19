@@ -41,6 +41,10 @@
 #   12   e8_gt_llm                      gt_llm          present (pure GT over word-embeddings, NO R-PEARL)
 #   13   e8_graph_mask_llm              graph_mask_llm  present (NO PE/GNN: attention mask forced to mirror adjacency, k=1)
 #   14   e8_gt_llm_no_edges             gt_llm          none    (idx12 + no edge list, pe_gain_init=0 cold-start)
+#   15   e8_graph_mask_llm_no_edges     graph_mask_llm  present (idx13 ablation: edgeless mask, mask_use_edges=false — no connectivity)
+#   16   e8_gt_llm_no_edges_L3          gt_llm          none    (gt_llm_no_edges GT-depth sweep, L=3; idx14 is L=2)
+#   17   e8_gt_llm_no_edges_L4          gt_llm          none    (gt_llm_no_edges GT-depth sweep, L=4)
+#   18   e8_gt_llm_no_edges_L5          gt_llm          none    (gt_llm_no_edges GT-depth sweep, L=5)
 #
 # Unique save_names are required: the committed yamls all share name: e8 and the
 # rpearl_*/_no_edges pairs share an architecture, so train_v2 auto-naming would
@@ -85,6 +89,10 @@ CONFIGS=(
     "$CFG_DIR/e8_gt_llm.yaml"
     "$CFG_DIR/e8_graph_mask_llm.yaml"
     "$CFG_DIR/e8_gt_llm_no_edges.yaml"
+    "$CFG_DIR/e8_graph_mask_llm_no_edges.yaml"
+    "$CFG_DIR/e8_gt_llm_no_edges_L3.yaml"
+    "$CFG_DIR/e8_gt_llm_no_edges_L4.yaml"
+    "$CFG_DIR/e8_gt_llm_no_edges_L5.yaml"
 )
 SAVE_NAMES=(
     e8_llm
@@ -102,6 +110,10 @@ SAVE_NAMES=(
     e8_gt_llm
     e8_graph_mask_llm
     e8_gt_llm_no_edges
+    e8_graph_mask_llm_no_edges
+    e8_gt_llm_no_edges_L3
+    e8_gt_llm_no_edges_L4
+    e8_gt_llm_no_edges_L5
 )
 
 TASK_ID=${SLURM_ARRAY_TASK_ID:-${1:-${TASK_ID:-0}}}
