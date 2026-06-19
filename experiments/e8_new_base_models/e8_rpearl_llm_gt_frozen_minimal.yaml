@@ -1,0 +1,39 @@
+name: e8
+architecture: rpearl_gt_llm
+wandb_project: GREP-PRISM
+wandb_run_name: e8_rpearl_llm_gt_frozen_minimal
+wandb_tag: e8_new_base_models
+checkpoint_dir: outputs/e8_new_base_models
+data: data/revised/gen/nav100_n30_gemma_data/split/formatted_all_new__train.json
+val_data: data/revised/gen/nav100_n30_gemma_data/split/formatted_all_new__val.json
+eval_data: data/revised/gen/nav100_n30_gemma_data/split/test_graphs/data_gen_023.json
+base_model: google/gemma-4-12B-it
+# bit4 disabled: freeze_llm=true => no LoRA adapter, and HF refuses to train a purely
+# quantized model. Frozen 12B bf16 (~24GB) fits the B200. (See frozen_pe1 config.)
+bit4: false
+per_device_train_batch_size: 1
+learning_rate: 0.0002
+epochs: 2
+r: 16
+debug: true
+dataset_proportion: 1.0
+max_seq_length: 8192
+text_edge_list: present
+# Minimal / local PE: 1 GT layer, 1-hop GT attention, smallest R-PEARL GCN (2 convs)
+# at 1 hop each. Tests whether a low-expressivity, local PE interferes less than the
+# deeper/global one. d_model/heads/hidden/probes unchanged.
+d_model: 1024
+gt_num_layers: 1
+gt_heads: 8
+k_gt: 1
+pe_hidden_channels: 256
+pe_num_layers: 2
+k_pe: 1
+num_samples: 40
+dropout: 0.1
+eps: 1e-6
+use_layer_norm: true
+device: -1
+# Continue the frozen-LLM probe: only the structural PE path trains, Ψ fully on.
+freeze_llm: true
+pe_gain_init: 1.0

@@ -1,3 +1,5 @@
+import warnings
+
 import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
@@ -54,11 +56,12 @@ class RandomGNNPositionalEncodings(nn.Module):
             raise ValueError(
                 f"probe_distribution must be 'gaussian' or 'rademacher', got {probe_distribution!r}"
             )
-        # Multi-hop structure is only reachable when pe_num_layers * k >= 3 (M5).
+        # Multi-hop structure is only reachable when pe_num_layers * k >= 3 (M5). Warn
+        # rather than raise so minimal/local PE probes (e.g. pe_num_layers=2, k=1) can run.
         if pe_num_layers * k < 3:
-            raise ValueError(
-                f"pe_num_layers * k must be >= 3 to reach multi-hop structure, "
-                f"got {pe_num_layers} * {k} = {pe_num_layers * k}"
+            warnings.warn(
+                f"pe_num_layers * k = {pe_num_layers}*{k} = {pe_num_layers * k} < 3: "
+                f"limited multi-hop reach (intentional for minimal/local PE probes)."
             )
         # Create a GCN that takes 1-dimensional random features
         self.pe_gcn = gcn.GCN(
