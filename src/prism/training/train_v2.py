@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import warnings
 
 from prism.data import data
 from prism.eval import callbacks
@@ -138,7 +139,81 @@ def _sharegpt_to_messages(example: Dict[str, Any]) -> Optional[List[Dict[str, st
 
 
 
-class GraphSFTTrainer(SFTTrainer):
+class GraphTokenAccuracyMixin:
+    """Logs ``graph_acc/scene_block`` and ``graph_acc/answer_nodes`` — teacher-forced
+    next-token accuracy restricted to graph-related tokens. Pure diagnostic: it reads
+    logits but never changes the loss or gradients.
+
+    * ``scene_block`` — tokens in the scene-graph block that name a node (the
+      positions the graph PE injects into).
+    * ``answer_nodes`` — node-name tokens the model emits in its final answer.
+
+    The two masks come from per-example index lists precomputed in
+    ``preprocess_dataset`` and carried verbatim by the collator
+    (:class:`prism.data.data.TokenIndexCollator`); right-padding keeps each index
+    valid in the padded batch. Counts accumulate across the logging window and are
+    flushed (DDP-reduced) in :meth:`log`, so the metric rides the trainer's existing
+    wandb logging cadence with no extra callback. Mixed into both the graph trainer
+    and the plain-``llm`` baseline trainer so the two are comparable.
+    """
+
+    def _reset_token_acc(self):
+        self._gta = {"scene_c": 0, "scene_n": 0, "ans_c": 0, "ans_n": 0}
+
+    def _accumulate_token_acc(self, outputs, input_ids, scene_idx, answer_idx):
+        logits = getattr(outputs, "logits", None)
+        if logits is None or (scene_idx is None and answer_idx is None):
+            return
+        if not hasattr(self, "_gta"):
+            self._reset_token_acc()
+        with torch.no_grad():
+            # preds[t] predicts token t+1; a node token at position p is graded by
+            # preds[p-1] == input_ids[p]. So compare in the shifted (target) frame
+            # and map each index p -> p-1.
+            preds = logits[:, :-1, :].argmax(dim=-1)      # [B, S-1]
+            correct = preds == input_ids[:, 1:]            # [B, S-1]
+            width = correct.shape[1]
+            for b in range(correct.shape[0]):
+                for key, idx in (("scene", scene_idx), ("ans", answer_idx)):
+                    if not idx or b >= len(idx):
+                        continue
+                    pos = [p - 1 for p in idx[b] if 1 <= p <= width]
+                    if not pos:
+                        continue
+                    sel = correct[b, torch.as_tensor(pos, device=correct.device)]
+                    self._gta[f"{key}_n"] += sel.numel()
+                    self._gta[f"{key}_c"] += int(sel.sum().item())
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # Pop the pass-through index columns so they're never forwarded to the model.
+        scene_idx = inputs.pop("scene_node_idx", None)
+        answer_idx = inputs.pop("answer_node_idx", None)
+        loss, outputs = super().compute_loss(
+            model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch)
+        try:
+            self._accumulate_token_acc(outputs, inputs["input_ids"], scene_idx, answer_idx)
+        except Exception as e:  # a diagnostic must never break training
+            warnings.warn(f"graph-token-accuracy metric skipped: {type(e).__name__}: {e}")
+        return (loss, outputs) if return_outputs else loss
+
+    def log(self, logs, *args, **kwargs):
+        gta = getattr(self, "_gta", None)
+        if gta is not None:
+            counts = torch.tensor(
+                [gta["scene_c"], gta["scene_n"], gta["ans_c"], gta["ans_n"]],
+                dtype=torch.float64, device=self.args.device)
+            if self.args.world_size > 1:
+                counts = self.accelerator.reduce(counts, reduction="sum")
+            scene_c, scene_n, ans_c, ans_n = counts.tolist()
+            if scene_n > 0:
+                logs["graph_acc/scene_block"] = scene_c / scene_n
+            if ans_n > 0:
+                logs["graph_acc/answer_nodes"] = ans_c / ans_n
+            self._reset_token_acc()
+        return super().log(logs, *args, **kwargs)
+
+
+class GraphSFTTrainer(GraphTokenAccuracyMixin, SFTTrainer):
     def __init__(self, *args, gnn_config: dict, **kwargs):
         super().__init__(*args, **kwargs)
         self.gnn_config = gnn_config
@@ -309,6 +384,15 @@ class GraphSFTTrainer(SFTTrainer):
             }, os.path.join(output_dir, "gnn_weights.pt"))
         if any(p.requires_grad for p in self.model.llm.parameters()):
             super().save_model(output_dir, _internal_call)
+
+
+class BaselineSFTTrainer(GraphTokenAccuracyMixin, SFTTrainer):
+    """Plain-``llm`` baseline trainer. Identical to ``SFTTrainer`` except it logs the
+    ``graph_acc/*`` metric (via :class:`GraphTokenAccuracyMixin`) so the baseline is
+    comparable to the graph architectures. Paired with
+    :class:`prism.data.data.TokenIndexCollator`, which carries the precomputed
+    graph-token index columns the metric needs.
+    """
 
 
 # ----------------------------
@@ -774,11 +858,12 @@ def train_model(config: TrainConfig, config_file: str = None):
         if config.freeze_llm:
             model.llm.requires_grad_(False)
     elif config.architecture == "llm":
-        # Pure LLM baseline — scene graph text stays in the prompt as-is.
-        # No custom collator: SFTTrainer's built-in collator handles
-        # tokenization from the `messages` column and padding.
+        # Pure LLM baseline — scene graph text stays in the prompt as-is. The graph
+        # is NOT injected; the collator only pads the (already tokenized) examples and
+        # carries the precomputed graph-token index columns so the baseline can log
+        # the same graph_acc/* metric as the graph archs.
         model = llm
-        collator = None
+        collator = data.TokenIndexCollator(tokenizer, mlm=False)
     else:
         raise ValueError(f"Unknown architecture: {config.architecture!r}. Choose 'rpearl_llm', 'rpearl_gt_llm', 'gt_llm', 'graph_mask_llm', 'composite_graph_gt', or 'llm'.")
 
@@ -942,8 +1027,9 @@ def train_model(config: TrainConfig, config_file: str = None):
             gnn_config=gnn_config,
         )
     else:
-        trainer = SFTTrainer(
+        trainer = BaselineSFTTrainer(
             model=model,
+            data_collator=collator,
             processing_class=tokenizer,
             peft_config=lora_config,
             train_dataset=train_dataset,

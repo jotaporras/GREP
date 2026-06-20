@@ -12,6 +12,29 @@ from prism.data import utils
 from prism.models.gnn_llm import build_injection_map, find_last_graph_scope, node_token_variants
 
 
+def node_index_columns(input_ids, node_token_seqs, *, scope_start, answer_start):
+    """Partition node-name token positions into the two graph_acc index lists.
+
+    ``build_injection_map`` finds every node-name span in the sequence; we split
+    those positions into two DISJOINT groups by the assistant-turn boundary:
+
+    * ``scene_idx``  — mentions in ``[scope_start, answer_start)``: the query
+      scene-graph block (and any node named in the task prompt). ``scope_start``
+      (from :func:`find_last_graph_scope`) drops mentions inside earlier ICL-example
+      graphs, mirroring the injection scope used in training/eval.
+    * ``answer_idx`` — mentions at/after ``answer_start``: node names the model emits
+      in its final answer.
+
+    Positions are sequence indices; with right-padding they're valid in the padded
+    batch, so the trainer scatters them straight into a ``[B, S]`` mask.
+    """
+    spans = build_injection_map(input_ids, node_token_seqs, scope_start=0)
+    positions = sorted({p for s in spans.values() for (a, b) in s for p in range(a, b)})
+    scene_idx = [p for p in positions if scope_start <= p < answer_start]
+    answer_idx = [p for p in positions if p >= answer_start]
+    return scene_idx, answer_idx
+
+
 def preprocess_dataset(
     ds: datasets.Dataset,
     tokenizer,
@@ -93,6 +116,11 @@ def preprocess_dataset(
         # there is no GNN to supply connectivity — the LLM must read it from text.
         # `text_edge_list` no longer gates the LLM text: edges are always present
         # in the compact block.
+        #
+        # Parse the scene graph from the ORIGINAL (verbose) messages first — the LLM
+        # ingests no graph, but the node names feed the graph-token-accuracy metric
+        # (`graph_acc/*`), so the baseline is comparable to the graph archs.
+        ds = ds.map(_parse_scene_graph)
         def _translate_to_compact_with_edges(example):
             example["messages"] = compact_prompt.spine_to_compact_messages(
                 example["conversations"], include_edges=True
@@ -101,6 +129,33 @@ def preprocess_dataset(
         ds = ds.map(_translate_to_compact_with_edges)
     ds = ds.map(_tokenize)
     ds = ds.filter(lambda e: any(m.get("role") == "assistant" for m in e["messages"]))
+
+    # Precompute the graph-token index columns for the graph_acc/* training metric.
+    # These are a static function of each tokenized example, so they're computed
+    # once here (not per-batch in the collator). With right-padding a token's index
+    # is identical in the unpadded example and the padded batch, so plain index
+    # lists suffice — the collator carries them through and the trainer scatters
+    # them into a [B, S] mask.
+    def _add_graph_token_indices(example):
+        sg = example["scene_graph_dict"]
+        names = [n["name"] for n in (sg.get("objects", []) + sg.get("regions", []))]
+        variants = node_token_variants(names, tokenizer)
+        input_ids = example["input_ids"]
+        # `answer_start` is the exact prompt length when the final (assistant) turn is
+        # dropped and the generation prompt re-added — the first answer token index.
+        answer_start = min(
+            len(tokenizer.apply_chat_template(
+                example["messages"][:-1], tokenize=True, add_generation_prompt=True)),
+            len(input_ids))
+        scene_idx, answer_idx = node_index_columns(
+            input_ids, variants,
+            scope_start=find_last_graph_scope(input_ids, tokenizer),
+            answer_start=answer_start)
+        example["scene_node_idx"] = scene_idx
+        example["answer_node_idx"] = answer_idx
+        example["answer_start"] = answer_start
+        return example
+    ds = ds.map(_add_graph_token_indices)
     return ds
 
 
@@ -137,16 +192,43 @@ def remove_edge_list(decoded: str) -> str:
     return decoded
 
 
-class SpineDataCollator(DataCollatorForLanguageModeling):
+class TokenIndexCollator(DataCollatorForLanguageModeling):
+    """Causal-LM collator that carries the precomputed graph-token index columns
+    (``scene_node_idx`` / ``answer_node_idx``) through batching untouched.
+
+    Those columns are static per example (built in ``preprocess_dataset``); with
+    right-padding each token index stays valid in the padded batch, so this collator
+    does NO graph logic — it only keeps the parent ``DataCollatorForLanguageModeling``
+    from trying to tensorize the ragged int lists. Used directly for the plain-``llm``
+    baseline and as the base for ``SpineDataCollator``. The trainer's graph-token
+    accuracy metric reads the two columns and pops them before the model forward.
+    """
+
+    # Non-tensor / bookkeeping columns stripped before the parent pads the batch.
+    _DROP_KEYS = {"conversations", "scene_graph", "scene_graph_dict", "messages",
+                  "text", "full_text", "answer_start"}
+    _PASSTHROUGH_KEYS = ("scene_node_idx", "answer_node_idx")
+
+    def __call__(self, features, return_tensors: Optional[str] = None):
+        passthrough = {
+            k: [f[k] for f in features]
+            for k in self._PASSTHROUGH_KEYS if features and k in features[0]
+        }
+        drop = self._DROP_KEYS | set(self._PASSTHROUGH_KEYS)
+        sanitized = [{k: v for k, v in f.items() if k not in drop} for f in features]
+        batch = super().__call__(sanitized)
+        batch.update(passthrough)
+        return batch
+
+
+class SpineDataCollator(TokenIndexCollator):
     """SPINE scene-graph collator.
 
     Expects ``scene_graph_dict`` to already be parsed in each example
     (by ``preprocess_dataset``).  Converts to PyG graphs, computes
-    injection maps, and batches them alongside the padded token tensors.
+    injection maps, and batches them alongside the padded token tensors —
+    plus the graph-token index pass-through inherited from ``TokenIndexCollator``.
     """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
 
     def _extract_graph(self, example):
         """Build PyG graph and injection map from a preprocessed example."""
@@ -166,24 +248,21 @@ class SpineDataCollator(DataCollatorForLanguageModeling):
         )
         return pyg_graph, injection_map
 
-    _NON_TENSOR_KEYS = {"conversations", "scene_graph", "scene_graph_dict", "messages", "text", "full_text"}
-
     def __call__(self, features, return_tensors: Optional[str] = None):
-        """Attach parsed PyG graphs and injection maps for each example."""
+        """Attach parsed PyG graphs and injection maps for each example.
+
+        Graphs are extracted from the raw features first (they still carry
+        ``scene_graph_dict``); ``TokenIndexCollator`` then strips the non-tensor
+        columns, pads the batch and re-attaches the graph-token index lists.
+        """
         pyg_graphs = []
         injection_maps = []
-        sanitized_examples = []
-
         for example in features:
             pyg_graph, injection_map = self._extract_graph(example)
             pyg_graphs.append(pyg_graph)
             injection_maps.append(injection_map)
 
-            sanitized_examples.append(
-                {k: v for k, v in example.items() if k not in self._NON_TENSOR_KEYS}
-            )
-
-        batch = super().__call__(sanitized_examples)
+        batch = super().__call__(features)
         batch["graphs"] = Batch.from_data_list(pyg_graphs)
         batch["injection_maps"] = injection_maps
         return batch

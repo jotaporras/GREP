@@ -828,54 +828,10 @@ def _gemma_regrade_block(planner_response, eval_sample: EvalSample,
     }
 
 
-def _aggregate_path_metrics(sample_results: List[dict]) -> dict:
-    """Mean M10 path metrics over samples that produced a parseable route."""
-    pms = [r.get("path_metrics") for r in sample_results]
-    pms = [p for p in pms if p and p.get("num_parsed", 0) > 0]
-    if not pms:
-        return {}
-
-    def _mean(key):
-        vals = [p[key] for p in pms if p.get(key) is not None]
-        return (sum(vals) / len(vals)) if vals else None
-
-    def _rate(key):
-        return sum(1 for p in pms if p.get(key)) / len(pms)
-
-    agg = {
-        "edge_validity_rate": _mean("edge_validity_rate"),
-        "nodes_exist_rate": _mean("nodes_exist_rate"),
-        "full_path_valid_rate": _rate("full_path_valid"),
-        "start_goal_ok_rate": _rate("start_goal_ok"),
-        "cost_optimality": _mean("cost_optimality"),
-        "num_with_path": len(pms),
-        # Routes the plan didn't carry but the model stated in its reasoning
-        # (recovered deterministically by regex, no model call).
-        "num_from_reasoning": sum(1 for p in pms if p.get("path_from_reasoning")),
-        # Routes recovered by the Gemma path rescue (regex found none in plan or
-        # reasoning; judge rewrote it in `a -> b -> c` and NetworkX re-graded it).
-        "num_rescued": sum(1 for p in pms if p.get("path_rescued")),
-    }
-    # Only the GREP_GEMMA_REGRADE reading stamps path_source; add this field there
-    # so the original aggregate stays byte-for-byte what a judge-free run writes.
-    if any(p.get("path_source") for p in pms):
-        agg["num_gemma_path"] = sum(1 for p in pms if p.get("path_source") == "gemma_judge")
-    # Deterministic structural aggregates (present when structured tasks ran).
-    structured = [p for p in pms if p.get("structured")]
-    if structured:
-        def _srate(key):
-            return sum(1 for p in structured if p.get(key)) / len(structured)
-        agg.update({
-            "structured_pass_rate": _srate("structured_correct"),
-            "waypoints_ok_rate": _srate("waypoints_ok"),
-            "avoid_ok_rate": _srate("avoid_ok"),
-            "required_edges_rate": _srate("required_edges_present"),
-            "num_structured": len(structured),
-        })
-    judged = [p["llm_judge_pass"] for p in pms if p.get("llm_judge_pass") is not None]
-    if judged:
-        agg["llm_judge_accuracy"] = sum(judged) / len(judged)
-    return agg
+# Canonical aggregation now lives in `path_validator` (model-free) so the offline
+# retro-grader shares one source. Kept under the original private name for the call
+# sites in this module and the eval callback.
+_aggregate_path_metrics = path_validator.aggregate_path_metrics
 
 
 def _is_graph_augmented(model) -> bool:

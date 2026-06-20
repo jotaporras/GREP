@@ -67,13 +67,24 @@ class EvalCallback(TrainerCallback):
         if wandb.run is not None:
             wandb.save(str(log_file), base_path=str(self._eval_log_dir))
 
+        # These three ride under the top-level `eval/` namespace (not `grep/path_`):
+        # `valid_path_rate` (A→B with no hallucinated nodes/edges),
+        # `path_optimality_rate` (emitted hops ÷ shortest hops over valid paths),
+        # `hallucination_rate` (parsed plan nodes absent from the graph).
+        eval_path_keys = ("valid_path_rate", "path_optimality_rate", "hallucination_rate")
         wandb_metrics = {"eval/accuracy": accuracy, "epoch": state.epoch}
         for k, v in path_metrics.items():
-            if v is not None:
+            if v is not None and k not in eval_path_keys:
                 wandb_metrics[f"grep/path_{k}"] = v
+        for k in eval_path_keys:
+            if path_metrics.get(k) is not None:
+                wandb_metrics[f"eval/{k}"] = path_metrics[k]
         wandb.log(wandb_metrics)
         self.metrics = {"eval/accuracy": accuracy}
-        self.metrics.update({f"grep/path_{k}": v for k, v in path_metrics.items() if v is not None})
+        self.metrics.update({f"grep/path_{k}": v for k, v in path_metrics.items()
+                             if v is not None and k not in eval_path_keys})
+        self.metrics.update({f"eval/{k}": path_metrics[k] for k in eval_path_keys
+                             if path_metrics.get(k) is not None})
 
     def on_step_end(self, args, state, control, **kwargs):
         if self._steps_per_interval is None:

@@ -177,6 +177,7 @@ def validate_path(
         "full_path_valid": False,
         "start_goal_ok": False,
         "cost_optimality": None,
+        "hop_optimality": None,
         "path_from_reasoning": from_reasoning,
         "path_rescued": rescued,
     }
@@ -201,6 +202,17 @@ def validate_path(
             result["cost_optimality"] = (emitted / shortest) if shortest > 0 else 1.0
         except (nx.NetworkXNoPath, nx.NodeNotFound):
             result["cost_optimality"] = None
+        # Hop-count optimality: emitted hops ÷ shortest-path HOPS (unweighted BFS),
+        # the route-length analogue of the distance-weighted cost_optimality above.
+        # The shortest length is a unique scalar even when many equally-short paths
+        # exist, so any optimal route scores 1.0. evaluate_sample nulls this for
+        # routes that don't correctly reach the A→B goal (it's only meaningful on a
+        # valid path); here it is computed whenever the emitted walk is edge-valid.
+        try:
+            hops = nx.shortest_path_length(G, parsed[0], parsed[-1])
+            result["hop_optimality"] = (len(pairs) / hops) if hops > 0 else 1.0
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            result["hop_optimality"] = None
     return result
 
 
@@ -601,6 +613,38 @@ def validate_structured(
     return m
 
 
+def _augment_eval_metrics(m: Dict, *, goal: Optional[str]) -> Dict:
+    """Add the eval/* per-sample metrics derived from a FINAL per-sample grade.
+
+    Called at the end of ``evaluate_sample`` (the single per-sample chokepoint) so
+    the fields below see the *post-override* ``start_goal_ok`` — ``validate_structured``
+    relaxes it for a reach-an-object route that legitimately ends one hop past the
+    goal region. Computing them here, not in ``validate_path``, is what makes the
+    reach-an-object case count as valid.
+
+    Adds:
+      * ``path_expected`` — a route is expected: a navigability / reachability task
+        with a resolved ``goal``. Positionality (``kind == "edges"``) and non-path
+        tasks are excluded so they don't dilute ``valid_path_rate``.
+      * ``valid_path_ab`` — starts at start, ends at goal, no hallucinated nodes, no
+        hallucinated edges (``full_path_valid`` AND the final ``start_goal_ok``). Path
+        *constraints* (waypoints / avoid) are intentionally NOT required here.
+      * ``hallucination_rate`` — fraction of parsed plan nodes absent from the graph
+        (``1 - nodes_exist_rate``), for any sample that emitted a route.
+      * ``hop_optimality`` is kept only for valid A→B paths (nulled otherwise): the
+        ratio is meaningless for a route that doesn't correctly reach the goal.
+    """
+    kind = m.get("kind")  # only set for structured tasks
+    m["path_expected"] = bool(goal is not None and kind != "edges")
+    m["hallucination_rate"] = (
+        (1.0 - m.get("nodes_exist_rate", 0.0)) if m.get("num_parsed", 0) > 0 else None)
+    m["valid_path_ab"] = bool(
+        m["path_expected"] and m.get("full_path_valid") and m.get("start_goal_ok"))
+    if not m["valid_path_ab"]:
+        m["hop_optimality"] = None
+    return m
+
+
 def evaluate_sample(
     task: str,
     response_text: str,
@@ -631,7 +675,7 @@ def evaluate_sample(
         structured["structured"] = True
         structured["judge_used"] = False
         structured["llm_judge_pass"] = None
-        return structured
+        return _augment_eval_metrics(structured, goal=structured.get("goal"))
 
     metrics = validate_path(
         response_text, graph_dict, start=init_node, goal=goal, directed=directed,
@@ -647,7 +691,7 @@ def evaluate_sample(
         )
         if should_judge else None
     )
-    return metrics
+    return _augment_eval_metrics(metrics, goal=goal)
 
 
 def gemma_regrade_path_metrics(
@@ -742,3 +786,85 @@ def combine_verdict(
         "false_negative": false_negative,
         "judged": judged,
     }
+
+
+# --------------------------------------------------------------------------
+# Run-level aggregation — the SINGLE source shared by the live eval
+# (``evaluate.py``), the eval callback (``eval/*`` wandb keys) and the offline
+# retro-grader (``apply_judge_to_eval_run.py``). Kept here (model-free module) so
+# the retro-grader can import it without pulling in the model stack.
+# --------------------------------------------------------------------------
+def aggregate_path_metrics(sample_results: List[dict]) -> dict:
+    """Mean M10 path metrics over an eval run's per-sample ``path_metrics``.
+
+    Two metric families with DIFFERENT denominators:
+
+    * **Legacy** (``edge_validity_rate``, ``nodes_exist_rate``, ``full_path_valid_rate``,
+      ``cost_optimality`` …, logged under ``grep/path_*``): averaged ONLY over samples
+      that produced a parseable route (``num_parsed > 0``). Unchanged — byte-identical
+      to what a judge-free live run has always written.
+    * **eval/\\***: computed over the FULL sample list so no-route / wrong-route path
+      samples count as failures (the faithful reading of "valid path rate"):
+        - ``valid_path_rate``      = #valid_path_ab / #path_expected
+        - ``path_optimality_rate`` = mean ``hop_optimality`` over valid A→B paths
+        - ``hallucination_rate``   = mean per-sample hallucination over routed samples
+    """
+    all_pm = [r.get("path_metrics") for r in sample_results]
+    all_pm = [p for p in all_pm if p]
+    pms = [p for p in all_pm if p.get("num_parsed", 0) > 0]
+
+    agg: dict = {}
+    if pms:
+        def _mean(key):
+            vals = [p[key] for p in pms if p.get(key) is not None]
+            return (sum(vals) / len(vals)) if vals else None
+
+        def _rate(key):
+            return sum(1 for p in pms if p.get(key)) / len(pms)
+
+        agg.update({
+            "edge_validity_rate": _mean("edge_validity_rate"),
+            "nodes_exist_rate": _mean("nodes_exist_rate"),
+            "full_path_valid_rate": _rate("full_path_valid"),
+            "start_goal_ok_rate": _rate("start_goal_ok"),
+            "cost_optimality": _mean("cost_optimality"),
+            "num_with_path": len(pms),
+            # Routes the plan didn't carry but the model stated in its reasoning
+            # (recovered deterministically by regex, no model call).
+            "num_from_reasoning": sum(1 for p in pms if p.get("path_from_reasoning")),
+            # Routes recovered by the Gemma path rescue (regex found none in plan or
+            # reasoning; judge rewrote it in `a -> b -> c` and NetworkX re-graded it).
+            "num_rescued": sum(1 for p in pms if p.get("path_rescued")),
+        })
+        # Only the GREP_GEMMA_REGRADE reading stamps path_source; add this field there
+        # so the original aggregate stays byte-for-byte what a judge-free run writes.
+        if any(p.get("path_source") for p in pms):
+            agg["num_gemma_path"] = sum(1 for p in pms if p.get("path_source") == "gemma_judge")
+        # Deterministic structural aggregates (present when structured tasks ran).
+        structured = [p for p in pms if p.get("structured")]
+        if structured:
+            def _srate(key):
+                return sum(1 for p in structured if p.get(key)) / len(structured)
+            agg.update({
+                "structured_pass_rate": _srate("structured_correct"),
+                "waypoints_ok_rate": _srate("waypoints_ok"),
+                "avoid_ok_rate": _srate("avoid_ok"),
+                "required_edges_rate": _srate("required_edges_present"),
+                "num_structured": len(structured),
+            })
+        judged = [p["llm_judge_pass"] for p in pms if p.get("llm_judge_pass") is not None]
+        if judged:
+            agg["llm_judge_accuracy"] = sum(judged) / len(judged)
+
+    # --- eval/* metrics over the FULL list (failures included) -------------------
+    expected = [p for p in all_pm if p.get("path_expected")]
+    if expected:
+        agg["valid_path_rate"] = sum(1 for p in expected if p.get("valid_path_ab")) / len(expected)
+        agg["num_path_expected"] = len(expected)
+    hop = [p["hop_optimality"] for p in all_pm if p.get("hop_optimality") is not None]
+    if hop:
+        agg["path_optimality_rate"] = sum(hop) / len(hop)
+    halluc = [p["hallucination_rate"] for p in all_pm if p.get("hallucination_rate") is not None]
+    if halluc:
+        agg["hallucination_rate"] = sum(halluc) / len(halluc)
+    return agg
