@@ -292,20 +292,19 @@ def eval_model_single_graph(
     graph_sim_cls = _NoToolsGraphSim if _spine_tools_disabled() else graph_sim.GraphSim
     graph_simulation = graph_sim_cls(graph_handler)
 
-    strip_edges = not include_edge_list
     is_gnn = _is_graph_augmented(model)
     if is_gnn:
         client = inference.GraphAugmentedInMemoryLLM(
-            model=model, 
+            model=model,
             tokenizer=tokenizer,
-            strip_edges=strip_edges, 
+            include_edges=include_edge_list,
             permutation=permutation,
         )
     else:
         client = inference.InMemoryLLM(
-            model=model, 
-            tokenizer=tokenizer, 
-            strip_edges=strip_edges,
+            model=model,
+            tokenizer=tokenizer,
+            include_edges=include_edge_list,
         )
 
 

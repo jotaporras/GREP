@@ -45,10 +45,15 @@ def preprocess_dataset(
 
     Applies three transforms in order:
     1. Rename ``conversations`` → ``messages``.
-    2. Translate to the compact format via ``spine_to_compact_messages``: graph
-       archs get the node-only block (GNN supplies edges); the ``llm`` baseline
-       gets the same block WITH edge bullets (``include_edges=True``), since it
-       has no GNN. ``text_edge_list`` no longer gates the LLM text.
+    2. Translate to the compact format via ``spine_to_compact_messages``. The
+       ``text_edge_list`` policy is resolved ONCE into
+       ``include_edges = (text_edge_list == "present")`` and threaded uniformly to
+       every architecture: when present, the LLM-facing scene-graph block carries
+       the ``• Region Edges:`` / ``• Object Edges:`` bullets; when absent, the
+       block lists node names only. For graph archs the GNN still ingests the FULL
+       structural edges (parsed from the ORIGINAL messages by ``_parse_scene_graph``)
+       regardless of this flag — the flag toggles only the LLM-facing text, which
+       is what enables the "PE/mask + text edges" vs "PE/mask only" ablation.
     3. Tokenize with the chat template, keeping ``conversations`` and
        ``messages`` columns for the collator, then filter out examples that
        have no assistant turn.
@@ -97,36 +102,46 @@ def preprocess_dataset(
     
     ds = ds.map(lambda e: {"messages": e["conversations"]})
 
+    # Resolve the edge policy ONCE: `text_edge_list == "present"` is the single
+    # source of truth for whether the LLM-facing scene-graph block carries edge
+    # bullets. It is applied UNIFORMLY to every architecture (construction-time
+    # inclusion — we never build edges then strip them). For graph archs the GNN
+    # still ingests the full structural edges from the ORIGINAL messages below
+    # regardless; this flag toggles only the text the LLM reads.
+    include_edges = (text_edge_list == "present")
+
     is_graph_arch = architecture in ("rpearl_llm", "rpearl_gt_llm", "gt_llm", "graph_mask_llm", "composite_graph_gt")
     if is_graph_arch:
         # Parse the GNN's scene graph from the ORIGINAL messages first, so the
         # compact translation below (which only rewrites the LLM-facing text)
-        # leaves the graph the GNN ingests untouched.
+        # leaves the graph the GNN ingests untouched — the GNN always sees the
+        # full connectivity, independent of `include_edges`.
         ds = ds.map(_parse_scene_graph)
         # Translate the verbose SPINE text to the compact format the LLM is
-        # trained/evaluated on. The compact block already carries node names +
-        # the bracketed edge lists, so `text_edge_list` stripping is moot here.
+        # trained/evaluated on. `include_edges` gates ONLY the LLM-facing edge
+        # bullets here; the GNN keeps the structural edges from `_parse_scene_graph`.
         def _translate_to_compact(example):
-            example["messages"] = compact_prompt.spine_to_compact_messages(example["conversations"])
+            example["messages"] = compact_prompt.spine_to_compact_messages(
+                example["conversations"], include_edges=include_edges
+            )
             return example
         ds = ds.map(_translate_to_compact)
     else:
-        # Plain-LLM baseline: the SAME compact format as the graph archs, but the
-        # scene-graph block carries the edge bullets (`include_edges=True`) since
-        # there is no GNN to supply connectivity — the LLM must read it from text.
-        # `text_edge_list` no longer gates the LLM text: edges are always present
-        # in the compact block.
+        # Plain-LLM baseline: the SAME compact format as the graph archs. With
+        # `include_edges` the scene-graph block carries the edge bullets so the
+        # LLM (which has no GNN) can read connectivity from text; without it the
+        # block lists node names only.
         #
         # Parse the scene graph from the ORIGINAL (verbose) messages first — the LLM
         # ingests no graph, but the node names feed the graph-token-accuracy metric
         # (`graph_acc/*`), so the baseline is comparable to the graph archs.
         ds = ds.map(_parse_scene_graph)
-        def _translate_to_compact_with_edges(example):
+        def _translate_to_compact_llm(example):
             example["messages"] = compact_prompt.spine_to_compact_messages(
-                example["conversations"], include_edges=True
+                example["conversations"], include_edges=include_edges
             )
             return example
-        ds = ds.map(_translate_to_compact_with_edges)
+        ds = ds.map(_translate_to_compact_llm)
     ds = ds.map(_tokenize)
     ds = ds.filter(lambda e: any(m.get("role") == "assistant" for m in e["messages"]))
 

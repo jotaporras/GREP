@@ -85,7 +85,8 @@ def _parse_args() -> argparse.Namespace:
                    help="Physical GPU index (default 0). Use -1 for device_map='auto'.")
     p.add_argument("--text-edge-list", choices=["present", "none"], default=None,
                    help="Override the textual-edge-list mode. Default: read from "
-                        "gnn_config.json for graph-augmented checkpoints, 'present' for plain LLMs.")
+                        "gnn_config.json for graph-augmented checkpoints, train_config.json "
+                        "for plain LLMs. Required if a plain-LLM checkpoint has neither.")
     p.add_argument("--use-icl", choices=["true", "false"], default="true",
                    help="Include SPINE in-context-learning examples in the planner prompt. "
                         "Default: true (matches historical behavior).")
@@ -101,14 +102,50 @@ def _is_gnn_checkpoint(path: str) -> bool:
 
 
 def _resolve_text_edge_list(checkpoint: str, is_gnn: bool, cli_override: str | None) -> str:
+    """Recover the train-time ``text_edge_list`` policy so eval matches training.
+
+    Graph checkpoints round-trip the value via ``gnn_config.json``; plain-LLM
+    checkpoints via ``train_config.json`` (written by ``BaselineSFTTrainer``). We
+    never silently assume ``"present"`` for EITHER kind: a checkpoint trained with
+    ``text_edge_list=none`` would then be evaluated with edge bullets re-added
+    (train/eval mismatch). If the persisted policy is absent and no CLI override
+    is given, fail loud rather than guess.
+
+    NOTE: a checkpoint trained BEFORE this feature was reintroduced recorded
+    ``text_edge_list`` while it had no effect (graph archs were always node-only).
+    Its recorded value can therefore misrepresent how it was trained — pass
+    ``--text-edge-list`` explicitly when re-evaluating such pre-refactor runs.
+    """
     if cli_override is not None:
         return cli_override
-    if not is_gnn:
-        return "present"
-    gnn_cfg_path = os.path.join(checkpoint, "gnn_config.json")
-    with open(gnn_cfg_path) as f:
-        gnn_cfg = json.load(f)
-    return gnn_cfg.get("text_edge_list", "present")
+    if is_gnn:
+        gnn_cfg_path = os.path.join(checkpoint, "gnn_config.json")
+        with open(gnn_cfg_path) as f:
+            gnn_cfg = json.load(f)
+        text_edge_list = gnn_cfg.get("text_edge_list")
+        if text_edge_list is None:
+            raise KeyError(
+                f"{gnn_cfg_path} does not record 'text_edge_list'; pass --text-edge-list "
+                f"present|none explicitly to evaluate this checkpoint."
+            )
+        return text_edge_list
+    train_cfg_path = os.path.join(checkpoint, "train_config.json")
+    if not os.path.exists(train_cfg_path):
+        raise FileNotFoundError(
+            f"{checkpoint} has no train_config.json recording the train-time "
+            f"text_edge_list policy. Cannot infer whether the LLM-facing scene-graph "
+            f"block was trained with edge bullets; pass --text-edge-list present|none "
+            f"explicitly to evaluate this checkpoint."
+        )
+    with open(train_cfg_path) as f:
+        train_cfg = json.load(f)
+    text_edge_list = train_cfg.get("text_edge_list")
+    if text_edge_list is None:
+        raise KeyError(
+            f"{train_cfg_path} does not record 'text_edge_list'; pass --text-edge-list "
+            f"present|none explicitly to evaluate this checkpoint."
+        )
+    return text_edge_list
 
 
 def _load_checkpoint(checkpoint: str, four_bit: bool, device: int):

@@ -106,13 +106,13 @@ def main() -> None:
 
     # --- 1. Training prompt: a real rollout -> compact (system + ICL dropped) -----
     conversation = try_load_json(args.plan_sample)
-    training_messages = format_training_messages(conversation)
+    training_messages = format_training_messages(conversation, include_edges=False)
     _rule(f"TRAINING PROMPT  (from {args.plan_sample.name})")
     _show(training_messages, tokenizer, add_generation_prompt=False)
     _reduction_summary(strip_icl(conversation), training_messages, tokenizer)
 
     # --- 2. Eval prompt: graph + task -> compact (open assistant turn) ------------
-    eval_messages = format_eval_messages(graph_dict, task)
+    eval_messages = format_eval_messages(graph_dict, task, include_edges=False)
     _rule(f"EVAL PROMPT  (from {args.graph_sample.name}, task {args.task_index})")
     _show(eval_messages, tokenizer, add_generation_prompt=True)  # mirrors query_llm
 
@@ -133,7 +133,7 @@ def main() -> None:
         {"role": "user", "content": "updates:[no_updates()]"},
         {"role": "assistant", "content": answer_json("hub_1, mess_hall_1", "hub_1 -> mess_hall_1")},
     ]
-    compact = spine_to_compact_messages(spine_convo)
+    compact = spine_to_compact_messages(spine_convo, include_edges=False)
     _rule("MULTI-TURN SPINE -> COMPACT  (SPINE system + ICL dropped; graph hoisted to system)")
     print(f"  input  roles: [{_roles(spine_convo)}]  ({len(spine_convo)} turns: SPINE system + 1 ICL pair + query + replan loop)")
     print(f"  output roles: [{_roles(compact)}]  ({len(compact)} turns: system(graph) + query + planning continuation)")
@@ -174,7 +174,7 @@ def main() -> None:
 
     # --- 4. Multi-task over ONE graph: graph in system, tasks stacked -------------
     all_tasks = [t["task"] for t in tasks]
-    multi_eval = format_eval_messages(graph_dict, all_tasks)
+    multi_eval = format_eval_messages(graph_dict, all_tasks, include_edges=False)
     roles_e = [m["role"] for m in multi_eval]
     _rule(f"MULTI-TASK EVAL  ({len(all_tasks)} tasks stacked under one shared graph)")
     print(f"  {len(multi_eval)} turns: 1 system(graph) + {roles_e.count('user')} stacked user tasks; "
@@ -186,7 +186,7 @@ def main() -> None:
     rollout_files = sorted(plan_dir.glob(f"sample_{graph_idx}_*.json"))
     if len(rollout_files) > 1:
         rollouts = [try_load_json(p) for p in rollout_files]
-        multi_train = assemble_training_conversation(rollouts)
+        multi_train = assemble_training_conversation(rollouts, include_edges=False)
         roles = [m["role"] for m in multi_train]
         _rule(f"MULTI-TASK TRAINING  ({len(rollout_files)} rollouts, graph {graph_idx}, tasks stacked under one graph)")
         print(f"  {len(multi_train)} turns ({roles.count('system')} system(graph) / {roles.count('user')} user / "
@@ -195,7 +195,7 @@ def main() -> None:
         _reduction_summary([m for r in rollouts for m in strip_icl(r)], multi_train, tokenizer)
 
         # Rendered view: how multiple tasks per graph actually look stacked.
-        few = assemble_training_conversation(rollouts[:3])
+        few = assemble_training_conversation(rollouts[:3], include_edges=False)
         n_tasks = sum(1 for m in few if m["role"] == "user")
         _rule(f"MULTIPLE TASKS PER GRAPH — rendered ({n_tasks} tasks stacked under one shared graph)")
         print(f"  one system(graph) message, then {n_tasks} (user task, assistant answer) pairs in the same conversation:")

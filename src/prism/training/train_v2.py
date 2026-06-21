@@ -392,7 +392,23 @@ class BaselineSFTTrainer(GraphTokenAccuracyMixin, SFTTrainer):
     comparable to the graph architectures. Paired with
     :class:`prism.data.data.TokenIndexCollator`, which carries the precomputed
     graph-token index columns the metric needs.
+
+    Persists a ``train_config.json`` (the plain-LLM analogue of the graph trainer's
+    ``gnn_config.json``) so the standalone eval boundary can recover the train-time
+    ``text_edge_list`` policy. Without it an LLM trained with ``text_edge_list=none``
+    would be silently evaluated with edge bullets re-added (train/eval mismatch).
     """
+
+    def __init__(self, *args, train_config: dict, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.train_config = train_config
+
+    def save_model(self, output_dir=None, _internal_call=False):
+        output_dir = output_dir or self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        with open(os.path.join(output_dir, "train_config.json"), "w") as f:
+            json.dump(self.train_config, f, indent=2)
+        super().save_model(output_dir, _internal_call)
 
 
 # ----------------------------
@@ -1035,6 +1051,11 @@ def train_model(config: TrainConfig, config_file: str = None):
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             args=sft_args,
+            train_config={
+                "architecture": config.architecture,
+                "base_model": config.base_model,
+                "text_edge_list": config.text_edge_list,
+            },
         )
 
     # Log all training config parameters to wandb

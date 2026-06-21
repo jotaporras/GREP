@@ -78,7 +78,7 @@ def main():
     print("=" * 60)
     graph_handler = graph_util.GraphHandler("")
     graph_sim_inst = graph_sim.GraphSim(graph_handler)
-    client = inference.GraphAugmentedInMemoryLLM(model=model, tokenizer=tokenizer)
+    client = inference.GraphAugmentedInMemoryLLM(model=model, tokenizer=tokenizer, include_edges=False)
     llm_planner = spine.SPINE(graph=graph_sim_inst.partial_graph, client=client)
 
     # Reset graph with sample data (same as eval_model loop)

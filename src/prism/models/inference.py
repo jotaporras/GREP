@@ -44,18 +44,24 @@ class InMemoryLLM:
     """SPINE-compatible LLM client for plain (non-graph-augmented) models.
 
     The text the LLM sees is the COMPACT translation (``spine_to_compact_messages``
-    with ``include_edges=True``): the verbose SPINE system prompt and ALL ICL
-    examples are dropped, and the scene graph becomes the compact node block plus
-    ``• Region Edges:`` / ``• Object Edges:`` bullets (there is no GNN, so the
-    edges must be in text). The compact generation is inverse-translated back to a
+    with ``include_edges=self.include_edges``): the verbose SPINE system prompt and
+    ALL ICL examples are dropped, and the scene graph becomes the compact node
+    block, plus the ``• Region Edges:`` / ``• Object Edges:`` bullets when
+    ``include_edges`` is True (the plain LLM has no GNN, so it can only read
+    connectivity from text). The compact generation is inverse-translated back to a
     SPINE-JSON string. Same format as the graph client, minus the GNN pathway.
+    ``include_edges`` is the resolved ``text_edge_list == "present"`` policy and
+    must be passed by the caller (no default — see the eval boundary).
     """
 
-    def __init__(self, model, tokenizer, device=None, strip_edges: bool = False):
+    def __init__(self, model, tokenizer, include_edges: bool):
         self.model = model
         self.tokenizer = tokenizer
-        self.device = device if device is not None else next(model.parameters()).device
-        self.strip_edges = strip_edges
+        # The model uniquely determines its device — no policy to expose, so no
+        # override arg (a `device=None` sentinel would be the prohibited
+        # None-delegates-to-inner-default pattern).
+        self.device = next(model.parameters()).device
+        self.include_edges = include_edges
 
     def format_prompt(self, base_request: str, graph_as_json: str) -> List[Dict]:
         return [{"role": "user", "content": f"task: {base_request}. scene graph {graph_as_json}"}]
@@ -80,11 +86,12 @@ class InMemoryLLM:
         return outputs[:, input_ids.shape[-1]:]
 
     def query_llm(self, msg: List[Dict], max_new_tokens: int = 2048):
-        # Plain-LLM baseline now consumes the SAME compact format as the graph
-        # archs, but WITH edge bullets in the scene-graph block (include_edges=True)
-        # since there is no GNN to supply connectivity — the LLM reads edges from
-        # text. The verbose SPINE system prompt + ICL are dropped by the translator.
-        llm_msg = compact_prompt.spine_to_compact_messages(msg, include_edges=True)
+        # Plain-LLM baseline consumes the SAME compact format as the graph archs.
+        # `self.include_edges` (the resolved `text_edge_list` policy) gates the
+        # edge bullets in the scene-graph block: when present the LLM reads
+        # connectivity from text (it has no GNN); when absent the block lists node
+        # names only. The verbose SPINE system prompt + ICL are dropped by the translator.
+        llm_msg = compact_prompt.spine_to_compact_messages(msg, include_edges=self.include_edges)
         input = self.tokenizer.apply_chat_template(
             llm_msg, tokenize=True, add_generation_prompt=True, return_tensors="pt"
         )
@@ -113,18 +120,21 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
     computes GNN-augmented embeddings, and generates via the LoRA-modified LLM.
     Falls back to plain LLM generation when no graph is found in the prompt.
 
-    The text the LLM sees is the COMPACT translation (``spine_to_compact_messages``):
-    the verbose system prompt and ALL few-shot ICL examples are dropped (the format
-    is learned by SFT, and dropping ICL keeps train/eval symmetric), and the scene
-    graph becomes the compact node/edge block. Graph parsing for the GNN always runs
-    on the ORIGINAL, unmodified message, so the GNN retains complete coords/edges
-    regardless. (``strip_edges`` is now moot for graph models — the compact block
-    always carries the bracketed edge lists.) PE injection operates over the compact
-    input_ids; the model's compact output is inverse-translated back to SPINE JSON.
+    The text the LLM sees is the COMPACT translation (``spine_to_compact_messages``
+    with ``include_edges=self.include_edges``): the verbose system prompt and ALL
+    few-shot ICL examples are dropped (the format is learned by SFT, and dropping
+    ICL keeps train/eval symmetric), and the scene graph becomes the compact node
+    block — plus the ``• Region Edges:`` / ``• Object Edges:`` bullets when
+    ``include_edges`` is True. Graph parsing for the GNN always runs on the
+    ORIGINAL, unmodified message, so the GNN retains the complete structural
+    coords/edges regardless of ``include_edges``; the flag toggles ONLY the
+    LLM-facing text (enabling a "PE + text edges" vs "PE only" ablation). PE
+    injection operates over the compact input_ids; the model's compact output is
+    inverse-translated back to SPINE JSON.
     """
 
-    def __init__(self, model, tokenizer, device=None, strip_edges: bool = False, permutation=None):
-        super().__init__(model, tokenizer, device, strip_edges)
+    def __init__(self, model, tokenizer, include_edges: bool, permutation=None):
+        super().__init__(model, tokenizer, include_edges=include_edges)
         self.permutation = permutation
 
     def _parse_all_pyg_graphs(self, msg: List[Dict]) -> List:
@@ -147,10 +157,11 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
         pyg_graphs = self._parse_all_pyg_graphs(msg)
 
         # Forward-translate the SPINE prompt to the compact text the LLM was
-        # trained on (system dropped; scene graph -> compacted node/edge block;
-        # any prior assistant answers -> <think>…</think> form). The GNN keeps the
-        # original `msg` above, so connectivity is unaffected.
-        llm_msg = compact_prompt.spine_to_compact_messages(msg)
+        # trained on (system dropped; scene graph -> compacted node block, with the
+        # edge bullets iff `self.include_edges`; any prior assistant answers ->
+        # <think>…</think> form). The GNN keeps the original `msg` above and its
+        # full structural edges, so connectivity is unaffected by this flag.
+        llm_msg = compact_prompt.spine_to_compact_messages(msg, include_edges=self.include_edges)
 
         input = self.tokenizer.apply_chat_template(
             llm_msg, tokenize=True, add_generation_prompt=True, return_tensors="pt"

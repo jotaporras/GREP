@@ -166,7 +166,7 @@ COMPACT_SYSTEM_PROMPT_WITH_EDGES = (
 )
 
 
-def _graph_block(graph_dict: dict, include_edges: bool = False) -> str:
+def _graph_block(graph_dict: dict, include_edges: bool) -> str:
     """The scene-graph block, emitted once as a leading system message.
 
     Keeps the ``Scene graph:`` header so it stays the single
@@ -192,7 +192,7 @@ def _graph_block(graph_dict: dict, include_edges: bool = False) -> str:
     return "\n".join(lines)
 
 
-def _system_content(graph_dict: dict, include_edges: bool = False) -> str:
+def _system_content(graph_dict: dict, include_edges: bool) -> str:
     """Leading system-message content: the system prompt + the scene-graph block.
 
     The prompt precedes the ``Scene graph:`` block, so ``find_last_graph_scope``
@@ -208,7 +208,7 @@ def _system_content(graph_dict: dict, include_edges: bool = False) -> str:
 
 
 def build_conversation(
-    graph_dict: dict, turns: List[Dict[str, str]], include_edges: bool = False
+    graph_dict: dict, turns: List[Dict[str, str]], include_edges: bool
 ) -> List[Dict[str, str]]:
     """Assemble a chat ``messages`` list for ONE shared graph.
 
@@ -242,7 +242,7 @@ def build_conversation(
     return messages
 
 
-def format_eval_messages(graph_dict: dict, tasks) -> List[Dict[str, str]]:
+def format_eval_messages(graph_dict: dict, tasks, include_edges: bool) -> List[Dict[str, str]]:
     """Build a compact eval prompt as a chat ``messages`` list (no answers).
 
     ``tasks`` may be a single task string (one ``user`` turn) or a list of task
@@ -258,9 +258,16 @@ def format_eval_messages(graph_dict: dict, tasks) -> List[Dict[str, str]]:
         Scene graph with ``"regions"`` and ``"objects"`` lists of ``{"name": ...}``.
     tasks : str | list[str]
         One task, or several tasks over the one graph.
+    include_edges : bool
+        Whether to write the ``• Region Edges:`` / ``• Object Edges:`` bullets
+        into the scene-graph block (plain-LLM baseline) or omit them
+        (graph-augmented archs, whose GNN supplies connectivity). Required: this
+        is a policy decision the caller must make, never defaulted here.
     """
     task_list = [tasks] if isinstance(tasks, str) else list(tasks)
-    return build_conversation(graph_dict, [{"task": t} for t in task_list])
+    return build_conversation(
+        graph_dict, [{"task": t} for t in task_list], include_edges=include_edges
+    )
 
 
 def append_followup_task(messages: List[Dict[str, str]], task: str) -> List[Dict[str, str]]:
@@ -273,18 +280,22 @@ def append_followup_task(messages: List[Dict[str, str]], task: str) -> List[Dict
     return messages + [{"role": "user", "content": task.strip()}]
 
 
-def format_training_messages(conversation: List[Dict[str, str]]) -> List[Dict[str, str]]:
+def format_training_messages(
+    conversation: List[Dict[str, str]], include_edges: bool
+) -> List[Dict[str, str]]:
     """Build a compact training example (one SPINE rollout) as ``messages``.
 
     ``conversation`` is a logged rollout (``[system] + ICL turns + real task``);
     :func:`assemble_training_conversation` handles the general multi-rollout case.
-    Equivalent to ``assemble_training_conversation([conversation])``.
+    Equivalent to ``assemble_training_conversation([conversation], include_edges)``.
+    ``include_edges`` is a required policy arg threaded straight through (see
+    :func:`assemble_training_conversation`).
     """
-    return assemble_training_conversation([conversation])
+    return assemble_training_conversation([conversation], include_edges=include_edges)
 
 
 def assemble_training_conversation(
-    rollouts: List[List[Dict[str, str]]]
+    rollouts: List[List[Dict[str, str]]], include_edges: bool
 ) -> List[Dict[str, str]]:
     """Merge per-task SPINE rollouts for ONE graph into a multi-task example.
 
@@ -297,6 +308,11 @@ def assemble_training_conversation(
 
     All rollouts must describe the SAME graph; mismatched node sets raise (fail
     loud) so a mixed-graph batch can't silently corrupt the shared graph block.
+
+    ``include_edges`` is a required policy arg passed straight to
+    :func:`build_conversation`: True writes the edge bullets into the shared
+    scene-graph block (plain-LLM baseline), False omits them (graph-augmented
+    archs). It is never defaulted here.
     """
     if not rollouts:
         raise ValueError("assemble_training_conversation requires >= 1 rollout")
@@ -320,7 +336,7 @@ def assemble_training_conversation(
             "task": _extract_task(user_turn["content"]),
             "assistant": _format_assistant(assistant_turn["content"]),
         })
-    return build_conversation(graph_dict, turns)
+    return build_conversation(graph_dict, turns, include_edges=include_edges)
 
 
 def render(messages, tokenizer=None, add_generation_prompt: bool = False) -> str:
@@ -475,7 +491,7 @@ def _compact_user_content(content: str) -> str:
 
 
 def spine_to_compact_messages(
-    messages: List[Dict[str, str]], include_edges: bool = False
+    messages: List[Dict[str, str]], include_edges: bool
 ) -> List[Dict[str, str]]:
     """FORWARD translator: a SPINE ``messages`` list -> compact ``messages``.
 
