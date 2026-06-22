@@ -76,9 +76,17 @@ run_stage() {  # run_stage <yaml> <save_name> [extra train args...]
 }
 
 # ---- Stage 1: SFT (LoRA, PE frozen) ----
-log "===== Stage 1: SFT (LoRA, PE frozen) ====="
-run_stage "$CFG_DIR/stage1.yaml" e9_ms_s1
-STAGE1_DIR=$(resolve_ckpt e9_ms_s1)
+# SKIP_STAGE1=1 reuses an EXISTING Stage-1 checkpoint and jumps straight to Stage 2
+# (e.g. to re-tune Stage 2 without repaying the SFT cost). The checkpoint is located
+# by resolve_ckpt (newest-mtime e9_ms_s1_* glob) UNLESS STAGE1_DIR is set explicitly
+# in the environment — pass STAGE1_DIR=<dir> to pin a specific Stage-1 run.
+if [[ "${SKIP_STAGE1:-0}" == "1" ]]; then
+    log "===== Stage 1: SKIPPED (SKIP_STAGE1=1) — reusing existing checkpoint ====="
+else
+    log "===== Stage 1: SFT (LoRA, PE frozen) ====="
+    run_stage "$CFG_DIR/stage1.yaml" e9_ms_s1
+fi
+STAGE1_DIR=${STAGE1_DIR:-$(resolve_ckpt e9_ms_s1)}
 log "Stage 1 checkpoint: $STAGE1_DIR"
 
 # ---- Stage 2: PE-only on edge-list loss (LLM+adapter frozen) ----
