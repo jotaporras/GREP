@@ -50,6 +50,11 @@
 #   21   e8_gt_llm_no_edges_L5_d4096    gt_llm          none    (L5 GT-WIDTH sweep, d_model=4096, ~519M GT params)
 #   22   e8_llm_zeroshot                llm             present (NO TRAINING: base Gemma zero-shot, edges in prompt)
 #   23   e8_llm_zeroshot_no_edges       llm             none    (NO TRAINING: base Gemma zero-shot, no edges in prompt)
+#   --- gemma-4-31B (dense) base, pe_gain_init=0, loss_target=responses (answer-only loss) ---
+#   24   e8_rpearl_llm_g31b_pegain0             rpearl_llm    present (31B base, zero-init gate, response-only loss)
+#   25   e8_rpearl_llm_g31b_pegain0_no_edges    rpearl_llm    none    (idx24 + edges removed)
+#   26   e8_rpearl_llm_gt_g31b_pegain0          rpearl_gt_llm present (31B base GT, zero-init gate, response-only loss)
+#   27   e8_rpearl_llm_gt_g31b_pegain0_no_edges rpearl_gt_llm none    (idx26 + edges removed)
 #
 # Unique save_names are required: the committed yamls all share name: e8 and the
 # rpearl_*/_no_edges pairs share an architecture, so train_v2 auto-naming would
@@ -103,6 +108,10 @@ CONFIGS=(
     "$CFG_DIR/e8_gt_llm_no_edges_L5_d4096.yaml"
     "$CFG_DIR/e8_llm_zeroshot.yaml"
     "$CFG_DIR/e8_llm_zeroshot_no_edges.yaml"
+    "$CFG_DIR/e8_rpearl_llm_g31b_pegain0.yaml"
+    "$CFG_DIR/e8_rpearl_llm_g31b_pegain0_no_edges.yaml"
+    "$CFG_DIR/e8_rpearl_llm_gt_g31b_pegain0.yaml"
+    "$CFG_DIR/e8_rpearl_llm_gt_g31b_pegain0_no_edges.yaml"
 )
 SAVE_NAMES=(
     e8_llm
@@ -129,6 +138,10 @@ SAVE_NAMES=(
     e8_gt_llm_no_edges_L5_d4096
     e8_llm_zeroshot
     e8_llm_zeroshot_no_edges
+    e8_rpearl_llm_g31b_pegain0
+    e8_rpearl_llm_g31b_pegain0_no_edges
+    e8_rpearl_llm_gt_g31b_pegain0
+    e8_rpearl_llm_gt_g31b_pegain0_no_edges
 )
 
 TASK_ID=${SLURM_ARRAY_TASK_ID:-${1:-${TASK_ID:-0}}}

@@ -1,0 +1,42 @@
+name: e8
+architecture: rpearl_gt_llm
+wandb_project: GREP-PRISM
+wandb_run_name: e8_rpearl_llm_gt_g31b_pegain0_no_edges
+wandb_tag: e8_new_base_models
+checkpoint_dir: outputs/e8_new_base_models
+data: data/revised/gen/nav100_n30_gemma_data/split/formatted_all_new__train.json
+val_data: data/revised/gen/nav100_n30_gemma_data/split/formatted_all_new__val.json
+eval_data: data/revised/gen/nav100_n30_gemma_data/split/test_graphs/data_gen_023.json
+# Dense 31B Gemma (vs 12B in the original e8 set). 4-bit QLoRA to fit one B200.
+base_model: google/gemma-4-31B-it
+bit4: true
+per_device_train_batch_size: 1
+learning_rate: 0.0002
+epochs: 2
+r: 16
+debug: true
+dataset_proportion: 1.0
+max_seq_length: 8192
+# Edges removed from the text — the graph signal must come through the PE alone.
+text_edge_list: none
+# Supervise ONLY the assistant response tokens (template-agnostic masking).
+loss_target: responses
+# Graph Transformer + R-PEARL params
+d_model: 1024
+gt_num_layers: 2
+gt_heads: 8
+pe_hidden_channels: 256
+pe_num_layers: 2
+num_samples: 40
+dropout: 0.1
+k_pe: 2
+k_gt: 2
+eps: 1e-6
+use_layer_norm: true
+freeze_llm: false
+device: -1
+# Zero-init injection gate (g = tanh(0) = 0): at init the forward is identical to
+# the plain LLM (Ψ=0). The PE still trains — tanh'(0)=1 ramps pe_gain off zero on
+# step 0, unlocking the encoder gradient — so this is a clean cold-start, not a
+# starved one.
+pe_gain_init: 0.0
