@@ -26,7 +26,7 @@ eval_epoch_interval: 2.0
 base_model: google/gemma-4-12B-it
 bit4: false
 per_device_train_batch_size: 1
-learning_rate: 0.0002
+learning_rate: 0.005
 # "As long as it takes" — generous; bump or pass --max_steps as needed.
 epochs: 8
 r: 16

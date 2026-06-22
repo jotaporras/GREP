@@ -925,6 +925,33 @@ def _load_pe_weights_into(model, init_pe_from: str, architecture: str) -> None:
     print(f"[multistage] loaded PE weights from {weights_path}")
 
 
+# Multimodal Gemma-4 bases (e.g. google/gemma-4-31B, model_type "gemma4") load as
+# Gemma4ForConditionalGeneration: AutoModelForCausalLM maps "gemma4" to the full
+# conditional-generation model, so the vision_tower and audio_tower come along.
+# Those towers' attention/MLP use Gemma4ClippableLinear wrappers (NOT nn.Linear),
+# which PEFT cannot adapt — and their inner projections share leaf names with the
+# text decoder (q_proj/k_proj/v_proj/o_proj/gate_proj/up_proj/down_proj), so the
+# default target_modules suffix-match hits them and get_peft_model raises
+# "Target module Gemma4ClippableLinear(...) is not supported". We only train the
+# text path, so exclude the towers. The text decoder (Gemma4TextAttention /
+# Gemma4TextMLP) uses plain nn.Linear, so it stays fully adaptable. Text-only and
+# "unified" bases (Llama, gemma-4-12B = gemma4_unified) have no such towers — the
+# regex matches nothing there, leaving their adapters byte-for-byte unchanged.
+_MM_TOWER_KEYS = ("vision_tower", "audio_tower")
+
+
+def _peft_tower_exclude(model) -> "str | None":
+    """Return a PEFT `exclude_modules` regex for a multimodal base, else None.
+
+    Detected from the actual module tree (not the model-id) so it is robust to
+    the LoRA wrapper prefix and to future multimodal variants.
+    """
+    has_tower = any(
+        any(k in name for k in _MM_TOWER_KEYS) for name, _ in model.named_modules()
+    )
+    return r".*(?:" + "|".join(_MM_TOWER_KEYS) + r").*" if has_tower else None
+
+
 def train_model(config: TrainConfig, config_file: str = None):
     os.environ["WANDB_PROJECT"] = config.wandb_project
     os.environ["WANDB_RUN_GROUP"] = config.wandb_tag
@@ -1190,15 +1217,22 @@ def train_model(config: TrainConfig, config_file: str = None):
         eval_dataset = None
         print(f"Using all {len(full_dataset)} samples for training (no validation).")
 
-    # LoRA config (PEFT)
+    # LoRA config (PEFT). For multimodal bases, exclude the vision/audio towers
+    # (their Gemma4ClippableLinear projections are not PEFT-adaptable and share
+    # leaf names with the text decoder); see _peft_tower_exclude.
+    tower_exclude = _peft_tower_exclude(model)
     lora_config = LoraConfig(
         r=config.r,
         lora_alpha=config.lora_alpha,
         lora_dropout=config.lora_dropout,
         bias="none",
         target_modules=config.target_modules,
+        exclude_modules=tower_exclude,
         task_type="CAUSAL_LM",
     )
+    if tower_exclude:
+        print(f"[peft] multimodal base detected — excluding LoRA targets matching "
+              f"{tower_exclude!r} (vision/audio towers)")
 
     # Optimizer choice: use 8-bit AdamW when bitsandbytes is active; else fused AdamW
     optim = "adamw_bnb_8bit" if config.bit4 else "adamw_torch_fused"
