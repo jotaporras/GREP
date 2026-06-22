@@ -1,0 +1,27 @@
+name: e8
+architecture: llm
+wandb_project: GREP-PRISM
+wandb_run_name: e8_llm_zeroshot
+wandb_tag: e8_new_base_models
+checkpoint_dir: outputs/e8_new_base_models
+data: data/revised/gen/nav100_n30_gemma_data/split/formatted_all_new__train.json
+val_data: data/revised/gen/nav100_n30_gemma_data/split/formatted_all_new__val.json
+eval_data: data/revised/gen/nav100_n30_gemma_data/split/test_graphs/data_gen_023.json
+base_model: google/gemma-4-12B-it
+bit4: true
+per_device_train_batch_size: 1
+learning_rate: 0.0002
+epochs: 1
+r: 16
+debug: true
+# ZERO-SHOT BASELINE — no_train skips optimization and evaluates base Gemma as-is,
+# to measure whether the base model can solve the navigation paths out of the box
+# (a fresh LoRA is zero-init -> identity, so the wrapped model == the base model).
+# WITH edges: text_edge_list=present -> the edge list IS written in the prompt.
+# The train/val sets are never used (training is skipped), so dataset_proportion is
+# tiny to avoid pointlessly tokenizing the full corpus; eval_data is unaffected.
+no_train: true
+dataset_proportion: 0.01
+max_seq_length: 8192
+text_edge_list: present
+device: -1
