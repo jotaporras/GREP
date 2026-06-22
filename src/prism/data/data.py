@@ -104,30 +104,70 @@ def edge_list_token_positions(full_text, input_ids, tokenizer):
 def assistant_token_positions(messages, input_ids, tokenizer):
     """Token positions of EVERY assistant turn in a tokenized example.
 
-    Supervised target for ``loss_target='responses'`` (assistant-only loss). For
-    each assistant message ``i`` the span runs from the first generated token —
-    the prompt length of ``messages[:i]`` with the generation prompt re-added —
-    through the end of that turn (prompt length of ``messages[:i+1]``, which
-    includes the turn terminator, so the model learns to stop). Multi-turn-correct:
-    every assistant turn is included, not just the last (this generalizes the
-    ``answer_start`` computation, which is just turn ``i``'s start for the final
-    turn). Template-agnostic — no ``{% generation %}`` template support needed, so
-    it works for Gemma/Qwen/Llama alike.
+    Supervised target for ``loss_target='responses'`` (assistant-only loss).
+    Multi-turn-correct (every assistant turn, not just the last) and
+    template-agnostic — no ``{% generation %}`` template support needed, so it works
+    for Gemma/Qwen/Llama alike.
 
-    Assumes the chat template is prefix-stable (a turn's tokens don't depend on
-    later turns) — the same assumption ``answer_start`` already relies on. Spans
-    are clamped to ``len(input_ids)`` for safety.
+    Anchored on each assistant turn's CONTENT, not on chat-template length
+    arithmetic: ``len(apply_chat_template(messages[:i], ...))`` is NOT a stable token
+    index into the full tokenization (Gemma's template ``| trim``s content and the
+    independent re-render shifts boundaries), which silently truncated the first
+    token(s) of every turn. Instead we locate the content's char span and map it to
+    token indices the same robust way ``edge_list_token_positions`` does:
+
+    * Primary: char span via the fast tokenizer's offset mapping, trusted only when
+      re-encoding reproduces ``input_ids`` exactly.
+    * Fallback: contiguous subsequence match of the content tokens.
+
+    Each span is extended by the immediately following turn-terminator special token
+    (e.g. Gemma ``<end_of_turn>``) so the model still learns to stop, but never into
+    the next turn. A turn whose content can't be located is skipped (the trainer
+    leaves it unmasked rather than masking the wrong tokens). The cumulative
+    ``cursor`` makes repeated content match the correct (later) occurrence.
     """
-    n = len(input_ids)
+    input_ids = list(input_ids)
+    full_text = tokenizer.apply_chat_template(messages, tokenize=False)
+    special = set(getattr(tokenizer, "all_special_ids", []) or [])
+
+    # Primary path: offset mapping, trusted only when the ids round-trip exactly.
+    try:
+        enc = tokenizer(full_text, add_special_tokens=False, return_offsets_mapping=True)
+        offsets = enc["offset_mapping"] if list(enc["input_ids"]) == input_ids else None
+    except Exception:
+        offsets = None
+
     positions = []
-    for i, m in enumerate(messages):
+    cursor = 0
+    for m in messages:
         if m.get("role") != "assistant":
             continue
-        start = len(tokenizer.apply_chat_template(
-            messages[:i], tokenize=True, add_generation_prompt=True, return_dict=False))
-        end = len(tokenizer.apply_chat_template(
-            messages[:i + 1], tokenize=True, return_dict=False))
-        positions.extend(range(min(start, n), min(end, n)))
+        # Templates commonly `| trim` content; match the rendered (stripped) form.
+        content = (m.get("content") or "").strip()
+        if not content:
+            continue
+        cs = full_text.find(content, cursor)
+        if cs == -1:
+            continue
+        ce = cs + len(content)
+        cursor = ce
+
+        if offsets is not None:
+            span = [i for i, (a, b) in enumerate(offsets)
+                    if b > cs and a < ce and input_ids[i] not in special]
+        else:
+            needle = tokenizer(content, add_special_tokens=False)["input_ids"]
+            found = _find_subsequence(input_ids, needle)
+            span = list(range(*found)) if found is not None else []
+        if not span:
+            continue
+
+        # Include the single immediately-following terminator special (turn-end), so
+        # the model learns to stop — but not a run that would reach the next header.
+        end = span[-1] + 1
+        if end < len(input_ids) and input_ids[end] in special:
+            end += 1
+        positions.extend(range(span[0], end))
     return positions
 
 
