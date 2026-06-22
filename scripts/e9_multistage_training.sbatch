@@ -25,14 +25,17 @@
 #   sbatch scripts/e9_multistage_training.sbatch                # stages 1+2
 #   RUN_STAGE3=1 sbatch scripts/e9_multistage_training.sbatch   # all three
 #
-# NOTE: stages run WITHOUT `srun`. This is a single-task, single-GPU job, so the
-# batch step already owns the full allocation (1 GPU / 14 CPUs / 256G) and python
-# sees the GPU via the cgroup + CUDA_VISIBLE_DEVICES that SLURM sets. A nested `srun`
-# here only adds a step-launch CPU-bind negotiation that fails on the shared B200
-# nodes ("Unable to satisfy cpu bind request"), with no upside.
+# Each stage launches exactly like the working e8 pipeline (scripts/train_and_eval.sh):
+# `srun python -m prism.training.train_v2 ...` with SRUN_CPUS_PER_TASK exported
+# (SLURM 22.05+ no longer propagates --cpus-per-task to steps automatically). `srun`
+# is required so the step gets the GPU cgroup/device binding — running python bare
+# leaves the device unbound and CUDA reports "device busy or unavailable".
 
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/..}"
+
+# SLURM 22.05+ no longer propagates --cpus-per-task to srun steps automatically.
+export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-14}"
 
 CFG_DIR=experiments/e9_multistage_training
 PROJECT=${PROJECT:-GREP-PRISM}
@@ -60,7 +63,7 @@ resolve_ckpt() {
 
 run_stage() {  # run_stage <yaml> <save_name> [extra train args...]
     local cfg="$1" save_name="$2"; shift 2
-    local cmd=(python -m prism.training.train_v2 "$cfg"
+    local cmd=(srun python -m prism.training.train_v2 "$cfg"
         --save_name "$save_name"
         --wandb_project "$PROJECT"
         --wandb_run_name "$save_name"
@@ -95,8 +98,8 @@ else
     log "Stages 1+2 done. Inspect Stage-2 eval_logs, then run Stage 3 with:"
     cat <<EOF
 
-  CHECKPOINT_DIR='${CHECKPOINT_DIR}' RUN_STAGE3_ONLY=1 \\
-  python -m prism.training.train_v2 ${CFG_DIR}/stage3.yaml \\
+  CHECKPOINT_DIR='${CHECKPOINT_DIR}' \\
+  srun python -m prism.training.train_v2 ${CFG_DIR}/stage3.yaml \\
       --save_name e9_ms_s3 --wandb_project '${PROJECT}' --wandb_run_name e9_ms_s3 \\
       --wandb_tag '${EXPERIMENT_TAG}' --checkpoint_dir '${CHECKPOINT_DIR}' \\
       --init_lora_from '${STAGE2_DIR}' --init_pe_from '${STAGE2_DIR}'
