@@ -10,16 +10,30 @@ from prism.eval import evaluate
 
 
 class EvalCallback(TrainerCallback):
+    """Periodic train-time eval over one OR MANY held-out graphs.
+
+    ``eval_samples_by_graph`` maps a graph name (file stem) to its list of
+    `EvalSample`s; the callback runs `evaluate.eval_model_multiple_graphs` each
+    interval and reports the sample-weighted micro-average of the per-graph keyword
+    accuracy plus a per-graph breakdown. A single-graph dict reproduces the old
+    single-graph `eval/accuracy` (same objective-keyword metric). Evaluating several
+    graphs keeps the per-epoch signal from being a single-graph fluke (the e9
+    multistage plan wants ~5).
+    """
+
+    # Path-validity keys that ride under the top-level `eval/` namespace.
+    _EVAL_PATH_KEYS = ("valid_path_rate", "path_optimality_rate", "hallucination_rate")
+
     def __init__(
         self,
-        eval_samples,
+        eval_samples_by_graph,
         *,
         tokenizer,
         use_icl: bool,
         include_edge_list: bool,
         eval_epoch_interval: float = 1.0,
     ):
-        self.eval_samples = eval_samples
+        self.eval_samples_by_graph = eval_samples_by_graph
         self.tokenizer = tokenizer
         self.use_icl = use_icl
         self.include_edge_list = include_edge_list
@@ -37,28 +51,38 @@ class EvalCallback(TrainerCallback):
     def _run_eval(self, args, state, **kwargs):
         model = kwargs["model"]
         model.eval()
-        accuracy, sample_results = evaluate.eval_model_single_graph(
+        results = evaluate.eval_model_multiple_graphs(
             model,
             self.tokenizer,
-            self.eval_samples,
+            self.eval_samples_by_graph,
             include_edge_list=self.include_edge_list,
             use_icl=self.use_icl,
             permutation=None,
+            on_graph_done=None,
         )
         model.train()
 
-        # M10 (R4) path-validity metrics over the generate-then-validate samples,
-        # logged alongside the existing keyword accuracy.
-        path_metrics = evaluate._aggregate_path_metrics(sample_results)
+        # Sample-weighted micro-average of the per-graph keyword accuracy (the same
+        # objective-keyword metric as r.accuracy / the old single-graph headline),
+        # and aggregate the M10 (R4) path metrics over the concatenated samples.
+        all_samples = [s for r in results.values() for s in r.samples]
+        num_total = sum(r.num_total for r in results.values())
+        num_correct = sum(round(r.accuracy * r.num_total) for r in results.values())
+        accuracy = (num_correct / num_total) if num_total else 0.0
+        path_metrics = evaluate._aggregate_path_metrics(all_samples)
 
         log_data = {
             "step": state.global_step,
             "epoch": state.epoch,
             "accuracy": accuracy,
-            "num_samples": len(sample_results),
-            "num_correct": sum(r["correct"] for r in sample_results),
+            "num_graphs": len(results),
+            "num_samples": num_total,
+            "num_correct": num_correct,
             "path_metrics": path_metrics,
-            "samples": sample_results,
+            "per_graph": {name: {"accuracy": r.accuracy, "num_correct": r.num_correct,
+                                 "num_total": r.num_total}
+                          for name, r in results.items()},
+            "samples": all_samples,
         }
         log_file = self._eval_log_dir / f"step_{state.global_step:06d}_epoch_{state.epoch:.3f}.json"
         with open(log_file, "w") as f:
@@ -67,23 +91,23 @@ class EvalCallback(TrainerCallback):
         if wandb.run is not None:
             wandb.save(str(log_file), base_path=str(self._eval_log_dir))
 
-        # These three ride under the top-level `eval/` namespace (not `grep/path_`):
-        # `valid_path_rate` (A→B with no hallucinated nodes/edges),
-        # `path_optimality_rate` (emitted hops ÷ shortest hops over valid paths),
-        # `hallucination_rate` (parsed plan nodes absent from the graph).
-        eval_path_keys = ("valid_path_rate", "path_optimality_rate", "hallucination_rate")
+        # `eval/accuracy` is the overall micro-average; per-graph rates ride under
+        # `eval/acc/<stem>`. Path keys: `valid_path_rate`, `path_optimality_rate`,
+        # `hallucination_rate`.
         wandb_metrics = {"eval/accuracy": accuracy, "epoch": state.epoch}
+        for name, r in results.items():
+            wandb_metrics[f"eval/acc/{name}"] = r.accuracy
         for k, v in path_metrics.items():
-            if v is not None and k not in eval_path_keys:
+            if v is not None and k not in self._EVAL_PATH_KEYS:
                 wandb_metrics[f"grep/path_{k}"] = v
-        for k in eval_path_keys:
+        for k in self._EVAL_PATH_KEYS:
             if path_metrics.get(k) is not None:
                 wandb_metrics[f"eval/{k}"] = path_metrics[k]
         wandb.log(wandb_metrics)
         self.metrics = {"eval/accuracy": accuracy}
         self.metrics.update({f"grep/path_{k}": v for k, v in path_metrics.items()
-                             if v is not None and k not in eval_path_keys})
-        self.metrics.update({f"eval/{k}": path_metrics[k] for k in eval_path_keys
+                             if v is not None and k not in self._EVAL_PATH_KEYS})
+        self.metrics.update({f"eval/{k}": path_metrics[k] for k in self._EVAL_PATH_KEYS
                              if path_metrics.get(k) is not None})
 
     def on_step_end(self, args, state, control, **kwargs):

@@ -35,6 +35,102 @@ def node_index_columns(input_ids, node_token_seqs, *, scope_start, answer_start)
     return scene_idx, answer_idx
 
 
+def _find_subsequence(haystack, needle):
+    """First (start, end) index span where `needle` occurs contiguously in `haystack`."""
+    n, m = len(haystack), len(needle)
+    if m == 0 or m > n:
+        return None
+    first = needle[0]
+    for i in range(n - m + 1):
+        if haystack[i] == first and haystack[i:i + m] == needle:
+            return (i, i + m)
+    return None
+
+
+def edge_list_token_positions(full_text, input_ids, tokenizer):
+    """Token positions covering the edge-list bullet block in a tokenized example.
+
+    Locates the ``• Region Edges:`` … ``• Object Edges:`` span (emitted in the
+    leading system message by ``compact_prompt._graph_block`` when edges are
+    present) and returns the ``input_ids`` indices spanning it — the supervised
+    target for the multistage Stage-2 edge-list-reconstruction loss
+    (``loss_target='edge_list'``).
+
+    Primary path: char span via the fast tokenizer's offset mapping, trusted only
+    when re-encoding reproduces the chat-template ids exactly (true for the
+    Gemma/Llama templates, whose special tokens round-trip as literal text).
+    Fallback: contiguous subsequence match of the edge-block tokens. Returns ``[]``
+    if the block can't be located (the trainer then leaves that example unmasked).
+    """
+    try:
+        start_char = full_text.index("• Region Edges:")
+    except ValueError:
+        return []
+    obj = full_text.find("• Object Edges:", start_char)
+    if obj == -1:
+        return []
+    nl = full_text.find("\n", obj)
+    end_char = nl if nl != -1 else len(full_text)
+
+    input_ids = list(input_ids)
+    # The edge bullets are plain text, but the char-span end can spill onto the
+    # chat-template turn terminator (and on Llama the next role-header), which the
+    # tokenizer emits as SPECIAL ids — never part of the edge list. Drop those so
+    # the supervised span is exactly the edge tokens.
+    special = set(getattr(tokenizer, "all_special_ids", []) or [])
+
+    # Primary: offset mapping, trusted only when the ids round-trip exactly.
+    try:
+        enc = tokenizer(full_text, add_special_tokens=False, return_offsets_mapping=True)
+        if list(enc["input_ids"]) == input_ids:
+            return [i for i, (a, b) in enumerate(enc["offset_mapping"])
+                    if b > start_char and a < end_char and enc["input_ids"][i] not in special]
+    except Exception:
+        pass
+
+    # Fallback: locate the edge-block token subsequence directly in input_ids.
+    edge_text = full_text[start_char:end_char]
+    for variant in (edge_text, "\n" + edge_text, " " + edge_text):
+        needle = tokenizer(variant, add_special_tokens=False)["input_ids"]
+        span = _find_subsequence(input_ids, needle)
+        if span is not None:
+            lo, hi = span
+            while hi > lo and input_ids[hi - 1] in special:
+                hi -= 1
+            return list(range(lo, hi))
+    return []
+
+
+def assistant_token_positions(messages, input_ids, tokenizer):
+    """Token positions of EVERY assistant turn in a tokenized example.
+
+    Supervised target for ``loss_target='responses'`` (assistant-only loss). For
+    each assistant message ``i`` the span runs from the first generated token —
+    the prompt length of ``messages[:i]`` with the generation prompt re-added —
+    through the end of that turn (prompt length of ``messages[:i+1]``, which
+    includes the turn terminator, so the model learns to stop). Multi-turn-correct:
+    every assistant turn is included, not just the last (this generalizes the
+    ``answer_start`` computation, which is just turn ``i``'s start for the final
+    turn). Template-agnostic — no ``{% generation %}`` template support needed, so
+    it works for Gemma/Qwen/Llama alike.
+
+    Assumes the chat template is prefix-stable (a turn's tokens don't depend on
+    later turns) — the same assumption ``answer_start`` already relies on. Spans
+    are clamped to ``len(input_ids)`` for safety.
+    """
+    n = len(input_ids)
+    positions = []
+    for i, m in enumerate(messages):
+        if m.get("role") != "assistant":
+            continue
+        start = len(tokenizer.apply_chat_template(
+            messages[:i], tokenize=True, add_generation_prompt=True, return_dict=False))
+        end = len(tokenizer.apply_chat_template(
+            messages[:i + 1], tokenize=True, return_dict=False))
+        positions.extend(range(min(start, n), min(end, n)))
+    return positions
+
+
 def preprocess_dataset(
     ds: datasets.Dataset,
     tokenizer,
@@ -160,7 +256,8 @@ def preprocess_dataset(
         # dropped and the generation prompt re-added — the first answer token index.
         answer_start = min(
             len(tokenizer.apply_chat_template(
-                example["messages"][:-1], tokenize=True, add_generation_prompt=True)),
+                example["messages"][:-1], tokenize=True,
+                add_generation_prompt=True, return_dict=False)),
             len(input_ids))
         scene_idx, answer_idx = node_index_columns(
             input_ids, variants,
@@ -169,6 +266,18 @@ def preprocess_dataset(
         example["scene_node_idx"] = scene_idx
         example["answer_node_idx"] = answer_idx
         example["answer_start"] = answer_start
+        # Supervised-token spans for the masked loss_target modes (carried through
+        # the collator, applied in the trainer's compute_loss):
+        #   assistant_idx  -> loss_target='responses' (assistant-only loss)
+        #   edge_list_idx  -> loss_target='edge_list'  (Stage-2 PE reconstruction)
+        example["assistant_idx"] = assistant_token_positions(
+            example["messages"], input_ids, tokenizer)
+        # Edge bullets only exist in the text when include_edges; empty otherwise.
+        if include_edges:
+            full_text = tokenizer.apply_chat_template(example["messages"], tokenize=False)
+            example["edge_list_idx"] = edge_list_token_positions(full_text, input_ids, tokenizer)
+        else:
+            example["edge_list_idx"] = []
         return example
     ds = ds.map(_add_graph_token_indices)
     return ds
@@ -222,7 +331,7 @@ class TokenIndexCollator(DataCollatorForLanguageModeling):
     # Non-tensor / bookkeeping columns stripped before the parent pads the batch.
     _DROP_KEYS = {"conversations", "scene_graph", "scene_graph_dict", "messages",
                   "text", "full_text", "answer_start"}
-    _PASSTHROUGH_KEYS = ("scene_node_idx", "answer_node_idx")
+    _PASSTHROUGH_KEYS = ("scene_node_idx", "answer_node_idx", "assistant_idx", "edge_list_idx")
 
     def __call__(self, features, return_tensors: Optional[str] = None):
         passthrough = {

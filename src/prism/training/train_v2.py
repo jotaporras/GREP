@@ -27,7 +27,7 @@ from transformers import (
     BitsAndBytesConfig,
     HfArgumentParser,
 )
-from peft import LoraConfig
+from peft import LoraConfig, PeftModel
 from trl import SFTConfig, SFTTrainer, apply_chat_template
 
 
@@ -139,10 +139,85 @@ def _sharegpt_to_messages(example: Dict[str, Any]) -> Optional[List[Dict[str, st
 
 
 
+# loss_target -> the precomputed per-example index column (built in
+# data.preprocess_dataset, carried by the collator) naming the supervised token
+# positions. "all" is absent: no masking, full-sequence next-token loss. Add a new
+# masked objective by precomputing a new column and registering it here — nothing
+# else in compute_loss changes.
+_LOSS_TARGET_COLUMN = {"responses": "assistant_idx", "edge_list": "edge_list_idx"}
+
+
+class LossTargetMixin:
+    """Restricts the next-token loss to a configurable token span (``loss_target``).
+
+    ``all`` (default) trains on the full sequence; ``responses`` on assistant turns
+    (assistant-only loss); ``edge_list`` on the ``• Region/Object Edges:`` bullets.
+    The supervised positions come from per-example index columns
+    (``assistant_idx`` / ``edge_list_idx``) precomputed in ``preprocess_dataset`` and
+    carried by the collator, mapped to ``loss_target`` via ``_LOSS_TARGET_COLUMN``.
+
+    Unlike :class:`GraphTokenAccuracyMixin` (a pure diagnostic), this mixin DOES
+    change the loss/gradients. It is cooperative: it masks ``inputs['labels']`` then
+    defers to ``super().compute_loss``, so it composes with the diagnostic mixin and
+    the base trainer via MRO. Mix it in BEFORE the diagnostic mixin so masking
+    happens before the forward.
+    """
+
+    def _set_loss_target(self, loss_target: str):
+        """Configure the supervised-token span. Call after ``super().__init__``.
+
+        Any masked target (responses / edge_list) supervises a SUBSET of tokens, but
+        HF's token-weighted normalization (``num_items_in_batch``) is computed on the
+        FULL pre-mask batch, so it would under-normalize the summed CE
+        (~seq_len/span, batch-dependent). Disabling the loss-kwargs path makes the LM
+        loss fall back to ``reduction="mean"`` over the kept (non -100) tokens — a
+        correct mean-CE over exactly the supervised span. ``all`` keeps HF's default
+        (numerator and denominator both span the sequence).
+        """
+        self.loss_target = loss_target
+        if loss_target != "all":
+            self.model_accepts_loss_kwargs = False
+
+    def _mask_labels_to_positions(self, inputs, idx_lists, target):
+        """Mask ``inputs['labels']`` to -100 outside the per-example supervised positions.
+
+        ``idx_lists`` is a per-example list of token positions (e.g. assistant_idx /
+        edge_list_idx). If a batch ends up with NO supervised tokens, fall back to its
+        full-sequence labels with a warning (better than a NaN all-masked loss).
+        """
+        labels = inputs["labels"]
+        keep = torch.zeros_like(labels, dtype=torch.bool)
+        for b, idx in enumerate(idx_lists):
+            if not idx or b >= labels.shape[0]:
+                continue
+            pos = torch.as_tensor([p for p in idx if 0 <= p < labels.shape[1]],
+                                  device=labels.device, dtype=torch.long)
+            if pos.numel():
+                keep[b, pos] = True
+        if keep.any():
+            inputs["labels"] = labels.masked_fill(~keep, -100)
+        else:
+            warnings.warn(
+                f"loss_target={target!r} but no supervised tokens located in this "
+                "batch; falling back to full-sequence loss for it.")
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # Pop the mask columns so they never reach the model forward, then restrict
+        # the loss to the configured span ('all' / absent column => no masking).
+        mask_columns = {name: inputs.pop(name, None)
+                        for name in set(_LOSS_TARGET_COLUMN.values())}
+        target = getattr(self, "loss_target", "all")
+        col = _LOSS_TARGET_COLUMN.get(target)
+        if col is not None and mask_columns.get(col) is not None \
+                and inputs.get("labels") is not None:
+            self._mask_labels_to_positions(inputs, mask_columns[col], target)
+        return super().compute_loss(
+            model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch)
+
+
 class GraphTokenAccuracyMixin:
-    """Logs ``graph_acc/scene_block`` and ``graph_acc/answer_nodes`` — teacher-forced
-    next-token accuracy restricted to graph-related tokens. Pure diagnostic: it reads
-    logits but never changes the loss or gradients.
+    """This mixin computes and logs ``graph_acc/scene_block`` and ``graph_acc/answer_nodes`` metrics. teacher-forced
+    next-token accuracy restricted to graph-related tokens.
 
     * ``scene_block`` — tokens in the scene-graph block that name a node (the
       positions the graph PE injects into).
@@ -185,7 +260,6 @@ class GraphTokenAccuracyMixin:
                     self._gta[f"{key}_c"] += int(sel.sum().item())
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        # Pop the pass-through index columns so they're never forwarded to the model.
         scene_idx = inputs.pop("scene_node_idx", None)
         answer_idx = inputs.pop("answer_node_idx", None)
         loss, outputs = super().compute_loss(
@@ -213,10 +287,21 @@ class GraphTokenAccuracyMixin:
         return super().log(logs, *args, **kwargs)
 
 
-class GraphSFTTrainer(GraphTokenAccuracyMixin, SFTTrainer):
-    def __init__(self, *args, gnn_config: dict, **kwargs):
+class GraphSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
+    def __init__(self, *args, gnn_config: dict, freeze_pe: bool = False,
+                 loss_target: str = "all", **kwargs):
         super().__init__(*args, **kwargs)
         self.gnn_config = gnn_config
+        # Multistage controls (see TrainConfig): `freeze_pe` keeps the PE module
+        # frozen for a pure-SFT stage; `loss_target` selects which token span the
+        # next-token loss is computed over (read by GraphTokenAccuracyMixin).
+        self.freeze_pe = freeze_pe
+        self._set_loss_target(loss_target)
+        if freeze_pe:
+            # Stage-1 SFT: leave the PE module exactly at init (do NOT re-enable
+            # the grads PEFT froze). With pe_gain_init=0 the gate is closed, so the
+            # PE is structurally present but inert — only the LoRA adapter trains.
+            return
         # PEFT freezes all non-LoRA parameters. Re-enable gradients for the
         # graph encoder and gate/projection so they actually train.
         if gnn_config.get("architecture") == "composite_graph_gt":
@@ -382,11 +467,16 @@ class GraphSFTTrainer(GraphTokenAccuracyMixin, SFTTrainer):
                 **({'pe_norm': self.model.pe_norm.state_dict()}
                    if self.model.pe_norm is not None else {}),
             }, os.path.join(output_dir, "gnn_weights.pt"))
-        if any(p.requires_grad for p in self.model.llm.parameters()):
+        # Save the LoRA adapter whenever one is attached — including a FROZEN
+        # adapter (multistage Stage 2 trains only the PE but must still persist the
+        # carried-forward Stage-1 adapter so the checkpoint is self-contained and
+        # the next stage / eval loads the SFT'd LLM, not the raw base). The legacy
+        # `freeze_llm: true` PE-only path attaches no adapter, so this is skipped.
+        if getattr(self.model, "peft_config", None) is not None:
             super().save_model(output_dir, _internal_call)
 
 
-class BaselineSFTTrainer(GraphTokenAccuracyMixin, SFTTrainer):
+class BaselineSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
     """Plain-``llm`` baseline trainer. Identical to ``SFTTrainer`` except it logs the
     ``graph_acc/*`` metric (via :class:`GraphTokenAccuracyMixin`) so the baseline is
     comparable to the graph architectures. Paired with
@@ -399,9 +489,10 @@ class BaselineSFTTrainer(GraphTokenAccuracyMixin, SFTTrainer):
     would be silently evaluated with edge bullets re-added (train/eval mismatch).
     """
 
-    def __init__(self, *args, train_config: dict, **kwargs):
+    def __init__(self, *args, train_config: dict, loss_target: str = "all", **kwargs):
         super().__init__(*args, **kwargs)
         self.train_config = train_config
+        self._set_loss_target(loss_target)
 
     def save_model(self, output_dir=None, _internal_call=False):
         output_dir = output_dir or self.args.output_dir
@@ -482,6 +573,14 @@ class TrainConfig:
 
     def __post_init__(self):
         self.eps = float(self.eps)
+        if self.loss_target not in ("all", "responses", "edge_list"):
+            raise ValueError(
+                f"loss_target must be 'all', 'responses', or 'edge_list', "
+                f"got {self.loss_target!r}")
+        if self.loss_target == "edge_list" and self.text_edge_list != "present":
+            raise ValueError(
+                "loss_target='edge_list' requires text_edge_list='present' "
+                "(the edge bullets must be in the text to supervise them).")
     k_gt: int = 3
     text_edge_list: str = "present"   # "present" or "none"
     # Composite-graph params (used when architecture == "composite_graph_gt")
@@ -601,20 +700,60 @@ class TrainConfig:
     # caller's behalf. Historical behavior: True (None used to cascade to
     # SPINE's default of True).
     eval_use_icl: bool = True
+    # --- Multistage training (e9) ----------------------------------------
+    # Weight-only init from a prior stage's checkpoint (NOT HF resume: a fresh
+    # optimizer + epoch budget + freeze regime is built each stage). These carry
+    # the SFT'd LLM and trained PE forward between stages.
+    #   init_lora_from: directory of a saved LoRA adapter (adapter_model.safetensors)
+    #     to attach instead of a fresh zero-init adapter. The rpearl_llm wrapper
+    #     structure is preserved across stages, so no key remap is needed.
+    #   init_pe_from:   directory of a saved gnn_weights.pt whose PE state
+    #     (pe_model/pe_proj/pe_gain/pe_norm) is loaded into the fresh PE module.
+    init_lora_from: Optional[str] = None
+    init_pe_from: Optional[str] = None
+    # Freeze the (carried-forward) LoRA adapter — Stage 2 trains ONLY the PE while
+    # keeping the Stage-1 SFT'd LLM fixed. Distinct from `freeze_llm` (which drops
+    # the adapter entirely and trains the PE on the raw base).
+    freeze_lora: bool = False
+    # Freeze the PE module — Stage 1 SFT trains ONLY the LoRA while the PE stays
+    # inert at init (paired with pe_gain_init=0). See GraphSFTTrainer.__init__.
+    freeze_pe: bool = False
+    # Loss target span — which tokens the next-token loss is computed over:
+    #   "all"       full-sequence (default; historical behavior).
+    #   "responses" assistant turns only (assistant-only SFT). Template-agnostic —
+    #               done via a precomputed assistant_idx span, NOT TRL's
+    #               assistant_only_loss (which is inert here + needs {% generation %}
+    #               markers Gemma's template lacks).
+    #   "edge_list" the `• Region Edges:` / `• Object Edges:` bullets only (Stage 2:
+    #               the PE learns to reconstruct adjacency). Requires
+    #               text_edge_list=present so the edge tokens exist.
+    loss_target: str = "all"
+    # Train-time eval breadth: evaluate the first N graphs resolved from
+    # `eval_data` (a file, directory, or glob) each interval. The plan calls for
+    # ~5 graphs so the per-epoch signal is not a single-graph fluke.
+    eval_num_graphs: int = 5
+    # How often the train-time EvalCallback fires, in epochs (was hardcoded 1.0).
+    # Raise it (e.g. 2.0) for the long Stage-2 PE-only run to bound eval cost.
+    eval_epoch_interval: float = 1.0
 
 
-def _load_eval_samples(eval_data_path: str) -> list:
-    """Load a single-graph eval file as a list of `EvalSample`s.
+def _load_eval_samples_by_graph(eval_data: str, num_graphs: int) -> dict:
+    """Resolve `eval_data` (file, directory, or glob) into `{graph_name: [EvalSample]}`,
+    truncated to the first `num_graphs` graphs (sorted by file stem).
 
-    Used by the train-time periodic `EvalCallback`. For multi-graph
-    post-train eval see `_run_post_train_cross_eval`.
+    Used by the train-time periodic `EvalCallback` and the `no_train` zero-shot
+    baseline so both score the same multi-graph held-out set. A single-file
+    `eval_data` resolves to one graph (back-compatible). `num_graphs <= 0` keeps
+    all resolved graphs.
     """
-    with open(eval_data_path) as f:
-        payload = json.load(f)
-    graph_name = os.path.splitext(os.path.basename(eval_data_path))[0]
-    return evaluate.construct_eval_samples_from_dict(
-        payload["graph"], payload["tasks"], graph_name=graph_name,
-    )
+    samples_by_graph, _ = loading.load_samples_by_graph(eval_data)
+    if num_graphs and num_graphs > 0 and len(samples_by_graph) > num_graphs:
+        kept = list(samples_by_graph.items())[:num_graphs]
+        dropped = len(samples_by_graph) - num_graphs
+        print(f"[eval] capping train-time eval to {num_graphs} of "
+              f"{len(samples_by_graph)} graphs ({dropped} dropped)")
+        samples_by_graph = dict(kept)
+    return samples_by_graph
 
 
 def _run_post_train_cross_eval(model, tokenizer, config: "TrainConfig", output_dir: str) -> None:
@@ -661,9 +800,10 @@ def _run_post_train_cross_eval(model, tokenizer, config: "TrainConfig", output_d
 
 
 def _run_zero_shot_eval(
-    model, tokenizer, config: "TrainConfig", output_dir: str, eval_samples: list
+    model, tokenizer, config: "TrainConfig", output_dir: str, eval_samples_by_graph: dict
 ) -> None:
-    """Evaluate the untrained base model on ``eval_data`` for the ``no_train`` baseline.
+    """Evaluate the untrained base model over the multi-graph eval set for the
+    ``no_train`` baseline.
 
     Mirrors the per-epoch :class:`prism.eval.callbacks.EvalCallback` artifact
     (``eval_logs/step_000000_epoch_0.000.json`` + the ``eval/accuracy`` wandb
@@ -676,33 +816,58 @@ def _run_zero_shot_eval(
     eval_log_dir = os.path.join(output_dir, "eval_logs")
     os.makedirs(eval_log_dir, exist_ok=True)
     model.eval()
-    accuracy, sample_results = evaluate.eval_model_single_graph(
+    results = evaluate.eval_model_multiple_graphs(
         model,
         tokenizer,
-        eval_samples,
+        eval_samples_by_graph,
         include_edge_list=(config.text_edge_list == "present"),
         use_icl=config.eval_use_icl,
         permutation=None,
+        on_graph_done=None,
     )
-    path_metrics = evaluate._aggregate_path_metrics(sample_results)
-    log_data = {
-        "step": 0,
-        "epoch": 0.0,
-        "accuracy": accuracy,
-        "num_samples": len(sample_results),
-        "num_correct": sum(r["correct"] for r in sample_results),
-        "path_metrics": path_metrics,
-        "samples": sample_results,
-    }
+    log_data = _aggregate_multi_graph_eval(results, step=0, epoch=0.0)
     log_file = os.path.join(eval_log_dir, "step_000000_epoch_0.000.json")
     with open(log_file, "w") as f:
         json.dump(log_data, f, indent=2, default=str)
     print(
-        f"[no_train] zero-shot eval/accuracy = {accuracy:.4f} "
-        f"({log_data['num_correct']}/{log_data['num_samples']}) -> {log_file}"
+        f"[no_train] zero-shot eval/accuracy = {log_data['accuracy']:.4f} "
+        f"({log_data['num_correct']}/{log_data['num_samples']}) over "
+        f"{log_data['num_graphs']} graph(s) -> {log_file}"
     )
     if wandb.run is not None:
-        wandb.log({"eval/accuracy": accuracy, "epoch": 0.0})
+        wandb.log({"eval/accuracy": log_data["accuracy"], "epoch": 0.0})
+
+
+def _aggregate_multi_graph_eval(results: dict, *, step: int, epoch: float) -> dict:
+    """Fold per-graph `GraphEvalResultSummary`s into one eval-log payload.
+
+    Overall accuracy is the micro-average of the per-graph keyword rate
+    (`GraphEvalResultSummary.accuracy`) weighted by sample count — Σ(rate·n) / Σn.
+    This is the SAME objective-keyword metric the old single-graph EvalCallback
+    logged as `eval/accuracy` and that the per-graph `eval/acc/<name>` breakdown
+    reports, so the headline reconciles with the breakdown and stays comparable to
+    prior runs. Path metrics are aggregated over the concatenated samples, and a
+    `per_graph` breakdown is kept. Shape matches the old single-graph log apart from
+    the extra `num_graphs` / `per_graph` keys.
+    """
+    all_samples = [s for r in results.values() for s in r.samples]
+    num_total = sum(r.num_total for r in results.values())
+    # Per-graph keyword-correct count = accuracy·n (integer); sum for the headline.
+    num_correct = sum(round(r.accuracy * r.num_total) for r in results.values())
+    accuracy = (num_correct / num_total) if num_total else 0.0
+    return {
+        "step": step,
+        "epoch": epoch,
+        "accuracy": accuracy,
+        "num_graphs": len(results),
+        "num_samples": num_total,
+        "num_correct": num_correct,
+        "path_metrics": evaluate._aggregate_path_metrics(all_samples),
+        "per_graph": {name: {"accuracy": r.accuracy, "num_correct": r.num_correct,
+                             "num_total": r.num_total}
+                      for name, r in results.items()},
+        "samples": all_samples,
+    }
 
 
 def _write_cross_eval_json(
@@ -735,6 +900,31 @@ def _write_cross_eval_json(
 # ----------------------------
 # Training
 # ----------------------------
+def _load_pe_weights_into(model, init_pe_from: str, architecture: str) -> None:
+    """Load a saved PE module (`gnn_weights.pt`) from a prior stage into `model`.
+
+    Mirrors the eval-time reload in `loaders.graph_augmented_llm_from_pretrained`
+    (loaders.py:268-274) but operates on a TRAINING model — no merge, no eval().
+    Carries the Stage-2-trained encoder into Stage 3. Only the rpearl_llm /
+    rpearl_gt_llm PE layouts are wired (the architectures the multistage plan uses).
+    """
+    weights_path = os.path.join(init_pe_from, "gnn_weights.pt")
+    gnn_weights = torch.load(weights_path, map_location="cpu")
+    if architecture == "rpearl_gt_llm":
+        model.pe_model.load_state_dict(gnn_weights["gt_model"], strict=False)
+    elif architecture == "rpearl_llm":
+        model.pe_model.load_state_dict(gnn_weights["pe_model"], strict=False)
+    else:
+        raise NotImplementedError(
+            f"init_pe_from is only wired for rpearl_llm / rpearl_gt_llm, got {architecture!r}")
+    model.pe_proj.load_state_dict(gnn_weights["pe_proj"])
+    if "pe_gain" in gnn_weights:
+        model.pe_gain.data.copy_(gnn_weights["pe_gain"])
+    if getattr(model, "pe_norm", None) is not None and "pe_norm" in gnn_weights:
+        model.pe_norm.load_state_dict(gnn_weights["pe_norm"])
+    print(f"[multistage] loaded PE weights from {weights_path}")
+
+
 def train_model(config: TrainConfig, config_file: str = None):
     os.environ["WANDB_PROJECT"] = config.wandb_project
     os.environ["WANDB_RUN_GROUP"] = config.wandb_tag
@@ -933,6 +1123,32 @@ def train_model(config: TrainConfig, config_file: str = None):
     else:
         raise ValueError(f"Unknown architecture: {config.architecture!r}. Choose 'rpearl_llm', 'rpearl_gt_llm', 'gt_llm', 'graph_mask_llm', 'composite_graph_gt', or 'llm'.")
 
+    # --- Multistage init (e9): weight-only carry-over from a prior stage. -----
+    # PE first (it lives OUTSIDE the LoRA adapter), then attach the carried adapter
+    # in place of a fresh one. Keeping the rpearl_llm wrapper structure identical
+    # across stages keeps the adapter keys identical, so PeftModel.from_pretrained
+    # loads it natively — no remap (the remap in loaders.py exists only because
+    # eval loads the adapter onto a BARE LLM). This is NOT HF resume: a fresh
+    # optimizer / epoch budget / freeze regime is built below each stage.
+    is_graph_arch = config.architecture in (
+        "rpearl_llm", "rpearl_gt_llm", "gt_llm", "graph_mask_llm", "composite_graph_gt")
+    if (config.init_pe_from or config.init_lora_from) and not is_graph_arch:
+        raise ValueError(
+            "init_pe_from / init_lora_from are only supported for graph architectures.")
+    if config.init_pe_from:
+        _load_pe_weights_into(model, config.init_pe_from, config.architecture)
+    attach_existing_adapter = config.init_lora_from is not None
+    if attach_existing_adapter:
+        model = PeftModel.from_pretrained(
+            model, config.init_lora_from, is_trainable=not config.freeze_lora)
+        if config.gradient_checkpointing and not config.freeze_lora:
+            # The fresh-adapter path gets this via TRL's get_peft_model; replicate
+            # it for the pre-attached (trainable) adapter so LoRA gradients flow
+            # back through the frozen base under gradient checkpointing.
+            model.enable_input_require_grads()
+        print(f"[multistage] attached {'frozen' if config.freeze_lora else 'trainable'} "
+              f"LoRA adapter from {config.init_lora_from}")
+
     # Load & optionally downsample data
     full_dataset = datasets.load_dataset("json", data_files=[config.data], split="train")
     if config.debug:
@@ -1086,11 +1302,15 @@ def train_model(config: TrainConfig, config_file: str = None):
             model=model,
             data_collator=collator,
             processing_class=tokenizer,
-            peft_config=lora_config if not config.freeze_llm else None,
+            # No fresh adapter when one was carried forward (it's already attached)
+            # or when freeze_llm requests a PE-only run on the raw base.
+            peft_config=lora_config if (not config.freeze_llm and not attach_existing_adapter) else None,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             args=sft_args,
             gnn_config=gnn_config,
+            freeze_pe=config.freeze_pe,
+            loss_target=config.loss_target,
         )
     else:
         trainer = BaselineSFTTrainer(
@@ -1106,6 +1326,7 @@ def train_model(config: TrainConfig, config_file: str = None):
                 "base_model": config.base_model,
                 "text_edge_list": config.text_edge_list,
             },
+            loss_target=config.loss_target,
         )
 
     # Log all training config parameters to wandb
@@ -1115,13 +1336,13 @@ def train_model(config: TrainConfig, config_file: str = None):
             with open(config_file) as f:
                 wandb.config.update({"_config_yaml": f.read()}, allow_val_change=True)
 
-    eval_samples = _load_eval_samples(config.eval_data)
+    eval_samples_by_graph = _load_eval_samples_by_graph(config.eval_data, config.eval_num_graphs)
     trainer.add_callback(callbacks.EvalCallback(
-        eval_samples,
+        eval_samples_by_graph,
         tokenizer=tokenizer,
         use_icl=config.eval_use_icl,
         include_edge_list=(config.text_edge_list == "present"),
-        eval_epoch_interval=1.0,
+        eval_epoch_interval=config.eval_epoch_interval,
     ))
 
     if config.architecture in ("rpearl_llm", "rpearl_gt_llm", "gt_llm"):
@@ -1149,7 +1370,7 @@ def train_model(config: TrainConfig, config_file: str = None):
     # without a training loop, so the eval is run explicitly here instead).
     if config.no_train:
         print("[no_train] Skipping optimization — evaluating the base model zero-shot.")
-        _run_zero_shot_eval(trainer.model, tokenizer, config, sft_args.output_dir, eval_samples)
+        _run_zero_shot_eval(trainer.model, tokenizer, config, sft_args.output_dir, eval_samples_by_graph)
     else:
         trainer.train()
 
