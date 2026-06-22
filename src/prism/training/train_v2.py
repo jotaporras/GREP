@@ -431,6 +431,11 @@ class TrainConfig:
     wandb_tag: str = "spine"
     epochs: int = 2
     max_steps: int = -1  # If > 0, overrides epochs and switches eval/save to step-based (dev use)
+    # Zero-shot baseline: skip optimization entirely and evaluate the model as-is
+    # (a freshly-initialized LoRA is zero-init -> identity, so the wrapped model
+    # behaves exactly as the base model). Measures out-of-the-box path solving.
+    # Argparse-layer default; never assumed by any library function.
+    no_train: bool = False
     val_frac: float = 0.1
     # LoRA
     lora_alpha: int = 16
@@ -653,6 +658,51 @@ def _run_post_train_cross_eval(model, tokenizer, config: "TrainConfig", output_d
         )
 
     evaluate.print_summary_table(list(results.values()))
+
+
+def _run_zero_shot_eval(
+    model, tokenizer, config: "TrainConfig", output_dir: str, eval_samples: list
+) -> None:
+    """Evaluate the untrained base model on ``eval_data`` for the ``no_train`` baseline.
+
+    Mirrors the per-epoch :class:`prism.eval.callbacks.EvalCallback` artifact
+    (``eval_logs/step_000000_epoch_0.000.json`` + the ``eval/accuracy`` wandb
+    point) so the base model's out-of-the-box score is directly comparable to the
+    trained runs and consumable by the judge-eval skill. ``include_edge_list`` is
+    resolved here from the same ``text_edge_list == "present"`` policy used
+    everywhere else, so the with-/without-edges baselines differ only in the
+    LLM-facing edge text.
+    """
+    eval_log_dir = os.path.join(output_dir, "eval_logs")
+    os.makedirs(eval_log_dir, exist_ok=True)
+    model.eval()
+    accuracy, sample_results = evaluate.eval_model_single_graph(
+        model,
+        tokenizer,
+        eval_samples,
+        include_edge_list=(config.text_edge_list == "present"),
+        use_icl=config.eval_use_icl,
+        permutation=None,
+    )
+    path_metrics = evaluate._aggregate_path_metrics(sample_results)
+    log_data = {
+        "step": 0,
+        "epoch": 0.0,
+        "accuracy": accuracy,
+        "num_samples": len(sample_results),
+        "num_correct": sum(r["correct"] for r in sample_results),
+        "path_metrics": path_metrics,
+        "samples": sample_results,
+    }
+    log_file = os.path.join(eval_log_dir, "step_000000_epoch_0.000.json")
+    with open(log_file, "w") as f:
+        json.dump(log_data, f, indent=2, default=str)
+    print(
+        f"[no_train] zero-shot eval/accuracy = {accuracy:.4f} "
+        f"({log_data['num_correct']}/{log_data['num_samples']}) -> {log_file}"
+    )
+    if wandb.run is not None:
+        wandb.log({"eval/accuracy": accuracy, "epoch": 0.0})
 
 
 def _write_cross_eval_json(
@@ -1094,8 +1144,14 @@ def train_model(config: TrainConfig, config_file: str = None):
         if getattr(config, "lam_c_warmup_steps", 0) > 0 and getattr(config, "c_bias", False):
             trainer.add_callback(callbacks.LamCWarmupCallback(config.lam_c_warmup_steps))
 
-    # Start training
-    trainer.train()
+    # Start training — skipped for the zero-shot `no_train` baseline, which only
+    # evaluates the untrained base model (the per-epoch EvalCallback never fires
+    # without a training loop, so the eval is run explicitly here instead).
+    if config.no_train:
+        print("[no_train] Skipping optimization — evaluating the base model zero-shot.")
+        _run_zero_shot_eval(trainer.model, tokenizer, config, sft_args.output_dir, eval_samples)
+    else:
+        trainer.train()
 
     # Save model artifacts
     trainer.save_model()

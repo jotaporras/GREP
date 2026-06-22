@@ -48,6 +48,8 @@
 #   19   e8_gt_llm_no_edges_L5_d2048    gt_llm          none    (L5 GT-WIDTH sweep, d_model=2048; idx18 is d=1024)
 #   20   e8_gt_llm_no_edges_L5_d3072    gt_llm          none    (L5 GT-WIDTH sweep, d_model=3072)
 #   21   e8_gt_llm_no_edges_L5_d4096    gt_llm          none    (L5 GT-WIDTH sweep, d_model=4096, ~519M GT params)
+#   22   e8_llm_zeroshot                llm             present (NO TRAINING: base Gemma zero-shot, edges in prompt)
+#   23   e8_llm_zeroshot_no_edges       llm             none    (NO TRAINING: base Gemma zero-shot, no edges in prompt)
 #
 # Unique save_names are required: the committed yamls all share name: e8 and the
 # rpearl_*/_no_edges pairs share an architecture, so train_v2 auto-naming would
@@ -99,6 +101,8 @@ CONFIGS=(
     "$CFG_DIR/e8_gt_llm_no_edges_L5_d2048.yaml"
     "$CFG_DIR/e8_gt_llm_no_edges_L5_d3072.yaml"
     "$CFG_DIR/e8_gt_llm_no_edges_L5_d4096.yaml"
+    "$CFG_DIR/e8_llm_zeroshot.yaml"
+    "$CFG_DIR/e8_llm_zeroshot_no_edges.yaml"
 )
 SAVE_NAMES=(
     e8_llm
@@ -123,6 +127,8 @@ SAVE_NAMES=(
     e8_gt_llm_no_edges_L5_d2048
     e8_gt_llm_no_edges_L5_d3072
     e8_gt_llm_no_edges_L5_d4096
+    e8_llm_zeroshot
+    e8_llm_zeroshot_no_edges
 )
 
 TASK_ID=${SLURM_ARRAY_TASK_ID:-${1:-${TASK_ID:-0}}}
