@@ -54,8 +54,8 @@ if _early_args.device >= 0:
     os.environ["CUDA_VISIBLE_DEVICES"] = str(_early_args.device)
 
 
+from prism.data import data
 from prism.eval import evaluate
-from prism.eval import loading
 from prism.models import loaders
 from prism.models import utils as model_utils
 
@@ -281,7 +281,7 @@ def main() -> None:
     checkpoint = os.path.abspath(args.checkpoint.rstrip("/"))
     ckpt_name = os.path.basename(checkpoint)
 
-    samples_by_graph, graph_file_by_name = loading.load_samples_by_graph(args.graphs)
+    samples_by_graph, graph_file_by_name = data.load_samples_by_graph(args.graphs)
 
     is_gnn = _is_gnn_checkpoint(checkpoint)
     text_edge_list = _resolve_text_edge_list(checkpoint, is_gnn, args.text_edge_list)

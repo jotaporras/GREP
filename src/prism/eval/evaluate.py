@@ -1,8 +1,9 @@
-"""Canonical in-memory eval library for PRISM planning eval.
+"""Scoring library for PRISM planning eval.
 
-Callers pass an already-loaded `(model, tokenizer)` and pre-parsed graph/task dicts;
-no I/O, no checkpoint loading. All policy args (`include_edge_list`, `use_icl`, `permutation`)
-are required — no library-level defaults.
+Callers pass an already-loaded `(model, tokenizer)` and pre-parsed graph/task dicts.
+Loading graphs/tasks from disk lives in `prism.data.data.load_samples_by_graph`.
+All policy args (`include_edge_list`, `use_icl`, `permutation`) are required — no
+library-level defaults.
 
 Public surface:
 - `EvalSample`                       — namedtuple `(task, answer, graph, init_node, graph_name)`.

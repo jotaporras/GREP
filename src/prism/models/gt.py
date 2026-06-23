@@ -14,14 +14,10 @@ warnings.filterwarnings("ignore", ".*Sparse CSR tensor support is in beta state.
 
 
 class SparseGraphAttention(nn.Module):
-    """
-    Single-layer sparse graph transformer attention (Eq. 13 of Porras-Valenzuela).
+    """Single-layer sparse graph-transformer attention over k-hop neighborhoods.
 
-    Computes scaled dot-product attention restricted to k-hop neighborhoods.
-
-    Uses manual gather/scatter instead of PyG MessagePassing.propagate to
-    avoid JIT-compiled propagate + autocast bf16 scatter kernel interactions
-    that trigger CUDA device-side assertions on some GPU/driver combinations.
+    Uses manual gather/scatter (not PyG ``MessagePassing.propagate``) to avoid a
+    bf16 autocast scatter-kernel interaction that crashes on some GPUs.
 
     Args:
         d_model (int): Input/output feature dimension
@@ -31,21 +27,16 @@ class SparseGraphAttention(nn.Module):
 
     def __init__(self, d_model: int, heads: int = 4, dropout: float = 0.1):
         super().__init__()
-
-        # Store preliminary information.
         self.heads = heads
         self.head_dim = d_model // heads
         self.d_model = d_model
 
-        # Instantiate this attention layer's query, key, and value matrices.
         self.W_Q = nn.Linear(d_model, d_model, bias=False)
         self.W_K = nn.Linear(d_model, d_model, bias=False)
         self.W_V = nn.Linear(d_model, d_model, bias=False)
-
-        # Register a scale factor for the attention scores.
+        # 1/sqrt(head_dim) attention scale.
         self.register_buffer("scale", torch.tensor(self.head_dim, dtype=torch.float).rsqrt())
 
-        # Register dropout and the output linear map.
         self.dropout: nn.Module = nn.Dropout(dropout)
         self.attn_dropout: nn.Module = SparseCSRDropout(dropout)
         self.W_O = nn.Linear(d_model, d_model, bias=False)
@@ -53,7 +44,6 @@ class SparseGraphAttention(nn.Module):
     def forward(self, x: Tensor, edge_index: Tensor) -> Tensor:
         N = x.shape[0]
 
-        # Gather the query, key, and value projections for input signal x.
         q = self.W_Q(x).view(N, self.heads, self.head_dim).permute(1, 0, 2)
         k = self.W_K(x).view(N, self.heads, self.head_dim).permute(1, 0, 2)
         v = self.W_V(x).view(N, self.heads, self.head_dim).permute(1, 0, 2)
@@ -63,10 +53,7 @@ class SparseGraphAttention(nn.Module):
             indices=edge_index, values=values, size=(N, N)
         ).coalesce().to_sparse_csr()
 
-        # Perform sparse multi-head self-attention.
         out = self._mha_sparse_attention(q, k, v, A)
-
-        # Apply the output projection and dropout.
         out = self.dropout(self.W_O(out))
         return out
 
@@ -89,20 +76,13 @@ class SparseGraphAttention(nn.Module):
 
 
 class _SafeBatchedSparseAttn(torch.autograd.Function):
-    """Per-head sparse attention (memory-bounded).
+    """Per-head sparse attention, memory-bounded.
 
-    Both the forward and backward loop over heads. The previous forward batched
-    all heads into one ``(H*N, H*N)`` block-diagonal ``sampled_addmm``; that
-    materialised H copies of the N×N sparsity pattern (and H times the score
-    nnz), an H-fold memory blow-up that OOMs on the composite graph, where
-    N = token-cycle length ≈ thousands. Looping caps peak memory at a single
-    head's N×N pattern plus one ``[N, F_head]`` fp32 working copy.
-
-    The fp32 cast happens **per head and only for the sparse score op**
-    (``torch.sparse.sampled_addmm`` is fp32-only). The saved tensors keep their
-    original (e.g. bf16) dtype, so the backward stash is half the size of the
-    old fp32 copies, and the dense ``[H, N, F_head]`` features never exist in
-    fp32 all at once.
+    Forward and backward loop over heads so peak memory is one head's N×N sparsity
+    pattern plus one ``[N, F_head]`` fp32 working copy, rather than all H at once
+    (which OOMs on the composite graph, N ≈ thousands). The fp32 cast is per-head
+    and only for the sparse score op (``sampled_addmm`` is fp32-only); saved
+    tensors keep their original (e.g. bf16) dtype.
     """
 
     @staticmethod
@@ -114,11 +94,8 @@ class _SafeBatchedSparseAttn(torch.autograd.Function):
         fp32 score tensor is local and freed when the head finishes.
         """
         N = qi.shape[0]
-        # The sparse ops (sampled_addmm, sparse.mm) are fp32-only. .float() casts
-        # the operands, but a surrounding bf16 autocast (the Graph-Transformer fusion
-        # eval path) would still recast them to bf16 and raise "not implemented for
-        # BFloat16", so
-        # autocast is explicitly disabled for this fp32-only region.
+        # Sparse ops (sampled_addmm, sparse.mm) are fp32-only; disable autocast so a
+        # surrounding bf16 context can't recast the operands and raise on BFloat16.
         with torch.autocast(device_type=qi.device.type, enabled=False):
             unnormalized = torch.sparse.sampled_addmm(
                 input=A_csr_f, mat1=qi.float(), mat2=ki.float().T, beta=0.0
@@ -152,8 +129,7 @@ class _SafeBatchedSparseAttn(torch.autograd.Function):
                     .reshape(N, H * F_head)
                     .to(orig_dtype))
 
-        # Save the original-dtype tensors (half the size of fp32 copies); the
-        # backward recasts per head, mirroring the forward.
+        # Save original-dtype tensors; backward recasts per head, mirroring forward.
         ctx.save_for_backward(QX, KX, VX, A_csr_f, scale)
         ctx.orig_dtype = orig_dtype
         ctx.attn_dropout = attn_dropout
@@ -172,9 +148,8 @@ class _SafeBatchedSparseAttn(torch.autograd.Function):
         grad_KX = torch.zeros_like(KX)
         grad_VX = torch.zeros_like(VX)
 
-        # Per-head backward: recompute the same head attention with grad enabled.
-        # (Sparse autograd on the block-diagonal path is unreliable, so we drive
-        # the gradient through the per-head primitive that the forward also uses.)
+        # Per-head backward: recompute each head's attention with grad enabled,
+        # driving gradients through the same primitive the forward uses.
         for i in range(H):
             with torch.enable_grad():
                 qi = QX[i].detach().float().requires_grad_(True)
@@ -204,8 +179,6 @@ class SparseTransformerBlock(nn.Module):
     def __init__(self, d_model: int, heads: int = 4, dropout: float = 0.1,
                  normalize: bool = True):
         super().__init__()
-
-        # Set up Attention, Dropout, Feed-Forward Network, and LayerNorm layers.
         self.attn = SparseGraphAttention(d_model, heads=heads, dropout=dropout)
         self.dropout: nn.Module = nn.Dropout(dropout)
         self.ffn = nn.Sequential(
@@ -223,9 +196,8 @@ class SparseTransformerBlock(nn.Module):
 
 
     def forward(self, x: Tensor, edge_index: Tensor) -> Tensor:
-        # Compute attention, (optional) norm, FFN, and another (optional) norm.
-        # When self.normalize is False the residual adds carry through unnormalized
-        # so the block preserves magnitude.
+        # Attention + residual, FFN + residual, each with optional LayerNorm
+        # (skipped when normalize=False, leaving the block magnitude-preserving).
         h = self.attn(x, edge_index)
         x = self.norms[0](x + self.dropout(h)) if self.normalize else x + self.dropout(h)
         h = self.ffn(x)
@@ -234,22 +206,17 @@ class SparseTransformerBlock(nn.Module):
 
 
 class GraphTransformer(nn.Module):
-    """
-    Full Graph Transformer with R-PEARL positional encodings.
+    """Full Graph Transformer with R-PEARL positional encodings.
 
     Pipeline: R-PEARL(graph) -> PE ⊕ node_features -> stacked SparseTransformerBlocks -> output
 
-    Graph Transformer fusion (when token embeddings are supplied): node features are
-    ``H0 = X_full + Psi``, where ``X_full`` carries the token embeddings on the
-    directed-cycle (token) nodes and zeros on the scene nodes, and ``Psi`` is the
-    R-PEARL encoding (the transferability-paper form ``X + Psi_G``). No gate lives
-    here — the cold-start gate is applied at the LLM input as
-    ``inputs_embeds = X + gate * Y[V_Tx]``. Only the token-node rows of the output
-    are used downstream.
+    With token embeddings supplied (fusion), node features are ``H0 = X_full + Psi``:
+    ``X_full`` holds the token embeddings on the cycle (token) nodes and zeros on
+    scene nodes, ``Psi`` is the R-PEARL encoding. No gate here — the cold-start gate
+    is applied at the LLM input. Only the token-node output rows are used.
 
-    When token embeddings are omitted the module keeps its legacy behavior — a
-    pure R-PEARL-fed PE generator — so existing ``rpearl_gt_llm`` callers are
-    unaffected.
+    With token embeddings omitted, it falls back to a pure R-PEARL PE generator
+    (the ``rpearl_gt_llm`` path).
 
     Args:
         num_layers (int): Number of transformer blocks.
@@ -281,18 +248,14 @@ class GraphTransformer(nn.Module):
                 f"pe_readout must be 'mean' or 'second_moment', got {pe_readout!r}"
             )
 
-        # Register preliminary information.
         self.k_hops = k_gt
         self.heads = heads
         self.num_layers = num_layers
         self.d_model = d_model
         self.eps = eps
-        # R-PEARL readout fed into the Graph Transformer fusion:
-        #   "mean"          : H0 = X_full + Ψ,  Ψ = E_q[Φ(q)]   (first moment)
-        #   "second_moment" : H0 = seeded + C·seeded, seeded = [X on token ; Ψ on scene],
-        #                     C = E_q[Φ(q)Φ(q)ᵀ] applied over the full composite graph
-        #                     (the proof's circulant c(n-m)); see
-        #                     RandomGNNPositionalEncodings.second_moment_apply.
+        # PE readout used in fusion: "mean" (first moment Ψ) or "second_moment"
+        # (covariance C applied over the composite graph). See forward() for the
+        # exact H0.
         self.pe_readout = pe_readout
 
         # Set up R-PEARL Positional Encoder and Transformer Blocks.
@@ -305,28 +268,21 @@ class GraphTransformer(nn.Module):
             center_second_moment=center_second_moment,
             node_feature_dim=node_feature_dim,
         )
-        # Blocks 0..L-2 keep their LayerNorms (stability through depth); the final
-        # block is norm-free (normalize=False) so the output magnitude survives for
-        # the learnable output gate below.
+        # Final block is norm-free (normalize=False) so its output magnitude
+        # survives for the output gate; earlier blocks keep LayerNorm.
         self.blocks = nn.ModuleList([
             SparseTransformerBlock(
                 d_model, heads=heads, dropout=dropout,
                 normalize=(i < num_layers - 1),
             ) for i in range(num_layers)
         ])
-        # Learnable tanh(g) gate on the GT output: g = tanh(output_gain) ∈ (-1, 1).
-        # Lets the model dial the structural output up or down (toward 0 recovers the
-        # base LLM) instead of pinning it to a fixed scale. Init output_gain=1.0 →
-        # g ≈ 0.76. A single scalar, transferable, saved with gt_model.
+        # Learnable scalar output gate: g = tanh(output_gain) ∈ (-1, 1), init ≈ 0.76.
+        # Lets the model scale the structural output (0 recovers the base LLM).
         self.output_gain = nn.Parameter(torch.tensor(1.0))
 
     @torch.no_grad()
     def _expand_edge_index(self, edge_index: Tensor, num_nodes: int, k_hops: int = 1) -> Tensor:
-        """
-        Expands the edge index to the ≤k-hop neighborhood via sparse (A+I)^k.
-
-        Uses sparse COO matrix power for O(nnz) computation, suitable for
-        graphs with 1,000+ nodes.
+        """Expand the edge index to the ≤k-hop neighborhood via sparse (A+I)^k.
 
         Args:
             edge_index (LongTensor): edge indices [2, E]
@@ -335,12 +291,11 @@ class GraphTransformer(nn.Module):
         """
         k = k_hops if k_hops is not None else self.k_hops
 
-        # Convert edge index to a Sparse Tensor. Build (A + I) so that exponentiation
-        # captures all nodes within k hops, not just nodes reachable in exactly k steps.
+        # (A + I) so the matrix power reaches all nodes within k hops, not only
+        # those reachable in exactly k steps.
         edge_idx_self, _ = add_self_loops(edge_index, num_nodes=num_nodes)
 
-        # Build binary sparse adjacency (A + I) for reachability via repeated
-        # sparse matmul. Binarize after each step so entries stay 0/1.
+        # Binary adjacency; re-binarized after each matmul so entries stay 0/1.
         values = torch.ones(edge_idx_self.shape[1], device=edge_idx_self.device)
         adj = torch.sparse_coo_tensor(
             edge_idx_self, values, (num_nodes, num_nodes)
@@ -356,12 +311,9 @@ class GraphTransformer(nn.Module):
             ).coalesce()
 
         expanded_edge_index = reachable.indices()
-
-        # Return the coalesced edge index.
         return coalesce(expanded_edge_index, num_nodes=num_nodes)
 
     def forward(self, data, token_embeddings=None, is_token=None, permutation=None) -> Tensor:
-        # Move input data to the Graph Transformer's device.
         try:
             device = next(self.parameters()).device
         except StopIteration:
@@ -378,19 +330,14 @@ class GraphTransformer(nn.Module):
         else:
             pe_data = data
 
-        # Graph Transformer input fusion. No gate here — the cold-start gate sits at the LLM input (see
-        # gated_injection.GatedInjection).
-        #   pe_readout="mean"          : H0 = X_full + Ψ, Ψ = E_q[Φ(q)] (first moment;
-        #                                X_full = token embeddings on cycle rows, 0 on scene).
-        #   pe_readout="second_moment" : H0 = seeded + C·seeded, where
-        #                                seeded = [X on token rows ; Ψ_scene on scene rows]
-        #                                and C = E_q[Φ(q)Φ(q)ᵀ] is the relative-position
-        #                                operator (proof's c(n-m)) applied over the entire
-        #                                composite graph (C·seeded = E_q[Φ(Φᵀ seeded)], C
-        #                                never formed). Tokens get the second moment (the
-        #                                first moment collapses on the vertex-transitive
-        #                                cycle); scene rows carry their first-moment PE so
-        #                                scene–scene structure propagates through C.
+        # Input fusion (no gate here — the cold-start gate is at the LLM input):
+        #   "mean":          H0 = X_full + Ψ   (Ψ = first moment; X_full = token
+        #                    embeddings on cycle rows, 0 on scene).
+        #   "second_moment": H0 = seeded + C·seeded, seeded = [X on token rows ;
+        #                    Ψ on scene rows], C = E_q[Φ(q)Φ(q)ᵀ] applied over the
+        #                    composite graph (never formed). Tokens get the second
+        #                    moment (the first collapses on the symmetric cycle);
+        #                    scene rows keep their first-moment PE.
         if token_embeddings is None:
             # Legacy pure-PE-generator path (rpearl_gt_llm): first moment is the PE.
             x = self.pe_model(pe_data)
@@ -418,15 +365,11 @@ class GraphTransformer(nn.Module):
                 data._khop_edge_index = self._expand_edge_index(edge_index, x.size(0))
             khop_edge_index = data._khop_edge_index
 
-        # Run the transformer blocks in the LLM's low-precision dtype when token
-        # embeddings are supplied (the Graph-Transformer fusion path). Training already runs the
-        # GT under a bf16 autocast, but eval/generate has no autocast, so the GT
-        # would otherwise hold the dense [N, 4096] attention/FFN activations in
-        # fp32 — on the composite graph (N = token-cycle length ≈ thousands) that
-        # OOMs. The fp32-only sparse score op casts locally (see
-        # _SafeBatchedSparseAttn._head_attn), so only the dense projections/FFN
-        # drop to bf16. The legacy PE-generator path (token_embeddings is None)
-        # keeps full fp32, unchanged.
+        # In the fusion path, run the blocks in the LLM's low-precision dtype:
+        # eval/generate has no autocast, so the dense [N, d_model] activations would
+        # otherwise sit in fp32 and OOM on the composite graph (N ≈ thousands). The
+        # fp32-only sparse score op still casts locally (see _head_attn). The
+        # PE-generator path (token_embeddings is None) stays fp32.
         amp_dtype = None
         if token_embeddings is not None and token_embeddings.dtype in (torch.float16, torch.bfloat16):
             amp_dtype = token_embeddings.dtype
@@ -440,21 +383,16 @@ class GraphTransformer(nn.Module):
             amp_ctx = contextlib.nullcontext()
 
         with amp_ctx:
-            # Run signal through all Transformer Blocks. During training, activation-
-            # checkpoint each block so its dense [N, d_model] attention/FFN activations
-            # are recomputed in the backward pass instead of all being retained at once
-            # — the GT's dominant training-memory term. use_reentrant=False
-            # preserves RNG state (dropout masks match on recompute) and carries the
-            # autocast dtype into the recomputed forward. At eval (no grad) this is
-            # skipped: checkpoint would only add a recompute with nothing to save.
+            # During training, activation-checkpoint each block so its dense
+            # [N, d_model] activations are recomputed in backward instead of all
+            # retained at once (the GT's dominant memory term). use_reentrant=False
+            # preserves RNG state and the autocast dtype. Skipped at eval (no grad).
             for block in self.blocks:
                 if self.training and torch.is_grad_enabled():
                     x = checkpoint(block, x, khop_edge_index, use_reentrant=False)
                 else:
                     x = block(x, khop_edge_index)
-            # Learnable tanh(g) output gate; the model dials the structural output's
-            # magnitude itself (no ad-hoc embedding-scale matching). No-op shape-wise
-            # when token_embeddings is None.
+            # Learnable output gate (no-op when token_embeddings is None).
             if token_embeddings is not None:
                 x = x * torch.tanh(self.output_gain).to(x.dtype)
         return x

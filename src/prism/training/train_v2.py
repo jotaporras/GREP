@@ -6,7 +6,6 @@ import warnings
 from prism.data import data
 from prism.eval import callbacks
 from prism.eval import evaluate
-from prism.eval import loading
 from prism.models import gnn_llm
 from prism.models import r_pearl as r_pearl_module
 from prism.models import gt as gt_module
@@ -26,6 +25,8 @@ from transformers import (
     AutoTokenizer,
     BitsAndBytesConfig,
     HfArgumentParser,
+    PreTrainedModel,
+    PreTrainedTokenizer,
 )
 from peft import LoraConfig, PeftModel
 from trl import SFTConfig, SFTTrainer
@@ -66,8 +67,11 @@ def _model_short_name(base_model: str) -> str:
     return name
 
 
-def _ensure_pad_tokens(tokenizer, model):
-    # Many chat models use EOS as PAD during training
+def _ensure_pad_tokens(tokenizer: PreTrainedTokenizer, model: PreTrainedModel) -> None:
+    """Ensure tokenizer and model config have a pad token for training.
+
+    Many chat models ship without a dedicated PAD token; we alias EOS instead.
+    """
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     if getattr(model.config, "pad_token_id", None) is None:
@@ -584,29 +588,10 @@ class TrainConfig:
     eval_epoch_interval: float = 1.0
 
 
-def _load_eval_samples_by_graph(eval_data: str, num_graphs: int) -> dict:
-    """Resolve `eval_data` (file, directory, or glob) into `{graph_name: [EvalSample]}`,
-    truncated to the first `num_graphs` graphs (sorted by file stem).
-
-    Used by the train-time periodic `EvalCallback` and the `no_train` zero-shot
-    baseline so both score the same multi-graph held-out set. A single-file
-    `eval_data` resolves to one graph (back-compatible). `num_graphs <= 0` keeps
-    all resolved graphs.
-    """
-    samples_by_graph, _ = loading.load_samples_by_graph(eval_data)
-    if num_graphs and num_graphs > 0 and len(samples_by_graph) > num_graphs:
-        kept = list(samples_by_graph.items())[:num_graphs]
-        dropped = len(samples_by_graph) - num_graphs
-        print(f"[eval] capping train-time eval to {num_graphs} of "
-              f"{len(samples_by_graph)} graphs ({dropped} dropped)")
-        samples_by_graph = dict(kept)
-    return samples_by_graph
-
-
 def _run_post_train_cross_eval(model, tokenizer, config: "TrainConfig", output_dir: str) -> None:
     """Run cross-eval on the in-memory model after training and write per-graph JSONs.
 
-    Disk I/O happens in `loading.load_samples_by_graph`; this function is
+    Disk I/O happens in `data.load_samples_by_graph`; this function is
     pure orchestration: load → eval → write. Output shape matches the old
     `eval_checkpoint_on_graphs.py` (consumed by eval_viewer.html and the
     judge-eval skill).
@@ -615,7 +600,7 @@ def _run_post_train_cross_eval(model, tokenizer, config: "TrainConfig", output_d
     if target is None:
         return
 
-    samples_by_graph, graph_file_by_name = loading.load_samples_by_graph(target)
+    samples_by_graph, graph_file_by_name = data.load_samples_by_graph(target)
 
     is_gnn = config.architecture in ("rpearl_llm", "rpearl_gt_llm", "gt_llm", "graph_mask_llm", "composite_graph_gt")
     architecture = "graph-augmented" if is_gnn else "llm"
@@ -1187,7 +1172,7 @@ def train_model(config: TrainConfig, config_file: str = None):
             with open(config_file) as f:
                 wandb.config.update({"_config_yaml": f.read()}, allow_val_change=True)
 
-    eval_samples_by_graph = _load_eval_samples_by_graph(config.eval_data, config.eval_num_graphs)
+    eval_samples_by_graph = data.load_eval_samples_by_graph(config.eval_data, config.eval_num_graphs)
     trainer.add_callback(callbacks.EvalCallback(
         eval_samples_by_graph,
         tokenizer=tokenizer,

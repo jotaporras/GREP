@@ -1,7 +1,9 @@
 import ast
+import glob
 import json
+import os
 import re
-from typing import Optional, no_type_check
+from typing import Dict, List, Optional, Tuple, no_type_check
 
 import datasets
 from torch_geometric.data import Batch
@@ -9,7 +11,64 @@ from transformers.data.data_collator import DataCollatorForLanguageModeling
 
 from prism.data import compact_prompt
 from prism.data import utils
+from prism.eval import evaluate
 from prism.models.gnn_llm import build_injection_map, find_last_graph_scope, node_token_variants
+
+
+def load_eval_samples_by_graph(eval_data: str, num_graphs: int) -> Dict[str, List[evaluate.EvalSample]]:
+    """Resolve `eval_data` (file, directory, or glob) into `{graph_name: [EvalSample]}`,
+    truncated to the first `num_graphs` graphs (sorted by file stem).
+
+    Used by the train-time periodic `EvalCallback` and the `no_train` zero-shot
+    baseline so both score the same multi-graph held-out set. A single-file
+    `eval_data` resolves to one graph (back-compatible). `num_graphs <= 0` keeps
+    all resolved graphs.
+    """
+    samples_by_graph, _ = load_samples_by_graph(eval_data)
+    if num_graphs and num_graphs > 0 and len(samples_by_graph) > num_graphs:
+        kept = list(samples_by_graph.items())[:num_graphs]
+        dropped = len(samples_by_graph) - num_graphs
+        print(f"[eval] capping train-time eval to {num_graphs} of "
+              f"{len(samples_by_graph)} graphs ({dropped} dropped)")
+        samples_by_graph = dict(kept)
+    return samples_by_graph
+
+
+def load_samples_by_graph(target: str) -> Tuple[Dict[str, List[evaluate.EvalSample]], Dict[str, str]]:
+    """Resolve `target` (file, directory, or glob) and load each graph JSON.
+
+    Returns `(samples_by_graph, graph_file_by_name)`, both keyed by graph file
+    stem (e.g. ``"data_gen_004"``): the per-graph `EvalSample` list ready for
+    `evaluate.eval_model_multiple_graphs`, and the source path of each.
+
+    Raises `SystemExit` if `target` resolves to zero matching files.
+    """
+    graph_files = _resolve_graph_files(target)
+
+    samples_by_graph: Dict[str, List[evaluate.EvalSample]] = {}
+    graph_file_by_name: Dict[str, str] = {}
+    for gf in graph_files:
+        stem = os.path.splitext(os.path.basename(gf))[0]
+        with open(gf) as f:
+            payload = json.load(f)
+        samples_by_graph[stem] = evaluate.construct_eval_samples_from_dict(
+            payload["graph"], payload["tasks"], graph_name=stem,
+        )
+        graph_file_by_name[stem] = gf
+    return samples_by_graph, graph_file_by_name
+
+
+def _resolve_graph_files(target: str) -> List[str]:
+    """Expand `target` (single file, directory of JSONs, or glob) into a sorted list."""
+    if os.path.isdir(target):
+        files = sorted(glob.glob(os.path.join(target, "*.json")))
+    elif any(ch in target for ch in ("*", "?", "[")):
+        files = sorted(glob.glob(target))
+    else:
+        files = [target]
+    if not files:
+        raise SystemExit(f"No graph JSON files found at {target}")
+    return files
 
 
 def node_index_columns(input_ids, node_token_seqs, *, scope_start, answer_start):
