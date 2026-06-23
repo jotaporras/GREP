@@ -75,24 +75,36 @@ run_stage() {  # run_stage <yaml> <save_name> [extra train args...]
     "${cmd[@]}"
 }
 
-# ---- Stage 1: SFT (LoRA, PE frozen) ----
-# SKIP_STAGE1=1 reuses an EXISTING Stage-1 checkpoint and jumps straight to Stage 2
-# (e.g. to re-tune Stage 2 without repaying the SFT cost). The checkpoint is located
-# by resolve_ckpt (newest-mtime e9_ms_s1_* glob) UNLESS STAGE1_DIR is set explicitly
-# in the environment — pass STAGE1_DIR=<dir> to pin a specific Stage-1 run.
-if [[ "${SKIP_STAGE1:-0}" == "1" ]]; then
-    log "===== Stage 1: SKIPPED (SKIP_STAGE1=1) — reusing existing checkpoint ====="
-else
-    log "===== Stage 1: SFT (LoRA, PE frozen) ====="
-    run_stage "$CFG_DIR/stage1.yaml" e9_ms_s1
-fi
-STAGE1_DIR=${STAGE1_DIR:-$(resolve_ckpt e9_ms_s1)}
-log "Stage 1 checkpoint: $STAGE1_DIR"
+# Each stage can be SKIPPED to reuse an existing checkpoint instead of recomputing
+# it (the carried weights are the same either way):
+#   SKIP_STAGE1=1  reuse a Stage-1 checkpoint, start at Stage 2
+#   SKIP_STAGE2=1  reuse a Stage-2 checkpoint, start at Stage 3 (implies skipping 1)
+# Each skipped stage's dir is located by resolve_ckpt (newest-mtime glob) UNLESS
+# pinned explicitly via STAGE1_DIR=<dir> / STAGE2_DIR=<dir>. Skipping Stage 2 also
+# skips Stage 1 (Stage 3 only needs the Stage-2 checkpoint), so STAGE1_DIR is never
+# required in that case.
+SKIP_STAGE2=${SKIP_STAGE2:-0}
+SKIP_STAGE1=${SKIP_STAGE1:-0}
+[[ "$SKIP_STAGE2" == "1" ]] && SKIP_STAGE1=1
 
 # ---- Stage 2: PE-only on edge-list loss (LLM+adapter frozen) ----
-log "===== Stage 2: PE-only (LLM+adapter frozen, edge-list loss) ====="
-run_stage "$CFG_DIR/stage2.yaml" e9_ms_s2 --init_lora_from "$STAGE1_DIR"
-STAGE2_DIR=$(resolve_ckpt e9_ms_s2)
+if [[ "$SKIP_STAGE2" == "1" ]]; then
+    log "===== Stages 1+2: SKIPPED (SKIP_STAGE2=1) — reusing existing Stage-2 checkpoint ====="
+else
+    # ---- Stage 1: SFT (LoRA, PE frozen) ----
+    if [[ "$SKIP_STAGE1" == "1" ]]; then
+        log "===== Stage 1: SKIPPED (SKIP_STAGE1=1) — reusing existing checkpoint ====="
+    else
+        log "===== Stage 1: SFT (LoRA, PE frozen) ====="
+        run_stage "$CFG_DIR/stage1.yaml" e9_ms_s1
+    fi
+    STAGE1_DIR=${STAGE1_DIR:-$(resolve_ckpt e9_ms_s1)}
+    log "Stage 1 checkpoint: $STAGE1_DIR"
+
+    log "===== Stage 2: PE-only (LLM+adapter frozen, edge-list loss) ====="
+    run_stage "$CFG_DIR/stage2.yaml" e9_ms_s2 --init_lora_from "$STAGE1_DIR"
+fi
+STAGE2_DIR=${STAGE2_DIR:-$(resolve_ckpt e9_ms_s2)}
 log "Stage 2 checkpoint: $STAGE2_DIR"
 
 # ---- Stage 3: joint PE+LoRA, edges removed ----
@@ -101,18 +113,17 @@ if [[ "${RUN_STAGE3:-0}" == "1" ]]; then
     run_stage "$CFG_DIR/stage3.yaml" e9_ms_s3 \
         --init_lora_from "$STAGE2_DIR" --init_pe_from "$STAGE2_DIR"
     log "Stage 3 checkpoint: $(resolve_ckpt e9_ms_s3)"
-    log "Done. All three stages complete."
+    log "Done."
 else
-    log "Stages 1+2 done. Inspect Stage-2 eval_logs, then run Stage 3 with:"
+    log "Stage 2 done. Inspect Stage-2 eval_logs, then submit Stage 3 as a batch job:"
     cat <<EOF
 
-  CHECKPOINT_DIR='${CHECKPOINT_DIR}' \\
-  srun python -m prism.training.train_v2 ${CFG_DIR}/stage3.yaml \\
-      --save_name e9_ms_s3 --wandb_project '${PROJECT}' --wandb_run_name e9_ms_s3 \\
-      --wandb_tag '${EXPERIMENT_TAG}' --checkpoint_dir '${CHECKPOINT_DIR}' \\
-      --init_lora_from '${STAGE2_DIR}' --init_pe_from '${STAGE2_DIR}'
+  SKIP_STAGE2=1 RUN_STAGE3=1 \\
+  STAGE2_DIR='${STAGE2_DIR}' \\
+  sbatch scripts/e9_multistage_training.sbatch
 
-  (run that inside an allocation, or re-submit this sbatch with RUN_STAGE3=1 to
-   chain all three in one job.)
+  (Submit as sbatch — NOT a bare srun on the login node, which lands on a CPU
+   partition with no conda env. This reuses the Stage-2 checkpoint above and runs
+   only Stage 3.)
 EOF
 fi
