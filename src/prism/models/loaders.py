@@ -149,8 +149,7 @@ def graph_augmented_llm_from_pretrained(
         if model.pe_norm is not None and "pe_norm" in gnn_weights:
             model.pe_norm.load_state_dict(gnn_weights["pe_norm"])
     elif architecture == "gt_llm":
-        # Pure Graph Transformer over semantic node features (no R-PEARL). Saved via the
-        # generic non-composite path: key 'pe_model' holds the SemanticGraphTransformer.
+        # Pure GT over semantic node features; key 'pe_model' holds the SemanticGraphTransformer.
         pe_model = gt_module.SemanticGraphTransformer(
             node_feature_dim=llm.config.get_text_config().hidden_size,
             d_model=gnn_cfg["d_model"],
@@ -182,7 +181,7 @@ def graph_augmented_llm_from_pretrained(
             use_edges=gnn_cfg.get("mask_use_edges", True),
         )
     elif architecture == "composite_graph_gt":
-        # M9 composite-graph assembly: Graph Transformer (R-PEARL inside) + M7 gate
+        # Composite-graph model: Graph Transformer (R-PEARL inside) + cold-start gate
         # over a RoPE-disabled LLM. Rebuild from gnn_config and load the saved weights.
         gt_model = gt_module.GraphTransformer(
             num_layers=gnn_cfg["gt_num_layers"],
@@ -217,13 +216,8 @@ def graph_augmented_llm_from_pretrained(
         )
         if (gnn_cfg.get("pe_qk_injection", False) or gnn_cfg.get("c_per_layer", False)
                 or gnn_cfg.get("c_bias", False)):
-            # In-attention injection in place of RoPE (disable_llm_rope from
-            # composite_kwargs). Variants on the same patched-attention hook:
-            #   pe_qk_injection: dedicated W_q/W_k/W_v ADD the GT code at every layer;
-            #   c_per_layer:     C_tok REPLACES q/k at every layer (q ← C_tok·q);
-            #   c_bias (Design D): NO q/k transform — C_tok is an ADDITIVE logit bias
-            #                    (+ S̃) and a residual value mix; position = c(t−u).
-            # inputs_embeds is the M7 gated blend in all.
+            # In-attention injection variants: pe_qk_injection adds GT code to q/k/v;
+            # c_per_layer replaces q/k; c_bias (Design D) is an additive logit bias.
             model = gnn_llm.InjectedCompositeGraphLLM(
                 llm, gt_model, d_model=gnn_cfg["d_model"],
                 inject_v=gnn_cfg.get("pe_inject_v", True),

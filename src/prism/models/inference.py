@@ -18,14 +18,10 @@ from prism.models.gnn_llm import (
 
 
 def _core_graph_model(model):
-    """Peel PEFT wrappers to the CompositeGraphLLM / GraphAugmentedLLM core.
+    """Peel PEFT wrappers to reach the CompositeGraphLLM / GraphAugmentedLLM / GraphMaskLLM core.
 
-    The eval model is loaded PEFT-wrapped (PeftModel -> LoraModel -> graph model),
-    so ``isinstance(model, CompositeGraphLLM)`` is False on the wrapper and the
-    wrong injection branch runs (then fails on a missing ``pe_proj``). Unwrap to
-    the underlying graph model first. The LoRA adapters live inside the graph
-    model's ``.llm`` submodule (PEFT patches it in place), so calling the core's
-    methods/``.llm`` still runs the adapted LLM.
+    PEFT-wrapped models fail isinstance checks; unwrapping ensures the correct injection branch runs.
+    LoRA adapters remain live inside the graph model's .llm (PEFT patches it in place).
     """
     inner = model
     for _ in range(5):
@@ -43,23 +39,14 @@ def _core_graph_model(model):
 class InMemoryLLM:
     """SPINE-compatible LLM client for plain (non-graph-augmented) models.
 
-    The text the LLM sees is the COMPACT translation (``spine_to_compact_messages``
-    with ``include_edges=self.include_edges``): the verbose SPINE system prompt and
-    ALL ICL examples are dropped, and the scene graph becomes the compact node
-    block, plus the ``• Region Edges:`` / ``• Object Edges:`` bullets when
-    ``include_edges`` is True (the plain LLM has no GNN, so it can only read
-    connectivity from text). The compact generation is inverse-translated back to a
-    SPINE-JSON string. Same format as the graph client, minus the GNN pathway.
-    ``include_edges`` is the resolved ``text_edge_list == "present"`` policy and
-    must be passed by the caller (no default — see the eval boundary).
+    Uses the compact prompt translation (SPINE system prompt + ICL dropped; scene graph
+    compacted; edge bullets present iff ``include_edges``). Compact output is
+    inverse-translated back to SPINE JSON.
     """
 
     def __init__(self, model, tokenizer, include_edges: bool):
         self.model = model
         self.tokenizer = tokenizer
-        # The model uniquely determines its device — no policy to expose, so no
-        # override arg (a `device=None` sentinel would be the prohibited
-        # None-delegates-to-inner-default pattern).
         self.device = next(model.parameters()).device
         self.include_edges = include_edges
 
@@ -67,10 +54,7 @@ class InMemoryLLM:
         return [{"role": "user", "content": f"task: {base_request}. scene graph {graph_as_json}"}]
 
     def _decode(self, outputs) -> str:
-        # clean_up_tokenization_spaces=False: the cleanup step is a WordPiece
-        # post-process that is destructive for BPE (Llama) — it strips spaces
-        # before punctuation and corrupts the generated plan text. Off here also
-        # silences the transformers warning.
+        # clean_up_tokenization_spaces=False: WordPiece post-process corrupts BPE (Llama) plan text.
         return self.tokenizer.batch_decode(
             outputs, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )[0].strip()
@@ -86,11 +70,6 @@ class InMemoryLLM:
         return outputs[:, input_ids.shape[-1]:]
 
     def query_llm(self, msg: List[Dict], max_new_tokens: int = 2048):
-        # Plain-LLM baseline consumes the SAME compact format as the graph archs.
-        # `self.include_edges` (the resolved `text_edge_list` policy) gates the
-        # edge bullets in the scene-graph block: when present the LLM reads
-        # connectivity from text (it has no GNN); when absent the block lists node
-        # names only. The verbose SPINE system prompt + ICL are dropped by the translator.
         llm_msg = compact_prompt.spine_to_compact_messages(msg, include_edges=self.include_edges)
         input = self.tokenizer.apply_chat_template(
             llm_msg, tokenize=True, add_generation_prompt=True, return_tensors="pt"
@@ -105,32 +84,18 @@ class InMemoryLLM:
 
         compact_response = self._decode(outputs)
         print(f"[spine-llm] raw_output (first 500 chars): {compact_response[:500]}")
-        # Inverse-translate the compact generation back to a SPINE-JSON string so
-        # SPINE's parser (`try_parse`) + grader consume it unchanged (mirrors the
-        # graph client). The model is now trained to emit the compact <think>…</think>
-        # plan form, so the raw output is compact, not SPINE JSON.
+        # Inverse-translate compact output back to SPINE JSON for SPINE's parser and grader.
         planner_response = compact_prompt.compact_output_to_spine_json(compact_response)
         return planner_response, True
 
 
 class GraphAugmentedInMemoryLLM(InMemoryLLM):
-    """SPINE-compatible LLM client that runs full GraphAugmentedLLM (GNN + LoRA) inference.
+    """SPINE-compatible client for GraphAugmentedLLM / CompositeGraphLLM inference.
 
-    Parses the scene graph from the SPINE prompt text, builds a PyG graph,
-    computes GNN-augmented embeddings, and generates via the LoRA-modified LLM.
-    Falls back to plain LLM generation when no graph is found in the prompt.
-
-    The text the LLM sees is the COMPACT translation (``spine_to_compact_messages``
-    with ``include_edges=self.include_edges``): the verbose system prompt and ALL
-    few-shot ICL examples are dropped (the format is learned by SFT, and dropping
-    ICL keeps train/eval symmetric), and the scene graph becomes the compact node
-    block — plus the ``• Region Edges:`` / ``• Object Edges:`` bullets when
-    ``include_edges`` is True. Graph parsing for the GNN always runs on the
-    ORIGINAL, unmodified message, so the GNN retains the complete structural
-    coords/edges regardless of ``include_edges``; the flag toggles ONLY the
-    LLM-facing text (enabling a "PE + text edges" vs "PE only" ablation). PE
-    injection operates over the compact input_ids; the model's compact output is
-    inverse-translated back to SPINE JSON.
+    GNN always parses the ORIGINAL message for full structural edges; ``include_edges``
+    toggles only the LLM-facing text (enabling "PE + text edges" vs "PE only" ablation).
+    Compact output is inverse-translated back to SPINE JSON. Falls back to plain LLM
+    generation when no graph is found in the prompt.
     """
 
     def __init__(self, model, tokenizer, include_edges: bool, permutation=None):
@@ -152,15 +117,8 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
         return graphs
 
     def query_llm(self, msg: List[Dict], max_new_tokens: int = 2048):
-        # Always parse PyG graphs from the ORIGINAL message so the GNN has full
-        # connectivity (coords + edges) regardless of the compact text below.
+        # Parse PyG graphs from ORIGINAL message (full connectivity, unaffected by include_edges).
         pyg_graphs = self._parse_all_pyg_graphs(msg)
-
-        # Forward-translate the SPINE prompt to the compact text the LLM was
-        # trained on (system dropped; scene graph -> compacted node block, with the
-        # edge bullets iff `self.include_edges`; any prior assistant answers ->
-        # <think>…</think> form). The GNN keeps the original `msg` above and its
-        # full structural edges, so connectivity is unaffected by this flag.
         llm_msg = compact_prompt.spine_to_compact_messages(msg, include_edges=self.include_edges)
 
         input = self.tokenizer.apply_chat_template(
@@ -176,8 +134,7 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
 
         compact_response = self._decode(outputs)
         print(f"[spine-llm] raw_output (first 500 chars): {compact_response[:500]}")
-        # Inverse-translate the compact generation back to a SPINE-JSON string so
-        # SPINE's parser (`try_parse`) and the grader consume it unchanged.
+        # Inverse-translate compact output back to SPINE JSON.
         planner_response = compact_prompt.compact_output_to_spine_json(compact_response)
         return planner_response, True
 
@@ -210,19 +167,14 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
         # Standalone + space-preceded tokenizations per node (100% injection).
         node_token_seqs = node_token_variants(pyg_graph.node_names, self.tokenizer)
 
-        # Scope injection to the last (query) graph block: only token positions
-        # at/after the final "scene graph:" marker are eligible. Otherwise the
-        # query graph's node labels would also match identical strings inside
-        # earlier ICL-example graphs and inject PE into the wrong regions.
+        # Scope to last (query) graph block; prevents ICL-example nodes from matching query labels.
         scope_start = find_last_graph_scope(input_ids_list, self.tokenizer)
         print(f"[spine-llm] injection scope_start={scope_start} / {len(input_ids_list)} tokens")
 
         injection_map = build_injection_map(input_ids_list, node_token_seqs, scope_start=scope_start)
 
         if isinstance(graph_model, GraphMaskLLM):
-            # Parameter-free structural mask: build the [1, 1, seq, seq] additive adjacency
-            # bias, arm it on the wrapper (the patched attention reads it during prefill;
-            # cached decode steps skip via the shape guard), and generate from input_ids.
+            # Build and arm [1, 1, seq, seq] additive adjacency bias; cleared in finally.
             graph_model._struct_bias = graph_model.build_structural_mask(
                 input_ids.shape[1], [pyg_graph], [injection_map], input_ids.device)
             try:
@@ -236,19 +188,14 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
                 graph_model._struct_bias = None
 
         if isinstance(graph_model, InjectedCompositeGraphLLM):
-            # e-u-aligned variant: the GT code is added post-RoPE into q/k/v inside
-            # every attention layer (prepare_generation arms self._pe_signal and returns
-            # the plain X embeddings). Injection auto-skips cached decode steps, so only
-            # the prompt carries it; generated tokens ride on RoPE. Disarm afterwards.
+            # GT code injected post-RoPE into q/k/v per layer via prepare_generation.
+            # Injection skips cached decode steps (prompt only); disarmed in finally.
             inputs_embeds = graph_model.prepare_generation(
                 input_ids, [pyg_graph], [injection_map], permutation=self.permutation)
             hook_handle = None
             try:
-                # Decode-time composite-graph extension ("the brain grows"): arm the kernel
-                # caches from the prompt graph, then a forward PRE-hook extends the graph and
-                # computes the new token's kernel row BEFORE each decode attention runs.
-                # (A LogitsProcessor runs AFTER the forward, so it would lag the row by one
-                # token; the pre-hook reads the decode input_ids in time.)
+                # Decode-time graph extension: pre-hook extends composite graph and computes
+                # new token's kernel row before each decode attention step.
                 if getattr(graph_model, "c_bias", False):
                     c = input_ids.shape[1]
                     aug = graph_model._composite_graph(
@@ -281,9 +228,7 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
                 graph_model._pe_taps = None
 
         if isinstance(graph_model, CompositeGraphLLM):
-            # M9: assemble the composite graph (cycle + scene + cross-links) from the
-            # last graph's scene PyG + scoped injection map, run M4→M6→M7, and feed
-            # the fused token embeddings to the RoPE-disabled LLM.
+            # Build composite graph (token cycle + scene + cross-links), fuse embeddings via GT + gate.
             inputs_embeds = graph_model._fuse_embeddings(
                 input_ids, [pyg_graph], [injection_map], permutation=self.permutation)
             return graph_model.llm.generate(
@@ -292,18 +237,13 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
                 pad_token_id=self.tokenizer.eos_token_id,
             )
 
-        # Base R-PEARL GraphAugmentedLLM (non-composite): apply RoPE(X) + Ψ exactly as
-        # training. build_pe_signal applies the learnable tanh gate and places Ψ at the
-        # scoped node-name spans; arming it on the model makes the patched attention
-        # layers add it post-RoPE. Injection
-        # auto-skips cached single-token decode steps (seq mismatch), so only the prompt
-        # tokens carry Ψ. Disarm afterwards so no stale signal leaks into a later call.
+        # Base R-PEARL: build_pe_signal places Ψ at scoped node spans (tanh gate);
+        # attention layers add it post-RoPE. Injection skips cached decode steps; disarmed in finally.
         psi = graph_model.build_pe_signal(
             embeddings, [pyg_graph], [injection_map], permutation=self.permutation)
         graph_model._pe_signal = psi
         gen_kwargs = {}
-        # Mirror training: identity-RoPE the prompt's graph-token spans (position_id 0).
-        # Generated tokens are non-graph, so generate() extends with natural positions.
+        # Identity-RoPE (position_id 0) for graph-token spans, matching training.
         if getattr(graph_model, "_disable_graph_token_rope", False):
             gen_kwargs["position_ids"] = graph_model.graph_token_position_ids(
                 [injection_map], embeddings.shape[1], embeddings.device)

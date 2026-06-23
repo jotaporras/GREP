@@ -16,9 +16,7 @@ class EvalCallback(TrainerCallback):
     `EvalSample`s; the callback runs `evaluate.eval_model_multiple_graphs` each
     interval and reports the sample-weighted micro-average of the per-graph keyword
     accuracy plus a per-graph breakdown. A single-graph dict reproduces the old
-    single-graph `eval/accuracy` (same objective-keyword metric). Evaluating several
-    graphs keeps the per-epoch signal from being a single-graph fluke (the e9
-    multistage plan wants ~5).
+    single-graph `eval/accuracy` (same objective-keyword metric).
     """
 
     # Path-validity keys that ride under the top-level `eval/` namespace.
@@ -62,9 +60,7 @@ class EvalCallback(TrainerCallback):
         )
         model.train()
 
-        # Sample-weighted micro-average of the per-graph keyword accuracy (the same
-        # objective-keyword metric as r.accuracy / the old single-graph headline),
-        # and aggregate the M10 (R4) path metrics over the concatenated samples.
+        # Sample-weighted micro-average keyword accuracy + aggregate path-validity metrics.
         all_samples = [s for r in results.values() for s in r.samples]
         num_total = sum(r.num_total for r in results.values())
         num_correct = sum(round(r.accuracy * r.num_total) for r in results.values())
@@ -129,27 +125,19 @@ class GradientDebugCallback(TrainerCallback):
     """Logs per-component gradient norms, structural-signal magnitudes, and
     injection counts to W&B.
 
-    Architecture-aware — covers both graph-augmented LLM families:
+    Covers both graph-augmented LLM families:
 
-    - ``GraphAugmentedLLM`` (``rpearl_llm`` / ``rpearl_gt_llm``): a ``pe_model``
-      (R-PEARL, optionally inside a GraphTransformer), a ``pe_proj`` head, a
-      scalar ``pe_gain``, and ``_augment_embeddings`` for injection. Logs grad
-      norms for the GNN/PE, projection, gain, LoRA, and — for the GT variant —
-      the inner R-PEARL, GT attention blocks, and GT output norm, plus the
-      ``pe_proj`` output magnitude.
-    - ``CompositeGraphLLM`` (``composite_graph_gt``, M4–M9): a ``gt_model``
-      (GraphTransformer holding R-PEARL), the M7 ``injection`` gate, and
-      ``_fuse_embeddings`` for injection. Logs grad norms for the inner R-PEARL,
-      GT blocks, GT output norm, the whole GT, the gate, and LoRA, plus the GT
-      output ``Y`` magnitude and the gate value.
+    - ``GraphAugmentedLLM`` (``rpearl_llm`` / ``rpearl_gt_llm``): logs grad norms
+      for the GNN/PE, pe_proj, pe_gain, LoRA, and (GT variant) inner R-PEARL +
+      GT blocks; plus pe_proj output magnitude.
+    - ``CompositeGraphLLM`` (``composite_graph_gt``): logs grad norms for the inner
+      R-PEARL, GT blocks, GT output norm, whole GT, gate, and LoRA; plus GT output
+      ``Y`` magnitude, gate value, and tanh output-gain scalars.
 
-    Hooks observe without duplicating logic. Gradient norms are captured by
-    ``_capture_grad_norms`` (called from ``GraphSFTTrainer.training_step`` after
-    backward, before zero_grad) so they reflect real gradients — HF Trainer
-    zeroes grads before ``on_log`` fires, so reading ``.grad`` there returns 0.
-    The composite-graph spectral diagnostics (Fiedler, scene-mass, contrib-ratio)
-    live in ``AugGraphDebugCallback``; this callback is the gradient/magnitude
-    view and the two compose on the same ``composite_graph_gt`` run.
+    Grad norms are captured by ``_capture_grad_norms`` (called after backward,
+    before zero_grad) — HF Trainer zeroes grads before ``on_log``, so ``.grad``
+    reads 0 there. Spectral diagnostics (Fiedler, scene-mass) live in
+    ``AugGraphDebugCallback``.
     """
 
     def __init__(self):
@@ -174,7 +162,7 @@ class GradientDebugCallback(TrainerCallback):
 
     @staticmethod
     def _is_augmented(inner):
-        """True for the M4–M9 ``CompositeGraphLLM`` (``gt_model`` + M7 ``injection``)."""
+        """True for the composite-graph ``CompositeGraphLLM`` (``gt_model`` + gate ``injection``)."""
         return hasattr(inner, "gt_model") and hasattr(inner, "injection")
 
     @staticmethod
@@ -183,11 +171,7 @@ class GradientDebugCallback(TrainerCallback):
         return hasattr(inner, "pe_model") or hasattr(inner, "gt_model")
 
     def _install_hooks(self, model):
-        """Install lightweight hooks that observe without duplicating logic.
-
-        Unwraps PEFT so the injection wrapper lives on the actual graph-augmented
-        instance (whose ``forward`` calls it), not on the PeftModel wrapper.
-        """
+        """Install forward hooks on the unwrapped graph-augmented instance."""
         if self._hooked:
             return
         inner = self._unwrap_peft(model)
@@ -208,8 +192,7 @@ class GradientDebugCallback(TrainerCallback):
 
         inner.pe_proj.register_forward_hook(_pe_proj_hook)
 
-        # Hook 2: wrap _augment_embeddings on the actual GraphAugmentedLLM so
-        # that self._augment_embeddings() inside forward() hits our wrapper.
+        # Hook 2: wrap _augment_embeddings to capture emb_norm and injection count.
         orig_augment = inner._augment_embeddings
 
         def _wrapped_augment(input_ids, graphs, injection_maps):
@@ -224,13 +207,7 @@ class GradientDebugCallback(TrainerCallback):
         inner._augment_embeddings = _wrapped_augment
 
     def _install_augmented_hooks(self, inner):
-        """CompositeGraphLLM: GT output (Y) norm + ``_fuse_embeddings`` wrap.
-
-        The GT output ``Y`` is the structural signal the M7 gate scales into the
-        LLM, so its magnitude (and any NaN) is the analogue of the legacy
-        ``pe_proj`` output. ``_fuse_embeddings`` carries the same signature used
-        at train and eval (``permutation`` keyword), so the wrapper must forward it.
-        """
+        """CompositeGraphLLM: GT output (Y) norm + ``_fuse_embeddings`` wrap."""
         callback = self
 
         def _gt_hook(_module, _input, output):
@@ -275,7 +252,7 @@ class GradientDebugCallback(TrainerCallback):
         )
 
         if self._is_augmented(inner):
-            # CompositeGraphLLM: GraphTransformer (R-PEARL + blocks) + M7 gate.
+            # CompositeGraphLLM: GraphTransformer (R-PEARL + blocks) + cold-start gate.
             gt = inner.gt_model
             self._captured_grad_norms["gt"] = self._grad_norm(gt.parameters())
             self._captured_grad_norms["rpearl"] = self._grad_norm(gt.pe_model.parameters())
@@ -300,14 +277,11 @@ class GradientDebugCallback(TrainerCallback):
 
     @staticmethod
     def _filter_norm_metrics(inner):
-        """Log the c_bias Ĉ scale (composite_graph_gt only). The old β=1/F R-PEARL
-        filter-norm diagnostics are gone with the spectral-norm machinery."""
+        """Log the c_bias Ĉ scale (composite_graph_gt only)."""
         out = {}
         if getattr(inner, "c_bias", False):
             try:
-                # analytic Ĉ from the R-PEARL taps (deterministic; c_bias positional kernel).
-                # no_grad: logging only — Ĉ is built from grad-carrying taps, so without it
-                # float(...) on those tensors warns (and would build a throwaway grad graph).
+                # no_grad: Ĉ is built from grad-carrying taps; float() without it warns.
                 with torch.no_grad():
                     C_hat, c_row = inner._analytic_c_tok(64, next(inner.parameters()).device)
                     out["grep/c_bias/c_hat_diag"] = float(C_hat.diagonal().max())  # =1 (normalized)
@@ -329,7 +303,7 @@ class GradientDebugCallback(TrainerCallback):
         g = self._captured_grad_norms
 
         if self._is_augmented(inner):
-            # CompositeGraphLLM (composite_graph_gt): R-PEARL + GT + M7 gate.
+            # CompositeGraphLLM (composite_graph_gt): R-PEARL + GT + cold-start gate.
             metrics = {
                 "debug/grad_norm_lora": g.get("lora", 0.0),
                 "debug/grad_norm_gt": g.get("gt", 0.0),
@@ -341,8 +315,7 @@ class GradientDebugCallback(TrainerCallback):
                 "debug/embedding_norm": self._emb_norm,
                 "debug/num_injections": self._num_injections,
                 "debug/gate_value": float(inner.injection.gate.detach().float().mean().item()),
-                # Learnable tanh(g) output gates (GT output + R-PEARL output): the
-                # effective magnitude multiplier the model has learned on each signal.
+                # Learnable tanh(g) output-gain scalars for GT output and R-PEARL output.
                 "debug/gt_output_gain": float(inner.gt_model.output_gain.detach().tanh().item()),
                 "debug/rpearl_output_gain": float(inner.gt_model.pe_model.output_gain.detach().tanh().item()),
                 "debug/lr": lr,
@@ -374,25 +347,18 @@ class GradientDebugCallback(TrainerCallback):
 
 
 class AugGraphDebugCallback(TrainerCallback):
-    """M11 — log composite-graph diagnostics for the ``composite_graph_gt`` model.
+    """Log composite-graph diagnostics for the ``composite_graph_gt`` model.
 
-    Logs to W&B (E3/R6):
+    Logs to W&B:
       - ``aug_graph/fiedler``     — λ₂ of the augmented Laplacian (sparse LOBPCG /
-                                    eigsh; never densified). Trending → 0 means the
-                                    sequence and scene layers are disconnecting.
-      - ``aug_graph/scene_mass``  — fraction of a cross-linked token's k-hop mass
-                                    landing on scene nodes. Collapsing → the scene
-                                    is being swamped by the cycle.
-      - ``grep/structural_gate``  — the M7 gate (forced up once edges are stripped).
-      - ``grep/contrib_ratio``    — ‖gate·Y[V_Tx]‖ / ‖X‖, the true injected-signal
-                                    energy (a scalar gate alone hides this).
+                                    eigsh; never densified). Trending → 0: layers disconnecting.
+      - ``aug_graph/scene_mass``  — fraction of a cross-linked token's k-hop mass on
+                                    scene nodes. Collapsing: scene swamped by the cycle.
+      - ``grep/structural_gate``  — the cold-start gate value.
+      - ``grep/contrib_ratio``    — ‖gate·Y[V_Tx]‖ / ‖X‖, injected-signal energy ratio.
 
-    Path metrics (M10) are logged separately by ``EvalCallback``.
-
-    Styled after ``GradientDebugCallback``: lightweight hooks capture the last
-    composite graph and the gated contribution during forward; ``on_log`` computes
-    the (sparse) spectral quantities and logs. Only active for a model exposing
-    the M7 ``injection`` gate (i.e. ``CompositeGraphLLM``); a no-op otherwise.
+    Path-validity metrics are logged separately by ``EvalCallback``. No-op for
+    models without the cold-start gate ``injection`` attribute.
     """
 
     def __init__(self, enable_visualizer: bool = False, visualizer_dir: str | None = None):
@@ -419,8 +385,7 @@ class AugGraphDebugCallback(TrainerCallback):
         callback = self
         inner = self._unwrap_peft(model)
 
-        # Hook 1: capture the last per-sample composite graph so on_log can compute
-        # Fiedler / scene-mass without duplicating the M4 build.
+        # Hook 1: capture the last composite graph for Fiedler / scene-mass in on_log.
         orig_aug = inner._composite_graph
 
         def _wrapped_aug(scene, injection_map, c, device, permutation=None):
@@ -458,19 +423,19 @@ class AugGraphDebugCallback(TrainerCallback):
                 "grep/contrib_ratio": self._contrib_ratio,
             }
             if aug is not None:
-                # Sparse solvers only (M4): fiedler() uses LOBPCG/eigsh, scene_mass()
+                # Sparse solvers only: fiedler() uses LOBPCG/eigsh, scene_mass()
                 # uses sparse mat-mat — the N×N matrix is never densified.
                 try:
                     metrics["aug_graph/fiedler"] = aug.fiedler()
                 except Exception as e:
-                    print(f"[M11] fiedler computation failed: {type(e).__name__}: {e}")
+                    print(f"[diagnostics] fiedler computation failed: {type(e).__name__}: {e}")
                 try:
                     metrics["aug_graph/scene_mass"] = aug.scene_mass()
                 except Exception as e:
-                    print(f"[M11] scene_mass computation failed: {type(e).__name__}: {e}")
+                    print(f"[diagnostics] scene_mass computation failed: {type(e).__name__}: {e}")
             wandb.log(metrics, step=state.global_step)
 
-        # M12: one-shot composite-graph + spectral-clustering render on the first
+        # One-shot composite-graph + spectral-clustering render on the first
         # logging step after a graph is captured, when enabled.
         if self._enable_visualizer and not self._visualized and aug is not None:
             self._visualized = True
@@ -480,20 +445,13 @@ class AugGraphDebugCallback(TrainerCallback):
                 visualizer.visualize(aug, out_dir,
                                      source=f"{Path(args.output_dir).name} @ step {state.global_step}")
             except Exception as e:
-                print(f"[M12] visualizer failed: {type(e).__name__}: {e}")
+                print(f"[visualizer] failed: {type(e).__name__}: {e}")
 
 
 class LoraWarmupCallback(TrainerCallback):
-    """Freeze the LLM/LoRA parameters for the first ``warmup_steps`` optimizer
-    steps so the structural path (GT, R-PEARL, gate) learns first (R6).
-
-    With the LLM frozen, the loss gradient still flows to the structural params
-    through ``inputs_embeds`` (which require grad), so the GT/gate get an
-    isolated learning signal before LoRA starts competing for the objective.
-    This counters the observed failure where the LLM content-fits the task in
-    the first ~60 steps and the structural gradients then collapse to ~0. After
-    ``warmup_steps`` the LoRA params are re-enabled and resume training (the
-    optimizer already holds them, so updates simply resume).
+    """Freeze LLM/LoRA parameters for the first ``warmup_steps`` optimizer steps
+    so the structural path (GT, R-PEARL, gate) gets an isolated learning signal.
+    Re-enables LoRA at step ``warmup_steps`` (optimizer already holds them).
     """
 
     def __init__(self, warmup_steps: int):
@@ -516,8 +474,7 @@ class LoraWarmupCallback(TrainerCallback):
         if self.warmup_steps <= 0 or model is None:
             return
         inner = self._unwrap_peft(model)
-        # Capture the currently-trainable LLM params (the LoRA adapters), then
-        # freeze them. Saved so we can re-enable exactly these after warmup.
+        # Capture and freeze the currently-trainable LLM params (LoRA adapters).
         self._frozen_params = [p for p in inner.llm.parameters() if p.requires_grad]
         for p in self._frozen_params:
             p.requires_grad_(False)
@@ -535,12 +492,9 @@ class LoraWarmupCallback(TrainerCallback):
 
 
 class LamCWarmupCallback(TrainerCallback):
-    """Linearly ramp the c_bias additive covariance gain λ_C from 0→1 over the first
-    ``warmup_steps`` optimizer steps (Design D). The dense sampled Ĉ has O(1) entries
-    everywhere, so at full λ_C from step 0 it swamps the ⟨q,k⟩ content logits and
-    attention starts near-uniform; ramping it in lets selection establish first, then
-    Ĉ supplies position. Sets ``inner._lam_c_warmup`` each step (read in the patched
-    attention as ``λ_C·_lam_c_warmup``); no-op when ``warmup_steps<=0``.
+    """Linearly ramp the c_bias covariance gain λ_C from 0→1 over the first
+    ``warmup_steps`` optimizer steps. Sets ``inner._lam_c_warmup`` each step
+    (read in patched attention as ``λ_C·_lam_c_warmup``); no-op when ``warmup_steps<=0``.
     """
 
     def __init__(self, warmup_steps: int):

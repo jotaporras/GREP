@@ -22,20 +22,7 @@ def safe_parse_graph(
     utm_origin: Optional[np.ndarray] = None,
     flip_coords=False,
 ) -> Tuple[nx.Graph, str]:
-    """Parse scene graph in `data` into a networkx object.
-
-    Parameters
-    ----------
-    data : Dict[str, Dict[str, str]]
-        graph where keys-values are nodes-attributes
-    rotation : Optional[Rotation]
-        current rotation of robot
-
-    Returns
-    -------
-    Tuple[nx.Graph, str]
-        Networkx and string of json
-    """
+    """Parse scene graph dict into a (networkx.Graph, raw_str) pair."""
     origin = np.array([0, 0])
     data = deepcopy(data)  # don't modify input data
     as_str = str(data)
@@ -97,29 +84,9 @@ def safe_parse_graph(
 def scene_graph_dict_to_pyg(scene_graph_dict: dict) -> Data:
     """Convert a scene graph dict to a PyG Data object.
 
-    Parameters
-    ----------
-    scene_graph_dict : dict
-        Scene graph with the following expected keys:
-
-        - ``"objects"`` : list of dicts, each with at minimum:
-            - ``"name"`` (str) — unique node identifier
-            - ``"coords"`` (list[float]) — 2-D or 3-D spatial coordinates
-            - any additional attributes are preserved as node features
-        - ``"regions"`` : list of dicts, same schema as ``"objects"``
-        - ``"object_connections"`` : list of 2-element lists ``[name_a, name_b]``
-          representing undirected edges between object nodes
-        - ``"region_connections"`` : list of 2-element lists ``[name_a, name_b]``
-          representing undirected edges between region nodes
-        - ``"robot_location"`` (optional) : any value indicating where the robot
-          is in the scene; stored verbatim on the returned graph
-
-    Returns
-    -------
-    Data
-        PyG Data object with attributes:
-        ``coords``, ``x``, ``edge_index``, ``node_names``, ``node_types``,
-        ``robot_location``, and ``raw_scene_graph``.
+    Returns a Data with ``coords``, ``x``, ``edge_index``, ``edge_weight``
+    (Gaussian heat-kernel affinity), ``distance_m``, ``node_names``, ``node_types``,
+    ``robot_location``, ``raw_scene_graph``.
     """
     nx_graph, _ = safe_parse_graph(scene_graph_dict)
     node_names = list(nx_graph.nodes)
@@ -127,23 +94,13 @@ def scene_graph_dict_to_pyg(scene_graph_dict: dict) -> Data:
         [nx_graph.nodes[n]["coords"] for n in node_names], dtype=torch.float32
     )
     pyg_graph = pyg_utils.from_networkx(nx_graph)
-    # safe_parse_graph stores the raw Euclidean edge distance (meters) under the
-    # networkx "weight" attribute, which from_networkx copies to pyg_graph.weight
-    # (one entry per directed edge). Grab it before the cleanup below.
+    # networkx "weight" (Euclidean meters) is copied by from_networkx as pyg_graph.weight.
     raw_distance = getattr(pyg_graph, "weight", None)
-    # Drop all networkx node/edge attributes that are not explicitly set below.
-    # from_networkx copies every attr (type, weight, …); graphs with no edges/nodes
-    # won't have the edge attrs, causing Batch.from_data_list to fail when mixing
-    # empty and non-empty graphs.
+    # Drop copied networkx attrs to avoid Batch.from_data_list failures on mixed empty/nonempty graphs.
     for attr in ("edge_type", "edge_weight", "weight", "type"):
         if hasattr(pyg_graph, attr):
             delattr(pyg_graph, attr)
-    # Convert raw distance to the E1 Gaussian heat-kernel affinity
-    # exp(-d^2 / 2σ^2), σ = per-graph median distance, and keep it as
-    # `edge_weight` so TAGConv couples closer nodes more strongly. Raw meters are
-    # retained under `distance_m` for the path validator (M10). Edgeless graphs
-    # get no edge_weight, so downstream forwards stay unweighted (and Batch
-    # mixing keeps working).
+    # edge_weight = exp(-d^2 / 2σ^2), σ = per-graph median distance (E1 Gaussian affinity).
     if raw_distance is not None and raw_distance.numel() > 0:
         d = raw_distance.float()
         sigma = d.median()
@@ -175,13 +132,8 @@ def try_load_json(file):
 def strip_icl(msgs: List[Dict[str, str]]) -> List[Dict[str, str]]:
     """Strip the few-shot ICL prefix from a logged SPINE rollout.
 
-    A logged rollout is ``[system] + ICL example turns + real task turns``.
-    Every ICL example *and* the real task start with a ``user`` message whose
-    content begins with ``task:``; the real task is the *last* such message.
-    Returns ``[system] + msgs[real_task_idx:]``, keeping the system turn.
-
-    Replaces the old hardcoded ``cutbefore=36`` slice, which silently corrupted
-    training data whenever the ICL example set changed length.
+    Returns ``[system] + msgs[real_task_idx:]`` where real_task_idx is the last
+    ``user`` message whose content starts with ``task:``.
     """
     if not (isinstance(msgs, list) and msgs):
         raise ValueError("rollout must be a non-empty list of messages")

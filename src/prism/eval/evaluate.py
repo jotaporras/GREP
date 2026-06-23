@@ -1,24 +1,10 @@
-"""Canonical eval library for PRISM planning eval.
+"""Canonical in-memory eval library for PRISM planning eval.
 
-Pure in-memory contract: callers pass an already-loaded `(model, tokenizer)`
-and already-parsed graph/task dicts. File I/O and checkpoint loading live
-in the experiment scripts and in `train_v2`.
-
-No defaults on any policy argument. Every caller is expected to pass
-`include_edge_list`, `use_icl`, and `permutation` explicitly. This is
-deliberate — silent defaults inside the canonical library hide behavior
-changes from the experiment scripts and the trainer.
-
-Booleans inside the library, human-readable strings at the boundary: the
-CLI / config layers keep `text_edge_list: "present" | "none"` for wandb
-and stdout log readability; scripts convert to `include_edge_list: bool`
-just before calling into here.
-
-Imports follow the repo's qualified-module convention (`graph_util.GraphHandler`,
-not `GraphHandler`).
+Callers pass an already-loaded `(model, tokenizer)` and pre-parsed graph/task dicts;
+no I/O, no checkpoint loading. All policy args (`include_edge_list`, `use_icl`, `permutation`)
+are required — no library-level defaults.
 
 Public surface:
-
 - `EvalSample`                       — namedtuple `(task, answer, graph, init_node, graph_name)`.
 - `GraphEvalResultSummary`           — per-graph aggregate result record.
 - `construct_eval_samples_from_dict` — shape-conversion helper.
@@ -49,23 +35,16 @@ import spine.prompts.prompts as spine_prompts
 _orig_get_base_prompt = spine_prompts.get_base_prompt_update_graph
 
 
-# R10: ICL is a 2/5 switch, and the e7/composite-graph model is trained with
-# TWO in-context examples. SPINE's stock get_base_prompt uses five
-# (EXAMPLE_1..EXAMPLE_5), which roughly triples the prompt length — and hence
-# the composite-graph cycle length (one node per token) — versus training. With
-# RoPE disabled (M8) the model is acutely sensitive to that distribution shift
-# and degenerates into repeated-token output. Pin eval to the same two examples
-# the model trained on so train and eval ICL counts match.
+# Pin eval to the same two ICL examples the model trained on: SPINE's default uses five
+# (EXAMPLE_1..EXAMPLE_5), tripling prompt length vs training and causing repeated-token
+# degeneration (especially with RoPE disabled).
 _ICL_EXAMPLES_2 = examples.EXAMPLE_1 + examples.EXAMPLE_2
 
 
 def _fixed_get_base_prompt(request, scene_graph, use_icl=True):
-    # use_icl=True -> exactly the 2 training ICL examples; use_icl=False -> 1
-    # (EXAMPLE_1), preserving the prior minimal-prompt behavior for that flag.
+    # use_icl=True -> 2 training ICL examples; use_icl=False -> 1 (EXAMPLE_1).
     sys_prompt = spine_prompts.SYS_PROMPT
-    # Eval-only system-prompt additions. The latent-connections note is always
-    # present; the no-tool directive only when tool calling is disabled. Build a
-    # fresh dict either way so the shared SYS_PROMPT object is never mutated.
+    # Build a fresh dict to avoid mutating the shared SYS_PROMPT object.
     content = sys_prompt["content"] + _LATENT_CONNECTIONS_NOTE
     if _spine_tools_disabled():
         # Tell the model what `_NoToolsGraphSim` already enforces: the API actions
@@ -93,10 +72,7 @@ from prism.eval import path_validator
 # ----------------------------------------------------------------------------
 # Tool-calling toggle
 # ----------------------------------------------------------------------------
-# SPINE's "tools" are the environment-interrogating actions the planner emits in
-# its plan: they reveal new graph structure / descriptions and drive the
-# explore->feedback loop. The terminal `answer` action is NOT a tool — it is
-# detected by `PlanningSim.run_planning` itself, independent of `take_action`.
+# SPINE tool actions (excludes `answer`, which is handled by PlanningSim.run_planning).
 _SPINE_TOOL_ACTIONS = frozenset(
     {"map_region", "explore_region", "extend_map", "inspect", "goto"}
 )
@@ -113,12 +89,8 @@ def _spine_tools_disabled() -> bool:
 
 
 def _gemma_regrade_enabled() -> bool:
-    """True when GREP_GEMMA_REGRADE asks for the second Gemma-path reading.
-
-    When on, every sample additionally carries a ``gemma_regrade`` block: its path
-    metrics and objective correctness graded on the route the Gemma judge recovers
-    from the full response. The ORIGINAL regex/reasoning scores stay at the top
-    level untouched — both readings are kept side by side.
+    """True when GREP_GEMMA_REGRADE is set; adds a ``gemma_regrade`` block per sample
+    with scores regraded on the Gemma-recovered route alongside the original scores.
     """
     return os.environ.get("GREP_GEMMA_REGRADE", "0").strip().lower() in (
         "1",
@@ -128,11 +100,7 @@ def _gemma_regrade_enabled() -> bool:
     )
 
 
-# Appended to SYS_PROMPT (by `_fixed_get_base_prompt`) on EVERY eval, regardless
-# of the tool toggle. GREP-PRISM injects the graph's connectivity into the
-# model's latent space (the GNN/GREP pathway), so the planner can reason over
-# relationships that may not be spelled out in the textual scene graph. This note
-# makes that latent access explicit in the prompt.
+# Appended to SYS_PROMPT on every eval: tells the planner about GNN latent connectivity.
 _LATENT_CONNECTIONS_NOTE = (
     "\n\nNote: the graph's connections are available to you in latent space. You "
     "can reason over the relationships and paths between nodes from this latent "
@@ -140,11 +108,8 @@ _LATENT_CONNECTIONS_NOTE = (
 )
 
 
-# Appended to SYS_PROMPT (by `_fixed_get_base_prompt`) only when tools are
-# disabled. It reframes the API as a planning vocabulary so the model's prompt
-# matches the runtime contract `_NoToolsGraphSim` enforces: no action executes
-# and no observation ever returns. Written as advice in SPINE's own register
-# (plan over the actions, then commit to answer()).
+# Appended to SYS_PROMPT only when tools are disabled: reframes API actions as
+# planning vocabulary (no execution, no observations).
 _NO_TOOL_CALL_DIRECTIVE = (
     "\n\nTOOL CALLING IS DISABLED FOR THIS TASK — READ CAREFULLY:\n"
     "- The API actions (goto, explore_region, map_region, inspect, extend_map) are "
@@ -162,16 +127,10 @@ _NO_TOOL_CALL_DIRECTIVE = (
 
 
 class _NoToolsGraphSim(graph_sim.GraphSim):
-    """GraphSim that drops every SPINE tool action.
+    """GraphSim that no-ops every SPINE tool action.
 
-    Disabling tool calling without crippling the planner's ability to reason: a
-    tool action becomes a no-op that reveals nothing and returns "no updates", so
-    `run_planning` neither breaks early nor advances the observed graph. Because
-    the loop keeps running until the planner emits `answer` (or hits
-    `max_iterations`), the model retains its full multi-turn reasoning budget —
-    it may take several turns and answer — it simply has no tools to call and must
-    reason from the graph it was already given. `answer` falls through to the base
-    implementation unchanged.
+    Tool actions return False (no update); the planning loop continues until `answer`
+    or `max_iterations`. `answer` falls through to the base implementation unchanged.
     """
 
     def take_action(self, action, argument) -> bool:
@@ -189,28 +148,16 @@ EvalSample = namedtuple(
     ["task", "answer", "graph", "init_node", "graph_name", "acceptance_criterion"],
 )
 # acceptance_criterion is optional: only e6-style datasets carry it. When present
-# it enables the M10 Gemma judge; otherwise M10 falls back to regex/NetworkX.
+# it enables the path validator's Gemma judge; otherwise the validator falls back to regex/NetworkX.
 EvalSample.__new__.__defaults__ = (None,)
-"""
-
-Evaluation sample task specification: An eval task is given by a natural-languaget ask specification,
-associated to a graph, and a starting node. 
-
-`graph_name` is a stable identifier (typically the source-file stem, e.g.
-"data_gen_004"). It is stamped onto every per-sample result dict so that
-debugging tools can trace a sample back to its source graph without
-relying on the surrounding output filename or metadata block.
-"""
+# graph_name is a stable id (e.g. file stem "data_gen_004") stamped on every result dict.
 
 
 @dataclass
 class GraphEvalResultSummary:
-    """Aggregate results from evaluating one model over one graph's samples.
-
-    Returned by `eval_model_multiple_graphs` (keyed by graph name). `samples`
-    is the raw per-sample result list produced by `eval_model_single_graph`;
-    the other fields are cached aggregates so the summary table doesn't have
-    to re-walk it.
+    """Per-graph aggregate result record. `samples` is the raw per-sample list;
+    other fields are cached aggregates. Returned keyed by graph name from
+    `eval_model_multiple_graphs`.
     """
     name: str
     num_total: int
@@ -228,12 +175,9 @@ class GraphEvalResultSummary:
     use_icl: bool
     permutation: Optional[dict]
     samples: List[dict] = field(default_factory=list)
-    # M10 (R4) path-validity aggregates over this graph's samples. Empty when
-    # no sample produced a parseable route.
+    # Path-validity aggregates; empty when no sample produced a parseable route.
     path_metrics: dict = field(default_factory=dict)
-    # GREP_GEMMA_REGRADE second reading: objective accuracy / counts / path metrics
-    # recomputed on the Gemma-recovered routes. None when the regrade is off — the
-    # ORIGINAL aggregates above are always the headline.
+    # GREP_GEMMA_REGRADE second reading on Gemma-recovered routes; None when disabled.
     gemma: Optional[dict] = None
 
 
@@ -251,42 +195,14 @@ def eval_model_single_graph(
     use_icl: bool,
     permutation,
 ) -> Tuple[float, List[Dict]]:
-    """Run the planning-simulation loop over `eval_samples` related to the same grpah
+    """Run the planning-simulation loop over `eval_samples` (all same underlying graph).
 
-    All samples in `eval_samples` are assumed to share the same underlying
-    graph dict. For multi-graph evaluation use `eval_model_multiple_graphs`.
+    For multi-graph evaluation use `eval_model_multiple_graphs`.
 
-    Args:
-        model:              Already-loaded planner model (plain LLM or
-                            GraphAugmentedLLM, optionally PEFT-wrapped).
-        tokenizer:          Matching tokenizer.
-        eval_samples:       List of `EvalSample` (>= 1 element).
-        include_edge_list:  True to include the textual edge list in the
-                            planner prompt, False to strip it. Must match
-                            how the checkpoint was trained. CLI / config
-                            layers should keep this as the human-readable
-                            string `"present"`/`"none"` for wandb and convert
-                            at the boundary.
-        use_icl:            True/False — required concrete bool. The library
-                            does not delegate to SPINE's internal default;
-                            callers must decide.
-        permutation:        `prism.models.utils.Permutation` or `None`.
-                            When set on a plain LLM the graph dict is
-                            permuted per-sample; ignored for graph-augmented
-                            models. `None` here is a real value
-                            ("no permutation"), not a delegated default.
-
-    Returns:
-        `(accuracy, sample_results)` where `accuracy` is the OBJECTIVE
-        RegEx/NetworkX keyword accuracy — computed from RegEx fields only, never
-        from the judge. The separate Gemma judge score is carried per-sample
-        (`subjective_correct` — None when unjudged, `false_positive`,
-        `false_negative`) and aggregated into `subjective_accuracy` (over judged
-        samples only, judge verdict only) by `eval_model_multiple_graphs`. The two
-        scores share no inputs: `false_positive`/`false_negative` are diagnostics
-        comparing them and feed neither. A sample the judge cannot score is omitted
-        from the subjective accuracy (and warned about), never copied from RegEx.
-        `sample_results` is a list of dicts with one entry per sample.
+    Returns `(accuracy, sample_results)`:
+    - `accuracy` is the objective RegEx/NetworkX keyword accuracy (judge-free).
+    - `sample_results` is one dict per sample; `subjective_correct` / `false_positive` /
+      `false_negative` carry the Gemma judge's separate verdict where it ran.
     """
     graph_handler = graph_util.GraphHandler("")
     graph_sim_cls = _NoToolsGraphSim if _spine_tools_disabled() else graph_sim.GraphSim
@@ -355,10 +271,7 @@ def eval_model_single_graph(
             structured = bool(pm and pm.get("structured"))
             judge_pass = (pm or {}).get("llm_judge_pass")
             if structured:
-                # Structural task (positionality / reachability / navigability):
-                # the objective verdict is the deterministic NetworkX edge/path
-                # check; the Gemma judge is not run. No subjective column, no
-                # false-positive/negative diagnostics.
+                # Structural task: objective verdict is the deterministic NetworkX check; no judge.
                 sc = bool(pm.get("structured_correct"))
                 v = {
                     "objective_correct": sc, "objective_keyword": sc,
@@ -366,11 +279,8 @@ def eval_model_single_graph(
                     "false_negative": False, "judged": False,
                 }
             else:
-                # Legacy / non-structural (yes-no, count): two completely separate
-                # graders. `objective_*` is the pure RegEx/NetworkX score (the judge
-                # never touches it). `subjective_*` is the Gemma judge's score where
-                # it ran. The judge moves the subjective column only: down on a false
-                # positive (RegEx correct, judge wrong), up on a false negative.
+                # Non-structural: `objective_*` is RegEx/NetworkX only; `subjective_*` is the
+                # Gemma judge's score (false_positive/false_negative flag divergences).
                 ac_present = bool(eval_sample.acceptance_criterion)
                 if ac_present and judge_pass is None:
                     n_judge_fallback += 1
@@ -390,11 +300,7 @@ def eval_model_single_graph(
                 "terminated_by": planning_result.terminated_by if planning_result else None,
                 "formatted": result.formatted,
                 "plan_keyword": result.plan_keyword,
-                # `correct` is the OBJECTIVE RegEx/NetworkX verdict (judge-free).
-                # `subjective_correct` is the separate judge-based verdict.
-                # `false_positive`/`false_negative` flag where the judge disagreed
-                # with RegEx. `llm_judge_pass` is the raw judge verdict (None unless
-                # yes/no or an acceptance_criterion exists).
+                # correct=objective (RegEx/NetworkX); subjective_correct=Gemma judge; false_pos/neg=divergence.
                 "correct": v["objective_correct"],
                 "structured": structured,
                 "subjective_correct": v["subjective_correct"],
@@ -405,8 +311,7 @@ def eval_model_single_graph(
                 "traceback": None,
                 "path_metrics": pm,
             }
-            # GREP_GEMMA_REGRADE: attach a second reading (scores regraded on the
-            # Gemma-recovered route) alongside the original scores above.
+            # GREP_GEMMA_REGRADE: attach per-sample regraded scores.
             if _gemma_regrade_enabled():
                 sample_dict["gemma_regrade"] = _gemma_regrade_block(
                     planner_response, eval_sample, result)
@@ -471,14 +376,10 @@ def eval_model_multiple_graphs(
     permutation,
     on_graph_done: Optional[Callable[[str, GraphEvalResultSummary], None]],
 ) -> Dict[str, GraphEvalResultSummary]:
-    """Evaluate one model over many graphs and return per-graph aggregates.
-    
+    """Evaluate one model over many graphs; returns per-graph GraphEvalResultSummary dicts.
 
-    `graph_samples` maps graph names (typically file stems) to the list of eval samples
-    corresponding to that graph.
-
-    `use_icl` is forwarded as-is to every graph's `eval_model_single_graph`
-    call. No auto / force-on policy: the caller's word is final.
+    `graph_samples` maps graph names to their eval-sample lists. All policy args
+    forwarded as-is to `eval_model_single_graph`.
     """
     results: Dict[str, GraphEvalResultSummary] = {}
     for name, samples in graph_samples.items():
@@ -497,13 +398,12 @@ def eval_model_multiple_graphs(
         )
         elapsed = time.time() - t0
 
-        # Objective (RegEx/NetworkX) aggregates — read only RegEx fields.
+        # Objective (RegEx/NetworkX) aggregates.
         num_correct = sum(r["correct"] for r in sample_results)
         num_formatted = sum(r["formatted"] for r in sample_results)
         num_keyword = sum(r["plan_keyword"] for r in sample_results)
         num_errors = sum(1 for r in sample_results if r["error"] is not None)
-        # Subjective (Gemma judge) aggregates — read only the judge verdict, over
-        # the judged samples ONLY. No RegEx value is mixed in.
+        # Subjective (Gemma judge) aggregates, over judged samples only.
         judged = [r for r in sample_results if r["llm_judge_pass"] is not None]
         num_judged = len(judged)
         subjective_accuracy = (
@@ -512,9 +412,7 @@ def eval_model_multiple_graphs(
         num_false_pos = sum(1 for r in sample_results if r.get("false_positive"))
         num_false_neg = sum(1 for r in sample_results if r.get("false_negative"))
 
-        # GREP_GEMMA_REGRADE second reading: same objective/subjective/path
-        # aggregates, computed from each sample's `gemma_regrade` block (scores on
-        # the Gemma-recovered route). None unless the regrade ran.
+        # GREP_GEMMA_REGRADE: aggregate scores from each sample's gemma_regrade block.
         gemma_blocks = [r["gemma_regrade"] for r in sample_results if r.get("gemma_regrade")]
         gemma = None
         if gemma_blocks:
@@ -667,12 +565,12 @@ def print_summary_table(results: List[GraphEvalResultSummary]) -> None:
         print(f"{'TOTAL':<{name_width}}  {oa:>9.1%}  {ga:>10.1%}  {g_orig:>10}  {g_gem:>10}")
         print(sep)
 
-    # M10 (R4) path-validity block — only printed when some graph yielded routes.
+    # Path-validity block — only printed when some graph yielded routes.
     pm_results = [r for r in results if r.path_metrics]
     if pm_results:
         def _fmt(v):
             return f"{v:.2f}" if isinstance(v, (int, float)) else "  —"
-        print("\nPATH-VALIDITY (M10)")
+        print("\nPATH-VALIDITY")
         print(f"{'Eval File':<{name_width}}  {'edge_val':>8}  {'nodes_ex':>8}  "
               f"{'full_valid':>10}  {'start_goal':>10}  {'cost_opt':>8}  {'judge':>6}")
         for r in pm_results:
@@ -693,14 +591,7 @@ def construct_eval_samples_from_dict(
     tasks_list: List[dict],
     graph_name: str,
 ) -> List[EvalSample]:
-    """Convert a parsed `{"graph": ..., "tasks": [...]}` payload into `EvalSample`s.
-
-    Pure in-memory; no I/O. Callers (scripts, train_v2) `json.load` the file,
-    decide what the graph's stable identifier is (typically the filename
-    stem), and pass `data["graph"]`, `data["tasks"]`, and that identifier in.
-    Every sample produced here will carry `graph_name` so per-sample result
-    dicts can be traced back to their source graph.
-    """
+    """Convert graph_dict + tasks_list into EvalSamples, stamping graph_name on each."""
     return [
         EvalSample(
             task=t["task"],
@@ -754,12 +645,7 @@ def _construct_eval_result(parsed_answer: Dict[str, str], answer_key: str) -> Tu
 
 
 def _sample_path_metrics(planner_response, eval_sample: EvalSample) -> Optional[dict]:
-    """M10 (R4) per-sample path validation; never raises (returns None on failure).
-
-    Pulls the route out of the planner's ``plan`` field, validates it against the
-    sample's graph (regex + NetworkX), and runs the Gemma judge only if the
-    sample carries an ``acceptance_criterion``.
-    """
+    """Per-sample path validation (regex + NetworkX + optional Gemma judge). Returns None on error."""
     try:
         plan = planner_response.get("plan") if isinstance(planner_response, dict) else planner_response
         return path_validator.evaluate_sample(
@@ -777,11 +663,8 @@ def _sample_path_metrics(planner_response, eval_sample: EvalSample) -> Optional[
 
 
 def _objective_verdict(pm, result: "_EvalResult", eval_sample: EvalSample):
-    """The ``(v, structured, judge_pass)`` triple for a path-metrics dict.
-
-    Mirrors the per-sample verdict logic in ``eval_model_single_graph`` but with no
-    side effects (no ``n_judge_fallback`` bump), so it can grade the Gemma-regrade
-    path metrics with the SAME rules as the original.
+    """Compute ``(v, structured, judge_pass)`` from path metrics using the same rules as
+    ``eval_model_single_graph``, but without side effects (no ``n_judge_fallback`` bump).
     """
     structured = bool(pm and pm.get("structured"))
     judge_pass = (pm or {}).get("llm_judge_pass")
@@ -802,13 +685,8 @@ def _objective_verdict(pm, result: "_EvalResult", eval_sample: EvalSample):
 
 def _gemma_regrade_block(planner_response, eval_sample: EvalSample,
                          result: "_EvalResult") -> dict:
-    """The ``gemma_regrade`` sub-record: the sample's scores regraded on the
-    Gemma-recovered route, kept ALONGSIDE the original top-level scores.
-
-    The path metrics come from ``path_validator.gemma_regrade_path_metrics`` — the
-    SAME shared function the retro-grader (``apply_judge_to_eval_run.py``) uses — so
-    the two readings are byte-identical. It stamps ``path_source``
-    (``gemma_judge`` / ``regex_fallback``) and the raw ``gemma_route``.
+    """Build the ``gemma_regrade`` sub-record: scores regraded on the Gemma-recovered
+    route via ``path_validator.gemma_regrade_path_metrics``.
     """
     pm_g = path_validator.gemma_regrade_path_metrics(
         planner_response, eval_sample.graph,
@@ -827,19 +705,12 @@ def _gemma_regrade_block(planner_response, eval_sample: EvalSample,
     }
 
 
-# Canonical aggregation now lives in `path_validator` (model-free) so the offline
-# retro-grader shares one source. Kept under the original private name for the call
-# sites in this module and the eval callback.
+# Alias from path_validator for backward-compatible call sites.
 _aggregate_path_metrics = path_validator.aggregate_path_metrics
 
 
 def _is_graph_augmented(model) -> bool:
-    """True if `model` is (or wraps) a graph-augmented LLM, including under PEFT.
-
-    Covers the legacy `GraphAugmentedLLM` (PE injection), the parameter-free
-    `GraphMaskLLM` (structural attention mask), and the M9 `CompositeGraphLLM`
-    (composite-graph fusion).
-    """
+    """True if `model` is (or wraps) a GraphAugmentedLLM / GraphMaskLLM / CompositeGraphLLM (including PEFT)."""
     graph_types = (gnn_llm.GraphAugmentedLLM, gnn_llm.GraphMaskLLM, gnn_llm.CompositeGraphLLM)
     if isinstance(model, graph_types):
         return True

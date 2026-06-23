@@ -115,8 +115,9 @@ class _SafeBatchedSparseAttn(torch.autograd.Function):
         """
         N = qi.shape[0]
         # The sparse ops (sampled_addmm, sparse.mm) are fp32-only. .float() casts
-        # the operands, but a surrounding bf16 autocast (the M6 eval path) would
-        # still recast them to bf16 and raise "not implemented for BFloat16", so
+        # the operands, but a surrounding bf16 autocast (the Graph-Transformer fusion
+        # eval path) would still recast them to bf16 and raise "not implemented for
+        # BFloat16", so
         # autocast is explicitly disabled for this fp32-only region.
         with torch.autocast(device_type=qi.device.type, enabled=False):
             unnormalized = torch.sparse.sampled_addmm(
@@ -238,11 +239,11 @@ class GraphTransformer(nn.Module):
 
     Pipeline: R-PEARL(graph) -> PE ⊕ node_features -> stacked SparseTransformerBlocks -> output
 
-    M6 fusion (when token embeddings are supplied): node features are
+    Graph Transformer fusion (when token embeddings are supplied): node features are
     ``H0 = X_full + Psi``, where ``X_full`` carries the token embeddings on the
     directed-cycle (token) nodes and zeros on the scene nodes, and ``Psi`` is the
     R-PEARL encoding (the transferability-paper form ``X + Psi_G``). No gate lives
-    here — the M7 cold-start gate is applied at the LLM input as
+    here — the cold-start gate is applied at the LLM input as
     ``inputs_embeds = X + gate * Y[V_Tx]``. Only the token-node rows of the output
     are used downstream.
 
@@ -286,7 +287,7 @@ class GraphTransformer(nn.Module):
         self.num_layers = num_layers
         self.d_model = d_model
         self.eps = eps
-        # R-PEARL readout fed into the M6 fusion:
+        # R-PEARL readout fed into the Graph Transformer fusion:
         #   "mean"          : H0 = X_full + Ψ,  Ψ = E_q[Φ(q)]   (first moment)
         #   "second_moment" : H0 = seeded + C·seeded, seeded = [X on token ; Ψ on scene],
         #                     C = E_q[Φ(q)Φ(q)ᵀ] applied over the full composite graph
@@ -377,7 +378,7 @@ class GraphTransformer(nn.Module):
         else:
             pe_data = data
 
-        # M6 input fusion. No gate here — the M7 gate sits at the LLM input (see
+        # Graph Transformer input fusion. No gate here — the cold-start gate sits at the LLM input (see
         # gated_injection.GatedInjection).
         #   pe_readout="mean"          : H0 = X_full + Ψ, Ψ = E_q[Φ(q)] (first moment;
         #                                X_full = token embeddings on cycle rows, 0 on scene).
@@ -418,7 +419,7 @@ class GraphTransformer(nn.Module):
             khop_edge_index = data._khop_edge_index
 
         # Run the transformer blocks in the LLM's low-precision dtype when token
-        # embeddings are supplied (the M6 fusion path). Training already runs the
+        # embeddings are supplied (the Graph-Transformer fusion path). Training already runs the
         # GT under a bf16 autocast, but eval/generate has no autocast, so the GT
         # would otherwise hold the dense [N, 4096] attention/FFN activations in
         # fp32 — on the composite graph (N = token-cycle length ≈ thousands) that
@@ -442,7 +443,7 @@ class GraphTransformer(nn.Module):
             # Run signal through all Transformer Blocks. During training, activation-
             # checkpoint each block so its dense [N, d_model] attention/FFN activations
             # are recomputed in the backward pass instead of all being retained at once
-            # — the GT's dominant training-memory term (spec M9). use_reentrant=False
+            # — the GT's dominant training-memory term. use_reentrant=False
             # preserves RNG state (dropout masks match on recompute) and carries the
             # autocast dtype into the recomputed forward. At eval (no grad) this is
             # skipped: checkpoint would only add a recompute with nothing to save.

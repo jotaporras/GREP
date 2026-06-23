@@ -1,10 +1,10 @@
-"""M4 — assemble the composite graph G and its graph shift operator S.
+"""Assemble the composite graph G and its graph shift operator S.
 
 The composite graph glues a directed-cycle "sequence layer" (one node per token,
-nodes 0..c-1) to the scene graph (nodes c..c+|V_Sc|-1) with cross-links (E2):
+nodes 0..c-1) to the scene graph (nodes c..c+|V_Sc|-1) via cross-links:
 
   - sequence layer: directed cycle  i -> (i+1) mod c, weight cycle_weight;
-  - scene layer:     edges from G_Sc with the E1 affinity weight, directedness
+  - scene layer:     edges from G_Sc with the scene affinity weight, directedness
                      preserved (the scene edge_index is used as given);
   - cross-links:     (a) every token of every mention of a label <-> that
                      label's scene node, and (b) all mention-tokens of a label
@@ -15,7 +15,7 @@ S is the two-sided degree normalization Ŝ = D^{-1/2}(A+I)D^{-1/2} of the
 *directed* adjacency: it scales but does not symmetrize (no reverse edges, no
 ``to_undirected``), preserving the directed circulant of the sequence cycle so
 its spectrum stays complex. The symmetric Laplacian (``laplacian``/``fiedler``)
-is a diagnostic for M11 (Fiedler) and M12 (spectral clustering) only and must
+is a connectivity diagnostic (Fiedler, spectral clustering) only and must
 never feed back as the operator. Everything stays sparse; the N×N matrix
 (N ≈ 8200) is never densified.
 """
@@ -56,33 +56,23 @@ class CompositeGraph:
         return self.num_token_nodes + self.num_scene_nodes
 
     def laplacian(self):
-        """Combinatorial Laplacian L = D - A of the symmetrized graph, as a sparse
-        tensor on the graph's own device.
+        """Combinatorial Laplacian L = D - A of the symmetrized graph.
 
-        Combinatorial (not normalized) so the Fiedler value is monotone under edge
-        addition — adding the E2 mention cliques can only raise connectivity, never
-        lower it (a normalized Laplacian would distort this through degree scaling).
-        Stays on-device (GPU when the graph is) so the M11 debug metrics don't force
-        a CPU round-trip during training cross-eval. Sparse throughout; the graph
-        has no self-loops, so L = D - A needs none.
+        Sparse, no self-loops; stays on the graph's own device.
         """
         N = self.num_nodes
         device = self.edge_index.device
         sym_index, sym_weight = _symmetrize(self.edge_index, self.edge_weight, N)
         deg = torch.zeros(N, device=device).index_add_(0, sym_index[0], sym_weight)
-        # Assemble L = D - A sparsely: diagonal D, then negated off-diagonal A.
         diag = torch.arange(N, device=device).unsqueeze(0).expand(2, -1)
         lap_index = torch.cat([diag, sym_index], dim=1)
         lap_weight = torch.cat([deg, -sym_weight])
         return torch.sparse_coo_tensor(lap_index, lap_weight, (N, N)).coalesce()
 
     def fiedler(self) -> float:
-        """Fiedler value λ₂ of the combinatorial Laplacian.
+        """Fiedler value λ₂ of the combinatorial Laplacian; > 0 iff G is connected.
 
-        > 0 iff G is connected. Uses ``torch.lobpcg`` on the sparse L so it runs on
-        the graph's device (GPU when training) with no CPU transfer; only on
-        failure (e.g. graphs too small for LOBPCG) does it fall back to scipy
-        ``eigsh`` on CPU. Never densifies the N×N matrix.
+        Uses ``torch.lobpcg`` on sparse L; falls back to scipy ``eigsh`` on failure.
         """
         L = self.laplacian()
         try:
@@ -102,11 +92,8 @@ class CompositeGraph:
     def scene_mass(self, k: int = 2) -> float:
         """Fraction of a cross-linked token's k-hop propagated mass on scene nodes.
 
-        Drops a unit mass on each token node that carries a cross-link, diffuses it
-        k steps through S, and averages the share landing on scene nodes. Batched
-        into a single sparse mat-mat per hop and kept on the GSO's device, so it
-        stays fast on GPU. With cross-links removed the layers are disconnected, so
-        this collapses to ≈0 (the M4 sanity quantity).
+        Drops unit mass on each cross-linked token, diffuses k steps through S, and
+        averages the scene-node share. Collapses to ≈0 if cross-links are absent.
         """
         N = self.num_nodes
         device = self.gso.device
@@ -149,16 +136,16 @@ def build_composite_graph(
     crosslink_mention_to_node: bool = True,
     crosslink_mention_clique: bool = True,
 ) -> CompositeGraph:
-    """Assemble the composite graph G and its GSO S (M4).
+    """Assemble the composite graph G and its GSO S.
 
     Args:
         num_token_nodes: c, the sequence-layer length.
         scene_edge_index: [2, E_sc] scene edges in local 0..|V_Sc|-1 indexing.
-        scene_edge_weight: [E_sc] E1 affinity weights aligned to scene_edge_index.
+        scene_edge_weight: [E_sc] scene affinity weights aligned to scene_edge_index.
         num_scene_nodes: |V_Sc|.
         injection_map: {scene_node_idx: [(start, end), ...]} token spans of each
-            scene node's mentions (M3 output, already scoped to the last graph).
-        cycle_weight / cycle_directed / crosslink_*: see GREPConfig / E2.
+            scene node's mentions, already scoped to the last graph.
+        cycle_weight / cycle_directed / crosslink_*: see GREPConfig.
 
     Returns:
         CompositeGraph with directed (edge_index, edge_weight), is_token mask, and
@@ -192,7 +179,7 @@ def build_composite_graph(
         cols.append(scene_edge_index[1] + c)
         vals.append(scene_edge_weight.to(device=device, dtype=f32))
 
-    # --- cross-links (E2), restricted to last-graph mentions via injection_map ---
+    # --- cross-links, restricted to last-graph mentions via injection_map ---
     for node_idx, spans in injection_map.items():
         scene_global = c + node_idx
         token_ids = sorted({t for start, end in spans for t in range(start, end) if t < c})
@@ -229,14 +216,8 @@ def build_composite_graph(
 def _build_gso(edge_index: Tensor, edge_weight: Tensor, num_nodes: int) -> Tensor:
     """Two-sided degree-normalized GSO Ŝ = D^{-1/2}(A+I)D^{-1/2} on the DIRECTED A.
 
-    The normalization scales but does NOT symmetrize: no reverse edges are added
-    and ``to_undirected`` is never called, so the directed circulant of the
-    sequence cycle is preserved (its spectrum stays complex with distinct
-    arguments, unlike the real ±k-degenerate spectrum of the undirected cycle).
-    A forward-only cycle edge i→(i+1) therefore leaves S[i+1, i] == 0 (absent a
-    cross-link). D is the per-node degree of (A+I) (row sums), applied on both
-    sides. The symmetric Laplacian (``laplacian``/``fiedler``, M11/M12) is a
-    diagnostic only and never feeds back here.
+    Does NOT symmetrize (no reverse edges, no ``to_undirected``), so a forward-only
+    cycle edge i→(i+1) leaves S[i+1, i] == 0. D = row-degree of (A+I).
     """
     sl_index, sl_weight = add_self_loops(
         edge_index, edge_weight, fill_value=1.0, num_nodes=num_nodes

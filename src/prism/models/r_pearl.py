@@ -23,11 +23,11 @@ class RandomGNNPositionalEncodings(nn.Module):
             always a plain LayerNorm now.
         eps (float): Retained for config back-compat (unused).
         probe_distribution (str): "gaussian" (N(0,I)) or "rademacher" (±1). Both
-            satisfy E[q]=0 and unit second moment (R7).
+            satisfy E[q]=0 and unit second moment.
         m_test (int): Probe count M at eval/test. Larger ⇒ lower-variance Monte
-            Carlo estimate ⇒ reproducible-in-practice without a seed (R7).
+            Carlo estimate ⇒ reproducible-in-practice without a seed.
             Defaults to ``num_samples`` when unset.
-        fixed_seed_mode (bool): R7 determinism switch. False (default) resamples
+        fixed_seed_mode (bool): Determinism switch. False (default) resamples
             the probes every forward pass (train and eval). True re-seeds the RNG
             with ``fixed_seed_value`` on every forward so the probes — and hence
             Ψ — are identical across runs.
@@ -57,66 +57,44 @@ class RandomGNNPositionalEncodings(nn.Module):
             raise ValueError(
                 f"probe_distribution must be 'gaussian' or 'rademacher', got {probe_distribution!r}"
             )
-        # Multi-hop structure is only reachable when pe_num_layers * k >= 3 (M5). Warn
-        # rather than raise so minimal/local PE probes (e.g. pe_num_layers=2, k=1) can run.
+        # Warn rather than raise: pe_num_layers*k < 3 gives limited multi-hop reach.
         if pe_num_layers * k < 3:
             warnings.warn(
                 f"pe_num_layers * k = {pe_num_layers}*{k} = {pe_num_layers * k} < 3: "
                 f"limited multi-hop reach (intentional for minimal/local PE probes)."
             )
-        # Input-feature mode. node_feature_dim is None => the original PEARL random-probe
-        # encoder: 1-D random features sampled per forward, averaged over m probes. When
-        # set (= the LLM embedding dim), forward() instead runs ONE deterministic GCN pass
-        # over the caller-supplied per-node features in ``data.x`` (e.g. mean word-embedding
-        # per node) — no probes, no Monte-Carlo averaging.
+        # node_feature_dim=None → random-probe encoder (1-D probes averaged over m samples).
+        # When set → deterministic GCN over caller-supplied ``data.x``; no probes.
         self.node_feature_dim = node_feature_dim
         in_channels = 1 if node_feature_dim is None else node_feature_dim
         self.pe_gcn = gcn.GCN(
             in_channels, pe_hidden_channels, pe_num_layers,
             skip_connection=True, dropout=dropout, k=k
         )
-        # Add a final projection to ensure output is d_model dimensions
         self.output_projection = nn.Linear(pe_hidden_channels, d_model)
 
         self.dropout = nn.Dropout(dropout)
-        # ``use_layer_norm`` retained for config/back-compat; the readout is always a
-        # plain LayerNorm now (the old Lipschitz/BatchNorm variants are gone).
+        # ``use_layer_norm`` retained for config back-compat; always a plain LayerNorm.
         self.use_layer_norm = use_layer_norm
         self.norm = nn.LayerNorm(d_model)
-        # Learnable tanh(g) gate on the R-PEARL output (first moment Ψ in forward() and
-        # the second moment C·signal in second_moment_apply()). g = tanh(output_gain)
-        # ∈ (-1, 1); init output_gain=1 → g ≈ 0.76. Lets the model scale the positional
-        # signal up/down instead of it being fixed by the norm/rescale. Scalar, saved.
+        # Learnable tanh(g) gate applied to Ψ and C·s. g = tanh(output_gain) ∈ (-1,1);
+        # init output_gain=1 → g ≈ 0.76. Scalar parameter, saved.
         self.output_gain = nn.Parameter(torch.tensor(1.0))
-        # m_train / m_test probe counts (R7); self.M kept as the train alias.
+        # m_train / m_test probe counts; self.M kept as the train alias.
         self.m_train = num_samples
         self.m_test = num_samples if m_test is None else m_test
         self.M = num_samples
         self.probe_distribution = probe_distribution
         self.fixed_seed_mode = fixed_seed_mode
         self.fixed_seed_value = fixed_seed_value
-        # Cap on the number of [rows, d_model] entries materialised in one GCN
-        # batch. The batched forward stacks `m` probe copies of the N-node graph
-        # into a single [m*N, d_model] pass; at eval (m_test large) over the
-        # composite graph (N = context_len + scene nodes) that tensor OOMs, so the
-        # probes are split into chunks of `floor(max_probe_rows / N)` and the
-        # per-chunk means are accumulated (the MC estimate is mean-over-probes, so
-        # this is identical to a single pass — only the peak memory differs).
+        # Cap on peak [chunk*N, d_model] during the batched GCN forward; splits
+        # probes into chunks of floor(max_probe_rows/N) — same MC estimate.
         self.max_probe_rows = max_probe_rows
-        # Companion cap on the TAGConv MESSAGE gather. The batched GCN materialises
-        # x_j = [chunk * num_EDGES, channels] in message passing; this is the tensor
-        # that OOMs, and it scales with edges, not nodes. ``max_probe_rows`` bounds
-        # chunk*num_nodes and is blind to edge count, so a dense composite graph
-        # (long token cycle + mention cliques, E >> N) blows past the node-based
-        # bound. ``max_gather_rows`` bounds chunk*num_edges as well; chunk is the
-        # min of the two caps. For ordinary graphs (E ~ N) the node cap binds and
-        # chunk is unchanged (bit-identical output, same speed); only edge-dense
-        # graphs — the ones that previously OOMed — get the smaller, fitting chunk.
-        # Pure MC-estimate invariant: same probes, only the chunk grouping differs.
+        # Companion cap on [chunk*E, channels] in the TAGConv message gather.
+        # chunk = min(node-cap, edge-cap); the edge cap only binds for E >> N.
         self.max_gather_rows = max_gather_rows
-        # Center the second-moment readout into a covariance (C·s = E[Φ(Φᵀs)] − Ψ(Ψᵀs)).
-        # Required for the second moment to carry position: the nonlinear GCN gives Φ a
-        # nonzero mean whose rank-1 outer product ΨΨᵀ otherwise dominates E[ΦΦᵀ].
+        # Center E[ΦΦᵀ] into covariance C·s = E[Φ(Φᵀs)] − Ψ(Ψᵀs); removes the
+        # rank-1 ΨΨᵀ bias that otherwise dominates E[ΦΦᵀ].
         self.center_second_moment = center_second_moment
         self.eps = eps
 
@@ -125,7 +103,7 @@ class RandomGNNPositionalEncodings(nn.Module):
         """Draw the [num_nodes, m] probe matrix Q from the configured distribution.
 
         Gaussian: N(0, I). Rademacher: i.i.d. ±1. Both have E[q]=0 and unit second
-        moment, so they are valid R-PEARL probes (R7). Sampling is i.i.d. per node,
+        moment, so they are valid R-PEARL probes. Sampling is i.i.d. per node,
         keeping the encoder permutation-equivariant in distribution.
         """
         if self.probe_distribution == "gaussian":
@@ -147,7 +125,7 @@ class RandomGNNPositionalEncodings(nn.Module):
             edge_index: Graph edge indices [2, num_edges].
             num_nodes: Number of nodes in the graph.
             m: Number of probe samples (m_train at train, m_test at eval).
-            edge_weight: Optional per-edge weights [num_edges] (E1 affinity);
+            edge_weight: Optional per-edge weights [num_edges] (scene affinity weight);
                 the same weights apply to every one of the m graph copies.
 
         Returns:
@@ -230,27 +208,18 @@ class RandomGNNPositionalEncodings(nn.Module):
         if permutation is not None:
             edge_index = permutation.apply(edge_index, num_nodes, device=device)
 
-        # Probe count: m_train while training, m_test at eval (R7). Default mode
-        # resamples q every forward; fixed_seed_mode re-seeds with a constant so q
-        # (and hence Ψ) is identical across runs.
+        # m_train during training, m_test at eval; fixed_seed_mode re-seeds for reproducible Ψ.
         m = self.m_train if self.training else self.m_test
         generator = None
         if self.fixed_seed_mode:
             generator = torch.Generator(device=device)
             generator.manual_seed(self.fixed_seed_value)
 
-        # Sample all m probes up front (Q is [N, m], 1 feature dim ⇒ tiny). The
-        # memory blowup is the batched GCN activation [chunk*N, d_model], not Q,
-        # so we chunk only the GCN pass over column slices of the *same* Q. The
-        # probe set is therefore identical regardless of chunk size, so chunking
-        # is bit-transparent (and R7 reproducibility is unaffected).
+        # Sample all m probes upfront ([N, m], tiny). Chunk only the GCN pass
+        # over column slices of Q; probe set is identical regardless of chunk size.
         Q = self._sample_probes(num_nodes, m, device, generator)
 
-        # chunk = how many probes fit under the node cap AND the edge (gather) cap;
-        # train (small N/E, small m_train) keeps chunk == m (single pass, unchanged),
-        # eval splits so both [chunk*N, d_model] and the [chunk*E, channels] message
-        # gather stay bounded. The edge cap only binds for E >> N (dense composite
-        # graphs); otherwise the node cap binds and chunk is unchanged.
+        # chunk = min(node-cap, edge-cap); train typically uses chunk=m (single pass).
         num_edges = edge_index.shape[1]
         chunk = max(1, min(m, self.max_probe_rows // max(1, num_nodes),
                            self.max_gather_rows // max(1, num_edges)))
@@ -271,8 +240,7 @@ class RandomGNNPositionalEncodings(nn.Module):
             else:
                 pooled = self._batched_gcn_forward(
                     Qc, edge_index, num_nodes, mc, edge_weight=edge_weight, device=device)
-            # _batched_gcn_forward returns the mean over its mc probes; weight by
-            # mc and divide by m at the end to recover the global mean exactly.
+            # weight by mc; divide by m at end to recover global mean.
             contrib = pooled * mc
             pooled_sum = contrib if pooled_sum is None else pooled_sum + contrib
         pooled_pe = pooled_sum / m
@@ -284,35 +252,17 @@ class RandomGNNPositionalEncodings(nn.Module):
                             scale_to_signal: bool = True) -> torch.Tensor:
         """Apply the probe second moment ``C = E_q[Φ(q)Φ(q)ᵀ]`` to ``signal``.
 
-        Returns ``C·signal ∈ [N, d_model]`` WITHOUT ever forming the ``[N, N]``
-        matrix ``C``, via the associativity
-
+        Returns ``C·signal ∈ [N, d_model]`` without forming the [N, N] matrix, via
             C·s = E_q[ Φ(q) ( Φ(q)ᵀ s ) ].
-
-        ``C`` is the AugR-PEARL second moment — the deterministic, time-invariant
-        circulant autocorrelation ``[C]_{nm} = c(n-m)`` over the token cycle
-        (page-10 proof: ``C = F* diag(ρ) F``, ``ρ_k = |h(ω^k)|²``) — a *relative*-
-        position operator that does NOT collapse on the vertex-transitive cycle the
-        way the first moment ``E_q[Φ]`` does. ``Φ(q)`` runs over the entire composite
-        graph, so ``C`` spans token+scene; when ``signal`` is non-zero on every node
-        (token rows = X, scene rows = first-moment Ψ) the full structure
-        (scene–scene, scene–token, token–token) propagates.
-
-        Used by the Graph Transformer as ``H0 = signal + C·signal`` (the second-
-        moment readout). Size-robust / transferable (no size-locked parameter, no
-        factoring). Probe sampling, chunking, fixed-seed determinism and gradient
-        checkpointing mirror ``forward``; only the pooled statistic differs.
+        Probe sampling, chunking, fixed-seed, and gradient checkpointing mirror
+        ``forward``; only the pooled statistic differs.
 
         Args:
-            data: PyG Data with the (already-permuted, if any) composite-graph edges.
-            signal: [N, d_model] signal to apply ``C`` to (the GT's ``seeded``).
-            scale_to_signal: when True (default) magnitude-match the result to the
-                signal's mean row-norm and apply the learnable ``tanh(g)`` output
-                gate — the GT readout path. When False, return the **raw centered
-                covariance application** ``C·signal`` with no magnitude match and no
-                gate, so a caller can extract the ``C`` operator (e.g. the token
-                block ``C_tok`` for the per-layer q/k injection) and scale it
-                explicitly (e.g. to ``‖X‖``).
+            data: PyG Data with (already-permuted, if any) composite-graph edges.
+            signal: [N, d_model] signal to apply ``C`` to.
+            scale_to_signal: when True (default) applies the learnable ``tanh(g)``
+                gate. When False, returns raw ``C·signal`` with no gate (used to
+                materialize the ``C`` operator for per-layer q/k injection).
 
         Returns:
             ``C·signal`` in [N, d_model], gated by ``tanh(output_gain)``.
@@ -348,19 +298,11 @@ class RandomGNNPositionalEncodings(nn.Module):
 
         def _chunk_apply(Qc, ei, _dummy=None):
             mc = Qc.shape[1]
-            # Per-probe responses P_s = Φ(q^(s)) ∈ [N, d] (pool=False keeps them
-            # un-meaned); accumulate Σ_s P_s (P_sᵀ s) so the [d, d] inner product
-            # is the only dense intermediate — the N×N matrix is never formed. Also
-            # accumulate Σ_s P_s (the un-pooled first moment) so the readout can be
-            # centered into a covariance (see below).
+            # Per-probe Φ(q^(s)) ∈ [N, d]; accumulate Σ_s Φ(Φᵀs) — [d,d] inner
+            # product is the only dense intermediate, N×N is never formed.
             P = self._batched_gcn_forward(
                 Qc, ei, num_nodes, mc, edge_weight=edge_weight, device=device, pool=False
             )  # [mc, N, d]
-            # fp32 outer products (the dominant matmul). [The PSD-stable fp64 path was
-            # only needed by the old Monte-Carlo c_bias covariance kernel, which is now
-            # ANALYTIC (_analytic_c_from_taps) — the remaining callers (GT H0 `C·seeded`
-            # scaled to ‖signal‖; c_per_layer `C_tok` scaled to ‖X‖) are not PSD-asserted
-            # and ran in fp32 fine. fp64 here cost ~30x on GPUs with throttled fp64.]
             out = None
             for si in range(P.shape[0]):
                 Ps = P[si]                                   # [N, d]
@@ -381,24 +323,15 @@ class RandomGNNPositionalEncodings(nn.Module):
             psi_acc = psi_c if psi_acc is None else psi_acc + psi_c
         result = acc / m                                     # E_q[Φ(Φᵀ s)] (uncentered second moment)
         if self.center_second_moment:
-            # Center to the COVARIANCE: C·s = E[ΦΦᵀ]s − E[Φ]E[Φ]ᵀ s = E[Φ(Φᵀs)] − Ψ(Ψᵀs).
-            # The proof's circulant C = h(S)h(S)* assumes the zero-mean linear response
-            # Φ'=h(S)q; the nonlinear GCN gives Φ a nonzero mean whose outer product
-            # ΨΨᵀ is a rank-1 DC term that otherwise dominates E[ΦΦᵀ] (collapsing C to
-            # pure averaging). Subtracting it (Ψ = E_q[Φ], same raw probes) restores the
-            # position-bearing covariance the proof guarantees. Ψ here is the un-normed
-            # pooled Φ, matching the un-normed Φ in the second moment.
+            # C·s = E[ΦΦᵀ]s − ΨΨᵀs; subtract rank-1 ΨΨᵀ bias so C carries position.
+            # Ψ = E_q[Φ] (un-normed, same raw probes as the second-moment term).
             psi = psi_acc / m                                # E_q[Φ]  [N, d]
             result = result - psi @ (psi.transpose(0, 1) @ s)
         if not scale_to_signal:
-            # Raw centered covariance application C·signal — no magnitude match, no
-            # output gate. Used to materialize the C operator (e.g. C_tok) for the
-            # per-layer q/k replacement, which is scaled to ‖X‖ by the caller. The
-            # gate is deliberately skipped here: a tanh(g)→0 would zero the operator,
-            # which under a q←C·q replacement would collapse attention.
+            # Raw C·signal — no gate. Used when the caller scales C explicitly
+            # (e.g. C_tok for per-layer q/k injection, scaled to ‖X‖ externally).
             return result.to(signal.dtype)
-        # Learnable tanh(g) output gate; the model dials the relative-position
-        # operator's strength itself (no ad-hoc magnitude matching to ‖signal‖).
+        # Learnable tanh(g) output gate.
         return result * torch.tanh(self.output_gain).to(result.dtype)
 
     def covariance_token_block(self, data, c):
@@ -432,11 +365,8 @@ class RandomGNNPositionalEncodings(nn.Module):
         Q = self._sample_probes(N, m, device, gen)
         chunk = max(1, min(m, self.max_probe_rows // max(1, N),
                            self.max_gather_rows // max(1, ei.shape[1])))
-        # Collect the per-probe token-row responses (chunked GCN keeps the edge-gather
-        # bounded), then form the covariance from CENTERED outer products. This is the
-        # same C = E[ΦΦᵀ]−ΨΨᵀ but computed as (1/m)Σ(Φ_s−Ψ)(Φ_s−Ψ)ᵀ — manifestly PSD with
-        # no catastrophic cancellation (the un-centered E[ΦΦᵀ]−ΨΨᵀ gives slightly-negative
-        # diagonal variances in fp32, which the unit-diagonal normalization then blows up).
+        # Covariance via centered outer products (1/m)Σ(Φ_s−Ψ)(Φ_s−Ψ)ᵀ — manifestly PSD,
+        # avoids fp32 cancellation from un-centered E[ΦΦᵀ]−ΨΨᵀ.
         Pt_chunks = []
         for start in range(0, m, chunk):
             Qc = Q[:, start:start + chunk]

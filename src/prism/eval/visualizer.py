@@ -1,16 +1,15 @@
-"""M12 — visualize the composite graph and its spectral clustering (R10).
+"""Visualize the composite graph and its spectral clustering.
 
-Two artifacts for a single composite graph (from M4):
+Two artifacts for a single composite graph:
   1. an interactive vis.js HTML laying out the two layers — token (directed
      cycle) nodes vs. scene nodes — with cross-links highlighted;
   2. a spectral-clustering PNG coloring nodes by the Fiedler vector of the
      (diagnostic, symmetric) augmented Laplacian.
 
-Both **reuse the existing scripts** rather than reimplementing: the vis.js
-HTML shell from ``scripts/render_scene_graph.py`` and the GSO eigendecomposition
-+ panel drawing from ``scripts/spectral_clustering.py``. The c=8192 cycle is
-subsampled for legibility (all scene nodes + all cross-linked token nodes + a
-strided sample of the rest), as the spec recommends.
+Both reuse existing scripts: the vis.js HTML shell from
+``scripts/render_scene_graph.py`` and the GSO eigendecomposition from
+``scripts/spectral_clustering.py``. The cycle is subsampled for legibility
+(all scene nodes + cross-linked token nodes + strided sample of the rest).
 
 Gated behind ``enable_visualizer``; see ``visualize`` (the entry point).
 """
@@ -147,7 +146,7 @@ def render_composite_graph_html(aug, out_path: str, max_cycle: int = 80, source:
     for a, b in edges["clique"]:      # same-label multi-mention clique (E2b) — purple
         vis_edges.append({"from": a, "to": b, "color": {"color": "#9b59b6", "highlight": "#6c3483"}, "width": 0.8})
 
-    source_label = f"composite graph (M4) — source: {source}" if source else "composite graph (M4)"
+    source_label = f"composite graph — source: {source}" if source else "composite graph"
     html = rsg.HTML_TEMPLATE.format(
         title="Composite Graph", source_file=source_label,
         n_nodes=len(keep), n_edges=len(vis_edges), robot_location="—",
@@ -163,10 +162,7 @@ def render_composite_graph_html(aug, out_path: str, max_cycle: int = 80, source:
     return out_path
 
 
-# Per-class edge styling (color, width) shared by both artifacts' intent.
-# (color, width, alpha). The directed cycle is the structural backbone, so it
-# stays thick/opaque; the dense cross-link/clique edges are kept thin and faint
-# so the figure reads instead of blooming into a hairball.
+# Per-class edge styling (color, width, alpha) shared by both artifacts.
 _EDGE_STYLE = {
     "cycle": ("#006400", 2.5, 0.95),   # directed sequence cycle (dark green)
     "scene": ("#e05c5c", 1.0, 0.7),    # scene affinity edges
@@ -231,15 +227,14 @@ def render_spectral_clustering(aug, out_path: str, max_cycle: int = 80, source: 
 
 
 def visualize(aug, out_dir: str, config=None, source: str = None) -> Dict[str, str]:
-    """M12 entry point: write both artifacts for one composite graph.
+    """Write both artifacts for one composite graph.
 
-    ``source`` is an optional provenance label (e.g. the scene-graph file or
-    checkpoint) stamped onto both artifacts. Returns paths {"html",
-    "spectral_png"}. Intended to be gated by the caller on ``enable_visualizer``
-    (see callbacks.AugGraphDebugCallback).
+    ``source`` is an optional label stamped onto both artifacts. Returns
+    ``{"html", "spectral_png"}``. Gate via ``enable_visualizer`` (see
+    ``AugGraphDebugCallback``).
     """
     os.makedirs(out_dir, exist_ok=True)
     html = render_composite_graph_html(aug, os.path.join(out_dir, "composite_graph.html"), source=source)
     png = render_spectral_clustering(aug, os.path.join(out_dir, "composite_graph_spectral.png"), source=source)
-    print(f"[M12] visualizer wrote: {html} , {png}")
+    print(f"[visualizer] wrote: {html} , {png}")
     return {"html": html, "spectral_png": png}

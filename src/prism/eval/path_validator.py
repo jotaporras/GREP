@@ -1,4 +1,4 @@
-"""M10 — validate a generated plan/path against the scene graph (R4).
+"""Validate a generated plan/route against the scene graph.
 
 Two layers:
 
@@ -27,14 +27,11 @@ Two layers:
    evaluation turn (validation and test). The judge score and the RegEx score are
    kept **completely separate** — computed from disjoint inputs, neither reading the
    other: the RegEx/NetworkX accuracy is judge-free, and the *subjective* accuracy is
-   the judge's verdict over judged samples only. Relative to the objective baseline
-   the judge moves the subjective column only — it LOWERS it on a false positive
-   (RegEx correct, judge wrong) and RAISES it on a false negative (RegEx wrong, judge
-   correct). ``combine_verdict`` computes both verdicts plus the
-   ``false_positive``/``false_negative`` diagnostics. If the judge cannot load (no
-   weights/auth) those samples are simply absent from the subjective score (and the
-   caller warns) — never copied from RegEx. With no ``acceptance_criterion`` and a
-   non-yes/no answer, the judge is skipped entirely.
+   the judge's verdict over judged samples only. ``combine_verdict`` computes both
+   verdicts plus the ``false_positive``/``false_negative`` diagnostics. If the judge
+   cannot load (no weights/auth) those samples are simply absent from the subjective
+   score (and the caller warns) — never copied from RegEx. With no
+   ``acceptance_criterion`` and a non-yes/no answer, the judge is skipped entirely.
 
 The graph is built with the same coords→Euclidean ``distance_m`` convention as
 ``scene_graph_parser`` / ``data.utils``; directedness follows the source
@@ -134,21 +131,15 @@ def validate_path(
     ``cost_optimality`` (None unless ``full_path_valid`` and ≥2 nodes),
     ``path_from_reasoning``, ``path_rescued``.
 
-    When the regex finds NO route in ``generated_text`` (the plan), two fallbacks
-    fire in order:
+    When the regex finds no route in ``generated_text``, two fallbacks fire:
 
-    1. **Reasoning scan (always on, deterministic).** The regex re-scans
-       ``reasoning_text`` (the model's full response) so a route the model stated
-       only in its *reasoning* is still caught, taking the route it states LAST
-       (its final committed path). This runs for EVERY task — a route in the
-       reasoning is picked up regardless of the task ``kind``.
-    2. **Gemma rescue (gated).** Only if the reasoning scan also finds nothing and
-       ``rescue_response`` is given and ``GREP_PATH_RESCUE`` is enabled, the Gemma
-       judge recreates the route in the canonical ``a -> b -> c`` notation.
+    1. **Reasoning scan (always on).** Re-scans ``reasoning_text``, taking the
+       route stated LAST (final committed path).
+    2. **Gemma rescue (gated).** If ``rescue_response`` is given and
+       ``GREP_PATH_RESCUE`` is on, the judge rewrites the route in ``a -> b -> c``.
 
-    The SAME NetworkX diagnostics below grade whichever route is found. Both are
-    one-way: an empty/hallucinated route scores as no/invalid path and never
-    inflates. ``path_from_reasoning`` / ``path_rescued`` flag the source.
+    The same NetworkX diagnostics grade whichever route is found; both fallbacks
+    are one-way. ``path_from_reasoning`` / ``path_rescued`` flag the source.
     """
     G = build_graph(graph_dict, directed=directed)
     node_set = set(G.nodes)
@@ -157,14 +148,11 @@ def validate_path(
     from_reasoning = False
     rescued = False
     if not parsed and reasoning_text:
-        # The plan carried no route — check the model's reasoning too, taking the
-        # path it commits to LAST (deterministic, no model call). Always on.
+        # Reasoning scan: take the route the model commits to last (no model call).
         parsed = parse_path(reasoning_text, prefer_last=True)
         from_reasoning = bool(parsed)
     if not parsed and rescue_response and _path_rescue_enabled():
-        # Still nothing. Ask the Gemma judge to rewrite the route the model was
-        # trying to express in our `a -> b -> c` notation, then grade THAT route
-        # with the identical NetworkX diagnostics below.
+        # Gemma rescue: rewrite the route in `a -> b -> c` and re-run NetworkX.
         rescued_route = write_path_with_judge(
             rescue_response, node_set, task=task, start=start, goal=goal)
         parsed = parse_path(rescued_route, prefer_last=True)
@@ -202,12 +190,8 @@ def validate_path(
             result["cost_optimality"] = (emitted / shortest) if shortest > 0 else 1.0
         except (nx.NetworkXNoPath, nx.NodeNotFound):
             result["cost_optimality"] = None
-        # Hop-count optimality: emitted hops ÷ shortest-path HOPS (unweighted BFS),
-        # the route-length analogue of the distance-weighted cost_optimality above.
-        # The shortest length is a unique scalar even when many equally-short paths
-        # exist, so any optimal route scores 1.0. evaluate_sample nulls this for
-        # routes that don't correctly reach the A→B goal (it's only meaningful on a
-        # valid path); here it is computed whenever the emitted walk is edge-valid.
+        # Hop-count optimality: emitted hops ÷ shortest-path hops (unweighted BFS).
+        # Any optimal route scores 1.0; nulled by evaluate_sample for invalid A→B paths.
         try:
             hops = nx.shortest_path_length(G, parsed[0], parsed[-1])
             result["hop_optimality"] = (len(pairs) / hops) if hops > 0 else 1.0
@@ -233,9 +217,8 @@ def _load_judge():
     if _JUDGE["loaded"]:
         return _JUDGE["gen"]
     _JUDGE["loaded"] = True
-    # Hard off-switch: GREP_JUDGE=0 skips the model load entirely (no GPU memory/
-    # power spike). Disables BOTH the acceptance judge and the path rescue, since
-    # both route through here. Mirrors GREP_PATH_RESCUE's on-by-default semantics.
+    # Hard off-switch: GREP_JUDGE=0 skips the model load (disables both acceptance
+    # judge and path rescue, since both route through here).
     if os.environ.get("GREP_JUDGE", "1").strip().lower() not in ("1", "true", "yes", "on"):
         print("[path_validator] Gemma judge disabled (GREP_JUDGE=0); regex/NetworkX only.")
         _JUDGE["gen"] = None
@@ -280,18 +263,13 @@ def _load_judge():
     return _JUDGE["gen"]
 
 
-# A yes/no answer is one whose ground-truth `answer` regex contains the literal
-# word "yes" or "no" — exactly these are routed to the Gemma judge, since a bare
-# regex match on such answers is the most false-positive-prone.
+# A yes/no answer is one whose ground-truth `answer` regex contains "yes" or "no".
 _YESNO_ANSWER = re.compile(r"\b(yes|no)\b", re.I)
 
 
 def is_yes_no_task(task: Optional[str], answer: Optional[str]) -> bool:
     """True when the ground-truth ``answer`` regex contains 'yes' or 'no'.
-
-    The presence of yes/no in the answer is the trigger for the Gemma judge
-    (the ``task`` argument is unused but kept for call-site clarity).
-    """
+    ``task`` is unused but kept for call-site clarity."""
     return bool(answer and _YESNO_ANSWER.search(answer))
 
 
@@ -502,11 +480,8 @@ def derive_targets(graph_dict: dict, *, init_node, answer, criterion, task):
                 out.append(t)
         return out
 
-    # The answer regex authoritatively names the route's endpoints/waypoints;
-    # those nodes are required and must NEVER be treated as avoided — otherwise a
-    # criterion that mentions an endpoint inside a "without using ..." clause
-    # (e.g. "without using the bridge_1 <-> specimen_vault_1 edge") would drop the
-    # goal and silently fall back to the judge.
+    # The answer regex authoritatively names endpoints/waypoints; never treat them
+    # as avoided (a criterion can mention an endpoint in a "without using ..." clause).
     ans_ids = [t for t in ids(_strip_regex(answer)) if t != init_node]
     avoid = {t for span in _AVOID.findall(blob) for t in _NODE_ID.findall(span) if t in nodes}
     avoid -= set(ans_ids) | ({init_node} if init_node else set())
@@ -514,10 +489,8 @@ def derive_targets(graph_dict: dict, *, init_node, answer, criterion, task):
                  if t in nodes and t != init_node and t not in avoid]
     waypoints = list(dict.fromkeys(waypoints))  # de-dup, keep order
 
-    # Union of answer-named ids (ordered, authoritative for path endpoints) and
-    # criterion/task ids — so a positionality answer that names only the region
-    # still picks up the contained object (and its containment edge) from the
-    # criterion.
+    # Union of answer-named ids and criterion/task ids (positionality answers may
+    # name only the region; the object comes from the criterion).
     crit_ids = [t for t in ids(blob)
                 if t != init_node and t not in avoid and t not in waypoints]
     ordered = ans_ids + [t for t in crit_ids if t not in ans_ids]
@@ -544,16 +517,11 @@ def validate_structured(
 ) -> Optional[Dict]:
     """Deterministic edge/path verdict for a structural task. Never raises.
 
-    Returns the ``validate_path`` metrics extended with ``goal``, ``kind``,
-    ``waypoints_ok``, ``avoid_ok``, ``required_edges_present`` and the boolean
-    ``structured_correct`` — or ``None`` when the task isn't graph-structural
-    (no resolvable goal), so the caller falls back to the regex/judge path.
+    Returns ``validate_path`` metrics extended with ``goal``, ``kind``,
+    ``waypoints_ok``, ``avoid_ok``, ``required_edges_present``, ``structured_correct``
+    — or ``None`` when no goal resolves (caller falls back to regex/judge).
 
-    A route stated in the model's reasoning is always picked up (the deterministic
-    reasoning scan runs for every ``kind``). The Gemma path rescue, by contrast,
-    runs only for a ``kind == "path"`` task (reachability / navigability) when no
-    route is found at all — ``kind == "edges"`` (positionality) expects no route
-    and is never rescued by the model.
+    Reasoning scan runs for every ``kind``; Gemma rescue only for ``kind == "path"``.
     """
     goal, waypoints, avoid, required_edges, kind = derive_targets(
         graph_dict, init_node=init_node, answer=answer, criterion=criterion, task=task)
@@ -565,11 +533,8 @@ def validate_structured(
         rescue_response=(full_response if kind == "path" else None), task=task)
     parsed = m["parsed_nodes"]
     stated = parse_edges(generated_text, set(build_graph(graph_dict, directed=directed).nodes))
-    # A required containment edge counts as present if the model STATED it
-    # (`u <-> v` notation) OR its route TRAVERSES it (a consecutive pair in the
-    # path) — a reach-object route ends `goal_region -> object`, which expresses
-    # the containment without separate edge notation. (Objects are leaves hosted in
-    # one region, so this can only occur at the route's end.)
+    # A containment edge counts as present if stated (`u <-> v`) OR traversed
+    # (a reach-object route ends goal_region→object, expressing containment implicitly).
     path_edges = {frozenset((parsed[k], parsed[k + 1])) for k in range(len(parsed) - 1)}
     m["goal"] = goal
     m["kind"] = kind
@@ -584,16 +549,9 @@ def validate_structured(
         m["structured_correct"] = bool(
             goal_named and (m["required_edges_present"] if required_edges else True))
     else:  # reachability / navigability: a valid constrained walk to the goal.
-        # `goal` is the destination REGION. A reach-an-object route legitimately
-        # ends one hop PAST the goal at an object contained in it (final hop
-        # `goal_region -> object`, e.g. tool_shed_1 -> drill_1) — even when that
-        # object is not named in the criterion (so it isn't in required_edges).
-        # Score start_goal_ok on the start node (always provided in text) plus
-        # reaching the goal: ending at the goal region, OR ending at an object whose
-        # host (per the GRAPH) is the goal. This overrides validate_path's literal
-        # `parsed[-1] == goal`, which wrongly failed every reach-an-object route.
-        # The hop-edges (incl. the containment hop) are still checked by
-        # `full_path_valid`.
+        # `goal` is the destination REGION. A reach-an-object route legitimately ends
+        # one hop past the goal at a contained object (goal_region -> object); both
+        # endings count as reaching the goal (overrides validate_path's literal check).
         regions = {r["name"] for r in graph_dict.get("regions", [])}
         objects = {o["name"] for o in graph_dict.get("objects", [])}
         host = {}
@@ -614,25 +572,15 @@ def validate_structured(
 
 
 def _augment_eval_metrics(m: Dict, *, goal: Optional[str]) -> Dict:
-    """Add the eval/* per-sample metrics derived from a FINAL per-sample grade.
-
-    Called at the end of ``evaluate_sample`` (the single per-sample chokepoint) so
-    the fields below see the *post-override* ``start_goal_ok`` — ``validate_structured``
-    relaxes it for a reach-an-object route that legitimately ends one hop past the
-    goal region. Computing them here, not in ``validate_path``, is what makes the
-    reach-an-object case count as valid.
+    """Add eval/* per-sample metrics using the post-override ``start_goal_ok``.
 
     Adds:
-      * ``path_expected`` — a route is expected: a navigability / reachability task
-        with a resolved ``goal``. Positionality (``kind == "edges"``) and non-path
-        tasks are excluded so they don't dilute ``valid_path_rate``.
-      * ``valid_path_ab`` — starts at start, ends at goal, no hallucinated nodes, no
-        hallucinated edges (``full_path_valid`` AND the final ``start_goal_ok``). Path
-        *constraints* (waypoints / avoid) are intentionally NOT required here.
-      * ``hallucination_rate`` — fraction of parsed plan nodes absent from the graph
-        (``1 - nodes_exist_rate``), for any sample that emitted a route.
-      * ``hop_optimality`` is kept only for valid A→B paths (nulled otherwise): the
-        ratio is meaningless for a route that doesn't correctly reach the goal.
+      * ``path_expected`` — True for reachability/navigability tasks with a resolved
+        goal; excludes positionality (``kind == "edges"``) and non-path tasks.
+      * ``valid_path_ab`` — ``full_path_valid`` AND ``start_goal_ok`` (no waypoint/
+        avoid constraints required).
+      * ``hallucination_rate`` — ``1 - nodes_exist_rate`` for routed samples.
+      * ``hop_optimality`` — nulled for non-valid A→B paths.
     """
     kind = m.get("kind")  # only set for structured tasks
     m["path_expected"] = bool(goal is not None and kind != "edges")
@@ -657,7 +605,7 @@ def evaluate_sample(
     full_response: Optional[str] = None,
     directed: bool = False,
 ) -> Dict:
-    """M10 per-sample verdict: deterministic structured grade, else regex + judge.
+    """Per-sample verdict: deterministic structured grade, else regex + judge.
 
     A structural task (positionality / reachability / navigability — one whose
     answer/criterion resolves to a graph goal) is graded deterministically by
@@ -704,19 +652,14 @@ def gemma_regrade_path_metrics(
     task: Optional[str] = None,
     directed: bool = False,
 ) -> Optional[Dict]:
-    """GREP_GEMMA_REGRADE path metrics — the SINGLE source of truth shared by the
-    live eval (``evaluate.py``) and the retro-grader (``apply_judge_to_eval_run.py``)
-    so the two readings are byte-identical (and ``scalability_evaluation.py``, which
-    just delegates to ``evaluate``, inherits it).
+    """GREP_GEMMA_REGRADE path metrics — shared by live eval and retro-grader for
+    byte-identical results.
 
-    For EVERY sample, asks the Gemma judge to recover the route from the FULL
-    recorded response (``write_path_with_judge``) — not only when the regex found
-    nothing — then grades that route with the normal ``evaluate_sample``
-    diagnostics. ``path_source`` is ``'gemma_judge'`` when the judge's route parsed,
-    else ``'regex_fallback'`` (the metrics are then the ordinary plan/reasoning
-    grading, so a NONE/empty reply can't erase a route the plan really carried).
-    ``gemma_route`` always carries the raw judge output. Never raises — returns the
-    grade, or ``None`` only if the grade itself fails.
+    Asks the Gemma judge to recover the route from the full recorded response for
+    EVERY sample, then grades via ``evaluate_sample``. ``path_source`` is
+    ``'gemma_judge'`` when the judge's route parsed, else ``'regex_fallback'``
+    (ordinary plan/reasoning grading). ``gemma_route`` carries the raw judge output.
+    Never raises.
     """
     full = "" if planner_response is None else str(planner_response)
     plan = planner_response.get("plan") if isinstance(planner_response, dict) else planner_response
@@ -750,21 +693,15 @@ def combine_verdict(
     judge_pass: Optional[bool],
     acceptance_criterion_present: bool,
 ) -> Dict:
-    """Produce the two *completely separate* per-sample verdicts.
+    """Produce two separate per-sample verdicts from disjoint inputs.
 
-    The two scores are computed from **disjoint inputs** and never read each other:
+    * **objective** — RegEx/NetworkX args only (``regex_correct``/``regex_keyword``).
+    * **subjective** — ``judge_pass`` only; ``None`` when not judged.
 
-    * **objective** — a function of the RegEx/NetworkX args ONLY
-      (``regex_correct``/``regex_keyword``). The judge has zero effect on it.
-    * **subjective** — a function of ``judge_pass`` ONLY. It is the judge's boolean
-      where the judge ran (``acceptance_criterion`` present and a boolean returned),
-      else ``None`` (not judged — it does NOT borrow the RegEx value).
+    ``false_positive`` / ``false_negative`` compare the two verdicts and feed neither.
 
-    ``false_positive`` / ``false_negative`` are separate diagnostics that *compare*
-    the two verdicts (judge disagreeing with RegEx); they feed neither score.
-
-    Returns: ``objective_correct``/``objective_keyword`` (RegEx-only booleans),
-    ``subjective_correct``/``subjective_keyword`` (judge-only, ``None`` if unjudged),
+    Returns: ``objective_correct``, ``objective_keyword`` (RegEx-only);
+    ``subjective_correct``, ``subjective_keyword`` (judge-only, ``None`` if unjudged);
     ``false_positive``, ``false_negative``, ``judged``.
     """
     judged = acceptance_criterion_present and judge_pass is not None
@@ -789,22 +726,17 @@ def combine_verdict(
 
 
 # --------------------------------------------------------------------------
-# Run-level aggregation — the SINGLE source shared by the live eval
-# (``evaluate.py``), the eval callback (``eval/*`` wandb keys) and the offline
-# retro-grader (``apply_judge_to_eval_run.py``). Kept here (model-free module) so
-# the retro-grader can import it without pulling in the model stack.
+# Run-level aggregation — shared by evaluate.py, eval callback, and retro-grader.
 # --------------------------------------------------------------------------
 def aggregate_path_metrics(sample_results: List[dict]) -> dict:
-    """Mean M10 path metrics over an eval run's per-sample ``path_metrics``.
+    """Mean path-validation metrics over an eval run's per-sample ``path_metrics``.
 
-    Two metric families with DIFFERENT denominators:
+    Two metric families with different denominators:
 
     * **Legacy** (``edge_validity_rate``, ``nodes_exist_rate``, ``full_path_valid_rate``,
-      ``cost_optimality`` …, logged under ``grep/path_*``): averaged ONLY over samples
-      that produced a parseable route (``num_parsed > 0``). Unchanged — byte-identical
-      to what a judge-free live run has always written.
-    * **eval/\\***: computed over the FULL sample list so no-route / wrong-route path
-      samples count as failures (the faithful reading of "valid path rate"):
+      ``cost_optimality`` …, logged under ``grep/path_*``): averaged over samples with
+      a parseable route (``num_parsed > 0``).
+    * **eval/\\*** — computed over the full sample list (failures included):
         - ``valid_path_rate``      = #valid_path_ab / #path_expected
         - ``path_optimality_rate`` = mean ``hop_optimality`` over valid A→B paths
         - ``hallucination_rate``   = mean per-sample hallucination over routed samples
@@ -829,15 +761,12 @@ def aggregate_path_metrics(sample_results: List[dict]) -> dict:
             "start_goal_ok_rate": _rate("start_goal_ok"),
             "cost_optimality": _mean("cost_optimality"),
             "num_with_path": len(pms),
-            # Routes the plan didn't carry but the model stated in its reasoning
-            # (recovered deterministically by regex, no model call).
+            # Routes found in reasoning (not plan) by deterministic regex scan.
             "num_from_reasoning": sum(1 for p in pms if p.get("path_from_reasoning")),
-            # Routes recovered by the Gemma path rescue (regex found none in plan or
-            # reasoning; judge rewrote it in `a -> b -> c` and NetworkX re-graded it).
+            # Routes recovered by the Gemma path rescue (regex found none in plan or reasoning).
             "num_rescued": sum(1 for p in pms if p.get("path_rescued")),
         })
-        # Only the GREP_GEMMA_REGRADE reading stamps path_source; add this field there
-        # so the original aggregate stays byte-for-byte what a judge-free run writes.
+        # GREP_GEMMA_REGRADE only: keeps the original aggregate byte-identical for judge-free runs.
         if any(p.get("path_source") for p in pms):
             agg["num_gemma_path"] = sum(1 for p in pms if p.get("path_source") == "gemma_judge")
         # Deterministic structural aggregates (present when structured tasks ran).

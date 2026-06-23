@@ -49,7 +49,6 @@ def _parse_scene_graph_dictionary_from_conversation(
     if match is None:
         raise ValueError("Scene graph marker not found in first turn content.")
 
-    # The second group contains the graph dict.
     scene_graph_text = match.group(1).strip()
 
     try:
@@ -96,27 +95,11 @@ def build_scene_affinity_graph(
 ) -> nx.Graph:
     """Build the weighted scene graph G_Sc for the composite-graph pipeline.
 
-    Topology comes from the same object/region connection lists the rest of the
-    parser uses; node labels stay the canonical underscore-joined names. Every
-    edge gets a Gaussian heat-kernel affinity (E1)
+    Edge weight = exp(-d^2 / (2 * sigma^2)), sigma = median edge distance (E1 Gaussian affinity).
+    Degenerate graphs (no edges or sigma==0) fall back to weight 1. Raw Euclidean distance
+    kept under ``distance_m`` when ``keep_raw_distance_feature=True``.
 
-        weight = exp(-d^2 / (2 * sigma^2)),   sigma = median edge distance,
-
-    with the raw Euclidean distance kept under ``distance_m``. The median
-    bandwidth makes affinities comparable across graph scales and keeps closer
-    edges strictly stronger. Degenerate graphs (no edges, or sigma == 0) fall
-    back to weight 1.
-
-    Args:
-        scene_graph_dict: Parsed scene graph with objects/regions (each with a
-            ``coords`` list) and object/region connection lists.
-        sigma_mode: Bandwidth rule for the kernel. Only ``"median"`` is used.
-        keep_raw_distance_feature: Keep the raw meters under ``distance_m``.
-
-    Returns:
-        Undirected ``nx.Graph`` (directedness matches the source connections).
-        ``distance_m`` and affinity ``weight`` are stored per edge; node
-        ``coords`` are preserved for the validator (M10).
+    Returns an undirected ``nx.Graph`` with ``weight``, ``distance_m``, and node ``coords``.
     """
 
     coords = {
@@ -154,16 +137,7 @@ def build_scene_affinity_graph(
 def add_scene_graph_feature(
     dataset: Dataset,
 ) -> Dataset:
-    """Attach a scene graph feature to every example in the dataset and filter it.
-
-    Args:
-        dataset: HuggingFace ``Dataset`` containing conversation transcripts.
-        feature_name: Name of the feature that will store the parsed graph.
-
-    Returns:
-        Dataset with a new feature populated by parsed scene graphs and filtered so
-        that only examples with fully defined graphs remain.
-    """
+    """Attach ``scene_graph`` to every dataset example, then filter out examples with undefined nodes."""
 
     def _add_feature(example: Dict[str, Any]) -> Dict[str, Any]:
         example["scene_graph"] = _parse_scene_graph_dictionary_from_conversation(example)
