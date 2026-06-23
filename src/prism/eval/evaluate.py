@@ -14,6 +14,7 @@ Public surface:
 - `print_summary_table`              — stdout formatter over a list of results.
 - `run_zero_shot_eval`               — evaluate an untrained base model, write the eval-log JSON.
 - `run_post_train_cross_eval`        — post-training cross-eval over a graph set, write per-graph JSONs.
+- `GraphTokenAccuracyMixin`          — training-time diagnostic: teacher-forced graph-token accuracy.
 """
 from __future__ import annotations
 
@@ -22,10 +23,12 @@ import os
 import re
 import time
 import traceback as traceback_mod
+import warnings
 from collections import namedtuple
 from dataclasses import asdict, dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
+import torch
 import wandb
 
 from spine import spine
@@ -876,3 +879,84 @@ def _write_cross_eval_json(
     with open(out_file, "w") as f:
         json.dump(log_data, f, indent=2, default=str)
     print(f"  {name}: {result.num_correct}/{result.num_total} ({result.accuracy:.1%}) -> {out_file}")
+
+
+class GraphTokenAccuracyMixin:
+    """This mixin computes and logs ``graph_acc/scene_block`` and ``graph_acc/answer_nodes`` metrics. teacher-forced
+    next-token accuracy restricted to graph-related tokens.
+
+    * ``scene_block`` — tokens in the scene-graph block that name a node (the
+      positions the graph PE injects into).
+    * ``answer_nodes`` — node-name tokens the model emits in its final answer.
+
+    The two masks come from per-example index lists precomputed in
+    ``preprocess_dataset`` and carried verbatim by the collator
+    (:class:`prism.data.data.TokenIndexCollator`); right-padding keeps each index
+    valid in the padded batch. Counts accumulate across the logging window and are
+    flushed (DDP-reduced) in :meth:`log`, so the metric rides the trainer's existing
+    wandb logging cadence with no extra callback. Mixed into both the graph trainer
+    and the plain-``llm`` baseline trainer so the two are comparable.
+    """
+
+    def _reset_token_acc(self):
+        self._gta = {"scene_c": 0, "scene_n": 0, "ans_c": 0, "ans_n": 0}
+
+    def _accumulate_token_acc(self, outputs, input_ids, scene_idx, answer_idx):
+        logits = getattr(outputs, "logits", None)
+        if logits is None or (scene_idx is None and answer_idx is None):
+            return
+        if not hasattr(self, "_gta"):
+            self._reset_token_acc()
+        with torch.no_grad():
+            # preds[t] predicts token t+1; a node token at position p is graded by
+            # preds[p-1] == input_ids[p]. So compare in the shifted (target) frame
+            # and map each index p -> p-1.
+            preds = logits[:, :-1, :].argmax(dim=-1)  # [B, S-1]
+            correct = preds == input_ids[:, 1:]  # [B, S-1]
+            width = correct.shape[1]
+            for b in range(correct.shape[0]):
+                for key, idx in (("scene", scene_idx), ("ans", answer_idx)):
+                    if not idx or b >= len(idx):
+                        continue
+                    pos = [p - 1 for p in idx[b] if 1 <= p <= width]
+                    if not pos:
+                        continue
+                    sel = correct[b, torch.as_tensor(pos, device=correct.device)]
+                    self._gta[f"{key}_n"] += sel.numel()
+                    self._gta[f"{key}_c"] += int(sel.sum().item())
+
+    def compute_loss(
+        self, model, inputs, return_outputs=False, num_items_in_batch=None
+    ):
+        scene_idx = inputs.pop("scene_node_idx", None)
+        answer_idx = inputs.pop("answer_node_idx", None)
+        loss, outputs = super().compute_loss(
+            model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch
+        )
+        try:
+            self._accumulate_token_acc(
+                outputs, inputs["input_ids"], scene_idx, answer_idx
+            )
+        except Exception as e:  # a diagnostic must never break training
+            warnings.warn(
+                f"graph-token-accuracy metric skipped: {type(e).__name__}: {e}"
+            )
+        return (loss, outputs) if return_outputs else loss
+
+    def log(self, logs, *args, **kwargs):
+        gta = getattr(self, "_gta", None)
+        if gta is not None:
+            counts = torch.tensor(
+                [gta["scene_c"], gta["scene_n"], gta["ans_c"], gta["ans_n"]],
+                dtype=torch.float64,
+                device=self.args.device,
+            )
+            if self.args.world_size > 1:
+                counts = self.accelerator.reduce(counts, reduction="sum")
+            scene_c, scene_n, ans_c, ans_n = counts.tolist()
+            if scene_n > 0:
+                logs["graph_acc/scene_block"] = scene_c / scene_n
+            if ans_n > 0:
+                logs["graph_acc/answer_nodes"] = ans_c / ans_n
+            self._reset_token_acc()
+        return super().log(logs, *args, **kwargs)

@@ -320,6 +320,66 @@ def preprocess_dataset(
     return ds
 
 
+def load_and_split_dataset(config, tokenizer):
+    """Load, preprocess, and split training data according to ``config``.
+
+    Handles three cases in priority order: explicit pre-split val file
+    (``config.val_data``), random fraction split (``config.val_frac > 0``),
+    or no validation set.  When ``config.debug`` is True, both train and val
+    are downsampled to ``config.dataset_proportion`` before splitting.
+
+    Args:
+        config: TrainConfig (duck-typed) supplying ``data``, ``val_data``,
+            ``val_frac``, ``debug``, ``dataset_proportion``, ``architecture``,
+            and ``text_edge_list``.
+        tokenizer: tokenizer passed through to ``preprocess_dataset``.
+
+    Returns:
+        (train_dataset, eval_dataset) — ``eval_dataset`` is ``None`` when no
+        validation set is configured.
+    """
+    full_dataset = datasets.load_dataset("json", data_files=[config.data], split="train")
+    if config.debug:
+        full_dataset = full_dataset.select(range(round(len(full_dataset) * config.dataset_proportion)))
+
+    full_dataset = preprocess_dataset(
+        full_dataset, tokenizer,
+        architecture=config.architecture,
+        text_edge_list=config.text_edge_list,
+    )
+
+    if config.val_data:
+        train_dataset = full_dataset
+        eval_dataset = datasets.load_dataset("json", data_files=[config.val_data], split="train")
+        if config.debug:
+            eval_dataset = eval_dataset.select(range(round(len(eval_dataset) * config.dataset_proportion)))
+        eval_dataset = preprocess_dataset(
+            eval_dataset, tokenizer,
+            architecture=config.architecture,
+            text_edge_list=config.text_edge_list,
+        )
+        print(f"Using pre-split val file: {len(train_dataset)} train / {len(eval_dataset)} eval")
+    elif config.val_frac and config.val_frac > 0.0:
+        dataset_size = len(full_dataset)
+        val_size = int(dataset_size * config.val_frac)
+        train_size = dataset_size - val_size
+        split = full_dataset.train_test_split(
+            test_size=val_size,
+            train_size=train_size,
+            seed=3407,
+            shuffle=True,
+        )
+        train_dataset = split["train"]
+        eval_dataset = split["test"]
+        print(f"Dataset split: {len(train_dataset)} train / {len(eval_dataset)} eval")
+    else:
+        train_dataset = full_dataset
+        eval_dataset = None
+        print(f"Using all {len(full_dataset)} samples for training (no validation).")
+
+    return train_dataset, eval_dataset
+
+
 def remove_edge_list(decoded: str) -> str:
     """Remove ``object_connections`` and ``region_connections`` from a scene-graph prompt string.
 

@@ -30,11 +30,11 @@ from prism.data.data import (
     edge_list_token_positions,
     TokenIndexCollator,
 )
+from prism.eval.evaluate import GraphTokenAccuracyMixin
 from prism.training.train_v2 import (
     _LOSS_TARGET_COLUMN,
     BaselineSFTTrainer,
     GraphSFTTrainer,
-    GraphTokenAccuracyMixin,
     LossTargetMixin,
     TrainConfig,
 )

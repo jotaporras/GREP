@@ -269,3 +269,31 @@ def graph_augmented_llm_from_pretrained(
 
     model.eval()
     return model, tokenizer
+
+
+def load_pe_weights_into(model, init_pe_from: str, architecture: str) -> None:
+    """Load a saved PE module (``gnn_weights.pt``) from a prior stage into ``model``.
+
+    Operates on a training model (no merge, no eval). Only rpearl_llm /
+    rpearl_gt_llm PE layouts are supported.
+
+    Args:
+        model: GraphAugmentedLLM training model with pe_model / pe_proj / pe_gain attributes.
+        init_pe_from: path to a checkpoint directory containing ``gnn_weights.pt``.
+        architecture: one of ``"rpearl_llm"`` or ``"rpearl_gt_llm"``.
+    """
+    weights_path = os.path.join(init_pe_from, "gnn_weights.pt")
+    gnn_weights = torch.load(weights_path, map_location="cpu")
+    if architecture == "rpearl_gt_llm":
+        model.pe_model.load_state_dict(gnn_weights["gt_model"], strict=False)
+    elif architecture == "rpearl_llm":
+        model.pe_model.load_state_dict(gnn_weights["pe_model"], strict=False)
+    else:
+        raise NotImplementedError(
+            f"load_pe_weights_into is only wired for rpearl_llm / rpearl_gt_llm, got {architecture!r}")
+    model.pe_proj.load_state_dict(gnn_weights["pe_proj"])
+    if "pe_gain" in gnn_weights:
+        model.pe_gain.data.copy_(gnn_weights["pe_gain"])
+    if getattr(model, "pe_norm", None) is not None and "pe_norm" in gnn_weights:
+        model.pe_norm.load_state_dict(gnn_weights["pe_norm"])
+    print(f"[multistage] loaded PE weights from {weights_path}")

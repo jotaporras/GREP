@@ -20,7 +20,7 @@ import torch
 from pytest import approx
 
 from prism.data.data import node_index_columns
-from prism.training.train_v2 import GraphTokenAccuracyMixin
+from prism.eval.evaluate import GraphTokenAccuracyMixin
 
 
 # --------------------------------------------------------------------------

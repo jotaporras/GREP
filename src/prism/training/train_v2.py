@@ -6,20 +6,20 @@ import warnings
 from prism.data import data
 from prism.eval import callbacks
 from prism.eval import evaluate
-from prism.models import gnn_llm
-from prism.models import r_pearl as r_pearl_module
-from prism.models import gt as gt_module
+from prism.models import architectures
+from prism.models import composite_graph
+from prism.models import loaders as model_loaders
 
 import json
 from dataclasses import asdict, dataclass, field
 from typing import List, Dict, Any, Optional
 
 from dotenv import load_dotenv
+
 load_dotenv()
 
 import wandb
 import torch
-import datasets
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -33,33 +33,27 @@ from trl import SFTConfig, SFTTrainer
 
 
 def train_model(config: "TrainConfig", config_file: str = None):
-    os.environ["WANDB_PROJECT"] = config.wandb_project
-    os.environ["WANDB_RUN_GROUP"] = config.wandb_tag
-    os.environ["WANDB_TAGS"] = config.wandb_tag
-
-    wandb.init(
-        project=config.wandb_project,
-        name=config.wandb_run_name,
-        tags=[config.wandb_tag],
-        group=config.wandb_tag,
+    wandb_run_id = _setup_wandb(
+        config.wandb_project, config.wandb_run_name, config.wandb_tag
     )
-    wandb_run_id = wandb.run.id
+    # Dir: {name}_{architecture}_{model_slug}_r{r}[_4bit]
+    output_dir = _construct_output_dir(config, wandb_run_id)
 
-    # Checkpoint subdirectory name.
-    # Format: "{name}_{architecture}_{model_slug}_r{r}[_4bit]_{wandb_run_id}"
-    # Override with --save_name to use "{save_name}_{wandb_run_id}" instead.
-    model_slug = _model_short_name(config.base_model)
-    if config.save_name is not None:
-        save_name = f"{config.save_name}_{wandb_run_id}"
-    else:
-        save_name = f"{config.name}_{config.architecture}_{model_slug}_r{config.r}" + ("_4bit" if config.bit4 else "") + f"_{wandb_run_id}"
+    if os.path.isdir(output_dir) and os.listdir(output_dir) and not config.overwrite_ok:
+        raise RuntimeError(
+            f"Checkpoint directory already exists and is non-empty: {output_dir}\n"
+            f"Set overwrite_ok: true in your config to allow overwriting, "
+            f"or delete the directory manually."
+        )
 
     # Quantization / dtype
     bnb_config = None
     if config.bit4:
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16 if _bf16_supported() else torch.float16,
+            bnb_4bit_compute_dtype=torch.bfloat16
+            if _bf16_supported()
+            else torch.float16,
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
         )
@@ -74,215 +68,45 @@ def train_model(config: "TrainConfig", config_file: str = None):
     )
     tokenizer = AutoTokenizer.from_pretrained(config.base_model, use_fast=True)
     _ensure_pad_tokens(tokenizer, llm)
-    tokenizer.padding_side = "right" # ty: ignore[invalid-assignment]
+    tokenizer.padding_side = "right"  # ty: ignore[invalid-assignment]
 
-    # Semantic-feature mode: the GNN takes the LLM text hidden size as input width.
-    _text_hidden = llm.config.get_text_config().hidden_size
-    _node_feature_dim = _text_hidden if config.pe_node_features == "word_embeddings" else None
-
-    if config.architecture == "rpearl_llm":
-        # R-PEARL only: GCN positional encodings, no GT attention blocks.
-        pe_model = r_pearl_module.RandomGNNPositionalEncodings(
-            pe_hidden_channels=config.pe_hidden_channels,
-            pe_num_layers=config.pe_num_layers,
-            d_model=config.d_model,
-            num_samples=config.num_samples,
-            dropout=config.dropout,
-            k=config.k_pe,
-            eps=config.eps,
-            use_layer_norm=config.use_layer_norm,
-            node_feature_dim=_node_feature_dim,
-        )
-        model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=config.d_model,
-                                          eps=config.eps, pe_gain_init=config.pe_gain_init,
-                                          disable_graph_token_rope=config.disable_graph_token_rope,
-                                          use_pe_norm=config.use_pe_norm,
-                                          pe_node_features=config.pe_node_features)
-        collator = data.SpineDataCollator(tokenizer, mlm=False)
-
-        if config.freeze_llm:
-            model.llm.requires_grad_(False)
-    elif config.architecture == "rpearl_gt_llm":
-        # Full Graph Transformer: R-PEARL inside Sparse Attention blocks.
-        pe_model = gt_module.GraphTransformer(
-            num_layers=config.gt_num_layers,
-            pe_hidden_channels=config.pe_hidden_channels,
-            pe_num_layers=config.pe_num_layers,
-            d_model=config.d_model,
-            heads=config.gt_heads,
-            num_samples=config.num_samples,
-            dropout=config.dropout,
-            k_pe=config.k_pe,
-            k_gt=config.k_gt,
-            eps=config.eps,
-            use_layer_norm=config.use_layer_norm,
-            node_feature_dim=_node_feature_dim,
-        )
-        model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=config.d_model,
-                                          eps=config.eps, pe_gain_init=config.pe_gain_init,
-                                          disable_graph_token_rope=config.disable_graph_token_rope,
-                                          use_pe_norm=config.use_pe_norm,
-                                          pe_node_features=config.pe_node_features)
-        collator = data.SpineDataCollator(tokenizer, mlm=False)
-
-        if config.freeze_llm:
-            model.llm.requires_grad_(False)
-    elif config.architecture == "gt_llm":
-        # Pure Graph Transformer over semantic node features — no R-PEARL, no probes.
-        if config.pe_node_features != "word_embeddings":
-            raise ValueError(
-                "architecture 'gt_llm' requires pe_node_features='word_embeddings' "
-                f"(got {config.pe_node_features!r}); the GT has no random-probe input."
-            )
-        pe_model = gt_module.SemanticGraphTransformer(
-            node_feature_dim=_text_hidden,
-            d_model=config.d_model,
-            num_layers=config.gt_num_layers,
-            heads=config.gt_heads,
-            dropout=config.dropout,
-            k_gt=config.k_gt,
-        )
-        model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=config.d_model,
-                                          eps=config.eps, pe_gain_init=config.pe_gain_init,
-                                          disable_graph_token_rope=config.disable_graph_token_rope,
-                                          use_pe_norm=config.use_pe_norm,
-                                          pe_node_features=config.pe_node_features)
-        collator = data.SpineDataCollator(tokenizer, mlm=False)
-
-        if config.freeze_llm:
-            model.llm.requires_grad_(False)
-    elif config.architecture == "graph_mask_llm":
-        # Parameter-free structural attention mask: node tokens attend only along graph
-        # edges. Reuses SpineDataCollator so graphs + injection_maps reach the model.
-        model = gnn_llm.GraphMaskLLM(
-            llm, k_hops=config.mask_k_hops, symmetrize=config.mask_symmetrize,
-            use_edges=config.mask_use_edges)
-        collator = data.SpineDataCollator(tokenizer, mlm=False)
-
-        if config.freeze_llm:
-            model.llm.requires_grad_(False)
-    elif config.architecture == "composite_graph_gt":
-        # Composite-graph pipeline: token-cycle + scene graph + cross-links; R-PEARL +
-        # GT refine it; cold-start gate injects into the RoPE-disabled LLM.
-        gt_model = gt_module.GraphTransformer(
-            num_layers=config.gt_num_layers,
-            pe_hidden_channels=config.pe_hidden_channels,
-            pe_num_layers=config.pe_num_layers,
-            d_model=config.d_model,
-            heads=config.gt_heads,
-            num_samples=config.num_samples,
-            dropout=config.dropout,
-            k_pe=config.k_pe,
-            k_gt=config.k_gt,
-            eps=config.eps,
-            use_layer_norm=config.use_layer_norm,
-            probe_distribution=config.probe_distribution,
-            m_test=config.m_test,
-            max_gather_rows=config.max_gather_rows,
-            fixed_seed_mode=config.fixed_seed_mode,
-            fixed_seed_value=config.fixed_seed_value,
-            pe_readout=config.pe_readout,
-            center_second_moment=config.pe_center_moment,
-        )
-        composite_kwargs = dict(
-            gate_init=config.gate_init,
-            gate_per_dim=config.gate_per_dim,
-            injection_mode=config.injection_mode,
-            disable_llm_rope=config.disable_rope,
-            cycle_weight=config.cycle_weight,
-            cycle_directed=config.cycle_directed,
-            crosslink_weight=config.crosslink_weight,
-            crosslink_mention_to_node=config.crosslink_mention_to_node,
-            crosslink_mention_clique=config.crosslink_mention_clique,
-        )
-        if config.pe_qk_injection or config.c_per_layer or config.c_bias:
-            # Selects InjectedCompositeGraphLLM: pe_qk_injection adds GT code to q/k/v;
-            # c_per_layer replaces q/k with C_tok; c_bias uses C_tok as an additive bias.
-            composite_kwargs["inject_v"] = config.pe_inject_v
-            composite_kwargs["c_per_layer"] = config.c_per_layer
-            composite_kwargs["c_bias"] = config.c_bias
-            composite_kwargs["use_scene_bias"] = config.use_scene_bias
-            composite_kwargs["c_kernel"] = config.c_kernel
-            model = gnn_llm.InjectedCompositeGraphLLM(
-                llm, gt_model, d_model=config.d_model, **composite_kwargs)
-        else:
-            model = gnn_llm.CompositeGraphLLM(
-                llm, gt_model, d_model=config.d_model, **composite_kwargs)
-        collator = data.SpineDataCollator(tokenizer, mlm=False)
-
-        if config.freeze_llm:
-            model.llm.requires_grad_(False)
-    elif config.architecture == "llm":
-        # Pure LLM baseline; TokenIndexCollator carries graph-token index columns so
-        # graph_acc/* metrics are comparable to graph architectures.
-        model = llm
-        collator = data.TokenIndexCollator(tokenizer, mlm=False)
-    else:
-        raise ValueError(f"Unknown architecture: {config.architecture!r}. Choose 'rpearl_llm', 'rpearl_gt_llm', 'gt_llm', 'graph_mask_llm', 'composite_graph_gt', or 'llm'.")
+    model, collator = architectures.build_planner_model(config, llm, tokenizer)
 
     # --- Multistage init: weight-only carry-over from a prior stage (NOT HF resume). --
     # Load PE first (lives outside the LoRA adapter), then attach the carried adapter.
     is_graph_arch = config.architecture in (
-        "rpearl_llm", "rpearl_gt_llm", "gt_llm", "graph_mask_llm", "composite_graph_gt")
+        "rpearl_llm",
+        "rpearl_gt_llm",
+        "gt_llm",
+        "graph_mask_llm",
+        "composite_graph_gt",
+    )
     if (config.init_pe_from or config.init_lora_from) and not is_graph_arch:
         raise ValueError(
-            "init_pe_from / init_lora_from are only supported for graph architectures.")
+            "init_pe_from / init_lora_from are only supported for graph architectures."
+        )
     if config.init_pe_from:
-        _load_pe_weights_into(model, config.init_pe_from, config.architecture)
+        model_loaders.load_pe_weights_into(
+            model, config.init_pe_from, config.architecture
+        )
     attach_existing_adapter = config.init_lora_from is not None
     if attach_existing_adapter:
         model = PeftModel.from_pretrained(
-            model, config.init_lora_from, is_trainable=not config.freeze_lora)
+            model, config.init_lora_from, is_trainable=not config.freeze_lora
+        )
         if config.gradient_checkpointing and not config.freeze_lora:
             # Replicate TRL's get_peft_model behavior so LoRA gradients flow back
             # through the frozen base under gradient checkpointing.
             model.enable_input_require_grads()
-        print(f"[multistage] attached {'frozen' if config.freeze_lora else 'trainable'} "
-              f"LoRA adapter from {config.init_lora_from}")
-
-    # Load & optionally downsample data
-    full_dataset = datasets.load_dataset("json", data_files=[config.data], split="train")
-    if config.debug:
-        full_dataset = full_dataset.select(range(round(len(full_dataset) * config.dataset_proportion)))
-
-    full_dataset = data.preprocess_dataset(
-        full_dataset, tokenizer,
-        architecture=config.architecture,
-        text_edge_list=config.text_edge_list,
-    )
-
-    # Train/val split: prefer an explicit pre-split val file when provided.
-    if config.val_data:
-        train_dataset = full_dataset
-        eval_dataset = datasets.load_dataset("json", data_files=[config.val_data], split="train")
-        if config.debug:
-            eval_dataset = eval_dataset.select(range(round(len(eval_dataset) * config.dataset_proportion)))
-        eval_dataset = data.preprocess_dataset(
-            eval_dataset, tokenizer,
-            architecture=config.architecture,
-            text_edge_list=config.text_edge_list,
+        print(
+            f"[multistage] attached {'frozen' if config.freeze_lora else 'trainable'} "
+            f"LoRA adapter from {config.init_lora_from}"
         )
-        print(f"Using pre-split val file: {len(train_dataset)} train / {len(eval_dataset)} eval")
-    elif config.val_frac and config.val_frac > 0.0:
-        dataset_size = len(full_dataset)
-        val_size = int(dataset_size * config.val_frac)
-        train_size = dataset_size - val_size
-        split = full_dataset.train_test_split(
-            test_size=val_size,
-            train_size=train_size,
-            seed=3407,
-            shuffle=True,
-        )
-        train_dataset = split["train"]
-        eval_dataset = split["test"]
-        print(f"Dataset split: {len(train_dataset)} train / {len(eval_dataset)} eval")
-    else:
-        train_dataset = full_dataset
-        eval_dataset = None
-        print(f"Using all {len(full_dataset)} samples for training (no validation).")
 
-    # LoRA config; for multimodal bases, exclude vision/audio towers (see _peft_tower_exclude).
-    tower_exclude = _peft_tower_exclude(model)
+    train_dataset, eval_dataset = data.load_and_split_dataset(config, tokenizer)
+
+    # LoRA config; for multimodal bases, exclude vision/audio towers (see architectures.peft_tower_exclude).
+    tower_exclude = architectures.peft_tower_exclude(model)
     lora_config = LoraConfig(
         r=config.r,
         lora_alpha=config.lora_alpha,
@@ -293,25 +117,18 @@ def train_model(config: "TrainConfig", config_file: str = None):
         task_type="CAUSAL_LM",
     )
     if tower_exclude:
-        print(f"[peft] multimodal base detected — excluding LoRA targets matching "
-              f"{tower_exclude!r} (vision/audio towers)")
+        print(
+            f"[peft] multimodal base detected — excluding LoRA targets matching "
+            f"{tower_exclude!r} (vision/audio towers)"
+        )
 
     optim = "adamw_bnb_8bit" if config.bit4 else "adamw_torch_fused"
-
-    output_dir = str(os.path.join(config.checkpoint_dir, save_name))
-
-    if os.path.isdir(output_dir) and os.listdir(output_dir) and not config.overwrite_ok:
-        raise RuntimeError(
-            f"Checkpoint directory already exists and is non-empty: {output_dir}\n"
-            f"Set overwrite_ok: true in your config to allow overwriting, "
-            f"or delete the directory manually."
-        )
 
     # SFT trainer configuration
     sft_args = SFTConfig(
         dataset_num_proc=config.dataset_num_proc,
         dataloader_num_workers=config.dataloader_num_workers,
-        packing=False, # packing combines multiple examples into a single input_id. Keep disabled to avoid graph contamination.
+        packing=False,  # packing combines multiple examples into a single input_id. Keep disabled to avoid graph contamination.
         max_length=config.max_seq_length,
         per_device_train_batch_size=config.per_device_train_batch_size,
         per_device_eval_batch_size=config.per_device_eval_batch_size,
@@ -334,9 +151,6 @@ def train_model(config: "TrainConfig", config_file: str = None):
         report_to=config.report_to,
         run_name=config.wandb_run_name,
         optim=optim,
-        # key behavior parity with unsloth.train_on_responses_only
-        # Temporarily disabled because qwen doesn't support it.
-        #assistant_only_loss=True,  # train only on assistant tokens
         remove_unused_columns=False,
         # Checkpointing / Validation: step-based when max_steps is set (dev), else epoch-based.
         save_strategy="steps" if config.max_steps > 0 else "epoch",
@@ -347,7 +161,13 @@ def train_model(config: "TrainConfig", config_file: str = None):
         do_eval=True,
     )
 
-    if config.architecture in ("rpearl_llm", "rpearl_gt_llm", "gt_llm", "graph_mask_llm", "composite_graph_gt"):
+    if config.architecture in (
+        "rpearl_llm",
+        "rpearl_gt_llm",
+        "gt_llm",
+        "graph_mask_llm",
+        "composite_graph_gt",
+    ):
         gnn_config = {
             "architecture": config.architecture,
             "base_model": config.base_model,
@@ -363,34 +183,27 @@ def train_model(config: "TrainConfig", config_file: str = None):
             "pe_gain_init": config.pe_gain_init,
             "use_pe_norm": config.use_pe_norm,
             "pe_node_features": config.pe_node_features,
-            **({"k_gt": config.k_gt, "gt_num_layers": config.gt_num_layers,
-                "gt_heads": config.gt_heads}
-               if config.architecture in ("rpearl_gt_llm", "gt_llm", "composite_graph_gt") else {}),
+            **(
+                {
+                    "k_gt": config.k_gt,
+                    "gt_num_layers": config.gt_num_layers,
+                    "gt_heads": config.gt_heads,
+                }
+                if config.architecture
+                in ("rpearl_gt_llm", "gt_llm", "composite_graph_gt")
+                else {}
+            ),
             # graph_mask_llm rebuild params (read back by loaders for eval).
-            **({"mask_k_hops": config.mask_k_hops, "mask_symmetrize": config.mask_symmetrize,
-                "mask_use_edges": config.mask_use_edges}
-               if config.architecture == "graph_mask_llm" else {}),
-            # Composite-graph rebuild params (read back by loaders for eval).
-            **({"k_gt": config.k_gt, "gt_num_layers": config.gt_num_layers,
-                "gt_heads": config.gt_heads,
-                "probe_distribution": config.probe_distribution, "m_test": config.m_test,
-                "max_gather_rows": config.max_gather_rows,
-                "fixed_seed_mode": config.fixed_seed_mode, "fixed_seed_value": config.fixed_seed_value,
-                "injection_mode": config.injection_mode, "gate_init": config.gate_init,
-                "gate_per_dim": config.gate_per_dim, "disable_rope": config.disable_rope,
-                "structural_lr_mult": config.structural_lr_mult, "pe_readout": config.pe_readout,
-                "pe_center_moment": config.pe_center_moment,
-                "cycle_weight": config.cycle_weight, "cycle_directed": config.cycle_directed,
-                "crosslink_weight": config.crosslink_weight,
-                "crosslink_mention_to_node": config.crosslink_mention_to_node,
-                "crosslink_mention_clique": config.crosslink_mention_clique,
-                "pe_qk_injection": config.pe_qk_injection,
-                "pe_inject_v": config.pe_inject_v,
-                "c_per_layer": config.c_per_layer,
-                "c_bias": config.c_bias,
-                "use_scene_bias": config.use_scene_bias,
-                "c_kernel": config.c_kernel}
-               if config.architecture == "composite_graph_gt" else {}),
+            **(
+                {
+                    "mask_k_hops": config.mask_k_hops,
+                    "mask_symmetrize": config.mask_symmetrize,
+                    "mask_use_edges": config.mask_use_edges,
+                }
+                if config.architecture == "graph_mask_llm"
+                else {}
+            ),
+            **composite_graph.composite_graph_gnn_rebuild_params(config),
         }
         trainer = GraphSFTTrainer(
             model=model,
@@ -398,7 +211,9 @@ def train_model(config: "TrainConfig", config_file: str = None):
             processing_class=tokenizer,
             # No fresh adapter when one was carried forward (it's already attached)
             # or when freeze_llm requests a PE-only run on the raw base.
-            peft_config=lora_config if (not config.freeze_llm and not attach_existing_adapter) else None,
+            peft_config=lora_config
+            if (not config.freeze_llm and not attach_existing_adapter)
+            else None,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             args=sft_args,
@@ -430,14 +245,18 @@ def train_model(config: "TrainConfig", config_file: str = None):
             with open(config_file) as f:
                 wandb.config.update({"_config_yaml": f.read()}, allow_val_change=True)
 
-    eval_samples_by_graph = data.load_eval_samples_by_graph(config.eval_data, config.eval_num_graphs)
-    trainer.add_callback(callbacks.EvalCallback(
-        eval_samples_by_graph,
-        tokenizer=tokenizer,
-        use_icl=config.eval_use_icl,
-        include_edge_list=(config.text_edge_list == "present"),
-        eval_epoch_interval=config.eval_epoch_interval,
-    ))
+    eval_samples_by_graph = data.load_eval_samples_by_graph(
+        config.eval_data, config.eval_num_graphs
+    )
+    trainer.add_callback(
+        callbacks.EvalCallback(
+            eval_samples_by_graph,
+            tokenizer=tokenizer,
+            use_icl=config.eval_use_icl,
+            include_edge_list=(config.text_edge_list == "present"),
+            eval_epoch_interval=config.eval_epoch_interval,
+        )
+    )
 
     if config.architecture in ("rpearl_llm", "rpearl_gt_llm", "gt_llm"):
         trainer.add_callback(callbacks.GradientDebugCallback())
@@ -445,19 +264,27 @@ def train_model(config: "TrainConfig", config_file: str = None):
         # Per-component grad norms, GT output magnitude, gate value, injection count.
         trainer.add_callback(callbacks.GradientDebugCallback())
         # Fiedler, scene-mass, gate, contrib-ratio diagnostics (+ visualizer if enabled).
-        trainer.add_callback(callbacks.AugGraphDebugCallback(
-            enable_visualizer=config.enable_visualizer,
-            visualizer_dir=os.path.join(output_dir, "visuals"),
-        ))
+        trainer.add_callback(
+            callbacks.AugGraphDebugCallback(
+                enable_visualizer=config.enable_visualizer,
+                visualizer_dir=os.path.join(output_dir, "visuals"),
+            )
+        )
         if config.lora_warmup_steps > 0:
             trainer.add_callback(callbacks.LoraWarmupCallback(config.lora_warmup_steps))
-        if getattr(config, "lam_c_warmup_steps", 0) > 0 and getattr(config, "c_bias", False):
-            trainer.add_callback(callbacks.LamCWarmupCallback(config.lam_c_warmup_steps))
+        if getattr(config, "lam_c_warmup_steps", 0) > 0 and getattr(
+            config, "c_bias", False
+        ):
+            trainer.add_callback(
+                callbacks.LamCWarmupCallback(config.lam_c_warmup_steps)
+            )
 
     # no_train: evaluate the untrained base model zero-shot instead of training.
     if config.no_train:
         print("[no_train] Skipping optimization — evaluating the base model zero-shot.")
-        evaluate.run_zero_shot_eval(trainer.model, tokenizer, config, sft_args.output_dir, eval_samples_by_graph)
+        evaluate.run_zero_shot_eval(
+            trainer.model, tokenizer, config, sft_args.output_dir, eval_samples_by_graph
+        )
     else:
         trainer.train()
 
@@ -467,7 +294,10 @@ def train_model(config: "TrainConfig", config_file: str = None):
 
     if config.post_train_eval_graphs:
         evaluate.run_post_train_cross_eval(
-            trainer.model, tokenizer, config, sft_args.output_dir,
+            trainer.model,
+            tokenizer,
+            config,
+            sft_args.output_dir,
         )
 
     return trainer
@@ -501,10 +331,10 @@ def _model_short_name(base_model: str) -> str:
         meta-llama/Llama-3.1-8B-Instruct → llama-3.1-8b
         Qwen/Qwen2.5-0.5B-Instruct       → qwen2.5-0.5b
     """
-    name = base_model.split("/")[-1]          # drop org prefix
-    name = re.sub(r"-[Ii]nstruct$", "", name) # drop -Instruct suffix
+    name = base_model.split("/")[-1]  # drop org prefix
+    name = re.sub(r"-[Ii]nstruct$", "", name)  # drop -Instruct suffix
     name = name.lower()
-    name = re.sub(r"-+", "-", name)           # collapse consecutive hyphens
+    name = re.sub(r"-+", "-", name)  # collapse consecutive hyphens
     return name
 
 
@@ -519,6 +349,36 @@ def _ensure_pad_tokens(tokenizer: PreTrainedTokenizer, model: PreTrainedModel) -
         model.config.pad_token_id = tokenizer.pad_token_id
 
 
+def _setup_wandb(wandb_project: str, wandb_run_name: str, wandb_tag: str) -> str:
+    os.environ["WANDB_PROJECT"] = wandb_project
+    os.environ["WANDB_RUN_GROUP"] = wandb_tag
+    os.environ["WANDB_TAGS"] = wandb_tag
+
+    wandb.init(
+        project=wandb_project,
+        name=wandb_run_name,
+        tags=[wandb_tag],
+        group=wandb_tag,
+    )
+    return wandb.run.id
+
+
+def _construct_output_dir(config: "TrainConfig", wandb_run_id: str) -> str:
+    """Checkpoint output dir ``{checkpoint_dir}/{subdir}``.
+
+    ``subdir`` is the ``--save_name`` override or the auto-generated
+    ``{name}_{architecture}_{model_slug}_r{r}[_4bit]``. The wandb run ID is always appended.
+    """
+    if config.save_name is not None:
+        subdir = f"{config.save_name}_{wandb_run_id}"
+    else:
+        model_slug = _model_short_name(config.base_model)
+        subdir = (
+            f"{config.name}_{config.architecture}_{model_slug}_r{config.r}"
+            + ("_4bit" if config.bit4 else "")
+            + f"_{wandb_run_id}"
+        )
+    return str(os.path.join(config.checkpoint_dir, subdir))
 
 
 # Maps loss_target values to their precomputed per-example index column. "all" is
@@ -534,7 +394,7 @@ class LossTargetMixin:
     columns precomputed in ``preprocess_dataset``, mapped via ``_LOSS_TARGET_COLUMN``.
 
     Masks ``inputs['labels']`` then defers to ``super().compute_loss`` (cooperative,
-    MRO-safe). Mix in BEFORE :class:`GraphTokenAccuracyMixin` so masking happens first.
+    MRO-safe). Mix in BEFORE :class:`prism.eval.evaluate.GraphTokenAccuracyMixin` so masking happens first.
     """
 
     def _set_loss_target(self, loss_target: str):
@@ -560,8 +420,11 @@ class LossTargetMixin:
         for b, idx in enumerate(idx_lists):
             if not idx or b >= labels.shape[0]:
                 continue
-            pos = torch.as_tensor([p for p in idx if 0 <= p < labels.shape[1]],
-                                  device=labels.device, dtype=torch.long)
+            pos = torch.as_tensor(
+                [p for p in idx if 0 <= p < labels.shape[1]],
+                device=labels.device,
+                dtype=torch.long,
+            )
             if pos.numel():
                 keep[b, pos] = True
         if keep.any():
@@ -569,97 +432,45 @@ class LossTargetMixin:
         else:
             warnings.warn(
                 f"loss_target={target!r} but no supervised tokens located in this "
-                "batch; falling back to full-sequence loss for it.")
+                "batch; falling back to full-sequence loss for it."
+            )
 
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+    def compute_loss(
+        self, model, inputs, return_outputs=False, num_items_in_batch=None
+    ):
         # Pop the mask columns so they never reach the model forward, then restrict
         # the loss to the configured span ('all' / absent column => no masking).
-        mask_columns = {name: inputs.pop(name, None)
-                        for name in set(_LOSS_TARGET_COLUMN.values())}
+        mask_columns = {
+            name: inputs.pop(name, None) for name in set(_LOSS_TARGET_COLUMN.values())
+        }
         target = getattr(self, "loss_target", "all")
         col = _LOSS_TARGET_COLUMN.get(target)
-        if col is not None and mask_columns.get(col) is not None \
-                and inputs.get("labels") is not None:
+        if (
+            col is not None
+            and mask_columns.get(col) is not None
+            and inputs.get("labels") is not None
+        ):
             self._mask_labels_to_positions(inputs, mask_columns[col], target)
         return super().compute_loss(
-            model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch)
+            model,
+            inputs,
+            return_outputs=return_outputs,
+            num_items_in_batch=num_items_in_batch,
+        )
 
 
-class GraphTokenAccuracyMixin:
-    """This mixin computes and logs ``graph_acc/scene_block`` and ``graph_acc/answer_nodes`` metrics. teacher-forced
-    next-token accuracy restricted to graph-related tokens.
-
-    * ``scene_block`` — tokens in the scene-graph block that name a node (the
-      positions the graph PE injects into).
-    * ``answer_nodes`` — node-name tokens the model emits in its final answer.
-
-    The two masks come from per-example index lists precomputed in
-    ``preprocess_dataset`` and carried verbatim by the collator
-    (:class:`prism.data.data.TokenIndexCollator`); right-padding keeps each index
-    valid in the padded batch. Counts accumulate across the logging window and are
-    flushed (DDP-reduced) in :meth:`log`, so the metric rides the trainer's existing
-    wandb logging cadence with no extra callback. Mixed into both the graph trainer
-    and the plain-``llm`` baseline trainer so the two are comparable.
-    """
-
-    def _reset_token_acc(self):
-        self._gta = {"scene_c": 0, "scene_n": 0, "ans_c": 0, "ans_n": 0}
-
-    def _accumulate_token_acc(self, outputs, input_ids, scene_idx, answer_idx):
-        logits = getattr(outputs, "logits", None)
-        if logits is None or (scene_idx is None and answer_idx is None):
-            return
-        if not hasattr(self, "_gta"):
-            self._reset_token_acc()
-        with torch.no_grad():
-            # preds[t] predicts token t+1; a node token at position p is graded by
-            # preds[p-1] == input_ids[p]. So compare in the shifted (target) frame
-            # and map each index p -> p-1.
-            preds = logits[:, :-1, :].argmax(dim=-1)      # [B, S-1]
-            correct = preds == input_ids[:, 1:]            # [B, S-1]
-            width = correct.shape[1]
-            for b in range(correct.shape[0]):
-                for key, idx in (("scene", scene_idx), ("ans", answer_idx)):
-                    if not idx or b >= len(idx):
-                        continue
-                    pos = [p - 1 for p in idx[b] if 1 <= p <= width]
-                    if not pos:
-                        continue
-                    sel = correct[b, torch.as_tensor(pos, device=correct.device)]
-                    self._gta[f"{key}_n"] += sel.numel()
-                    self._gta[f"{key}_c"] += int(sel.sum().item())
-
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        scene_idx = inputs.pop("scene_node_idx", None)
-        answer_idx = inputs.pop("answer_node_idx", None)
-        loss, outputs = super().compute_loss(
-            model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch)
-        try:
-            self._accumulate_token_acc(outputs, inputs["input_ids"], scene_idx, answer_idx)
-        except Exception as e:  # a diagnostic must never break training
-            warnings.warn(f"graph-token-accuracy metric skipped: {type(e).__name__}: {e}")
-        return (loss, outputs) if return_outputs else loss
-
-    def log(self, logs, *args, **kwargs):
-        gta = getattr(self, "_gta", None)
-        if gta is not None:
-            counts = torch.tensor(
-                [gta["scene_c"], gta["scene_n"], gta["ans_c"], gta["ans_n"]],
-                dtype=torch.float64, device=self.args.device)
-            if self.args.world_size > 1:
-                counts = self.accelerator.reduce(counts, reduction="sum")
-            scene_c, scene_n, ans_c, ans_n = counts.tolist()
-            if scene_n > 0:
-                logs["graph_acc/scene_block"] = scene_c / scene_n
-            if ans_n > 0:
-                logs["graph_acc/answer_nodes"] = ans_c / ans_n
-            self._reset_token_acc()
-        return super().log(logs, *args, **kwargs)
+GraphTokenAccuracyMixin = evaluate.GraphTokenAccuracyMixin
 
 
 class GraphSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
-    def __init__(self, *args, gnn_config: dict, freeze_pe: bool = False,
-                 loss_target: str = "all", **kwargs):
+    def __init__(
+        self,
+        *args,
+        gnn_config: dict,
+        freeze_pe: bool = False,
+        loss_target: str = "all",
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.gnn_config = gnn_config
         self.freeze_pe = freeze_pe
@@ -706,13 +517,18 @@ class GraphSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
         """
         mult = float(self.gnn_config.get("structural_lr_mult", 1.0))
         # graph_mask_llm: parameter-free, no structural params — use stock optimizer.
-        if (self.optimizer is not None or mult == 1.0
-                or self.gnn_config.get("architecture") == "graph_mask_llm"):
+        if (
+            self.optimizer is not None
+            or mult == 1.0
+            or self.gnn_config.get("architecture") == "graph_mask_llm"
+        ):
             return super().create_optimizer()
 
         opt_model = self.model
         if self.gnn_config.get("architecture") == "composite_graph_gt":
-            structural = list(self.model.gt_model.parameters()) + list(self.model.injection.parameters())
+            structural = list(self.model.gt_model.parameters()) + list(
+                self.model.injection.parameters()
+            )
             # pe_qk_injection: q/k(/v) projections are structural (boosted LR).
             if hasattr(self.model, "pe_q_proj"):
                 for name in ("pe_q_proj", "pe_k_proj", "pe_v_proj"):
@@ -725,8 +541,11 @@ class GraphSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
                 if p is not None:
                     structural.append(p)
         else:
-            structural = (list(self.model.pe_model.parameters())
-                          + list(self.model.pe_proj.parameters()) + [self.model.pe_gain])
+            structural = (
+                list(self.model.pe_model.parameters())
+                + list(self.model.pe_proj.parameters())
+                + [self.model.pe_gain]
+            )
         structural_ids = {id(p) for p in structural}
 
         decay_names = set(self.get_decay_parameter_names(opt_model))
@@ -734,29 +553,42 @@ class GraphSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
         groups = []
         # Structural at boosted LR, LLM/LoRA at base LR; each split into decay / no-decay.
         for is_struct, lr in ((True, base_lr * mult), (False, base_lr)):
-            named = [(n, p) for n, p in opt_model.named_parameters()
-                     if p.requires_grad and (id(p) in structural_ids) == is_struct]
+            named = [
+                (n, p)
+                for n, p in opt_model.named_parameters()
+                if p.requires_grad and (id(p) in structural_ids) == is_struct
+            ]
             decay = [p for n, p in named if n in decay_names]
             no_decay = [p for n, p in named if n not in decay_names]
             if decay:
-                groups.append({"params": decay, "lr": lr, "weight_decay": self.args.weight_decay})
+                groups.append(
+                    {"params": decay, "lr": lr, "weight_decay": self.args.weight_decay}
+                )
             if no_decay:
                 groups.append({"params": no_decay, "lr": lr, "weight_decay": 0.0})
 
         try:
-            optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args, opt_model)
+            optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(
+                self.args, opt_model
+            )
         except TypeError:
-            optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args)
+            optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(
+                self.args
+            )
         optimizer_kwargs.pop("params", None)
         optimizer_kwargs.pop("lr", None)
         self.optimizer = optimizer_cls(groups, lr=base_lr, **optimizer_kwargs)
         n_struct = sum(p.numel() for p in structural if p.requires_grad)
-        print(f"[train] structural LR group: {mult}x base = {base_lr * mult:.2e} "
-              f"({n_struct / 1e6:.2f}M params); LLM/LoRA at base LR {base_lr:.2e}")
+        print(
+            f"[train] structural LR group: {mult}x base = {base_lr * mult:.2e} "
+            f"({n_struct / 1e6:.2f}M params); LLM/LoRA at base LR {base_lr:.2e}"
+        )
         return self.optimizer
 
     def training_step(self, model, inputs, num_items_in_batch=None, **kwargs):
-        loss = super().training_step(model, inputs, num_items_in_batch=num_items_in_batch, **kwargs)
+        loss = super().training_step(
+            model, inputs, num_items_in_batch=num_items_in_batch, **kwargs
+        )
         # Capture grad norms before zero_grad() (backward already ran in super).
         for cb in self.callback_handler.callbacks:
             if isinstance(cb, callbacks.GradientDebugCallback):
@@ -772,50 +604,68 @@ class GraphSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
         if self.gnn_config.get("architecture") == "composite_graph_gt":
             # Save the Graph Transformer (R-PEARL inside) and the cold-start gate.
             gnn_state = {
-                'gt_model': self.model.gt_model.state_dict(),
-                'injection': self.model.injection.state_dict(),
+                "gt_model": self.model.gt_model.state_dict(),
+                "injection": self.model.injection.state_dict(),
             }
             # In-attention injection variant: persist the dedicated q/k(/v) projections.
             if hasattr(self.model, "pe_q_proj"):
-                gnn_state['pe_q_proj'] = self.model.pe_q_proj.state_dict()
-                gnn_state['pe_k_proj'] = self.model.pe_k_proj.state_dict()
+                gnn_state["pe_q_proj"] = self.model.pe_q_proj.state_dict()
+                gnn_state["pe_k_proj"] = self.model.pe_k_proj.state_dict()
                 if getattr(self.model, "pe_v_proj", None) is not None:
-                    gnn_state['pe_v_proj'] = self.model.pe_v_proj.state_dict()
+                    gnn_state["pe_v_proj"] = self.model.pe_v_proj.state_dict()
             # c_bias: persist scalar gains λ_C/λ_S/λ_V.
             if getattr(self.model, "c_bias", False):
-                gnn_state['c_bias_gains'] = {
+                gnn_state["c_bias_gains"] = {
                     name: getattr(self.model, name).detach().cpu()
                     for name in ("lam_c", "lam_psi", "lam_v")
                     if getattr(self.model, name, None) is not None
                 }
             torch.save(gnn_state, os.path.join(output_dir, "gnn_weights.pt"))
-            torch.save({
-                'rpearl': self.model.gt_model.pe_model.state_dict(),
-            }, os.path.join(output_dir, "rpearl_weights.pt"))
+            torch.save(
+                {
+                    "rpearl": self.model.gt_model.pe_model.state_dict(),
+                },
+                os.path.join(output_dir, "rpearl_weights.pt"),
+            )
         elif self.gnn_config.get("architecture") == "graph_mask_llm":
             # Parameter-free: mask rebuilt from config; gnn_config.json + LoRA adapter suffice.
             pass
         elif self.gnn_config.get("architecture") == "rpearl_gt_llm":
             # Full GT: save the whole GraphTransformer (includes R-PEARL inside) + projection head.
-            torch.save({
-                'gt_model': self.model.pe_model.state_dict(),
-                'pe_proj': self.model.pe_proj.state_dict(),
-                'pe_gain': self.model.pe_gain.data,
-                **({'pe_norm': self.model.pe_norm.state_dict()}
-                   if self.model.pe_norm is not None else {}),
-            }, os.path.join(output_dir, "gnn_weights.pt"))
+            torch.save(
+                {
+                    "gt_model": self.model.pe_model.state_dict(),
+                    "pe_proj": self.model.pe_proj.state_dict(),
+                    "pe_gain": self.model.pe_gain.data,
+                    **(
+                        {"pe_norm": self.model.pe_norm.state_dict()}
+                        if self.model.pe_norm is not None
+                        else {}
+                    ),
+                },
+                os.path.join(output_dir, "gnn_weights.pt"),
+            )
             # Also save the inner R-PEARL separately for analysis / reuse.
-            torch.save({
-                'rpearl': self.model.pe_model.pe_model.state_dict(),
-            }, os.path.join(output_dir, "rpearl_weights.pt"))
+            torch.save(
+                {
+                    "rpearl": self.model.pe_model.pe_model.state_dict(),
+                },
+                os.path.join(output_dir, "rpearl_weights.pt"),
+            )
         else:
-            torch.save({
-                'pe_model': self.model.pe_model.state_dict(),
-                'pe_proj': self.model.pe_proj.state_dict(),
-                'pe_gain': self.model.pe_gain.data,
-                **({'pe_norm': self.model.pe_norm.state_dict()}
-                   if self.model.pe_norm is not None else {}),
-            }, os.path.join(output_dir, "gnn_weights.pt"))
+            torch.save(
+                {
+                    "pe_model": self.model.pe_model.state_dict(),
+                    "pe_proj": self.model.pe_proj.state_dict(),
+                    "pe_gain": self.model.pe_gain.data,
+                    **(
+                        {"pe_norm": self.model.pe_norm.state_dict()}
+                        if self.model.pe_norm is not None
+                        else {}
+                    ),
+                },
+                os.path.join(output_dir, "gnn_weights.pt"),
+            )
         # Save the LoRA adapter whenever one is attached (including frozen carried-forward
         # adapters). freeze_llm=True attaches no adapter, so this is skipped for that path.
         if getattr(self.model, "peft_config", None) is not None:
@@ -856,6 +706,8 @@ class TrainConfig:
     name: str
     checkpoint_dir: str
     data: str
+    wandb_run_name: str
+    wandb_tag: str
     bit4: bool = False
     eval_data: str = "data/eval/eval_1_multi_step.json"
     # Optional pre-split validation file (same schema as `data`). When set,
@@ -864,10 +716,10 @@ class TrainConfig:
     r: int = 16
     base_model: str = "meta-llama/Llama-3.2-3B-Instruct"
     wandb_project: str = "GREP-PRISM"
-    wandb_run_name: str = "spine_lora"
-    wandb_tag: str = "spine"
     epochs: int = 2
-    max_steps: int = -1  # If > 0, overrides epochs and switches eval/save to step-based (dev use)
+    max_steps: int = (
+        -1
+    )  # If > 0, overrides epochs and switches eval/save to step-based (dev use)
     # Zero-shot baseline: skip optimization and evaluate the untrained base model.
     no_train: bool = False
     val_frac: float = 0.1
@@ -876,8 +728,13 @@ class TrainConfig:
     lora_dropout: float = 0.2
     target_modules: List[str] = field(
         default_factory=lambda: [
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
         ]
     )
     # Trainer args
@@ -890,7 +747,7 @@ class TrainConfig:
     dataloader_num_workers: int = 4
     report_to: str = "wandb"
     learning_rate: float = 2e-4
-    warmup_steps: int = 5 # TODO consider warmup_steps: float= 0.03
+    warmup_steps: int = 5  
     weight_decay: float = 0.05
     debug: bool = False
     max_seq_length: int = 2048
@@ -916,13 +773,16 @@ class TrainConfig:
         if self.loss_target not in ("all", "responses", "edge_list"):
             raise ValueError(
                 f"loss_target must be 'all', 'responses', or 'edge_list', "
-                f"got {self.loss_target!r}")
+                f"got {self.loss_target!r}"
+            )
         if self.loss_target == "edge_list" and self.text_edge_list != "present":
             raise ValueError(
                 "loss_target='edge_list' requires text_edge_list='present' "
-                "(the edge bullets must be in the text to supervise them).")
+                "(the edge bullets must be in the text to supervise them)."
+            )
+
     k_gt: int = 3
-    text_edge_list: str = "present"   # "present" or "none"
+    text_edge_list: str = "present"  # "present" or "none"
     # Composite-graph params (used when architecture == "composite_graph_gt")
     cycle_directed: bool = True
     cycle_weight: float = 1.0
@@ -996,7 +856,7 @@ class TrainConfig:
     log_fiedler: bool = True
     log_scene_mass: bool = True
     enable_visualizer: bool = False
-    device: int = 0                   # GPU index to pin the model to; -1 = let device_map="auto" decide
+    device: int = 0  # GPU index to pin the model to; -1 = let device_map="auto" decide
     overwrite_ok: bool = False
     # Optional override for the checkpoint subdirectory name.
     # Default (None): auto-generated as "{name}_{architecture}_{model_slug}_r{r}[_4bit]_{wandb_run_id}"
@@ -1030,57 +890,13 @@ class TrainConfig:
 
 
 # ----------------------------
-# Training
-# ----------------------------
-def _load_pe_weights_into(model, init_pe_from: str, architecture: str) -> None:
-    """Load a saved PE module (``gnn_weights.pt``) from a prior stage into ``model``.
-
-    Operates on a training model (no merge, no eval). Only rpearl_llm /
-    rpearl_gt_llm PE layouts are supported.
-    """
-    weights_path = os.path.join(init_pe_from, "gnn_weights.pt")
-    gnn_weights = torch.load(weights_path, map_location="cpu")
-    if architecture == "rpearl_gt_llm":
-        model.pe_model.load_state_dict(gnn_weights["gt_model"], strict=False)
-    elif architecture == "rpearl_llm":
-        model.pe_model.load_state_dict(gnn_weights["pe_model"], strict=False)
-    else:
-        raise NotImplementedError(
-            f"init_pe_from is only wired for rpearl_llm / rpearl_gt_llm, got {architecture!r}")
-    model.pe_proj.load_state_dict(gnn_weights["pe_proj"])
-    if "pe_gain" in gnn_weights:
-        model.pe_gain.data.copy_(gnn_weights["pe_gain"])
-    if getattr(model, "pe_norm", None) is not None and "pe_norm" in gnn_weights:
-        model.pe_norm.load_state_dict(gnn_weights["pe_norm"])
-    print(f"[multistage] loaded PE weights from {weights_path}")
-
-
-# Multimodal Gemma-4 bases (e.g. gemma-4-31B) include vision/audio towers whose
-# projections use Gemma4ClippableLinear (not nn.Linear) — PEFT cannot adapt them,
-# and their leaf names collide with the text decoder. Exclude them from LoRA targets.
-# Text-only / "unified" bases (Llama, gemma-4-12B) have no towers; regex hits nothing.
-_MM_TOWER_KEYS = ("vision_tower", "audio_tower")
-
-
-def _peft_tower_exclude(model) -> "str | None":
-    """Return a PEFT `exclude_modules` regex for a multimodal base, else None.
-
-    Detected from the actual module tree (not the model-id) so it is robust to
-    the LoRA wrapper prefix and to future multimodal variants.
-    """
-    has_tower = any(
-        any(k in name for k in _MM_TOWER_KEYS) for name, _ in model.named_modules()
-    )
-    return r".*(?:" + "|".join(_MM_TOWER_KEYS) + r").*" if has_tower else None
-
-
-# ----------------------------
 # CLI
 # ----------------------------
 if __name__ == "__main__":
     parser = HfArgumentParser(TrainConfig)
     if len(sys.argv) >= 2 and sys.argv[1].endswith((".yaml", ".yml")):
         import yaml as _yaml
+
         with open(sys.argv[1]) as f:
             cfg_dict = _yaml.safe_load(f) or {}
         # Overlay --key value pairs from sys.argv[2:] onto the yaml dict so

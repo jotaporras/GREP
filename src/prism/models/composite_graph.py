@@ -227,3 +227,37 @@ def _build_gso(edge_index: Tensor, edge_weight: Tensor, num_nodes: int) -> Tenso
     dinv[torch.isinf(dinv)] = 0.0
     norm = dinv[sl_index[0]] * sl_weight * dinv[sl_index[1]]
     return torch.sparse_coo_tensor(sl_index, norm, (num_nodes, num_nodes)).coalesce()
+
+
+def composite_graph_gnn_rebuild_params(config) -> dict:
+    """GNN checkpoint rebuild params for ``composite_graph_gt`` (read back by loaders for eval)."""
+    if config.architecture != "composite_graph_gt":
+        return {}
+    return {
+        "k_gt": config.k_gt,
+        "gt_num_layers": config.gt_num_layers,
+        "gt_heads": config.gt_heads,
+        "probe_distribution": config.probe_distribution,
+        "m_test": config.m_test,
+        "max_gather_rows": config.max_gather_rows,
+        "fixed_seed_mode": config.fixed_seed_mode,
+        "fixed_seed_value": config.fixed_seed_value,
+        "injection_mode": config.injection_mode,
+        "gate_init": config.gate_init,
+        "gate_per_dim": config.gate_per_dim,
+        "disable_rope": config.disable_rope,
+        "structural_lr_mult": config.structural_lr_mult,
+        "pe_readout": config.pe_readout,
+        "pe_center_moment": config.pe_center_moment,
+        "cycle_weight": config.cycle_weight,
+        "cycle_directed": config.cycle_directed,
+        "crosslink_weight": config.crosslink_weight,
+        "crosslink_mention_to_node": config.crosslink_mention_to_node,
+        "crosslink_mention_clique": config.crosslink_mention_clique,
+        "pe_qk_injection": config.pe_qk_injection,
+        "pe_inject_v": config.pe_inject_v,
+        "c_per_layer": config.c_per_layer,
+        "c_bias": config.c_bias,
+        "use_scene_bias": config.use_scene_bias,
+        "c_kernel": config.c_kernel,
+    }
