@@ -22,8 +22,8 @@ eval_epoch_interval: 1.0
 base_model: google/gemma-4-12B-it
 bit4: false
 per_device_train_batch_size: 1
-learning_rate: 0.0002
-epochs: 1
+learning_rate: 0.001
+epochs: 2
 r: 16
 debug: false
 dataset_proportion: 1.0
