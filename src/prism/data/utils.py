@@ -10,7 +10,6 @@ import numpy as np
 import torch
 import torch_geometric.utils as pyg_utils
 from openai import OpenAI
-from openai.types.chat import ChatCompletion
 from scipy.spatial.transform import Rotation
 from spine.mapping.graph_util import parse_graph_coord
 from torch_geometric.data import Data

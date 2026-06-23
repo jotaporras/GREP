@@ -13,7 +13,7 @@ from prism.models import gt as gt_module
 
 import json
 from dataclasses import asdict, dataclass, field
-from typing import List, Dict, Any, Optional, no_type_check
+from typing import List, Dict, Any, Optional
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -28,7 +28,7 @@ from transformers import (
     HfArgumentParser,
 )
 from peft import LoraConfig, PeftModel
-from trl import SFTConfig, SFTTrainer, apply_chat_template
+from trl import SFTConfig, SFTTrainer
 
 
 # ----------------------------
@@ -59,7 +59,6 @@ def _model_short_name(base_model: str) -> str:
         meta-llama/Llama-3.1-8B-Instruct → llama-3.1-8b
         Qwen/Qwen2.5-0.5B-Instruct       → qwen2.5-0.5b
     """
-    import re
     name = base_model.split("/")[-1]          # drop org prefix
     name = re.sub(r"-[Ii]nstruct$", "", name) # drop -Instruct suffix
     name = name.lower()
@@ -74,68 +73,6 @@ def _ensure_pad_tokens(tokenizer, model):
     if getattr(model.config, "pad_token_id", None) is None:
         model.config.pad_token_id = tokenizer.pad_token_id
 
-
-def _normalize_role(role: str) -> str:
-    role = (role or "").lower()
-    if role in ("user", "human", "prompt", "customer", "asker"):
-        return "user"
-    if role in ("assistant", "gpt", "bot", "model"):
-        return "assistant"
-    if role in ("system", "developer"):
-        return "system"
-    # fallback—treat unknown as user
-    return "user"
-
-
-def _sharegpt_to_messages(example: Dict[str, Any]) -> Optional[List[Dict[str, str]]]:
-    """
-    TO DO: oct 29 not sure if necessary.
-    Convert common JSON patterns into a transformers-friendly `messages` list:
-      - { "conversations": [{"from": "...", "value": "..."} ...] }
-      - { "messages": [{"role": "...", "content": "..."} ...] }
-      - Alpaca-style: {"instruction": "...", "input": "...", "output": "..."}
-    Returns None if we can't detect any supported schema.
-    """
-    # Already in messages format
-    if "messages" in example and isinstance(example["messages"], list):
-        msgs = []
-        for m in example["messages"]:
-            if not isinstance(m, dict):
-                continue
-            role = _normalize_role(m.get("role", "user"))
-            content = m.get("content", "")
-            if content is None:
-                content = ""
-            msgs.append({"role": role, "content": str(content)})
-        return msgs if msgs else None
-
-    # ShareGPT style
-    if "conversations" in example and isinstance(example["conversations"], list):
-        msgs = []
-        for c in example["conversations"]:
-            if not isinstance(c, dict):
-                continue
-            role = _normalize_role(c.get("from", "user"))
-            content = c.get("value", "")
-            if content is None:
-                content = ""
-            msgs.append({"role": role, "content": str(content)})
-        return msgs if msgs else None
-
-    # Alpaca-style single-turn
-    instr = example.get("instruction")
-    output = example.get("output")
-    if instr is not None and output is not None:
-        user_text = instr
-        if example.get("input"):
-            # typical Alpaca concatenation
-            user_text = f"{instr}\n\n{example['input']}"
-        return [
-            {"role": "user", "content": str(user_text)},
-            {"role": "assistant", "content": str(output)},
-        ]
-
-    return None
 
 
 

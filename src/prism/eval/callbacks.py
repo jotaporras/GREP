@@ -561,22 +561,3 @@ class LamCWarmupCallback(TrainerCallback):
     def on_step_begin(self, args, state, control, model=None, **kwargs):
         if self.warmup_steps > 0 and model is not None:
             self._set(model, min(1.0, state.global_step / self.warmup_steps))
-
-
-class MetricsTrackerCallback(TrainerCallback):
-    """Custom callback that captures metrics for retrieval"""
-
-    def __init__(self, trainer):
-        self.trainer = trainer
-        # Flag this as our custom callback
-        self._is_metrics_tracker = True
-
-    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
-        """Capture metrics during evaluation"""
-        if metrics:
-            self.trainer.latest_metrics.update(metrics)
-
-    def on_log(self, args, state, control, logs=None, **kwargs):
-        """Capture metrics during logging"""
-        if logs:
-            self.trainer.latest_metrics.update(logs)

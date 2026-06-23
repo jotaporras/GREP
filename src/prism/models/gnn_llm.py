@@ -2,7 +2,6 @@ import copy
 import importlib
 import math
 import re
-import warnings
 from collections import defaultdict
 
 import torch
