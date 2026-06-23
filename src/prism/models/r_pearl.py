@@ -82,7 +82,7 @@ class RandomGNNPositionalEncodings(nn.Module):
         self.output_gain = nn.Parameter(torch.tensor(1.0))
         # m_train / m_test probe counts; self.M kept as the train alias.
         self.m_train = num_samples
-        self.m_test = num_samples if m_test is None else m_test
+        self.m_test = num_samples if m_test is None else m_test 
         self.M = num_samples
         self.probe_distribution = probe_distribution
         self.fixed_seed_mode = fixed_seed_mode

@@ -12,6 +12,8 @@ Public surface:
 - `eval_model_single_graph`          — single-graph scoring loop.
 - `eval_model_multiple_graphs`       — multi-graph driver with cross-cutting policy.
 - `print_summary_table`              — stdout formatter over a list of results.
+- `run_zero_shot_eval`               — evaluate an untrained base model, write the eval-log JSON.
+- `run_post_train_cross_eval`        — post-training cross-eval over a graph set, write per-graph JSONs.
 """
 from __future__ import annotations
 
@@ -23,6 +25,8 @@ import traceback as traceback_mod
 from collections import namedtuple
 from dataclasses import asdict, dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
+
+import wandb
 
 from spine import spine
 from spine.mapping import graph_util
@@ -721,3 +725,154 @@ def _is_graph_augmented(model) -> bool:
 
 def _graph_node_count(graph: dict) -> int:
     return len(graph.get("objects", {})) + len(graph.get("regions", {}))
+
+
+# ----------------------------------------------------------------------------
+# Training-time eval orchestration
+# ----------------------------------------------------------------------------
+# These wrap the scoring functions above with the disk-I/O + wandb logging that
+# train_v2.train_model needs (zero-shot baseline and post-training cross-eval).
+# They take a TrainConfig-shaped object (duck-typed; no import of TrainConfig).
+
+def run_post_train_cross_eval(model, tokenizer, config: "TrainConfig", output_dir: str) -> None:
+    """Run cross-eval on the in-memory model after training and write per-graph JSONs.
+
+    Disk I/O happens in `data.load_samples_by_graph`; this function is
+    pure orchestration: load → eval → write. Output shape matches the old
+    `eval_checkpoint_on_graphs.py` (consumed by eval_viewer.html and the
+    judge-eval skill).
+    """
+    # Local import: data.py imports this module, so a top-level import would cycle.
+    from prism.data import data
+
+    target = config.post_train_eval_graphs
+    if target is None:
+        return
+
+    samples_by_graph, graph_file_by_name = data.load_samples_by_graph(target)
+
+    is_gnn = config.architecture in ("rpearl_llm", "rpearl_gt_llm", "gt_llm", "graph_mask_llm", "composite_graph_gt")
+    architecture = "graph-augmented" if is_gnn else "llm"
+    out_dir = os.path.join(output_dir, "eval_logs", "cross_eval")
+    os.makedirs(out_dir, exist_ok=True)
+
+    model.eval()
+    print(f"\n[post-train eval] {len(samples_by_graph)} graph file(s) -> {out_dir}")
+    results = eval_model_multiple_graphs(
+        model,
+        tokenizer,
+        samples_by_graph,
+        include_edge_list=(config.text_edge_list == "present"),
+        use_icl=config.eval_use_icl,
+        permutation=None,
+        on_graph_done=None,
+    )
+
+    for name, result in results.items():
+        _write_cross_eval_json(
+            out_dir, name, result,
+            checkpoint=output_dir,
+            graph_file=graph_file_by_name[name],
+            architecture=architecture,
+            text_edge_list=config.text_edge_list,
+        )
+
+    print_summary_table(list(results.values()))
+
+
+def run_zero_shot_eval(
+    model, tokenizer, config: "TrainConfig", output_dir: str, eval_samples_by_graph: dict
+) -> None:
+    """Evaluate the untrained base model over the multi-graph eval set for the
+    ``no_train`` baseline.
+
+    Mirrors the per-epoch :class:`prism.eval.callbacks.EvalCallback` artifact
+    (``eval_logs/step_000000_epoch_0.000.json`` + the ``eval/accuracy`` wandb
+    point) so the base model's out-of-the-box score is directly comparable to the
+    trained runs and consumable by the judge-eval skill. ``include_edge_list`` is
+    resolved here from the same ``text_edge_list == "present"`` policy used
+    everywhere else, so the with-/without-edges baselines differ only in the
+    LLM-facing edge text.
+    """
+    eval_log_dir = os.path.join(output_dir, "eval_logs")
+    os.makedirs(eval_log_dir, exist_ok=True)
+    model.eval()
+    results = eval_model_multiple_graphs(
+        model,
+        tokenizer,
+        eval_samples_by_graph,
+        include_edge_list=(config.text_edge_list == "present"),
+        use_icl=config.eval_use_icl,
+        permutation=None,
+        on_graph_done=None,
+    )
+    log_data = _aggregate_multi_graph_eval(results, step=0, epoch=0.0)
+    log_file = os.path.join(eval_log_dir, "step_000000_epoch_0.000.json")
+    with open(log_file, "w") as f:
+        json.dump(log_data, f, indent=2, default=str)
+    print(
+        f"[no_train] zero-shot eval/accuracy = {log_data['accuracy']:.4f} "
+        f"({log_data['num_correct']}/{log_data['num_samples']}) over "
+        f"{log_data['num_graphs']} graph(s) -> {log_file}"
+    )
+    if wandb.run is not None:
+        wandb.log({"eval/accuracy": log_data["accuracy"], "epoch": 0.0})
+
+
+def _aggregate_multi_graph_eval(results: dict, *, step: int, epoch: float) -> dict:
+    """Fold per-graph `GraphEvalResultSummary`s into one eval-log payload.
+
+    Overall accuracy is the micro-average of the per-graph keyword rate
+    (`GraphEvalResultSummary.accuracy`) weighted by sample count — Σ(rate·n) / Σn.
+    This is the SAME objective-keyword metric the old single-graph EvalCallback
+    logged as `eval/accuracy` and that the per-graph `eval/acc/<name>` breakdown
+    reports, so the headline reconciles with the breakdown and stays comparable to
+    prior runs. Path metrics are aggregated over the concatenated samples, and a
+    `per_graph` breakdown is kept. Shape matches the old single-graph log apart from
+    the extra `num_graphs` / `per_graph` keys.
+    """
+    all_samples = [s for r in results.values() for s in r.samples]
+    num_total = sum(r.num_total for r in results.values())
+    # Per-graph keyword-correct count = accuracy·n (integer); sum for the headline.
+    num_correct = sum(round(r.accuracy * r.num_total) for r in results.values())
+    accuracy = (num_correct / num_total) if num_total else 0.0
+    return {
+        "step": step,
+        "epoch": epoch,
+        "accuracy": accuracy,
+        "num_graphs": len(results),
+        "num_samples": num_total,
+        "num_correct": num_correct,
+        "path_metrics": _aggregate_path_metrics(all_samples),
+        "per_graph": {name: {"accuracy": r.accuracy, "num_correct": r.num_correct,
+                             "num_total": r.num_total}
+                      for name, r in results.items()},
+        "samples": all_samples,
+    }
+
+
+def _write_cross_eval_json(
+    out_dir: str,
+    name: str,
+    result: GraphEvalResultSummary,
+    *,
+    checkpoint: str,
+    graph_file: str,
+    architecture: str,
+    text_edge_list: str,
+) -> None:
+    log_data = {
+        "checkpoint": checkpoint,
+        "graph_file": graph_file,
+        "architecture": architecture,
+        "text_edge_list": text_edge_list,
+        "accuracy": result.accuracy,
+        "num_samples": result.num_total,
+        "num_correct": result.num_correct,
+        "path_metrics": result.path_metrics,
+        "samples": result.samples,
+    }
+    out_file = os.path.join(out_dir, f"{name}.json")
+    with open(out_file, "w") as f:
+        json.dump(log_data, f, indent=2, default=str)
+    print(f"  {name}: {result.num_correct}/{result.num_total} ({result.accuracy:.1%}) -> {out_file}")

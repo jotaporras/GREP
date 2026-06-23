@@ -32,749 +32,7 @@ from peft import LoraConfig, PeftModel
 from trl import SFTConfig, SFTTrainer
 
 
-# ----------------------------
-# Utilities
-# ----------------------------
-def _bf16_supported() -> bool:
-    """Conservative check for bfloat16 support."""
-    try:
-        return torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-    except Exception:
-        return False
-
-
-def _fp16_supported() -> bool:
-    """Conservative check for fp16 support."""
-    if _bf16_supported():
-        return False
-    try:
-        return torch.cuda.is_available()
-    except Exception:
-        return False
-
-
-def _model_short_name(base_model: str) -> str:
-    """Extract a short filesystem-safe slug from a HuggingFace model ID.
-
-    Examples:
-        meta-llama/Llama-3.1-8B-Instruct → llama-3.1-8b
-        Qwen/Qwen2.5-0.5B-Instruct       → qwen2.5-0.5b
-    """
-    name = base_model.split("/")[-1]          # drop org prefix
-    name = re.sub(r"-[Ii]nstruct$", "", name) # drop -Instruct suffix
-    name = name.lower()
-    name = re.sub(r"-+", "-", name)           # collapse consecutive hyphens
-    return name
-
-
-def _ensure_pad_tokens(tokenizer: PreTrainedTokenizer, model: PreTrainedModel) -> None:
-    """Ensure tokenizer and model config have a pad token for training.
-
-    Many chat models ship without a dedicated PAD token; we alias EOS instead.
-    """
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    if getattr(model.config, "pad_token_id", None) is None:
-        model.config.pad_token_id = tokenizer.pad_token_id
-
-
-
-
-# Maps loss_target values to their precomputed per-example index column. "all" is
-# absent (full-sequence). Add a new target by precomputing a column and registering it.
-_LOSS_TARGET_COLUMN = {"responses": "assistant_idx", "edge_list": "edge_list_idx"}
-
-
-class LossTargetMixin:
-    """Restricts the next-token loss to a configurable token span (``loss_target``).
-
-    ``all`` (default) = full sequence; ``responses`` = assistant turns;
-    ``edge_list`` = edge bullets. Supervised positions come from per-example index
-    columns precomputed in ``preprocess_dataset``, mapped via ``_LOSS_TARGET_COLUMN``.
-
-    Masks ``inputs['labels']`` then defers to ``super().compute_loss`` (cooperative,
-    MRO-safe). Mix in BEFORE :class:`GraphTokenAccuracyMixin` so masking happens first.
-    """
-
-    def _set_loss_target(self, loss_target: str):
-        """Configure the supervised-token span. Call after ``super().__init__``.
-
-        For masked targets (responses / edge_list), disables the loss-kwargs path so
-        the LM loss uses reduction="mean" over only the supervised tokens, not HF's
-        full-batch normalization (which would under-normalize the masked span).
-        """
-        self.loss_target = loss_target
-        if loss_target != "all":
-            self.model_accepts_loss_kwargs = False
-
-    def _mask_labels_to_positions(self, inputs, idx_lists, target):
-        """Mask ``inputs['labels']`` to -100 outside the per-example supervised positions.
-
-        ``idx_lists`` is a per-example list of token positions (e.g. assistant_idx /
-        edge_list_idx). If a batch ends up with NO supervised tokens, fall back to its
-        full-sequence labels with a warning (better than a NaN all-masked loss).
-        """
-        labels = inputs["labels"]
-        keep = torch.zeros_like(labels, dtype=torch.bool)
-        for b, idx in enumerate(idx_lists):
-            if not idx or b >= labels.shape[0]:
-                continue
-            pos = torch.as_tensor([p for p in idx if 0 <= p < labels.shape[1]],
-                                  device=labels.device, dtype=torch.long)
-            if pos.numel():
-                keep[b, pos] = True
-        if keep.any():
-            inputs["labels"] = labels.masked_fill(~keep, -100)
-        else:
-            warnings.warn(
-                f"loss_target={target!r} but no supervised tokens located in this "
-                "batch; falling back to full-sequence loss for it.")
-
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        # Pop the mask columns so they never reach the model forward, then restrict
-        # the loss to the configured span ('all' / absent column => no masking).
-        mask_columns = {name: inputs.pop(name, None)
-                        for name in set(_LOSS_TARGET_COLUMN.values())}
-        target = getattr(self, "loss_target", "all")
-        col = _LOSS_TARGET_COLUMN.get(target)
-        if col is not None and mask_columns.get(col) is not None \
-                and inputs.get("labels") is not None:
-            self._mask_labels_to_positions(inputs, mask_columns[col], target)
-        return super().compute_loss(
-            model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch)
-
-
-class GraphTokenAccuracyMixin:
-    """This mixin computes and logs ``graph_acc/scene_block`` and ``graph_acc/answer_nodes`` metrics. teacher-forced
-    next-token accuracy restricted to graph-related tokens.
-
-    * ``scene_block`` — tokens in the scene-graph block that name a node (the
-      positions the graph PE injects into).
-    * ``answer_nodes`` — node-name tokens the model emits in its final answer.
-
-    The two masks come from per-example index lists precomputed in
-    ``preprocess_dataset`` and carried verbatim by the collator
-    (:class:`prism.data.data.TokenIndexCollator`); right-padding keeps each index
-    valid in the padded batch. Counts accumulate across the logging window and are
-    flushed (DDP-reduced) in :meth:`log`, so the metric rides the trainer's existing
-    wandb logging cadence with no extra callback. Mixed into both the graph trainer
-    and the plain-``llm`` baseline trainer so the two are comparable.
-    """
-
-    def _reset_token_acc(self):
-        self._gta = {"scene_c": 0, "scene_n": 0, "ans_c": 0, "ans_n": 0}
-
-    def _accumulate_token_acc(self, outputs, input_ids, scene_idx, answer_idx):
-        logits = getattr(outputs, "logits", None)
-        if logits is None or (scene_idx is None and answer_idx is None):
-            return
-        if not hasattr(self, "_gta"):
-            self._reset_token_acc()
-        with torch.no_grad():
-            # preds[t] predicts token t+1; a node token at position p is graded by
-            # preds[p-1] == input_ids[p]. So compare in the shifted (target) frame
-            # and map each index p -> p-1.
-            preds = logits[:, :-1, :].argmax(dim=-1)      # [B, S-1]
-            correct = preds == input_ids[:, 1:]            # [B, S-1]
-            width = correct.shape[1]
-            for b in range(correct.shape[0]):
-                for key, idx in (("scene", scene_idx), ("ans", answer_idx)):
-                    if not idx or b >= len(idx):
-                        continue
-                    pos = [p - 1 for p in idx[b] if 1 <= p <= width]
-                    if not pos:
-                        continue
-                    sel = correct[b, torch.as_tensor(pos, device=correct.device)]
-                    self._gta[f"{key}_n"] += sel.numel()
-                    self._gta[f"{key}_c"] += int(sel.sum().item())
-
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        scene_idx = inputs.pop("scene_node_idx", None)
-        answer_idx = inputs.pop("answer_node_idx", None)
-        loss, outputs = super().compute_loss(
-            model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch)
-        try:
-            self._accumulate_token_acc(outputs, inputs["input_ids"], scene_idx, answer_idx)
-        except Exception as e:  # a diagnostic must never break training
-            warnings.warn(f"graph-token-accuracy metric skipped: {type(e).__name__}: {e}")
-        return (loss, outputs) if return_outputs else loss
-
-    def log(self, logs, *args, **kwargs):
-        gta = getattr(self, "_gta", None)
-        if gta is not None:
-            counts = torch.tensor(
-                [gta["scene_c"], gta["scene_n"], gta["ans_c"], gta["ans_n"]],
-                dtype=torch.float64, device=self.args.device)
-            if self.args.world_size > 1:
-                counts = self.accelerator.reduce(counts, reduction="sum")
-            scene_c, scene_n, ans_c, ans_n = counts.tolist()
-            if scene_n > 0:
-                logs["graph_acc/scene_block"] = scene_c / scene_n
-            if ans_n > 0:
-                logs["graph_acc/answer_nodes"] = ans_c / ans_n
-            self._reset_token_acc()
-        return super().log(logs, *args, **kwargs)
-
-
-class GraphSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
-    def __init__(self, *args, gnn_config: dict, freeze_pe: bool = False,
-                 loss_target: str = "all", **kwargs):
-        super().__init__(*args, **kwargs)
-        self.gnn_config = gnn_config
-        self.freeze_pe = freeze_pe
-        self._set_loss_target(loss_target)
-        if freeze_pe:
-            # Stage-1 SFT: PE stays at init (gate closed); only LoRA trains.
-            return
-        # Re-enable gradients for graph encoder and gate/projection (PEFT froze them).
-        if gnn_config.get("architecture") == "composite_graph_gt":
-            for p in self.model.gt_model.parameters():
-                p.requires_grad = True
-            for p in self.model.injection.parameters():
-                p.requires_grad = True
-            # pe_qk_injection: re-enable q/k(/v) code projections PEFT froze.
-            if hasattr(self.model, "pe_q_proj"):
-                for name in ("pe_q_proj", "pe_k_proj", "pe_v_proj"):
-                    mod = getattr(self.model, name, None)
-                    if mod is not None:
-                        for p in mod.parameters():
-                            p.requires_grad = True
-            # c_bias scalar gains λ_C/λ_S/λ_V are non-LoRA — re-enable them.
-            for name in ("lam_c", "lam_psi", "lam_v"):
-                p = getattr(self.model, name, None)
-                if p is not None:
-                    p.requires_grad = True
-        elif gnn_config.get("architecture") == "graph_mask_llm":
-            # graph_mask_llm: parameter-free mask — only LoRA adapters train.
-            pass
-        else:
-            for p in self.model.pe_model.parameters():
-                p.requires_grad = True
-            for p in self.model.pe_proj.parameters():
-                p.requires_grad = True
-            self.model.pe_gain.requires_grad = True
-            # pe_norm is a non-LoRA module; re-enable so magnitude calibration adapts.
-            if getattr(self.model, "pe_norm", None) is not None:
-                for p in self.model.pe_norm.parameters():
-                    p.requires_grad = True
-
-    def create_optimizer(self):
-        """Two learning-rate groups: structural path (GT + R-PEARL + gate) at
-        ``structural_lr_mult`` × base LR; LLM/LoRA at base LR. Falls back to the
-        stock optimizer when the multiplier is 1.0.
-        """
-        mult = float(self.gnn_config.get("structural_lr_mult", 1.0))
-        # graph_mask_llm: parameter-free, no structural params — use stock optimizer.
-        if (self.optimizer is not None or mult == 1.0
-                or self.gnn_config.get("architecture") == "graph_mask_llm"):
-            return super().create_optimizer()
-
-        opt_model = self.model
-        if self.gnn_config.get("architecture") == "composite_graph_gt":
-            structural = list(self.model.gt_model.parameters()) + list(self.model.injection.parameters())
-            # pe_qk_injection: q/k(/v) projections are structural (boosted LR).
-            if hasattr(self.model, "pe_q_proj"):
-                for name in ("pe_q_proj", "pe_k_proj", "pe_v_proj"):
-                    mod = getattr(self.model, name, None)
-                    if mod is not None:
-                        structural += list(mod.parameters())
-            # c_bias scalar gains are structural too.
-            for name in ("lam_c", "lam_psi", "lam_v"):
-                p = getattr(self.model, name, None)
-                if p is not None:
-                    structural.append(p)
-        else:
-            structural = (list(self.model.pe_model.parameters())
-                          + list(self.model.pe_proj.parameters()) + [self.model.pe_gain])
-        structural_ids = {id(p) for p in structural}
-
-        decay_names = set(self.get_decay_parameter_names(opt_model))
-        base_lr = self.args.learning_rate
-        groups = []
-        # Structural at boosted LR, LLM/LoRA at base LR; each split into decay / no-decay.
-        for is_struct, lr in ((True, base_lr * mult), (False, base_lr)):
-            named = [(n, p) for n, p in opt_model.named_parameters()
-                     if p.requires_grad and (id(p) in structural_ids) == is_struct]
-            decay = [p for n, p in named if n in decay_names]
-            no_decay = [p for n, p in named if n not in decay_names]
-            if decay:
-                groups.append({"params": decay, "lr": lr, "weight_decay": self.args.weight_decay})
-            if no_decay:
-                groups.append({"params": no_decay, "lr": lr, "weight_decay": 0.0})
-
-        try:
-            optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args, opt_model)
-        except TypeError:
-            optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args)
-        optimizer_kwargs.pop("params", None)
-        optimizer_kwargs.pop("lr", None)
-        self.optimizer = optimizer_cls(groups, lr=base_lr, **optimizer_kwargs)
-        n_struct = sum(p.numel() for p in structural if p.requires_grad)
-        print(f"[train] structural LR group: {mult}x base = {base_lr * mult:.2e} "
-              f"({n_struct / 1e6:.2f}M params); LLM/LoRA at base LR {base_lr:.2e}")
-        return self.optimizer
-
-    def training_step(self, model, inputs, num_items_in_batch=None, **kwargs):
-        loss = super().training_step(model, inputs, num_items_in_batch=num_items_in_batch, **kwargs)
-        # Capture grad norms before zero_grad() (backward already ran in super).
-        for cb in self.callback_handler.callbacks:
-            if isinstance(cb, callbacks.GradientDebugCallback):
-                cb._capture_grad_norms(model)
-                break
-        return loss
-
-    def save_model(self, output_dir=None, _internal_call=False):
-        output_dir = output_dir or self.args.output_dir
-        os.makedirs(output_dir, exist_ok=True)
-        with open(os.path.join(output_dir, "gnn_config.json"), "w") as f:
-            json.dump(self.gnn_config, f, indent=2)
-        if self.gnn_config.get("architecture") == "composite_graph_gt":
-            # Save the Graph Transformer (R-PEARL inside) and the cold-start gate.
-            gnn_state = {
-                'gt_model': self.model.gt_model.state_dict(),
-                'injection': self.model.injection.state_dict(),
-            }
-            # In-attention injection variant: persist the dedicated q/k(/v) projections.
-            if hasattr(self.model, "pe_q_proj"):
-                gnn_state['pe_q_proj'] = self.model.pe_q_proj.state_dict()
-                gnn_state['pe_k_proj'] = self.model.pe_k_proj.state_dict()
-                if getattr(self.model, "pe_v_proj", None) is not None:
-                    gnn_state['pe_v_proj'] = self.model.pe_v_proj.state_dict()
-            # c_bias: persist scalar gains λ_C/λ_S/λ_V.
-            if getattr(self.model, "c_bias", False):
-                gnn_state['c_bias_gains'] = {
-                    name: getattr(self.model, name).detach().cpu()
-                    for name in ("lam_c", "lam_psi", "lam_v")
-                    if getattr(self.model, name, None) is not None
-                }
-            torch.save(gnn_state, os.path.join(output_dir, "gnn_weights.pt"))
-            torch.save({
-                'rpearl': self.model.gt_model.pe_model.state_dict(),
-            }, os.path.join(output_dir, "rpearl_weights.pt"))
-        elif self.gnn_config.get("architecture") == "graph_mask_llm":
-            # Parameter-free: mask rebuilt from config; gnn_config.json + LoRA adapter suffice.
-            pass
-        elif self.gnn_config.get("architecture") == "rpearl_gt_llm":
-            # Full GT: save the whole GraphTransformer (includes R-PEARL inside) + projection head.
-            torch.save({
-                'gt_model': self.model.pe_model.state_dict(),
-                'pe_proj': self.model.pe_proj.state_dict(),
-                'pe_gain': self.model.pe_gain.data,
-                **({'pe_norm': self.model.pe_norm.state_dict()}
-                   if self.model.pe_norm is not None else {}),
-            }, os.path.join(output_dir, "gnn_weights.pt"))
-            # Also save the inner R-PEARL separately for analysis / reuse.
-            torch.save({
-                'rpearl': self.model.pe_model.pe_model.state_dict(),
-            }, os.path.join(output_dir, "rpearl_weights.pt"))
-        else:
-            torch.save({
-                'pe_model': self.model.pe_model.state_dict(),
-                'pe_proj': self.model.pe_proj.state_dict(),
-                'pe_gain': self.model.pe_gain.data,
-                **({'pe_norm': self.model.pe_norm.state_dict()}
-                   if self.model.pe_norm is not None else {}),
-            }, os.path.join(output_dir, "gnn_weights.pt"))
-        # Save the LoRA adapter whenever one is attached (including frozen carried-forward
-        # adapters). freeze_llm=True attaches no adapter, so this is skipped for that path.
-        if getattr(self.model, "peft_config", None) is not None:
-            super().save_model(output_dir, _internal_call)
-
-
-class BaselineSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
-    """Plain-``llm`` baseline trainer. Identical to ``SFTTrainer`` except it logs the
-    ``graph_acc/*`` metric (via :class:`GraphTokenAccuracyMixin`) so the baseline is
-    comparable to the graph architectures. Paired with
-    :class:`prism.data.data.TokenIndexCollator`, which carries the precomputed
-    graph-token index columns the metric needs.
-
-    Persists a ``train_config.json`` (the plain-LLM analogue of the graph trainer's
-    ``gnn_config.json``) so the standalone eval boundary can recover the train-time
-    ``text_edge_list`` policy. Without it an LLM trained with ``text_edge_list=none``
-    would be silently evaluated with edge bullets re-added (train/eval mismatch).
-    """
-
-    def __init__(self, *args, train_config: dict, loss_target: str = "all", **kwargs):
-        super().__init__(*args, **kwargs)
-        self.train_config = train_config
-        self._set_loss_target(loss_target)
-
-    def save_model(self, output_dir=None, _internal_call=False):
-        output_dir = output_dir or self.args.output_dir
-        os.makedirs(output_dir, exist_ok=True)
-        with open(os.path.join(output_dir, "train_config.json"), "w") as f:
-            json.dump(self.train_config, f, indent=2)
-        super().save_model(output_dir, _internal_call)
-
-
-# ----------------------------
-# Config
-# ----------------------------
-@dataclass
-class TrainConfig:
-    name: str
-    checkpoint_dir: str
-    data: str
-    bit4: bool = False
-    eval_data: str = "data/eval/eval_1_multi_step.json"
-    # Optional pre-split validation file (same schema as `data`). When set,
-    # `val_frac` is ignored and this file is loaded as the eval dataset.
-    val_data: Optional[str] = None
-    r: int = 16
-    base_model: str = "meta-llama/Llama-3.2-3B-Instruct"
-    wandb_project: str = "SLM-distill"
-    wandb_run_name: str = "spine_lora"
-    wandb_tag: str = "spine"
-    epochs: int = 2
-    max_steps: int = -1  # If > 0, overrides epochs and switches eval/save to step-based (dev use)
-    # Zero-shot baseline: skip optimization and evaluate the untrained base model.
-    no_train: bool = False
-    val_frac: float = 0.1
-    # LoRA
-    lora_alpha: int = 16
-    lora_dropout: float = 0.2
-    target_modules: List[str] = field(
-        default_factory=lambda: [
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ]
-    )
-    # Trainer args
-    per_device_train_batch_size: int = 1
-    per_device_eval_batch_size: int = 1
-    gradient_accumulation_steps: int = 2
-    # Activation recompute (saves memory). use_reentrant=False required: GT passes
-    # grad-carrying inputs_embeds that the reentrant path mishandles.
-    gradient_checkpointing: bool = True
-    dataloader_num_workers: int = 4
-    report_to: str = "wandb"
-    learning_rate: float = 2e-4
-    warmup_steps: int = 5 # TODO consider warmup_steps: float= 0.03
-    weight_decay: float = 0.05
-    debug: bool = False
-    max_seq_length: int = 2048
-    dataset_num_proc: int = 8
-    dataset_proportion: float = 0.1
-    # Model args.
-    pe_hidden_channels: int = 256
-    pe_num_layers: int = 3
-    d_model: int = 3072
-    num_samples: int = 40
-    dropout: float = 0.1
-    k_pe: int = 3
-    use_layer_norm: bool = True
-    freeze_llm: bool = False
-    architecture: str = "rpearl_llm"  # "rpearl_llm", "rpearl_gt_llm", "gt_llm", "graph_mask_llm", "composite_graph_gt", or "llm"
-    # GT-specific params (used when architecture == "rpearl_gt_llm" / "composite_graph_gt")
-    gt_num_layers: int = 3
-    gt_heads: int = 8
-    eps: float = 1e-8
-
-    def __post_init__(self):
-        self.eps = float(self.eps)
-        if self.loss_target not in ("all", "responses", "edge_list"):
-            raise ValueError(
-                f"loss_target must be 'all', 'responses', or 'edge_list', "
-                f"got {self.loss_target!r}")
-        if self.loss_target == "edge_list" and self.text_edge_list != "present":
-            raise ValueError(
-                "loss_target='edge_list' requires text_edge_list='present' "
-                "(the edge bullets must be in the text to supervise them).")
-    k_gt: int = 3
-    text_edge_list: str = "present"   # "present" or "none"
-    # Composite-graph params (used when architecture == "composite_graph_gt")
-    cycle_directed: bool = True
-    cycle_weight: float = 1.0
-    affinity_kernel: str = "gaussian"
-    sigma_mode: str = "median"
-    keep_raw_distance_feature: bool = True
-    crosslink_weight: float = 1.0
-    crosslink_mention_to_node: bool = True
-    crosslink_mention_clique: bool = True
-    # R-PEARL sampling
-    probe_distribution: str = "gaussian"
-    m_test: int = 128
-    max_gather_rows: int = 2_000_000
-    fixed_seed_mode: bool = False
-    fixed_seed_value: int = 0
-    # R-PEARL readout fed to the GT (composite_graph_gt only): "mean" = E_q[Φ(q)];
-    # "second_moment" = C @ X for C = E_q[Φ(q)Φ(q)ᵀ] (carries relative position).
-    pe_readout: str = "mean"
-    # Center the second moment into a covariance (C·s = E[Φ(Φᵀs)] − Ψ(Ψᵀs)); needed
-    # so the mean doesn't dominate via rank-1 ΨΨᵀ and collapse C to averaging.
-    pe_center_moment: bool = True
-    # Initial value of the injection gate (g = tanh(pe_gain)). 0.0 = cold-start
-    # (Ψ off at init, gate ramps it in); 1.0 = active from step 0.
-    pe_gain_init: float = 0.0
-    # RMS-normalize and rescale the projected Ψ to the base model's embedding scale
-    # before injection (magnitude calibration).
-    use_pe_norm: bool = True
-    # R-PEARL input features: "random" = PEARL random probes; "word_embeddings" =
-    # mean word-embedding of the node's name tokens (deterministic, no probes).
-    pe_node_features: str = "random"
-    # Set position_id 0 on graph (node-name) tokens so RoPE is the identity there;
-    # their position comes from Ψ instead. Causality is unaffected.
-    disable_graph_token_rope: bool = False
-    # graph_mask_llm: node tokens attend only within mask_k_hops graph hops.
-    mask_k_hops: int = 1
-    # Symmetrize the adjacency (OR with its transpose) before building the mask.
-    mask_symmetrize: bool = True
-    # When False, mask is self-loops only (no cross-node attention) — floor ablation
-    # for whether edge connectivity in the mask matters.
-    mask_use_edges: bool = True
-    # Gated injection (composite_graph_gt only)
-    injection_mode: str = "interpolate"
-    gate_init: float = 0.0
-    gate_per_dim: bool = False
-    disable_rope: bool = True
-    # Inject the GT-refined token code into q/k(/v) inside every attention layer
-    # (dedicated W_q/W_k/W_v), in place of RoPE. composite_graph_gt only.
-    pe_qk_injection: bool = False
-    # Also inject into the attention *value* (v += W_v·Y_tok), not just q/k. False =
-    # q/k only (no value/readout path).
-    pe_inject_v: bool = True
-    # Replace post-RoPE q/k at every layer with the composite token covariance C_tok
-    # (q ← C_tok·q, k ← C_tok·k) instead of additive projections. Deterministic, scaled
-    # to ‖X‖. Selects InjectedCompositeGraphLLM; pairs with disable_rope=True.
-    c_per_layer: bool = False
-    # C_tok as additive logit bias (λ_C) + residual value mix (v ← v + λ_V·C·v);
-    # no q/k transform. Optional scene bias λ_S via use_scene_bias. Gains: λ_C,λ_S,λ_V.
-    c_bias: bool = False
-    use_scene_bias: bool = True
-    # Live c_bias covariance kernel: "sampled" (E_q[ΦΦᵀ]−ΨΨᵀ probe estimate) or
-    # "analytic" (all-layer H(S)H(S)* matrix powers). See InjectedCompositeGraphLLM.
-    c_kernel: str = "sampled"
-    # GT + R-PEARL + gate train at structural_lr_mult × base LR; lora_warmup_steps
-    # freezes LLM/LoRA for the first N steps so the structural path learns first.
-    structural_lr_mult: float = 1.0
-    lora_warmup_steps: int = 0
-    # c_bias (Design D): ramp the additive covariance gain λ_C 0→1 over the first N steps.
-    lam_c_warmup_steps: int = 0
-    # Prompt / debug-viz switches
-    n_icl_examples: int = 2
-    log_fiedler: bool = True
-    log_scene_mass: bool = True
-    enable_visualizer: bool = False
-    device: int = 0                   # GPU index to pin the model to; -1 = let device_map="auto" decide
-    overwrite_ok: bool = False
-    # Optional override for the checkpoint subdirectory name.
-    # Default (None): auto-generated as "{name}_{architecture}_{model_slug}_r{r}[_4bit]_{wandb_run_id}"
-    # Override: "{save_name}_{wandb_run_id}" — the run ID is always appended.
-    save_name: str = None
-    # Path (file or directory of {graph, tasks} JSONs) for post-training cross-eval;
-    # results written to <output_dir>/eval_logs/cross_eval/<graph>.json.
-    post_train_eval_graphs: Optional[str] = None
-    # Enable SPINE ICL examples during train-time eval and post-train cross-eval.
-    eval_use_icl: bool = True
-    # --- Multistage training ------------------------------------------------
-    # Weight-only init from a prior stage (NOT HF resume; fresh optimizer each stage).
-    # init_lora_from: attach a saved LoRA adapter instead of a fresh one.
-    # init_pe_from: load gnn_weights.pt into the fresh PE module.
-    init_lora_from: Optional[str] = None
-    init_pe_from: Optional[str] = None
-    # Freeze the carried-forward LoRA adapter (PE-only stage). Distinct from
-    # freeze_llm, which drops the adapter and trains PE on the raw base.
-    freeze_lora: bool = False
-    # Freeze the PE module — Stage 1 SFT trains ONLY the LoRA while the PE stays
-    # inert at init (paired with pe_gain_init=0). See GraphSFTTrainer.__init__.
-    freeze_pe: bool = False
-    # Token span for the next-token loss: "all" = full sequence; "responses" =
-    # assistant turns only (via precomputed assistant_idx); "edge_list" = edge
-    # bullets only (requires text_edge_list="present").
-    loss_target: str = "all"
-    # Number of graphs to evaluate each interval (first N from eval_data).
-    eval_num_graphs: int = 5
-    # EvalCallback cadence in epochs; raise for long PE-only stages to bound eval cost.
-    eval_epoch_interval: float = 1.0
-
-
-def _run_post_train_cross_eval(model, tokenizer, config: "TrainConfig", output_dir: str) -> None:
-    """Run cross-eval on the in-memory model after training and write per-graph JSONs.
-
-    Disk I/O happens in `data.load_samples_by_graph`; this function is
-    pure orchestration: load → eval → write. Output shape matches the old
-    `eval_checkpoint_on_graphs.py` (consumed by eval_viewer.html and the
-    judge-eval skill).
-    """
-    target = config.post_train_eval_graphs
-    if target is None:
-        return
-
-    samples_by_graph, graph_file_by_name = data.load_samples_by_graph(target)
-
-    is_gnn = config.architecture in ("rpearl_llm", "rpearl_gt_llm", "gt_llm", "graph_mask_llm", "composite_graph_gt")
-    architecture = "graph-augmented" if is_gnn else "llm"
-    out_dir = os.path.join(output_dir, "eval_logs", "cross_eval")
-    os.makedirs(out_dir, exist_ok=True)
-
-    model.eval()
-    print(f"\n[post-train eval] {len(samples_by_graph)} graph file(s) -> {out_dir}")
-    results = evaluate.eval_model_multiple_graphs(
-        model,
-        tokenizer,
-        samples_by_graph,
-        include_edge_list=(config.text_edge_list == "present"),
-        use_icl=config.eval_use_icl,
-        permutation=None,
-        on_graph_done=None,
-    )
-
-    for name, result in results.items():
-        _write_cross_eval_json(
-            out_dir, name, result,
-            checkpoint=output_dir,
-            graph_file=graph_file_by_name[name],
-            architecture=architecture,
-            text_edge_list=config.text_edge_list,
-        )
-
-    evaluate.print_summary_table(list(results.values()))
-
-
-def _run_zero_shot_eval(
-    model, tokenizer, config: "TrainConfig", output_dir: str, eval_samples_by_graph: dict
-) -> None:
-    """Evaluate the untrained base model over the multi-graph eval set for the
-    ``no_train`` baseline.
-
-    Mirrors the per-epoch :class:`prism.eval.callbacks.EvalCallback` artifact
-    (``eval_logs/step_000000_epoch_0.000.json`` + the ``eval/accuracy`` wandb
-    point) so the base model's out-of-the-box score is directly comparable to the
-    trained runs and consumable by the judge-eval skill. ``include_edge_list`` is
-    resolved here from the same ``text_edge_list == "present"`` policy used
-    everywhere else, so the with-/without-edges baselines differ only in the
-    LLM-facing edge text.
-    """
-    eval_log_dir = os.path.join(output_dir, "eval_logs")
-    os.makedirs(eval_log_dir, exist_ok=True)
-    model.eval()
-    results = evaluate.eval_model_multiple_graphs(
-        model,
-        tokenizer,
-        eval_samples_by_graph,
-        include_edge_list=(config.text_edge_list == "present"),
-        use_icl=config.eval_use_icl,
-        permutation=None,
-        on_graph_done=None,
-    )
-    log_data = _aggregate_multi_graph_eval(results, step=0, epoch=0.0)
-    log_file = os.path.join(eval_log_dir, "step_000000_epoch_0.000.json")
-    with open(log_file, "w") as f:
-        json.dump(log_data, f, indent=2, default=str)
-    print(
-        f"[no_train] zero-shot eval/accuracy = {log_data['accuracy']:.4f} "
-        f"({log_data['num_correct']}/{log_data['num_samples']}) over "
-        f"{log_data['num_graphs']} graph(s) -> {log_file}"
-    )
-    if wandb.run is not None:
-        wandb.log({"eval/accuracy": log_data["accuracy"], "epoch": 0.0})
-
-
-def _aggregate_multi_graph_eval(results: dict, *, step: int, epoch: float) -> dict:
-    """Fold per-graph `GraphEvalResultSummary`s into one eval-log payload.
-
-    Overall accuracy is the micro-average of the per-graph keyword rate
-    (`GraphEvalResultSummary.accuracy`) weighted by sample count — Σ(rate·n) / Σn.
-    This is the SAME objective-keyword metric the old single-graph EvalCallback
-    logged as `eval/accuracy` and that the per-graph `eval/acc/<name>` breakdown
-    reports, so the headline reconciles with the breakdown and stays comparable to
-    prior runs. Path metrics are aggregated over the concatenated samples, and a
-    `per_graph` breakdown is kept. Shape matches the old single-graph log apart from
-    the extra `num_graphs` / `per_graph` keys.
-    """
-    all_samples = [s for r in results.values() for s in r.samples]
-    num_total = sum(r.num_total for r in results.values())
-    # Per-graph keyword-correct count = accuracy·n (integer); sum for the headline.
-    num_correct = sum(round(r.accuracy * r.num_total) for r in results.values())
-    accuracy = (num_correct / num_total) if num_total else 0.0
-    return {
-        "step": step,
-        "epoch": epoch,
-        "accuracy": accuracy,
-        "num_graphs": len(results),
-        "num_samples": num_total,
-        "num_correct": num_correct,
-        "path_metrics": evaluate._aggregate_path_metrics(all_samples),
-        "per_graph": {name: {"accuracy": r.accuracy, "num_correct": r.num_correct,
-                             "num_total": r.num_total}
-                      for name, r in results.items()},
-        "samples": all_samples,
-    }
-
-
-def _write_cross_eval_json(
-    out_dir: str,
-    name: str,
-    result: evaluate.GraphEvalResultSummary,
-    *,
-    checkpoint: str,
-    graph_file: str,
-    architecture: str,
-    text_edge_list: str,
-) -> None:
-    log_data = {
-        "checkpoint": checkpoint,
-        "graph_file": graph_file,
-        "architecture": architecture,
-        "text_edge_list": text_edge_list,
-        "accuracy": result.accuracy,
-        "num_samples": result.num_total,
-        "num_correct": result.num_correct,
-        "path_metrics": result.path_metrics,
-        "samples": result.samples,
-    }
-    out_file = os.path.join(out_dir, f"{name}.json")
-    with open(out_file, "w") as f:
-        json.dump(log_data, f, indent=2, default=str)
-    print(f"  {name}: {result.num_correct}/{result.num_total} ({result.accuracy:.1%}) -> {out_file}")
-
-
-# ----------------------------
-# Training
-# ----------------------------
-def _load_pe_weights_into(model, init_pe_from: str, architecture: str) -> None:
-    """Load a saved PE module (``gnn_weights.pt``) from a prior stage into ``model``.
-
-    Operates on a training model (no merge, no eval). Only rpearl_llm /
-    rpearl_gt_llm PE layouts are supported.
-    """
-    weights_path = os.path.join(init_pe_from, "gnn_weights.pt")
-    gnn_weights = torch.load(weights_path, map_location="cpu")
-    if architecture == "rpearl_gt_llm":
-        model.pe_model.load_state_dict(gnn_weights["gt_model"], strict=False)
-    elif architecture == "rpearl_llm":
-        model.pe_model.load_state_dict(gnn_weights["pe_model"], strict=False)
-    else:
-        raise NotImplementedError(
-            f"init_pe_from is only wired for rpearl_llm / rpearl_gt_llm, got {architecture!r}")
-    model.pe_proj.load_state_dict(gnn_weights["pe_proj"])
-    if "pe_gain" in gnn_weights:
-        model.pe_gain.data.copy_(gnn_weights["pe_gain"])
-    if getattr(model, "pe_norm", None) is not None and "pe_norm" in gnn_weights:
-        model.pe_norm.load_state_dict(gnn_weights["pe_norm"])
-    print(f"[multistage] loaded PE weights from {weights_path}")
-
-
-# Multimodal Gemma-4 bases (e.g. gemma-4-31B) include vision/audio towers whose
-# projections use Gemma4ClippableLinear (not nn.Linear) — PEFT cannot adapt them,
-# and their leaf names collide with the text decoder. Exclude them from LoRA targets.
-# Text-only / "unified" bases (Llama, gemma-4-12B) have no towers; regex hits nothing.
-_MM_TOWER_KEYS = ("vision_tower", "audio_tower")
-
-
-def _peft_tower_exclude(model) -> "str | None":
-    """Return a PEFT `exclude_modules` regex for a multimodal base, else None.
-
-    Detected from the actual module tree (not the model-id) so it is robust to
-    the LoRA wrapper prefix and to future multimodal variants.
-    """
-    has_tower = any(
-        any(k in name for k in _MM_TOWER_KEYS) for name, _ in model.named_modules()
-    )
-    return r".*(?:" + "|".join(_MM_TOWER_KEYS) + r").*" if has_tower else None
-
-
-def train_model(config: TrainConfig, config_file: str = None):
+def train_model(config: "TrainConfig", config_file: str = None):
     os.environ["WANDB_PROJECT"] = config.wandb_project
     os.environ["WANDB_RUN_GROUP"] = config.wandb_tag
     os.environ["WANDB_TAGS"] = config.wandb_tag
@@ -1199,7 +457,7 @@ def train_model(config: TrainConfig, config_file: str = None):
     # no_train: evaluate the untrained base model zero-shot instead of training.
     if config.no_train:
         print("[no_train] Skipping optimization — evaluating the base model zero-shot.")
-        _run_zero_shot_eval(trainer.model, tokenizer, config, sft_args.output_dir, eval_samples_by_graph)
+        evaluate.run_zero_shot_eval(trainer.model, tokenizer, config, sft_args.output_dir, eval_samples_by_graph)
     else:
         trainer.train()
 
@@ -1208,11 +466,612 @@ def train_model(config: TrainConfig, config_file: str = None):
     tokenizer.save_pretrained(sft_args.output_dir)
 
     if config.post_train_eval_graphs:
-        _run_post_train_cross_eval(
+        evaluate.run_post_train_cross_eval(
             trainer.model, tokenizer, config, sft_args.output_dir,
         )
 
     return trainer
+
+
+# ----------------------------
+# Utilities
+# ----------------------------
+def _bf16_supported() -> bool:
+    """Conservative check for bfloat16 support."""
+    try:
+        return torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    except Exception:
+        return False
+
+
+def _fp16_supported() -> bool:
+    """Conservative check for fp16 support."""
+    if _bf16_supported():
+        return False
+    try:
+        return torch.cuda.is_available()
+    except Exception:
+        return False
+
+
+def _model_short_name(base_model: str) -> str:
+    """Extract a short filesystem-safe slug from a HuggingFace model ID.
+
+    Examples:
+        meta-llama/Llama-3.1-8B-Instruct → llama-3.1-8b
+        Qwen/Qwen2.5-0.5B-Instruct       → qwen2.5-0.5b
+    """
+    name = base_model.split("/")[-1]          # drop org prefix
+    name = re.sub(r"-[Ii]nstruct$", "", name) # drop -Instruct suffix
+    name = name.lower()
+    name = re.sub(r"-+", "-", name)           # collapse consecutive hyphens
+    return name
+
+
+def _ensure_pad_tokens(tokenizer: PreTrainedTokenizer, model: PreTrainedModel) -> None:
+    """Ensure tokenizer and model config have a pad token for training.
+
+    Many chat models ship without a dedicated PAD token; we alias EOS instead.
+    """
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    if getattr(model.config, "pad_token_id", None) is None:
+        model.config.pad_token_id = tokenizer.pad_token_id
+
+
+
+
+# Maps loss_target values to their precomputed per-example index column. "all" is
+# absent (full-sequence). Add a new target by precomputing a column and registering it.
+_LOSS_TARGET_COLUMN = {"responses": "assistant_idx", "edge_list": "edge_list_idx"}
+
+
+class LossTargetMixin:
+    """Restricts the next-token loss to a configurable token span (``loss_target``).
+
+    ``all`` (default) = full sequence; ``responses`` = assistant turns;
+    ``edge_list`` = edge bullets. Supervised positions come from per-example index
+    columns precomputed in ``preprocess_dataset``, mapped via ``_LOSS_TARGET_COLUMN``.
+
+    Masks ``inputs['labels']`` then defers to ``super().compute_loss`` (cooperative,
+    MRO-safe). Mix in BEFORE :class:`GraphTokenAccuracyMixin` so masking happens first.
+    """
+
+    def _set_loss_target(self, loss_target: str):
+        """Configure the supervised-token span. Call after ``super().__init__``.
+
+        For masked targets (responses / edge_list), disables the loss-kwargs path so
+        the LM loss uses reduction="mean" over only the supervised tokens, not HF's
+        full-batch normalization (which would under-normalize the masked span).
+        """
+        self.loss_target = loss_target
+        if loss_target != "all":
+            self.model_accepts_loss_kwargs = False
+
+    def _mask_labels_to_positions(self, inputs, idx_lists, target):
+        """Mask ``inputs['labels']`` to -100 outside the per-example supervised positions.
+
+        ``idx_lists`` is a per-example list of token positions (e.g. assistant_idx /
+        edge_list_idx). If a batch ends up with NO supervised tokens, fall back to its
+        full-sequence labels with a warning (better than a NaN all-masked loss).
+        """
+        labels = inputs["labels"]
+        keep = torch.zeros_like(labels, dtype=torch.bool)
+        for b, idx in enumerate(idx_lists):
+            if not idx or b >= labels.shape[0]:
+                continue
+            pos = torch.as_tensor([p for p in idx if 0 <= p < labels.shape[1]],
+                                  device=labels.device, dtype=torch.long)
+            if pos.numel():
+                keep[b, pos] = True
+        if keep.any():
+            inputs["labels"] = labels.masked_fill(~keep, -100)
+        else:
+            warnings.warn(
+                f"loss_target={target!r} but no supervised tokens located in this "
+                "batch; falling back to full-sequence loss for it.")
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # Pop the mask columns so they never reach the model forward, then restrict
+        # the loss to the configured span ('all' / absent column => no masking).
+        mask_columns = {name: inputs.pop(name, None)
+                        for name in set(_LOSS_TARGET_COLUMN.values())}
+        target = getattr(self, "loss_target", "all")
+        col = _LOSS_TARGET_COLUMN.get(target)
+        if col is not None and mask_columns.get(col) is not None \
+                and inputs.get("labels") is not None:
+            self._mask_labels_to_positions(inputs, mask_columns[col], target)
+        return super().compute_loss(
+            model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch)
+
+
+class GraphTokenAccuracyMixin:
+    """This mixin computes and logs ``graph_acc/scene_block`` and ``graph_acc/answer_nodes`` metrics. teacher-forced
+    next-token accuracy restricted to graph-related tokens.
+
+    * ``scene_block`` — tokens in the scene-graph block that name a node (the
+      positions the graph PE injects into).
+    * ``answer_nodes`` — node-name tokens the model emits in its final answer.
+
+    The two masks come from per-example index lists precomputed in
+    ``preprocess_dataset`` and carried verbatim by the collator
+    (:class:`prism.data.data.TokenIndexCollator`); right-padding keeps each index
+    valid in the padded batch. Counts accumulate across the logging window and are
+    flushed (DDP-reduced) in :meth:`log`, so the metric rides the trainer's existing
+    wandb logging cadence with no extra callback. Mixed into both the graph trainer
+    and the plain-``llm`` baseline trainer so the two are comparable.
+    """
+
+    def _reset_token_acc(self):
+        self._gta = {"scene_c": 0, "scene_n": 0, "ans_c": 0, "ans_n": 0}
+
+    def _accumulate_token_acc(self, outputs, input_ids, scene_idx, answer_idx):
+        logits = getattr(outputs, "logits", None)
+        if logits is None or (scene_idx is None and answer_idx is None):
+            return
+        if not hasattr(self, "_gta"):
+            self._reset_token_acc()
+        with torch.no_grad():
+            # preds[t] predicts token t+1; a node token at position p is graded by
+            # preds[p-1] == input_ids[p]. So compare in the shifted (target) frame
+            # and map each index p -> p-1.
+            preds = logits[:, :-1, :].argmax(dim=-1)      # [B, S-1]
+            correct = preds == input_ids[:, 1:]            # [B, S-1]
+            width = correct.shape[1]
+            for b in range(correct.shape[0]):
+                for key, idx in (("scene", scene_idx), ("ans", answer_idx)):
+                    if not idx or b >= len(idx):
+                        continue
+                    pos = [p - 1 for p in idx[b] if 1 <= p <= width]
+                    if not pos:
+                        continue
+                    sel = correct[b, torch.as_tensor(pos, device=correct.device)]
+                    self._gta[f"{key}_n"] += sel.numel()
+                    self._gta[f"{key}_c"] += int(sel.sum().item())
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        scene_idx = inputs.pop("scene_node_idx", None)
+        answer_idx = inputs.pop("answer_node_idx", None)
+        loss, outputs = super().compute_loss(
+            model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch)
+        try:
+            self._accumulate_token_acc(outputs, inputs["input_ids"], scene_idx, answer_idx)
+        except Exception as e:  # a diagnostic must never break training
+            warnings.warn(f"graph-token-accuracy metric skipped: {type(e).__name__}: {e}")
+        return (loss, outputs) if return_outputs else loss
+
+    def log(self, logs, *args, **kwargs):
+        gta = getattr(self, "_gta", None)
+        if gta is not None:
+            counts = torch.tensor(
+                [gta["scene_c"], gta["scene_n"], gta["ans_c"], gta["ans_n"]],
+                dtype=torch.float64, device=self.args.device)
+            if self.args.world_size > 1:
+                counts = self.accelerator.reduce(counts, reduction="sum")
+            scene_c, scene_n, ans_c, ans_n = counts.tolist()
+            if scene_n > 0:
+                logs["graph_acc/scene_block"] = scene_c / scene_n
+            if ans_n > 0:
+                logs["graph_acc/answer_nodes"] = ans_c / ans_n
+            self._reset_token_acc()
+        return super().log(logs, *args, **kwargs)
+
+
+class GraphSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
+    def __init__(self, *args, gnn_config: dict, freeze_pe: bool = False,
+                 loss_target: str = "all", **kwargs):
+        super().__init__(*args, **kwargs)
+        self.gnn_config = gnn_config
+        self.freeze_pe = freeze_pe
+        self._set_loss_target(loss_target)
+        if freeze_pe:
+            # Stage-1 SFT: PE stays at init (gate closed); only LoRA trains.
+            return
+        # Re-enable gradients for graph encoder and gate/projection (PEFT froze them).
+        if gnn_config.get("architecture") == "composite_graph_gt":
+            for p in self.model.gt_model.parameters():
+                p.requires_grad = True
+            for p in self.model.injection.parameters():
+                p.requires_grad = True
+            # pe_qk_injection: re-enable q/k(/v) code projections PEFT froze.
+            if hasattr(self.model, "pe_q_proj"):
+                for name in ("pe_q_proj", "pe_k_proj", "pe_v_proj"):
+                    mod = getattr(self.model, name, None)
+                    if mod is not None:
+                        for p in mod.parameters():
+                            p.requires_grad = True
+            # c_bias scalar gains λ_C/λ_S/λ_V are non-LoRA — re-enable them.
+            for name in ("lam_c", "lam_psi", "lam_v"):
+                p = getattr(self.model, name, None)
+                if p is not None:
+                    p.requires_grad = True
+        elif gnn_config.get("architecture") == "graph_mask_llm":
+            # graph_mask_llm: parameter-free mask — only LoRA adapters train.
+            pass
+        else:
+            for p in self.model.pe_model.parameters():
+                p.requires_grad = True
+            for p in self.model.pe_proj.parameters():
+                p.requires_grad = True
+            self.model.pe_gain.requires_grad = True
+            # pe_norm is a non-LoRA module; re-enable so magnitude calibration adapts.
+            if getattr(self.model, "pe_norm", None) is not None:
+                for p in self.model.pe_norm.parameters():
+                    p.requires_grad = True
+
+    def create_optimizer(self):
+        """Two learning-rate groups: structural path (GT + R-PEARL + gate) at
+        ``structural_lr_mult`` × base LR; LLM/LoRA at base LR. Falls back to the
+        stock optimizer when the multiplier is 1.0.
+        """
+        mult = float(self.gnn_config.get("structural_lr_mult", 1.0))
+        # graph_mask_llm: parameter-free, no structural params — use stock optimizer.
+        if (self.optimizer is not None or mult == 1.0
+                or self.gnn_config.get("architecture") == "graph_mask_llm"):
+            return super().create_optimizer()
+
+        opt_model = self.model
+        if self.gnn_config.get("architecture") == "composite_graph_gt":
+            structural = list(self.model.gt_model.parameters()) + list(self.model.injection.parameters())
+            # pe_qk_injection: q/k(/v) projections are structural (boosted LR).
+            if hasattr(self.model, "pe_q_proj"):
+                for name in ("pe_q_proj", "pe_k_proj", "pe_v_proj"):
+                    mod = getattr(self.model, name, None)
+                    if mod is not None:
+                        structural += list(mod.parameters())
+            # c_bias scalar gains are structural too.
+            for name in ("lam_c", "lam_psi", "lam_v"):
+                p = getattr(self.model, name, None)
+                if p is not None:
+                    structural.append(p)
+        else:
+            structural = (list(self.model.pe_model.parameters())
+                          + list(self.model.pe_proj.parameters()) + [self.model.pe_gain])
+        structural_ids = {id(p) for p in structural}
+
+        decay_names = set(self.get_decay_parameter_names(opt_model))
+        base_lr = self.args.learning_rate
+        groups = []
+        # Structural at boosted LR, LLM/LoRA at base LR; each split into decay / no-decay.
+        for is_struct, lr in ((True, base_lr * mult), (False, base_lr)):
+            named = [(n, p) for n, p in opt_model.named_parameters()
+                     if p.requires_grad and (id(p) in structural_ids) == is_struct]
+            decay = [p for n, p in named if n in decay_names]
+            no_decay = [p for n, p in named if n not in decay_names]
+            if decay:
+                groups.append({"params": decay, "lr": lr, "weight_decay": self.args.weight_decay})
+            if no_decay:
+                groups.append({"params": no_decay, "lr": lr, "weight_decay": 0.0})
+
+        try:
+            optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args, opt_model)
+        except TypeError:
+            optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args)
+        optimizer_kwargs.pop("params", None)
+        optimizer_kwargs.pop("lr", None)
+        self.optimizer = optimizer_cls(groups, lr=base_lr, **optimizer_kwargs)
+        n_struct = sum(p.numel() for p in structural if p.requires_grad)
+        print(f"[train] structural LR group: {mult}x base = {base_lr * mult:.2e} "
+              f"({n_struct / 1e6:.2f}M params); LLM/LoRA at base LR {base_lr:.2e}")
+        return self.optimizer
+
+    def training_step(self, model, inputs, num_items_in_batch=None, **kwargs):
+        loss = super().training_step(model, inputs, num_items_in_batch=num_items_in_batch, **kwargs)
+        # Capture grad norms before zero_grad() (backward already ran in super).
+        for cb in self.callback_handler.callbacks:
+            if isinstance(cb, callbacks.GradientDebugCallback):
+                cb._capture_grad_norms(model)
+                break
+        return loss
+
+    def save_model(self, output_dir=None, _internal_call=False):
+        output_dir = output_dir or self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        with open(os.path.join(output_dir, "gnn_config.json"), "w") as f:
+            json.dump(self.gnn_config, f, indent=2)
+        if self.gnn_config.get("architecture") == "composite_graph_gt":
+            # Save the Graph Transformer (R-PEARL inside) and the cold-start gate.
+            gnn_state = {
+                'gt_model': self.model.gt_model.state_dict(),
+                'injection': self.model.injection.state_dict(),
+            }
+            # In-attention injection variant: persist the dedicated q/k(/v) projections.
+            if hasattr(self.model, "pe_q_proj"):
+                gnn_state['pe_q_proj'] = self.model.pe_q_proj.state_dict()
+                gnn_state['pe_k_proj'] = self.model.pe_k_proj.state_dict()
+                if getattr(self.model, "pe_v_proj", None) is not None:
+                    gnn_state['pe_v_proj'] = self.model.pe_v_proj.state_dict()
+            # c_bias: persist scalar gains λ_C/λ_S/λ_V.
+            if getattr(self.model, "c_bias", False):
+                gnn_state['c_bias_gains'] = {
+                    name: getattr(self.model, name).detach().cpu()
+                    for name in ("lam_c", "lam_psi", "lam_v")
+                    if getattr(self.model, name, None) is not None
+                }
+            torch.save(gnn_state, os.path.join(output_dir, "gnn_weights.pt"))
+            torch.save({
+                'rpearl': self.model.gt_model.pe_model.state_dict(),
+            }, os.path.join(output_dir, "rpearl_weights.pt"))
+        elif self.gnn_config.get("architecture") == "graph_mask_llm":
+            # Parameter-free: mask rebuilt from config; gnn_config.json + LoRA adapter suffice.
+            pass
+        elif self.gnn_config.get("architecture") == "rpearl_gt_llm":
+            # Full GT: save the whole GraphTransformer (includes R-PEARL inside) + projection head.
+            torch.save({
+                'gt_model': self.model.pe_model.state_dict(),
+                'pe_proj': self.model.pe_proj.state_dict(),
+                'pe_gain': self.model.pe_gain.data,
+                **({'pe_norm': self.model.pe_norm.state_dict()}
+                   if self.model.pe_norm is not None else {}),
+            }, os.path.join(output_dir, "gnn_weights.pt"))
+            # Also save the inner R-PEARL separately for analysis / reuse.
+            torch.save({
+                'rpearl': self.model.pe_model.pe_model.state_dict(),
+            }, os.path.join(output_dir, "rpearl_weights.pt"))
+        else:
+            torch.save({
+                'pe_model': self.model.pe_model.state_dict(),
+                'pe_proj': self.model.pe_proj.state_dict(),
+                'pe_gain': self.model.pe_gain.data,
+                **({'pe_norm': self.model.pe_norm.state_dict()}
+                   if self.model.pe_norm is not None else {}),
+            }, os.path.join(output_dir, "gnn_weights.pt"))
+        # Save the LoRA adapter whenever one is attached (including frozen carried-forward
+        # adapters). freeze_llm=True attaches no adapter, so this is skipped for that path.
+        if getattr(self.model, "peft_config", None) is not None:
+            super().save_model(output_dir, _internal_call)
+
+
+class BaselineSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
+    """Plain-``llm`` baseline trainer. Identical to ``SFTTrainer`` except it logs the
+    ``graph_acc/*`` metric (via :class:`GraphTokenAccuracyMixin`) so the baseline is
+    comparable to the graph architectures. Paired with
+    :class:`prism.data.data.TokenIndexCollator`, which carries the precomputed
+    graph-token index columns the metric needs.
+
+    Persists a ``train_config.json`` (the plain-LLM analogue of the graph trainer's
+    ``gnn_config.json``) so the standalone eval boundary can recover the train-time
+    ``text_edge_list`` policy. Without it an LLM trained with ``text_edge_list=none``
+    would be silently evaluated with edge bullets re-added (train/eval mismatch).
+    """
+
+    def __init__(self, *args, train_config: dict, loss_target: str = "all", **kwargs):
+        super().__init__(*args, **kwargs)
+        self.train_config = train_config
+        self._set_loss_target(loss_target)
+
+    def save_model(self, output_dir=None, _internal_call=False):
+        output_dir = output_dir or self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        with open(os.path.join(output_dir, "train_config.json"), "w") as f:
+            json.dump(self.train_config, f, indent=2)
+        super().save_model(output_dir, _internal_call)
+
+
+# ----------------------------
+# Config
+# ----------------------------
+@dataclass
+class TrainConfig:
+    name: str
+    checkpoint_dir: str
+    data: str
+    bit4: bool = False
+    eval_data: str = "data/eval/eval_1_multi_step.json"
+    # Optional pre-split validation file (same schema as `data`). When set,
+    # `val_frac` is ignored and this file is loaded as the eval dataset.
+    val_data: Optional[str] = None
+    r: int = 16
+    base_model: str = "meta-llama/Llama-3.2-3B-Instruct"
+    wandb_project: str = "GREP-PRISM"
+    wandb_run_name: str = "spine_lora"
+    wandb_tag: str = "spine"
+    epochs: int = 2
+    max_steps: int = -1  # If > 0, overrides epochs and switches eval/save to step-based (dev use)
+    # Zero-shot baseline: skip optimization and evaluate the untrained base model.
+    no_train: bool = False
+    val_frac: float = 0.1
+    # LoRA
+    lora_alpha: int = 16
+    lora_dropout: float = 0.2
+    target_modules: List[str] = field(
+        default_factory=lambda: [
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",
+        ]
+    )
+    # Trainer args
+    per_device_train_batch_size: int = 1
+    per_device_eval_batch_size: int = 1
+    gradient_accumulation_steps: int = 2
+    # Activation recompute (saves memory). use_reentrant=False required: GT passes
+    # grad-carrying inputs_embeds that the reentrant path mishandles.
+    gradient_checkpointing: bool = True
+    dataloader_num_workers: int = 4
+    report_to: str = "wandb"
+    learning_rate: float = 2e-4
+    warmup_steps: int = 5 # TODO consider warmup_steps: float= 0.03
+    weight_decay: float = 0.05
+    debug: bool = False
+    max_seq_length: int = 2048
+    dataset_num_proc: int = 8
+    dataset_proportion: float = 0.1
+    # Model args.
+    pe_hidden_channels: int = 256
+    pe_num_layers: int = 3
+    d_model: int = 3072
+    num_samples: int = 40
+    dropout: float = 0.1
+    k_pe: int = 3
+    use_layer_norm: bool = True
+    freeze_llm: bool = False
+    architecture: str = "rpearl_llm"  # "rpearl_llm", "rpearl_gt_llm", "gt_llm", "graph_mask_llm", "composite_graph_gt", or "llm"
+    # GT-specific params (used when architecture == "rpearl_gt_llm" / "composite_graph_gt")
+    gt_num_layers: int = 3
+    gt_heads: int = 8
+    eps: float = 1e-8
+
+    def __post_init__(self):
+        self.eps = float(self.eps)
+        if self.loss_target not in ("all", "responses", "edge_list"):
+            raise ValueError(
+                f"loss_target must be 'all', 'responses', or 'edge_list', "
+                f"got {self.loss_target!r}")
+        if self.loss_target == "edge_list" and self.text_edge_list != "present":
+            raise ValueError(
+                "loss_target='edge_list' requires text_edge_list='present' "
+                "(the edge bullets must be in the text to supervise them).")
+    k_gt: int = 3
+    text_edge_list: str = "present"   # "present" or "none"
+    # Composite-graph params (used when architecture == "composite_graph_gt")
+    cycle_directed: bool = True
+    cycle_weight: float = 1.0
+    affinity_kernel: str = "gaussian"
+    sigma_mode: str = "median"
+    keep_raw_distance_feature: bool = True
+    crosslink_weight: float = 1.0
+    crosslink_mention_to_node: bool = True
+    crosslink_mention_clique: bool = True
+    # R-PEARL sampling
+    probe_distribution: str = "gaussian"
+    m_test: int = 128
+    max_gather_rows: int = 2_000_000
+    fixed_seed_mode: bool = False
+    fixed_seed_value: int = 0
+    # R-PEARL readout fed to the GT (composite_graph_gt only): "mean" = E_q[Φ(q)];
+    # "second_moment" = C @ X for C = E_q[Φ(q)Φ(q)ᵀ] (carries relative position).
+    pe_readout: str = "mean"
+    # Center the second moment into a covariance (C·s = E[Φ(Φᵀs)] − Ψ(Ψᵀs)); needed
+    # so the mean doesn't dominate via rank-1 ΨΨᵀ and collapse C to averaging.
+    pe_center_moment: bool = True
+    # Initial value of the injection gate (g = tanh(pe_gain)). 0.0 = cold-start
+    # (Ψ off at init, gate ramps it in); 1.0 = active from step 0.
+    pe_gain_init: float = 0.0
+    # RMS-normalize and rescale the projected Ψ to the base model's embedding scale
+    # before injection (magnitude calibration).
+    use_pe_norm: bool = True
+    # R-PEARL input features: "random" = PEARL random probes; "word_embeddings" =
+    # mean word-embedding of the node's name tokens (deterministic, no probes).
+    pe_node_features: str = "random"
+    # Set position_id 0 on graph (node-name) tokens so RoPE is the identity there;
+    # their position comes from Ψ instead. Causality is unaffected.
+    disable_graph_token_rope: bool = False
+    # graph_mask_llm: node tokens attend only within mask_k_hops graph hops.
+    mask_k_hops: int = 1
+    # Symmetrize the adjacency (OR with its transpose) before building the mask.
+    mask_symmetrize: bool = True
+    # When False, mask is self-loops only (no cross-node attention) — floor ablation
+    # for whether edge connectivity in the mask matters.
+    mask_use_edges: bool = True
+    # Gated injection (composite_graph_gt only)
+    injection_mode: str = "interpolate"
+    gate_init: float = 0.0
+    gate_per_dim: bool = False
+    disable_rope: bool = True
+    # Inject the GT-refined token code into q/k(/v) inside every attention layer
+    # (dedicated W_q/W_k/W_v), in place of RoPE. composite_graph_gt only.
+    pe_qk_injection: bool = False
+    # Also inject into the attention *value* (v += W_v·Y_tok), not just q/k. False =
+    # q/k only (no value/readout path).
+    pe_inject_v: bool = True
+    # Replace post-RoPE q/k at every layer with the composite token covariance C_tok
+    # (q ← C_tok·q, k ← C_tok·k) instead of additive projections. Deterministic, scaled
+    # to ‖X‖. Selects InjectedCompositeGraphLLM; pairs with disable_rope=True.
+    c_per_layer: bool = False
+    # C_tok as additive logit bias (λ_C) + residual value mix (v ← v + λ_V·C·v);
+    # no q/k transform. Optional scene bias λ_S via use_scene_bias. Gains: λ_C,λ_S,λ_V.
+    c_bias: bool = False
+    use_scene_bias: bool = True
+    # Live c_bias covariance kernel: "sampled" (E_q[ΦΦᵀ]−ΨΨᵀ probe estimate) or
+    # "analytic" (all-layer H(S)H(S)* matrix powers). See InjectedCompositeGraphLLM.
+    c_kernel: str = "sampled"
+    # GT + R-PEARL + gate train at structural_lr_mult × base LR; lora_warmup_steps
+    # freezes LLM/LoRA for the first N steps so the structural path learns first.
+    structural_lr_mult: float = 1.0
+    lora_warmup_steps: int = 0
+    # c_bias (Design D): ramp the additive covariance gain λ_C 0→1 over the first N steps.
+    lam_c_warmup_steps: int = 0
+    # Prompt / debug-viz switches
+    n_icl_examples: int = 2
+    log_fiedler: bool = True
+    log_scene_mass: bool = True
+    enable_visualizer: bool = False
+    device: int = 0                   # GPU index to pin the model to; -1 = let device_map="auto" decide
+    overwrite_ok: bool = False
+    # Optional override for the checkpoint subdirectory name.
+    # Default (None): auto-generated as "{name}_{architecture}_{model_slug}_r{r}[_4bit]_{wandb_run_id}"
+    # Override: "{save_name}_{wandb_run_id}" — the run ID is always appended.
+    save_name: str = None
+    # Path (file or directory of {graph, tasks} JSONs) for post-training cross-eval;
+    # results written to <output_dir>/eval_logs/cross_eval/<graph>.json.
+    post_train_eval_graphs: Optional[str] = None
+    # Enable SPINE ICL examples during train-time eval and post-train cross-eval.
+    eval_use_icl: bool = True
+    # --- Multistage training ------------------------------------------------
+    # Weight-only init from a prior stage (NOT HF resume; fresh optimizer each stage).
+    # init_lora_from: attach a saved LoRA adapter instead of a fresh one.
+    # init_pe_from: load gnn_weights.pt into the fresh PE module.
+    init_lora_from: Optional[str] = None
+    init_pe_from: Optional[str] = None
+    # Freeze the carried-forward LoRA adapter (PE-only stage). Distinct from
+    # freeze_llm, which drops the adapter and trains PE on the raw base.
+    freeze_lora: bool = False
+    # Freeze the PE module — Stage 1 SFT trains ONLY the LoRA while the PE stays
+    # inert at init (paired with pe_gain_init=0). See GraphSFTTrainer.__init__.
+    freeze_pe: bool = False
+    # Token span for the next-token loss: "all" = full sequence; "responses" =
+    # assistant turns only (via precomputed assistant_idx); "edge_list" = edge
+    # bullets only (requires text_edge_list="present").
+    loss_target: str = "all"
+    # Number of graphs to evaluate each interval (first N from eval_data).
+    eval_num_graphs: int = 5
+    # EvalCallback cadence in epochs; raise for long PE-only stages to bound eval cost.
+    eval_epoch_interval: float = 1.0
+
+
+# ----------------------------
+# Training
+# ----------------------------
+def _load_pe_weights_into(model, init_pe_from: str, architecture: str) -> None:
+    """Load a saved PE module (``gnn_weights.pt``) from a prior stage into ``model``.
+
+    Operates on a training model (no merge, no eval). Only rpearl_llm /
+    rpearl_gt_llm PE layouts are supported.
+    """
+    weights_path = os.path.join(init_pe_from, "gnn_weights.pt")
+    gnn_weights = torch.load(weights_path, map_location="cpu")
+    if architecture == "rpearl_gt_llm":
+        model.pe_model.load_state_dict(gnn_weights["gt_model"], strict=False)
+    elif architecture == "rpearl_llm":
+        model.pe_model.load_state_dict(gnn_weights["pe_model"], strict=False)
+    else:
+        raise NotImplementedError(
+            f"init_pe_from is only wired for rpearl_llm / rpearl_gt_llm, got {architecture!r}")
+    model.pe_proj.load_state_dict(gnn_weights["pe_proj"])
+    if "pe_gain" in gnn_weights:
+        model.pe_gain.data.copy_(gnn_weights["pe_gain"])
+    if getattr(model, "pe_norm", None) is not None and "pe_norm" in gnn_weights:
+        model.pe_norm.load_state_dict(gnn_weights["pe_norm"])
+    print(f"[multistage] loaded PE weights from {weights_path}")
+
+
+# Multimodal Gemma-4 bases (e.g. gemma-4-31B) include vision/audio towers whose
+# projections use Gemma4ClippableLinear (not nn.Linear) — PEFT cannot adapt them,
+# and their leaf names collide with the text decoder. Exclude them from LoRA targets.
+# Text-only / "unified" bases (Llama, gemma-4-12B) have no towers; regex hits nothing.
+_MM_TOWER_KEYS = ("vision_tower", "audio_tower")
+
+
+def _peft_tower_exclude(model) -> "str | None":
+    """Return a PEFT `exclude_modules` regex for a multimodal base, else None.
+
+    Detected from the actual module tree (not the model-id) so it is robust to
+    the LoRA wrapper prefix and to future multimodal variants.
+    """
+    has_tower = any(
+        any(k in name for k in _MM_TOWER_KEYS) for name, _ in model.named_modules()
+    )
+    return r".*(?:" + "|".join(_MM_TOWER_KEYS) + r").*" if has_tower else None
 
 
 # ----------------------------
