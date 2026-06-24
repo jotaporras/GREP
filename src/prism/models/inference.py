@@ -17,6 +17,13 @@ from prism.models.gnn_llm import (
 )
 
 
+# Decode is deterministic GREEDY for confirmatory eval (reproducible, no seed needed).
+# NOTE: the prior `temperature=0.01, min_p=0.1` were dead config — without `do_sample=True`
+# transformers ignores them and runs greedy, so this makes the actual behavior explicit
+# (results unchanged). Sampling params live here, in one place, if ever re-enabled.
+DECODE_KWARGS = {"do_sample": False, "use_cache": True}
+
+
 def _core_graph_model(model):
     """Peel PEFT wrappers to reach the CompositeGraphLLM / GraphAugmentedLLM / GraphMaskLLM core.
 
@@ -63,7 +70,7 @@ class InMemoryLLM:
         """Abstracts token generation. In the base case, it's just calling `model.generate`"""
         outputs = self.model.generate(
             input_ids=input_ids, attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens, use_cache=True, temperature=0.01, min_p=0.1,
+            max_new_tokens=max_new_tokens, **DECODE_KWARGS,
             pad_token_id=self.tokenizer.eos_token_id,
         )
         # Strip the input prefix — keep only newly generated tokens.
@@ -150,7 +157,7 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
         if not pyg_graphs:
             outputs = graph_model.llm.generate(
                 input_ids=input_ids, attention_mask=attention_mask,
-                max_new_tokens=max_new_tokens, use_cache=True, temperature=0.01, min_p=0.1,
+                max_new_tokens=max_new_tokens, **DECODE_KWARGS,
                 pad_token_id=self.tokenizer.eos_token_id,
             )
             return outputs[:, input_ids.shape[-1]:]
@@ -180,7 +187,7 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
             try:
                 outputs = graph_model.llm.generate(
                     input_ids=input_ids, attention_mask=attention_mask,
-                    max_new_tokens=max_new_tokens, use_cache=True, temperature=0.01, min_p=0.1,
+                    max_new_tokens=max_new_tokens, **DECODE_KWARGS,
                     pad_token_id=self.tokenizer.eos_token_id,
                 )
                 return outputs[:, input_ids.shape[-1]:]
@@ -214,7 +221,7 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
                         _extend_hook, with_kwargs=True)
                 return graph_model.llm.generate(
                     inputs_embeds=inputs_embeds, attention_mask=attention_mask,
-                    max_new_tokens=max_new_tokens, use_cache=True, temperature=0.01, min_p=0.1,
+                    max_new_tokens=max_new_tokens, **DECODE_KWARGS,
                     pad_token_id=self.tokenizer.eos_token_id,
                 )
             finally:
@@ -233,7 +240,7 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
                 input_ids, [pyg_graph], [injection_map], permutation=self.permutation)
             return graph_model.llm.generate(
                 inputs_embeds=inputs_embeds, attention_mask=attention_mask,
-                max_new_tokens=max_new_tokens, use_cache=True, temperature=0.01, min_p=0.1,
+                max_new_tokens=max_new_tokens, **DECODE_KWARGS,
                 pad_token_id=self.tokenizer.eos_token_id,
             )
 
@@ -250,7 +257,7 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
         try:
             return graph_model.llm.generate(
                 inputs_embeds=embeddings, attention_mask=attention_mask,
-                max_new_tokens=max_new_tokens, use_cache=True, temperature=0.01, min_p=0.1,
+                max_new_tokens=max_new_tokens, **DECODE_KWARGS,
                 pad_token_id=self.tokenizer.eos_token_id, **gen_kwargs,
             )
         finally:
