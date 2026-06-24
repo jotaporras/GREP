@@ -130,6 +130,10 @@ class GraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         self._struct_bias: torch.Tensor | None = None
         self._install_graph_mask()
 
+    def structural_parameters(self) -> list[nn.Parameter]:
+        """Parameter-free architecture: no graph params (only the LLM/LoRA train)."""
+        return []
+
     def _decoder_layers(self):
         """Return the LLM's decoder layer list (Llama/Qwen2: ``<CausalLM>.model.layers``)."""
         base = getattr(self.llm, "model", None)
@@ -364,6 +368,17 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         # Whether Ψ also enters the value/content path (v += W_v·Ψ).
         self._pe_inject_value: bool = True
         self._install_pe_injection()
+
+    def structural_parameters(self) -> list[nn.Parameter]:
+        """Graph-side parameters eligible for the boosted LR group: the graph encoder,
+        the Ψ→hidden projection, and the injection gate. ``pe_norm`` is intentionally
+        excluded here so it stays at base LR (it is grad-enabled by the trainer separately).
+        """
+        return (
+            list(self.pe_model.parameters())
+            + list(self.pe_proj.parameters())
+            + [self.pe_gain]
+        )
 
     def _decoder_layers(self):
         """Return the LLM's decoder layer list (Llama/Qwen2: ``<CausalLM>.model.layers``)."""
@@ -674,6 +689,10 @@ class CompositeGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         self.crosslink_weight = crosslink_weight
         self.crosslink_mention_to_node = crosslink_mention_to_node
         self.crosslink_mention_clique = crosslink_mention_clique
+
+    def structural_parameters(self) -> list[nn.Parameter]:
+        """Graph-side parameters: the GraphTransformer and the gated injection."""
+        return list(self.gt_model.parameters()) + list(self.injection.parameters())
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         self.llm.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
@@ -1092,6 +1111,20 @@ class InjectedCompositeGraphLLM(CompositeGraphLLM):
         self._pe_decode_row = None  # live decode bias row Ĉ[new, :key_len] (set per token)
         self._pe_inject_value = inject_v
         self._install_pe_injection()
+
+    def structural_parameters(self) -> list[nn.Parameter]:
+        """Base graph-side params plus the optional dedicated q/k/v code projections
+        (pe_qk_injection mode) and the scalar c_bias gains λ_C/λ_ψ/λ_V."""
+        params = super().structural_parameters()
+        for name in ("pe_q_proj", "pe_k_proj", "pe_v_proj"):
+            mod = getattr(self, name, None)
+            if mod is not None:
+                params += list(mod.parameters())
+        for name in ("lam_c", "lam_psi", "lam_v"):
+            p = getattr(self, name, None)
+            if p is not None:
+                params.append(p)
+        return params
 
     # ----- attention patch (ported from eval_unification, model-agnostic) -------
     def _decoder_layers(self):

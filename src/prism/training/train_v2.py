@@ -478,37 +478,15 @@ class GraphSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
         if freeze_pe:
             # Stage-1 SFT: PE stays at init (gate closed); only LoRA trains.
             return
-        # Re-enable gradients for graph encoder and gate/projection (PEFT froze them).
-        if gnn_config.get("architecture") == "composite_graph_gt":
-            for p in self.model.gt_model.parameters():
+        # Re-enable gradients on the graph-side params PEFT froze (each model class
+        # reports its own via structural_parameters(); parameter-free archs return []).
+        for p in self.model.structural_parameters():
+            p.requires_grad = True
+        # pe_norm is a non-LoRA module trained at base LR (kept out of the boosted
+        # structural group); re-enable it here so magnitude calibration adapts.
+        if getattr(self.model, "pe_norm", None) is not None:
+            for p in self.model.pe_norm.parameters():
                 p.requires_grad = True
-            for p in self.model.injection.parameters():
-                p.requires_grad = True
-            # pe_qk_injection: re-enable q/k(/v) code projections PEFT froze.
-            if hasattr(self.model, "pe_q_proj"):
-                for name in ("pe_q_proj", "pe_k_proj", "pe_v_proj"):
-                    mod = getattr(self.model, name, None)
-                    if mod is not None:
-                        for p in mod.parameters():
-                            p.requires_grad = True
-            # c_bias scalar gains λ_C/λ_S/λ_V are non-LoRA — re-enable them.
-            for name in ("lam_c", "lam_psi", "lam_v"):
-                p = getattr(self.model, name, None)
-                if p is not None:
-                    p.requires_grad = True
-        elif gnn_config.get("architecture") == "graph_mask_llm":
-            # graph_mask_llm: parameter-free mask — only LoRA adapters train.
-            pass
-        else:
-            for p in self.model.pe_model.parameters():
-                p.requires_grad = True
-            for p in self.model.pe_proj.parameters():
-                p.requires_grad = True
-            self.model.pe_gain.requires_grad = True
-            # pe_norm is a non-LoRA module; re-enable so magnitude calibration adapts.
-            if getattr(self.model, "pe_norm", None) is not None:
-                for p in self.model.pe_norm.parameters():
-                    p.requires_grad = True
 
     def create_optimizer(self):
         """Two learning-rate groups: structural path (GT + R-PEARL + gate) at
@@ -516,36 +494,12 @@ class GraphSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
         stock optimizer when the multiplier is 1.0.
         """
         mult = float(self.gnn_config.get("structural_lr_mult", 1.0))
-        # graph_mask_llm: parameter-free, no structural params — use stock optimizer.
-        if (
-            self.optimizer is not None
-            or mult == 1.0
-            or self.gnn_config.get("architecture") == "graph_mask_llm"
-        ):
+        opt_model = self.model
+        structural = self.model.structural_parameters()
+        # No multiplier, or a parameter-free arch (empty structural set) → stock optimizer.
+        if self.optimizer is not None or mult == 1.0 or not structural:
             return super().create_optimizer()
 
-        opt_model = self.model
-        if self.gnn_config.get("architecture") == "composite_graph_gt":
-            structural = list(self.model.gt_model.parameters()) + list(
-                self.model.injection.parameters()
-            )
-            # pe_qk_injection: q/k(/v) projections are structural (boosted LR).
-            if hasattr(self.model, "pe_q_proj"):
-                for name in ("pe_q_proj", "pe_k_proj", "pe_v_proj"):
-                    mod = getattr(self.model, name, None)
-                    if mod is not None:
-                        structural += list(mod.parameters())
-            # c_bias scalar gains are structural too.
-            for name in ("lam_c", "lam_psi", "lam_v"):
-                p = getattr(self.model, name, None)
-                if p is not None:
-                    structural.append(p)
-        else:
-            structural = (
-                list(self.model.pe_model.parameters())
-                + list(self.model.pe_proj.parameters())
-                + [self.model.pe_gain]
-            )
         structural_ids = {id(p) for p in structural}
 
         decay_names = set(self.get_decay_parameter_names(opt_model))
