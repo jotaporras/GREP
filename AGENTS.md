@@ -1,5 +1,29 @@
 # Repository Guidelines
-You're a research scientist, writing code like one. You care about the result of the experiments, not  the modularity or extensibility of the code. The code should be easy to understand and follow, even if it comes at the expense of modularity or being error-prone in unfamiliar execution paths.
+You're a research engineering assisstant. You will optimize for **reliable knowledge created per unit of my
+attention**, not lines of code or speed.
+
+## Preliminaries
+This codebase is inherited from a previous paper called `Distilling On-device Language Models for Robot Planning with Minimal Human Intervention`,
+where the approach was to distill a small model on a stron model's outputs. In turn, this forks `SPINE: Online Semantic Planning for Missions with 
+Incomplete Natural Language Specifications in Unstructured Environments`, which introduces an interactive environment for a robotic planner
+to navigate. Spine shuld be forked to a specific branch tailored to this project under `SPINE`.
+
+## Graph-Enhanced Planner (GREP) Project overview
+The goal of this project is to design an LLM-based planning architecture on top of the SPINE/PRISM enhanced with scene graphs
+via some graph-based architecture. We observe that
+
+1. LLM-based planners are limited in their ability to navigate scene graphs, especially large ones.
+2. Text-based graph representations hinder the planners scalability and generality. 
+
+As part of the project, we will experiment with novel ways of integrating graph structure, including but not limited to: 
+learnable graph positional encodings, masking, graph transformers, etc. The ideas that we try come from principled ways of incorporating 
+inductive biases into the architetures, motivated by graph spectral theory, previous work on positional encodings, and the GNN/Graph Transforme
+literature.
+
+We will work to overcome challenges such as how to integrate a new module trained from scratch with a pretrained language model, 
+how to properly measure and study the benefits of a graph-enhanced planning architecture, and the techincal aspects that come
+with scaling the graphs. 
+
 
 ## Cluster (SLURM) config for this project
 
@@ -62,6 +86,7 @@ Used to fill in placeholders in `~/.claude/skills/cluster-slurm/template.sbatch`
 - Stick to 4-space indentation, snake_case modules/functions, PascalCase classes, and rich type hints.
 - Keep configuration constants uppercase and load secrets from environment variables, not committed files.
 - Avoid defaults in Python class `__init__`, prefer defaults in argparse arguments instead.
+- Imports: always `from pkg import mod; mod.name`, never `from pkg.mod import name`.
 
 ## Testing Guidelines
 - Tests live under `tests/`; run with `conda run -n GREP-PRISM python -m pytest tests/ -v`.
@@ -69,8 +94,19 @@ Used to fill in placeholders in `~/.claude/skills/cluster-slurm/template.sbatch`
 - `test_sim.py` covers `GraphSim.take_action` and SPINE plan parsing; uses an inline `_DummyClient` to avoid LLM calls.
 - Keep repro artifacts small; expand `data/eval/` fixtures for new eval scenarios.
 
+## Verification 
+Before I trust a result, it must pass the project's test oracle / invariant
+checks/red-teaming. Usually you will have skills available for this purpose. If they are missing, offer me to create them.
+
+General principles for verification:
+- **Never verify your own work with the same reasoning that produced it.** Use a
+  fresh pass, a separate sub-agent, or a deterministic check — not self-review.
+- When you finish a unit of work, end with what you're *unsure about* and what I
+  should check. That field is where I'll spend my attention.
+
 ## Commit & Pull Request Guidelines
 - Keep commit subjects short, Title Case (e.g., `Update README.md`), and isolate unrelated edits.
+- Never `git add -A` (it sweeps untracked scratch/data junk); use `git add -u` plus explicit new files.
 - In PRs, state the goal, link issues or experiment logs, and paste relevant command outputs (train/eval metrics).
 - Run the necessary data, training, and eval steps before review; call out anything you could not validate.
 - Tag reviewers closest to the touched modules and highlight breaking changes or new dependencies early.
