@@ -9,6 +9,8 @@ save_name: null
 report_to: wandb
 overwrite_ok: false
 debug: false
+# Per-component grad-norm logging (no-op for non-PE/GT architectures).
+gradient_debug: true
 # Composite-graph debug/viz hooks (no-ops for non-composite architectures).
 log_fiedler: true
 log_scene_mass: true

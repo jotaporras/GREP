@@ -256,11 +256,11 @@ def train_model(config: omegaconf.DictConfig):
         )
     )
 
-    if config.architecture in ("rpearl_llm", "rpearl_gt_llm", "gt_llm"):
+    # Per-component grad norms, GT output magnitude, gate value, injection count.
+    if config.gradient_debug:
         trainer.add_callback(callbacks.GradientDebugCallback())
-    elif config.architecture == "composite_graph_gt":
-        # Per-component grad norms, GT output magnitude, gate value, injection count.
-        trainer.add_callback(callbacks.GradientDebugCallback())
+
+    if config.architecture == "composite_graph_gt":
         # Fiedler, scene-mass, gate, contrib-ratio diagnostics (+ visualizer if enabled).
         trainer.add_callback(
             callbacks.AugGraphDebugCallback(
