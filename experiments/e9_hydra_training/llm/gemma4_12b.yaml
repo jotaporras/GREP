@@ -1,0 +1,9 @@
+# @package _global_
+# Base LLM = Gemma-4 12B (e8 / e9). The merged default.
+base_model: google/gemma-4-12B-it
+# RoPE controls. disable_rope matches the dataclass default; it is consumed by the
+# composite/injection architectures (replaces RoPE with the structural code) and is a
+# no-op elsewhere. disable_graph_token_rope sets position_id 0 on node-name tokens so
+# RoPE is identity there (override `disable_graph_token_rope=true` for the norope_graph run).
+disable_rope: true
+disable_graph_token_rope: false

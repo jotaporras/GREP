@@ -1,0 +1,14 @@
+# @package _global_
+# e9 Stage 1 — SFT the LoRA only; the PE is structurally present but FROZEN and gated
+# off (pe_gain_init=0 from structural/default). Edges in text. The saved adapter is
+# carried into Stage 2 via init_lora_from.
+# Use with: architecture=rpearl_llm training=default
+freeze_llm: false
+freeze_lora: false
+freeze_pe: true
+init_lora_from: null
+init_pe_from: null
+loss_target: responses
+structural_lr_mult: 1.0
+lora_warmup_steps: 0
+lam_c_warmup_steps: 0

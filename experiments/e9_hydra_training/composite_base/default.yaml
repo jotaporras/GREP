@@ -1,0 +1,10 @@
+# @package _global_
+# Universal composite-graph fallbacks. These keys are read by
+# composite_graph.composite_graph_gnn_rebuild_params (architecture=composite_graph_gt) but
+# are NOT set by every composite_graphs design option. They live in this always-composed
+# group (vs composite_graphs/default.yaml, which is dropped whenever a non-default design is
+# selected) so that EVERY composite_graphs selection still supplies them. Composed BEFORE the
+# composite_graphs group in config.yaml, so any design may override these.
+pe_inject_v: true
+use_scene_bias: true
+c_kernel: sampled

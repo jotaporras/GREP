@@ -1,0 +1,44 @@
+# GREP-PRISM unified training config (Hydra).
+#
+# This tree replaces the per-run monolithic YAMLs under e7_architecture_improvements/,
+# e8_new_base_models/, and e9_multistage_training/ with composable config groups.
+# Every group option file is `# @package _global_`, so all keys land in one flat
+# namespace that mirrors the flat `TrainConfig` dataclass (src/prism/training/train_v3.py).
+#
+# The defaults below compose the MERGED, MOST-RECENT-WINS baseline (e9 > e8 > e7):
+# gemma-4-12B, revised corpus, bf16 (bit4=false), multi-graph eval, assistant-only loss.
+# Select group options or override flat keys on the CLI to reconstruct any original run;
+# see README.md for recipes.
+defaults:
+  - overview: e9
+  - data: revised
+  - training: default
+  - lora: default
+  - multistage: none
+  - llm: gemma4_12b
+  - structural: default
+  - r_pearl: default
+  - gt: default
+  - graph_mask: default
+  - composite_base: default
+  - composite_graphs: default
+  - eval: multi_graph
+  - device: auto
+  - _self_
+
+# Master architecture switch. Determines which structural groups the training code
+# actually reads; the others compose harmlessly (their flat keys are simply unused).
+#   llm | rpearl_llm | rpearl_gt_llm | gt_llm | graph_mask_llm | composite_graph_gt
+architecture: rpearl_llm
+
+# Hydra runtime: do NOT chdir (relative data:/checkpoint_dir: paths must resolve against
+# the launch cwd), and keep Hydra's own run logs under outputs/hydra/ rather than dated
+# dirs at the repo root.
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: outputs/hydra/${now:%Y-%m-%d_%H-%M-%S}
+  sweep:
+    dir: outputs/hydra/multirun/${now:%Y-%m-%d_%H-%M-%S}
+    subdir: ${hydra.job.num}

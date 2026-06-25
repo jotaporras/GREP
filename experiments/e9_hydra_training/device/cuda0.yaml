@@ -1,0 +1,3 @@
+# @package _global_
+# Pin the whole model to GPU index 0 (single-GPU runs, e.g. e7 c_bias).
+device: 0

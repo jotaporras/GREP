@@ -19,3 +19,5 @@ bitsandbytes
 tiktoken
 scipy
 dotenv
+hydra-core
+omegaconf

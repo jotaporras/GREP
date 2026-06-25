@@ -1,0 +1,11 @@
+# @package _global_
+# Numerics shared by BOTH the R-PEARL encoder and the Graph Transformer, plus the
+# PE-injection gate. Merged default = e8/e9 (d_model 1024, dropout 0.1).
+d_model: 1024
+dropout: 0.1
+use_layer_norm: true
+eps: 1e-6
+# PE-injection gate: g = tanh(pe_gain). 0.0 = closed at init (gate ramps Ψ in); the PE
+# still trains (tanh'(0)=1). use_pe_norm rescales projected Ψ to the embedding scale.
+pe_gain_init: 0.0
+use_pe_norm: true

@@ -1,0 +1,15 @@
+# @package _global_
+# Run identity & bookkeeping for the e9 (multistage) series — the merged default.
+name: e9
+wandb_project: GREP-PRISM
+wandb_run_name: e9_hydra
+wandb_tag: e9_multistage_training
+checkpoint_dir: outputs/e9_multistage_training
+save_name: null
+report_to: wandb
+overwrite_ok: false
+debug: false
+# Composite-graph debug/viz hooks (no-ops for non-composite architectures).
+log_fiedler: true
+log_scene_mass: true
+enable_visualizer: false

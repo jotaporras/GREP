@@ -1,0 +1,5 @@
+# @package _global_
+# Base LLM = Gemma-4 31B (e8 g31b runs).
+base_model: google/gemma-4-31B-it
+disable_rope: true
+disable_graph_token_rope: false

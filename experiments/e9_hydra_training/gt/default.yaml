@@ -1,0 +1,5 @@
+# @package _global_
+# Graph Transformer. Merged default = the rpearl_gt_llm baseline (L2, 8 heads, k_gt 2).
+gt_num_layers: 2
+gt_heads: 8
+k_gt: 2

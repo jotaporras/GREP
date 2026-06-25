@@ -1,0 +1,17 @@
+# @package _global_
+# Zero-shot baseline (e8 llm_zeroshot): skip optimization, evaluate the base model as-is.
+# train/val are never used, so dataset_proportion is tiny to avoid tokenizing the corpus.
+# Use with `architecture=llm`.
+bit4: true
+per_device_train_batch_size: 1
+per_device_eval_batch_size: 1
+gradient_accumulation_steps: 2
+gradient_checkpointing: true
+dataloader_num_workers: 4
+learning_rate: 0.0002
+warmup_steps: 5
+weight_decay: 0.05
+epochs: 1
+max_steps: -1
+no_train: true
+dataset_proportion: 0.01

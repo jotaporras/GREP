@@ -1,0 +1,39 @@
+# @package _global_
+# e7 composite_graph_gt — "Design D": RoPE-free C-in-attention (additive Ĉ + λ_ψ·Ψ̃ logit
+# bias + residual Ĉ-values). Original run used max_seq_length 2048, device 0.
+# Use with: architecture=composite_graph_gt data=legacy llm=llama31_8b overview=e7
+#           bit4=true device=cuda0 max_seq_length=2048
+d_model: 4096
+dropout: 0.05
+num_samples: 128
+k_pe: 2
+k_gt: 2
+gt_num_layers: 3
+gt_heads: 8
+pe_readout: second_moment
+pe_center_moment: true
+structural_lr_mult: 3.0
+lora_warmup_steps: 20
+lam_c_warmup_steps: 10
+# Composite graph construction
+cycle_directed: true
+cycle_weight: 1.0
+affinity_kernel: gaussian
+sigma_mode: median
+keep_raw_distance_feature: true
+crosslink_weight: 1.0
+crosslink_mention_to_node: true
+crosslink_mention_clique: true
+probe_distribution: gaussian
+m_test: 128
+max_gather_rows: 2000000
+fixed_seed_mode: false
+fixed_seed_value: 0
+# Gated injection — Design D
+injection_mode: interpolate
+gate_init: 0.3
+gate_per_dim: false
+c_per_layer: false
+pe_qk_injection: false
+c_bias: true
+c_kernel: sampled

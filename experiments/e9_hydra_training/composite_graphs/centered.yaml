@@ -1,0 +1,37 @@
+# @package _global_
+# e7 composite_graph_gt — "centered" design (injection_mode=none, centered second-moment
+# readout). Composed after structural/r_pearl/gt, so the structural overrides below win.
+# Use with: architecture=composite_graph_gt data=legacy llm=llama31_8b overview=e7 bit4=true
+# Structural overrides (vs the rpearl/gt baseline)
+d_model: 4096
+dropout: 0.05
+num_samples: 96
+k_pe: 2
+k_gt: 2
+gt_num_layers: 3
+gt_heads: 8
+pe_readout: second_moment
+pe_center_moment: true
+structural_lr_mult: 5.0
+lora_warmup_steps: 20
+n_icl_examples: 2
+# Composite graph construction
+cycle_directed: true
+cycle_weight: 1.0
+affinity_kernel: gaussian
+sigma_mode: median
+keep_raw_distance_feature: true
+crosslink_weight: 1.0
+crosslink_mention_to_node: true
+crosslink_mention_clique: true
+probe_distribution: gaussian
+m_test: 128
+fixed_seed_mode: false
+fixed_seed_value: 0
+# Gated injection
+injection_mode: none
+gate_init: 0.3
+gate_per_dim: false
+c_per_layer: false
+c_bias: false
+pe_qk_injection: false

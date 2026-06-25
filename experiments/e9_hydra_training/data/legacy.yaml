@@ -1,0 +1,9 @@
+# @package _global_
+# Legacy nav100 corpus (e7 architecture experiments).
+data: data/gen/nav100_n30_gemma_data/split/formatted_all_new__train.json
+val_data: data/gen/nav100_n30_gemma_data/split/formatted_all_new__val.json
+val_frac: 0.1
+dataset_proportion: 1.0
+dataset_num_proc: 8
+max_seq_length: 8192
+text_edge_list: none

@@ -1,0 +1,6 @@
+# @package _global_
+# graph_mask_llm structural attention mask (parameter-free). Two node tokens may attend
+# only if their nodes share an edge (k=1). Merged default.
+mask_k_hops: 1
+mask_symmetrize: true
+mask_use_edges: true

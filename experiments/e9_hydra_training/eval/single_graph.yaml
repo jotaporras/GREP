@@ -1,0 +1,8 @@
+# @package _global_
+# Single-graph eval (e7 / e8): eval_data is a single {graph, tasks} JSON file.
+eval_data: data/revised/gen/nav100_n30_gemma_data/split/test_graphs/data_gen_023.json
+eval_num_graphs: 5
+eval_epoch_interval: 1.0
+eval_use_icl: true
+n_icl_examples: 2
+post_train_eval_graphs: null

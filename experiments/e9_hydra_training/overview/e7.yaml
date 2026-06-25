@@ -1,0 +1,14 @@
+# @package _global_
+# Run identity & bookkeeping for the e7 (architecture experiments) series.
+name: e7
+wandb_project: GREP-PRISM
+wandb_run_name: e7_hydra
+wandb_tag: e7_architecture_experiments
+checkpoint_dir: outputs/e7_architecture_improvements
+save_name: null
+report_to: wandb
+overwrite_ok: false
+debug: true
+log_fiedler: true
+log_scene_mass: true
+enable_visualizer: false
