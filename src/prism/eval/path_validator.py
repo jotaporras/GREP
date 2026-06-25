@@ -579,13 +579,16 @@ def _augment_eval_metrics(m: Dict, *, goal: Optional[str]) -> Dict:
         goal; excludes positionality (``kind == "edges"``) and non-path tasks.
       * ``valid_path_ab`` — ``full_path_valid`` AND ``start_goal_ok`` (no waypoint/
         avoid constraints required).
-      * ``hallucination_rate`` — ``1 - nodes_exist_rate`` for routed samples.
+      * ``hallucination_rate`` — fraction of route hops that are not real graph
+        edges (``1 - edge_validity_rate``); captures both nonexistent nodes and
+        invented edges between real nodes. ``None`` for routes with no hop (<2 nodes).
       * ``hop_optimality`` — nulled for non-valid A→B paths.
     """
     kind = m.get("kind")  # only set for structured tasks
     m["path_expected"] = bool(goal is not None and kind != "edges")
+    # Edge hallucination: a route needs ≥2 nodes (one hop) to have any edge to grade.
     m["hallucination_rate"] = (
-        (1.0 - m.get("nodes_exist_rate", 0.0)) if m.get("num_parsed", 0) > 0 else None)
+        (1.0 - m.get("edge_validity_rate", 0.0)) if m.get("num_parsed", 0) >= 2 else None)
     m["valid_path_ab"] = bool(
         m["path_expected"] and m.get("full_path_valid") and m.get("start_goal_ok"))
     if not m["valid_path_ab"]:
@@ -733,13 +736,14 @@ def aggregate_path_metrics(sample_results: List[dict]) -> dict:
 
     Two metric families with different denominators:
 
-    * **Legacy** (``edge_validity_rate``, ``nodes_exist_rate``, ``full_path_valid_rate``,
-      ``cost_optimality`` …, logged under ``grep/path_*``): averaged over samples with
-      a parseable route (``num_parsed > 0``).
+    * **Legacy** (``edge_validity_rate``, ``cost_optimality`` …, logged under
+      ``grep/path_*``): averaged over samples with a parseable route
+      (``num_parsed > 0``).
     * **eval/\\*** — computed over the full sample list (failures included):
         - ``valid_path_rate``      = #valid_path_ab / #path_expected
         - ``path_optimality_rate`` = mean ``hop_optimality`` over valid A→B paths
-        - ``hallucination_rate``   = mean per-sample hallucination over routed samples
+        - ``hallucination_rate``   = mean per-sample edge-hallucination (invalid hops /
+          total hops) over routes with ≥2 nodes
     """
     all_pm = [r.get("path_metrics") for r in sample_results]
     all_pm = [p for p in all_pm if p]
@@ -751,14 +755,8 @@ def aggregate_path_metrics(sample_results: List[dict]) -> dict:
             vals = [p[key] for p in pms if p.get(key) is not None]
             return (sum(vals) / len(vals)) if vals else None
 
-        def _rate(key):
-            return sum(1 for p in pms if p.get(key)) / len(pms)
-
         agg.update({
             "edge_validity_rate": _mean("edge_validity_rate"),
-            "nodes_exist_rate": _mean("nodes_exist_rate"),
-            "full_path_valid_rate": _rate("full_path_valid"),
-            "start_goal_ok_rate": _rate("start_goal_ok"),
             "cost_optimality": _mean("cost_optimality"),
             "num_with_path": len(pms),
             # Routes found in reasoning (not plan) by deterministic regex scan.

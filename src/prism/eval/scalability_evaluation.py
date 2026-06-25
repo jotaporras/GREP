@@ -186,6 +186,7 @@ def _write_cross_eval_result(
         "accuracy": result.accuracy,
         "num_samples": result.num_total,
         "num_correct": result.num_correct,
+        "path_metrics": result.path_metrics,
         "samples": result.samples,
     }
     out_file = os.path.join(out_dir, f"{result.name}.json")

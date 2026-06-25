@@ -124,8 +124,10 @@ def test_augment_excludes_positionality_edges_tasks():
     assert m["valid_path_ab"] is False
 
 
-def test_augment_hallucination_rate_counts_missing_nodes():
-    m = pv._augment_eval_metrics(_base_metrics(nodes_exist_rate=0.5), goal="goal_1")
+def test_augment_hallucination_rate_counts_invalid_edges():
+    # Edge hallucination = 1 - edge_validity_rate (invalid hops / total hops),
+    # independent of nodes_exist_rate.
+    m = pv._augment_eval_metrics(_base_metrics(edge_validity_rate=0.5), goal="goal_1")
     assert m["hallucination_rate"] == approx(0.5)
 
 
@@ -133,6 +135,13 @@ def test_augment_no_route_has_none_hallucination():
     m = pv._augment_eval_metrics(_base_metrics(num_parsed=0, full_path_valid=False), goal="goal_1")
     assert m["hallucination_rate"] is None
     assert m["valid_path_ab"] is False
+
+
+def test_augment_single_node_route_has_none_hallucination():
+    # One node ⇒ no hop ⇒ edge hallucination is undefined.
+    m = pv._augment_eval_metrics(
+        _base_metrics(num_parsed=1, edge_validity_rate=0.0), goal="goal_1")
+    assert m["hallucination_rate"] is None
 
 
 # --------------------------------------------------------------------------
@@ -175,9 +184,10 @@ def test_aggregate_new_metric_denominators():
         # path expected but NO route emitted ⇒ counts as a valid_path failure.
         {"path_metrics": {"num_parsed": 0, "path_expected": True, "valid_path_ab": False,
                           "hop_optimality": None, "hallucination_rate": None}},
-        # positionality task: not path_expected; still contributes to hallucination.
+        # positionality task: not path_expected; single node ⇒ no hop ⇒ no edge
+        # hallucination (None), so it does not contribute to the hallucination mean.
         {"path_metrics": {"num_parsed": 1, "path_expected": False, "valid_path_ab": False,
-                          "hop_optimality": None, "hallucination_rate": 0.0,
+                          "hop_optimality": None, "hallucination_rate": None,
                           "nodes_exist_rate": 1.0, "edge_validity_rate": 0.0,
                           "full_path_valid": False, "start_goal_ok": False}},
     ]
@@ -185,7 +195,7 @@ def test_aggregate_new_metric_denominators():
     assert agg["num_path_expected"] == 3
     assert agg["valid_path_rate"] == approx(1 / 3)          # only sample 1 valid
     assert agg["path_optimality_rate"] == approx(1.0)        # only sample 1 has a hop ratio
-    assert agg["hallucination_rate"] == approx((0.0 + 0.5 + 0.0) / 3)  # routed samples 1,2,4
+    assert agg["hallucination_rate"] == approx((0.0 + 0.5) / 2)  # edge-routed samples 1,2
 
 
 def test_aggregate_legacy_keys_unchanged():
@@ -202,9 +212,12 @@ def test_aggregate_legacy_keys_unchanged():
     ]
     agg = pv.aggregate_path_metrics(samples)
     assert agg["edge_validity_rate"] == approx(0.75)
-    assert agg["nodes_exist_rate"] == approx(1.0)
-    assert agg["full_path_valid_rate"] == approx(0.5)
-    assert agg["start_goal_ok_rate"] == approx(0.5)
+    # nodes_exist_rate / full_path_valid_rate / start_goal_ok_rate were dropped from
+    # the reported aggregate (redundant with hallucination_rate / valid_path_rate);
+    # the per-sample primitives still feed those derived metrics.
+    assert "nodes_exist_rate" not in agg
+    assert "full_path_valid_rate" not in agg
+    assert "start_goal_ok_rate" not in agg
     assert agg["cost_optimality"] == approx(1.0)   # mean over non-None only
     assert agg["num_with_path"] == 2
     assert agg["num_from_reasoning"] == 1

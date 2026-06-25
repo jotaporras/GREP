@@ -579,13 +579,13 @@ def print_summary_table(results: List[GraphEvalResultSummary]) -> None:
         def _fmt(v):
             return f"{v:.2f}" if isinstance(v, (int, float)) else "  —"
         print("\nPATH-VALIDITY")
-        print(f"{'Eval File':<{name_width}}  {'edge_val':>8}  {'nodes_ex':>8}  "
-              f"{'full_valid':>10}  {'start_goal':>10}  {'cost_opt':>8}  {'judge':>6}")
+        print(f"{'Eval File':<{name_width}}  {'edge_val':>8}  {'cost_opt':>8}  "
+              f"{'valid_path':>10}  {'hop_opt':>8}  {'halluc':>8}  {'judge':>6}")
         for r in pm_results:
             p = r.path_metrics
             print(f"{r.name:<{name_width}}  {_fmt(p.get('edge_validity_rate')):>8}  "
-                  f"{_fmt(p.get('nodes_exist_rate')):>8}  {_fmt(p.get('full_path_valid_rate')):>10}  "
-                  f"{_fmt(p.get('start_goal_ok_rate')):>10}  {_fmt(p.get('cost_optimality')):>8}  "
+                  f"{_fmt(p.get('cost_optimality')):>8}  {_fmt(p.get('valid_path_rate')):>10}  "
+                  f"{_fmt(p.get('path_optimality_rate')):>8}  {_fmt(p.get('hallucination_rate')):>8}  "
                   f"{_fmt(p.get('llm_judge_accuracy')):>6}")
         print(sep)
 
