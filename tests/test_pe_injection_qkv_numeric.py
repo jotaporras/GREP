@@ -373,6 +373,88 @@ def test_full_forward_logits_change_with_graph():
     assert wrap._pe_signal is None, "Ψ left armed after forward"
 
 
+# --------------------------------------------------------------------------- #
+# Gradient flow: loss -> q/k/v injection -> Ψ -> pe_model / pe_proj / pe_gain. #
+# --------------------------------------------------------------------------- #
+
+def _grad_setup(pe_gain_init):
+    """Build wrap + graph, run forward+backward on a scalar logit loss, return wrap.
+
+    The ONLY connection from pe_model/pe_proj/pe_gain to the logits is the q/k/v
+    injection, so any grad arriving at them proves the injection is differentiable.
+    """
+    llm = _gemma()
+    if llm is None:
+        return None
+    torch.manual_seed(8)
+    wrap = _wrap(llm, d_model=16, pe_gain_init=pe_gain_init).eval()
+    seq, batch = 8, 1
+    ids = torch.randint(0, 64, (batch, seq))
+    g = _tiny_graph(3)
+    inj = {0: [(2, 3)], 1: [(4, 5)], 2: [(6, 7)]}
+    out = wrap(input_ids=ids, graphs=[g], injection_maps=[inj])
+    # Scalar loss with a generic dependence on every logit (no labels needed).
+    loss = out.logits.float().square().mean()
+    loss.backward()
+    return wrap
+
+
+def _gn(p):
+    """None-safe grad max-abs (returns 0.0 for a missing grad)."""
+    return 0.0 if p.grad is None else p.grad.abs().max().item()
+
+
+def _finite(p):
+    return p.grad is None or torch.isfinite(p.grad).all().item()
+
+
+def test_gradient_reaches_structural_params():
+    """Open gate: grad reaches pe_gain, pe_proj, pe_norm, and the GT/R-PEARL params,
+    all finite, all nonzero where signal is expected — through the q/k/v injection."""
+    wrap = _grad_setup(pe_gain_init=1.0)
+    if wrap is None:
+        return _skip("gemma4_unified unavailable")
+
+    assert _gn(wrap.pe_gain) > 0 and _finite(wrap.pe_gain), "pe_gain got no/NaN grad"
+    assert _gn(wrap.pe_proj.weight) > 0 and _finite(wrap.pe_proj.weight), \
+        "pe_proj got no/NaN grad"
+    assert wrap.pe_norm is not None
+    assert _gn(wrap.pe_norm.weight) > 0 and _finite(wrap.pe_norm.weight), \
+        "pe_norm got no/NaN grad"
+
+    # The GT/R-PEARL encoder: at least the GCN conv weights must receive grad, and
+    # every populated grad must be finite (catches NaN from the sparse/probe path).
+    pe_named = dict(wrap.pe_model.named_parameters())
+    gcn_grads = [v for k, v in pe_named.items()
+                 if "pe_gcn" in k and _gn(v) > 0]
+    assert gcn_grads, "no R-PEARL GCN parameter received a nonzero grad"
+    bad = [k for k, v in pe_named.items() if not _finite(v)]
+    assert not bad, f"non-finite grad in pe_model params: {bad}"
+
+    # All structural_parameters() entries carry a finite grad (the LR-group contract).
+    for p in wrap.structural_parameters():
+        assert _finite(p), "non-finite grad in a structural parameter"
+
+
+def test_cold_start_gate_blocks_structural_grad_but_not_gate():
+    """Cold start (pe_gain_init=0.0): Ψ = pe·tanh(0) = 0, so logits == stock, yet the
+    GATE still gets a nonzero grad (sech²(0)=1, it can learn to open) while pe_proj /
+    pe_model grads are killed by the closed gate. Documents the cold-start invariant."""
+    wrap = _grad_setup(pe_gain_init=0.0)
+    if wrap is None:
+        return _skip("gemma4_unified unavailable")
+
+    g_gain = _gn(wrap.pe_gain)
+    assert g_gain > 0 and _finite(wrap.pe_gain), \
+        f"cold-start pe_gain grad should be nonzero/finite, got {g_gain:.2e}"
+    # Downstream structural params: gate closed ⇒ exactly-zero grad (or None).
+    g_proj = _gn(wrap.pe_proj.weight)
+    assert g_proj == 0.0, f"pe_proj got grad through a closed gate (max|g|={g_proj:.2e})"
+    pe_named = dict(wrap.pe_model.named_parameters())
+    leaked = {k: _gn(v) for k, v in pe_named.items() if _gn(v) > 0}
+    assert not leaked, f"pe_model got grad through a closed gate: {leaked}"
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
