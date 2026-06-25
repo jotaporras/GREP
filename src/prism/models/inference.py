@@ -4,6 +4,8 @@ from typing import List, Dict
 
 import torch
 
+from spine import models as spine_models
+
 from prism.data import compact_prompt
 from prism.data import utils
 from prism.models.gnn_llm import (
@@ -43,22 +45,21 @@ def _core_graph_model(model):
     return inner
 
 
-class InMemoryLLM:
+class InMemoryLLM(spine_models.InMemoryLLM):
     """SPINE-compatible LLM client for plain (non-graph-augmented) models.
 
-    Uses the compact prompt translation (SPINE system prompt + ICL dropped; scene graph
-    compacted; edge bullets present iff ``include_edges``). Compact output is
-    inverse-translated back to SPINE JSON.
+    Subclasses ``spine.models.InMemoryLLM`` to inherit the shared SPINE client
+    contract (``format_prompt``); overrides ``query_llm`` to route through the
+    compact prompt translation (SPINE system prompt + ICL dropped; scene graph
+    compacted; edge bullets present iff ``include_edges``) and inverse-translate
+    the compact output back to SPINE JSON.
     """
 
     def __init__(self, model, tokenizer, include_edges: bool):
-        self.model = model
-        self.tokenizer = tokenizer
-        self.device = next(model.parameters()).device
+        # Reuse SPINE's __init__ for model/tokenizer/device; device is taken from
+        # the model's own parameters rather than the SPINE "cuda" default.
+        super().__init__(model, tokenizer, device=next(model.parameters()).device)
         self.include_edges = include_edges
-
-    def format_prompt(self, base_request: str, graph_as_json: str) -> List[Dict]:
-        return [{"role": "user", "content": f"task: {base_request}. scene graph {graph_as_json}"}]
 
     def _decode(self, outputs) -> str:
         # clean_up_tokenization_spaces=False: WordPiece post-process corrupts BPE (Llama) plan text.
