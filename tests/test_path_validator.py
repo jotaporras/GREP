@@ -107,9 +107,9 @@ def test_parse_path_prefer_last_takes_final_chain():
 
 
 def test_parse_path_neutralizes_undirected_edge_arrows():
-    """`u <-> v` edge statements must not be mistaken for a `->` route hop."""
-    # Only the genuine route a -> b should be parsed; the <-> edge is neutralised.
-    assert P.parse_path("edges: m <-> n. route: a -> b") == ["a", "b"]
+    """`u <=> v` edge statements must not be mistaken for a `->` route hop."""
+    # Only the genuine route a -> b should be parsed; the <=> edge is neutralised.
+    assert P.parse_path("edges: m <=> n. route: a -> b") == ["a", "b"]
 
 
 def test_parse_path_goto_actions():
@@ -205,9 +205,9 @@ def test_validate_path_start_goal_ok_logic():
 # ----------------------------------------------------------------------------
 
 def test_parse_edges_all_three_forms_and_quotes():
-    """`u <-> v`, `[u, v]`, `(u, v)` (quoted or not) all parse to frozenset pairs.
+    """`u <=> v`, `[u, v]`, `(u, v)` (quoted or not) all parse to frozenset pairs.
     Node ids must match the grid-id pattern (lowercase + _<int> tail)."""
-    text = "bay_1 <-> bay_2 and ['bay_3', 'bay_4'] and (bay_5, bay_6)"
+    text = "bay_1 <=> bay_2 and ['bay_3', 'bay_4'] and (bay_5, bay_6)"
     edges = P.parse_edges(text)
     assert frozenset(("bay_1", "bay_2")) in edges
     assert frozenset(("bay_3", "bay_4")) in edges
@@ -215,11 +215,11 @@ def test_parse_edges_all_three_forms_and_quotes():
 
 
 def test_parse_edges_drops_self_loops():
-    assert P.parse_edges("bay_1 <-> bay_1") == set()
+    assert P.parse_edges("bay_1 <=> bay_1") == set()
 
 
 def test_parse_edges_valid_nodes_filter():
-    edges = P.parse_edges("bay_1 <-> bay_2", valid_nodes={"bay_1"})
+    edges = P.parse_edges("bay_1 <=> bay_2", valid_nodes={"bay_1"})
     assert edges == set()  # bay_2 not allowed -> edge dropped
 
 

@@ -16,7 +16,8 @@ class RandomGNNPositionalEncodings(nn.Module):
         pe_hidden_channels (int): Hidden dimension for the GCN
         pe_num_layers (int): Number of layers in the GCN
         d_model (int): Output dimension
-        num_samples (int): Probe count M at train time (m_train).
+        num_samples (int): Probe count M for the Monte-Carlo probe estimate
+            (used for both train and eval).
         dropout (float): Dropout rate of the GCN associated.
         k (int): Convolution depth of the GCN.
         use_layer_norm (bool): Retained for config back-compat; the readout is
@@ -24,9 +25,6 @@ class RandomGNNPositionalEncodings(nn.Module):
         eps (float): Retained for config back-compat (unused).
         probe_distribution (str): "gaussian" (N(0,I)) or "rademacher" (±1). Both
             satisfy E[q]=0 and unit second moment.
-        m_test (int): Probe count M at eval/test. Larger ⇒ lower-variance Monte
-            Carlo estimate ⇒ reproducible-in-practice without a seed.
-            Defaults to ``num_samples`` when unset.
         fixed_seed_mode (bool): Determinism switch. False (default) resamples
             the probes every forward pass (train and eval). True re-seeds the RNG
             with ``fixed_seed_value`` on every forward so the probes — and hence
@@ -44,7 +42,6 @@ class RandomGNNPositionalEncodings(nn.Module):
         eps=1e-8,
         use_layer_norm=True,
         probe_distribution: str = "gaussian",
-        m_test: int = None,
         fixed_seed_mode: bool = False,
         fixed_seed_value: int = 0,
         max_probe_rows: int = 65536,
@@ -80,9 +77,7 @@ class RandomGNNPositionalEncodings(nn.Module):
         # Learnable tanh(g) gate applied to Ψ and C·s. g = tanh(output_gain) ∈ (-1,1);
         # init output_gain=1 → g ≈ 0.76. Scalar parameter, saved.
         self.output_gain = nn.Parameter(torch.tensor(1.0))
-        # m_train / m_test probe counts; self.M kept as the train alias.
-        self.m_train = num_samples
-        self.m_test = num_samples if m_test is None else m_test 
+        # Single probe count M for the Monte-Carlo estimate (train and eval).
         self.M = num_samples
         self.probe_distribution = probe_distribution
         self.fixed_seed_mode = fixed_seed_mode
@@ -124,7 +119,7 @@ class RandomGNNPositionalEncodings(nn.Module):
             Q: Random features [num_nodes, m].
             edge_index: Graph edge indices [2, num_edges].
             num_nodes: Number of nodes in the graph.
-            m: Number of probe samples (m_train at train, m_test at eval).
+            m: Number of probe samples (``self.M``, train and eval).
             edge_weight: Optional per-edge weights [num_edges] (scene affinity weight);
                 the same weights apply to every one of the m graph copies.
 
@@ -208,8 +203,8 @@ class RandomGNNPositionalEncodings(nn.Module):
         if permutation is not None:
             edge_index = permutation.apply(edge_index, num_nodes, device=device)
 
-        # m_train during training, m_test at eval; fixed_seed_mode re-seeds for reproducible Ψ.
-        m = self.m_train if self.training else self.m_test
+        # Probe count M (train and eval); fixed_seed_mode re-seeds for reproducible Ψ.
+        m = self.M
         generator = None
         if self.fixed_seed_mode:
             generator = torch.Generator(device=device)
@@ -286,7 +281,7 @@ class RandomGNNPositionalEncodings(nn.Module):
         # The GCN runs in fp32; apply the whole second moment in fp32.
         s = signal.to(device=device, dtype=torch.float32)
 
-        m = self.m_train if self.training else self.m_test
+        m = self.M
         generator = None
         if self.fixed_seed_mode:
             generator = torch.Generator(device=device)
@@ -357,7 +352,7 @@ class RandomGNNPositionalEncodings(nn.Module):
         if ew is not None:
             ew = ew.to(device)
         N = data.x.shape[0]
-        m = self.m_train if self.training else self.m_test
+        m = self.M
         gen = None
         if self.fixed_seed_mode:
             gen = torch.Generator(device=device)

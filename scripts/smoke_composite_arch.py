@@ -40,7 +40,7 @@ ei = cg.edge_index
 has = lambda s, d: bool(((ei[0] == s) & (ei[1] == d)).any())
 check("directed cycle forward edge present", has(0, 1) and has(c - 1, 0))
 check("directed cycle reverse edge absent (no crosslink there)", not has(1, 0))
-# crosslink both directions token<->scene
+# crosslink both directions token<=>scene
 check("crosslink token->scene & scene->token", has(2, c + 0) and has(c + 0, 2))
 # GSO: square, sparse, directed (S[1,0]==0 since reverse cycle edge absent)
 gso = cg.gso.coalesce()
@@ -54,7 +54,7 @@ check("GSO finite & coalesced", torch.isfinite(gval).all().item())
 # ---------- 2. R-PEARL first vs second moment scale ----------
 pe = RandomGNNPositionalEncodings(pe_hidden_channels=32, pe_num_layers=3,
                                   d_model=d_model, num_samples=8, k=2,
-                                  eps=1e-6, m_test=8)
+                                  eps=1e-6)
 pe.eval()
 pe_data = Data(x=torch.zeros(cg.num_nodes, 1), edge_index=cg.edge_index)
 pe_data.edge_weight = cg.edge_weight
@@ -97,12 +97,12 @@ pe.center_second_moment = False                # this check tests the raw associ
 with torch.no_grad():
     cx_a = pe.second_moment_apply(pe_data, seeded)
     # explicit: Σ_s Φ_s (Φ_sᵀ seeded)/m, then the SAME magnitude match
-    Q = pe._sample_probes(cg.num_nodes, pe.m_test, torch.device("cpu"),
+    Q = pe._sample_probes(cg.num_nodes, pe.M, torch.device("cpu"),
                           torch.Generator().manual_seed(7))
-    P = pe._batched_gcn_forward(Q, cg.edge_index.cpu(), cg.num_nodes, pe.m_test,
+    P = pe._batched_gcn_forward(Q, cg.edge_index.cpu(), cg.num_nodes, pe.M,
                                 edge_weight=cg.edge_weight, device=torch.device("cpu"),
                                 pool=False)
-    acc = sum(P[s] @ (P[s].T @ seeded) for s in range(P.shape[0])) / pe.m_test
+    acc = sum(P[s] @ (P[s].T @ seeded) for s in range(P.shape[0])) / pe.M
     ratio = seeded.float().norm(dim=-1).mean() / acc.float().norm(dim=-1).mean().clamp(min=1e-6)
     cx_b = acc * ratio * torch.tanh(pe.output_gain)        # include the R-PEARL output gate
 check("C·seeded == explicit ΣΦ(Φᵀs)/m (no N×N formed)",
@@ -132,7 +132,7 @@ pe.fixed_seed_mode = False
 def run_gt(mode, **kw):
     gt = GraphTransformer(num_layers=3, pe_hidden_channels=32, pe_num_layers=3,
                           d_model=d_model, heads=4, num_samples=8, k_pe=2, k_gt=2,
-                          eps=1e-6, m_test=8, spectral_norm_linears=False,
+                          eps=1e-6, spectral_norm_linears=False,
                           pe_readout=mode, **kw)
     return gt
 import math

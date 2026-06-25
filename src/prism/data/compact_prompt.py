@@ -110,14 +110,14 @@ def _node_names(entries: List[dict]) -> str:
 
 
 def _edges(pairs: List) -> str:
-    """Comma-join undirected edges as ``u <-> v`` from a list of ``[u, v]`` pairs.
+    """Comma-join undirected edges as ``u <=> v`` from a list of ``[u, v]`` pairs.
 
     Used for the ``• Region Edges:`` / ``• Object Edges:`` bullets in the
     plain-LLM compact block (``include_edges=True``): ``region_connections`` are
-    region<->region borders and ``object_connections`` bind each object to its
+    region<=>region borders and ``object_connections`` bind each object to its
     region. Malformed (non-pair) entries are skipped rather than raising.
     """
-    return ", ".join(f"{p[0]} <-> {p[1]}" for p in pairs if len(p) == 2)
+    return ", ".join(f"{p[0]} <=> {p[1]}" for p in pairs if len(p) == 2)
 
 
 # Shared <think>…</think> output contract — identical across both system-prompt
@@ -177,7 +177,7 @@ def _graph_block(graph_dict: dict, include_edges: bool) -> str:
     the GNN already ingests connectivity from the full SPINE scene-graph JSON, so
     edges in text would be redundant. With ``include_edges=True`` (the plain-LLM
     baseline, which has no GNN) the block additionally lists ``• Region Edges:``
-    (region<->region borders) and ``• Object Edges:`` (object<->region) so the
+    (region<=>region borders) and ``• Object Edges:`` (object<=>region) so the
     model can read connectivity from text.
     """
     lines = [
@@ -464,7 +464,7 @@ def _unwrap_plan(plan: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Live translator: SPINE messages <-> compact text at the LLM seam.
+# Live translator: SPINE messages <=> compact text at the LLM seam.
 #
 # These are the functions the training (`data.preprocess_dataset`) and eval
 # (`models.inference.GraphAugmentedInMemoryLLM.query_llm`) paths call. The GNN

@@ -51,7 +51,7 @@ def test_mask_blocks_nonadjacent_node_pairs():
     seq = 8
     # node0@1, node1@3, node2@5 (BOS=0 and gaps are non-node tokens)
     imap = [{0: [(1, 2)], 1: [(3, 4)], 2: [(5, 6)]}]
-    g = _graph(3, edges=[(0, 1)])  # only 0<->1
+    g = _graph(3, edges=[(0, 1)])  # only 0<=>1
     bias = wrap.build_structural_mask(seq, [g], imap, torch.device("cpu"), dtype=torch.float32)[0, 0]
 
     # node2 (pos5) attending node0 (pos1) and node1 (pos3): no edge -> blocked.
@@ -83,7 +83,7 @@ def test_symmetrize_makes_directed_edge_bidirectional():
 
 
 def test_k_hops_widens_neighbourhood():
-    """Chain 0-1-2. k=1 blocks 0<->2; k=2 allows it (2 hops via node1)."""
+    """Chain 0-1-2. k=1 blocks 0<=>2; k=2 allows it (2 hops via node1)."""
     seq = 8
     imap = [{0: [(1, 2)], 1: [(3, 4)], 2: [(5, 6)]}]
     g = _graph(3, edges=[(0, 1), (1, 2)])

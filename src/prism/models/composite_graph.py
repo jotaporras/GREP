@@ -6,7 +6,7 @@ nodes 0..c-1) to the scene graph (nodes c..c+|V_Sc|-1) via cross-links:
   - sequence layer: directed cycle  i -> (i+1) mod c, weight cycle_weight;
   - scene layer:     edges from G_Sc with the scene affinity weight, directedness
                      preserved (the scene edge_index is used as given);
-  - cross-links:     (a) every token of every mention of a label <-> that
+  - cross-links:     (a) every token of every mention of a label <=> that
                      label's scene node, and (b) all mention-tokens of a label
                      form a clique. Binary crosslink_weight, both directions.
 
@@ -238,7 +238,6 @@ def composite_graph_gnn_rebuild_params(config) -> dict:
         "gt_num_layers": config.gt_num_layers,
         "gt_heads": config.gt_heads,
         "probe_distribution": config.probe_distribution,
-        "m_test": config.m_test,
         "max_gather_rows": config.max_gather_rows,
         "fixed_seed_mode": config.fixed_seed_mode,
         "fixed_seed_value": config.fixed_seed_value,

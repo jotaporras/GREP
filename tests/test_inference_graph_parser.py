@@ -141,7 +141,7 @@ TOKEN_OTHER = 99     # filler / unrelated token
 
 
 class _FakeTokenizer:
-    """Minimal id<->piece tokenizer for the injection helpers.
+    """Minimal id<=>piece tokenizer for the injection helpers.
 
     ``batch_decode`` is per-token (one id per sublist) so ``find_last_graph_scope``
     can rebuild the text; ``encode`` ignores a leading space so both node-name

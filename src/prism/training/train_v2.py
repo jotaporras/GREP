@@ -748,7 +748,6 @@ class TrainConfig:
     crosslink_mention_clique: bool = True
     # R-PEARL sampling
     probe_distribution: str = "gaussian"
-    m_test: int = 128
     max_gather_rows: int = 2_000_000
     fixed_seed_mode: bool = False
     fixed_seed_value: int = 0

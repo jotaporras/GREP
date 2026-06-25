@@ -135,14 +135,14 @@ def test_structured_avoid_violated_route_fails_despite_valid_path():
 # ----------------------------------------------------------------------------
 
 def test_structured_positionality_requires_stated_containment_edge():
-    """Edges-kind: stating the containment edge box_1 <-> room_2 AND naming the goal
+    """Edges-kind: stating the containment edge box_1 <=> room_2 AND naming the goal
     region passes."""
     g = _containment_graph()
     m = P.validate_structured(
-        "box_1 <-> room_2", g,
+        "box_1 <=> room_2", g,
         init_node="room_1", answer="room_2",
         criterion="state that box_1 is located in room_2", task="where is box_1?",
-        full_response="box_1 <-> room_2")
+        full_response="box_1 <=> room_2")
     assert m is not None and m["kind"] == "edges"
     assert m["goal"] == "room_2"
     assert m["required_edges_present"] is True

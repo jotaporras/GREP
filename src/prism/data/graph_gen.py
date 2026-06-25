@@ -268,8 +268,8 @@ Generate EXACTLY n_tasks tasks (specified in `_metadata`). The tasks should pres
 **Existence tasks are NOT allowed** (bare yes/no node-existence is a semantic-matching false positive). Generate only Positionality, Reachability, and Navigability — every task must require graph topology to solve and must be answered with edges and (for Reachability/Navigability) a route, never a polar yes/no.
 
 **Required answer content — EDGES and PATHS (applies to every task):**
-- Phrase each `task` so the planner must report the relevant connecting edges as `A <-> B` and, for Reachability/Navigability, the full route as `A -> B -> C`. End reachability/navigability prompts with a clause such as "give the connecting edges and the route".
-- Grading is deterministic over the graph: a correct answer must STATE the containment/adjacency edge(s) (`A <-> B`) and, for routes, a valid walk from the start region to the destination region (honouring any required waypoint and avoided area). No yes/no.
+- Phrase each `task` so the planner must report the relevant connecting edges as `A <=> B` and, for Reachability/Navigability, the full route as `A -> B -> C`. End reachability/navigability prompts with a clause such as "give the connecting edges and the route".
+- Grading is deterministic over the graph: a correct answer must STATE the containment/adjacency edge(s) (`A <=> B`) and, for routes, a valid walk from the start region to the destination region (honouring any required waypoint and avoided area). No yes/no.
 
 Each task must be a JSON object with the following structure:
 
@@ -286,7 +286,7 @@ For example, if the graph contains a `fuel_depot_1` region holding a `fuel_tank_
   "task": "Reach the area holding the fuel tank from the starting area and report the connecting edges and the route.",
   "answer": "(?i)\bclearing_1\b.*\bfuel_depot_1\b",
   "init_node": "clearing_1",
-  "acceptance_criterion": "A correct answer reaches fuel_depot_1 (which contains fuel_tank_1) via comm_bunker_1, stating the edge fuel_depot_1 <-> fuel_tank_1 and a route clearing_1 -> comm_bunker_1 -> fuel_depot_1."
+  "acceptance_criterion": "A correct answer reaches fuel_depot_1 (which contains fuel_tank_1) via comm_bunker_1, stating the edge fuel_depot_1 <=> fuel_tank_1 and a route clearing_1 -> comm_bunker_1 -> fuel_depot_1."
 }
 
 **Answer regex rules (a coarse parallel check — grading is deterministic over the graph):**
@@ -303,20 +303,20 @@ The deterministic grader reads the goal region, any waypoints, the avoided areas
 
 **Acceptance criterion rules (these drive the deterministic grader):**
 - Write ONE sentence describing what a correct planner response must convey.
-- Name, by node id, the destination region (the goal), every required waypoint (write "via <node>" / "passing through <node>"), every avoided area (write "without using <node>"), and each object whose containment is part of the answer — so the grader can resolve the goal, constraints, and required `region <-> object` edges deterministically.
+- Name, by node id, the destination region (the goal), every required waypoint (write "via <node>" / "passing through <node>"), every avoided area (write "without using <node>"), and each object whose containment is part of the answer — so the grader can resolve the goal, constraints, and required `region <=> object` edges deterministically.
 - An avoided area must be a REAL region that is neither the start nor the destination and that the intended route genuinely bypasses. Never write a vacuous constraint: do not reference a non-existent edge, do not hedge ("if it existed"), and do not name the start/goal/waypoint in the "without using" clause.
 - Only write "via <node>" / "passing through <node>" when the TASK text itself imposes that waypoint. For an UNCONSTRAINED reach/route task, require only "a valid route" — do NOT name a specific intermediate region and do NOT spell out a full example path (e.g. "the route a -> b -> c") in the criterion. Many valid routes exist; the deterministic grader accepts any valid walk to the goal, and a baked-in intermediate wrongly fails a correct alternative.
 - For Reachability/Navigability the criterion must name the start region, the destination region, and require a valid route between them (plus any waypoint/avoid). For Positionality it must name the region and the contained object(s) so the containment edge is required.
 - Do NOT restate the task; describe the *answer*. The criterion is for offline grading ONLY — it is never shown to the planner.
 
 Examples of good acceptance criteria:
-- "A correct answer identifies fuel_depot_1 as the region containing fuel_tank_1, stating the edge fuel_depot_1 <-> fuel_tank_1."
+- "A correct answer identifies fuel_depot_1 as the region containing fuel_tank_1, stating the edge fuel_depot_1 <=> fuel_tank_1."
 - "A correct answer gives a route from clearing_1 to coolant_station_1 via power_conduit_1 and lists each connecting edge."
 - "A correct answer routes from decon_chamber_1 to quarantine_bay_1 without using ventilation_hub_1 and shows the full path."
 
 **Task generation instructions:**
 - DO NOT reference specific objects or nodes by id in the task text. Make the planner infer these from semantic content.
-- Phrase each task so the planner must output the connecting edges (`A <-> B`) and, for Reachability/Navigability, the route (`A -> B -> C`).
+- Phrase each task so the planner must output the connecting edges (`A <=> B`) and, for Reachability/Navigability, the route (`A -> B -> C`).
 - Each task must be solvable from the graph alone.
 - Mix the three allowed types (Positionality, Reachability, Navigability). Do not generate all tasks of the same type, and never generate an Existence (yes/no) task.
 
@@ -397,7 +397,7 @@ class TaskGraphGen:
                 "3. Navigability (multi-hop; answer with the full route and its edges)\n"
                 f"\nHere is a list of the types for the tasks: {task_types}\n"
                 "Generate tasks in order, matching each entry to the type above. Every "
-                "task must be answered with edges (A <-> B) and, for Reachability/"
+                "task must be answered with edges (A <=> B) and, for Reachability/"
                 "Navigability, a route (A -> B -> C) — never a bare yes/no."
             )
 

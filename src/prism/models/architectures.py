@@ -124,7 +124,6 @@ def build_planner_model(config, llm, tokenizer):
             eps=config.eps,
             use_layer_norm=config.use_layer_norm,
             probe_distribution=config.probe_distribution,
-            m_test=config.m_test,
             max_gather_rows=config.max_gather_rows,
             fixed_seed_mode=config.fixed_seed_mode,
             fixed_seed_value=config.fixed_seed_value,

@@ -5,7 +5,6 @@ pe_num_layers: 2
 num_samples: 40
 k_pe: 2
 probe_distribution: gaussian
-m_test: 128
 max_gather_rows: 2000000
 fixed_seed_mode: false
 fixed_seed_value: 0

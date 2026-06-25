@@ -264,7 +264,7 @@ def test_query_llm_include_edges_threads_to_compact_block():
     without.query_llm(_SPINE_MSG)
     sys_without = without.tokenizer.chat_messages[0]["content"]
 
-    assert "Region Edges:" in sys_with and "a <-> b" in sys_with
+    assert "Region Edges:" in sys_with and "a <=> b" in sys_with
     assert "Region Edges:" not in sys_without
     assert "Object Edges:" not in sys_without
 

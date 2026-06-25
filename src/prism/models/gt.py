@@ -236,7 +236,7 @@ class GraphTransformer(nn.Module):
                  pe_num_layers: int, d_model: int, heads: int = 4, num_samples: int = 30,
                  dropout: float = 0.1, k_pe: int = 3, k_gt: int = 3,
                  eps: float = 1e-8, use_layer_norm: bool = True,
-                 probe_distribution: str = "gaussian", m_test: int = None,
+                 probe_distribution: str = "gaussian",
                  max_gather_rows: int = 2_000_000,
                  fixed_seed_mode: bool = False, fixed_seed_value: int = 0,
                  pe_readout: str = "mean",
@@ -262,7 +262,7 @@ class GraphTransformer(nn.Module):
         self.pe_model = RandomGNNPositionalEncodings(
             pe_hidden_channels=pe_hidden_channels, pe_num_layers=pe_num_layers, d_model=d_model,
             num_samples=num_samples, dropout=dropout, k=k_pe, eps=eps, use_layer_norm=use_layer_norm,
-            probe_distribution=probe_distribution, m_test=m_test,
+            probe_distribution=probe_distribution,
             max_gather_rows=max_gather_rows,
             fixed_seed_mode=fixed_seed_mode, fixed_seed_value=fixed_seed_value,
             center_second_moment=center_second_moment,
@@ -373,9 +373,6 @@ class GraphTransformer(nn.Module):
         amp_dtype = None
         if token_embeddings is not None and token_embeddings.dtype in (torch.float16, torch.bfloat16):
             amp_dtype = token_embeddings.dtype
-            # CPU autocast supports bf16 only; never request fp16 autocast on CPU.
-            if amp_dtype == torch.float16 and device.type == "cpu":
-                amp_dtype = None
         if amp_dtype is not None:
             x = x.to(amp_dtype)
             amp_ctx = torch.autocast(device_type=device.type, dtype=amp_dtype)

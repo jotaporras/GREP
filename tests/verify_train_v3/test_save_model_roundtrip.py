@@ -116,7 +116,7 @@ def _gt(seed):
     return gt_module.GraphTransformer(
         num_layers=2, pe_hidden_channels=16, pe_num_layers=2, d_model=24, heads=2,
         num_samples=8, dropout=0.1, k_pe=2, k_gt=2, eps=1e-6, use_layer_norm=True,
-        probe_distribution="gaussian", m_test=16, max_gather_rows=200000,
+        probe_distribution="gaussian", max_gather_rows=200000,
         fixed_seed_mode=False, fixed_seed_value=0, pe_readout="second_moment",
         center_second_moment=True)
 

@@ -89,9 +89,9 @@ def parse_path(
     """Extract the ordered route from planner text.
 
     Pulls an ``a -> b -> c`` chain (the spec form), then ``goto(...)`` actions.
-    Undirected edge statements ``u <-> v`` are neutralised first so the ``->``
-    inside ``<->`` is never mistaken for a route hop — a response may carry both an
-    edge list and a path. By default the LONGEST chain is taken; ``prefer_last``
+    Undirected edge statements ``u <=> v`` use ``<=>``, not ``->``, so they never
+    collide with a route hop even when a response carries both an edge list and a
+    path. By default the LONGEST chain is taken; ``prefer_last``
     instead takes the chain stated LAST — the model's final committed route, after
     any earlier exploratory revisions (used when scanning free-form reasoning).
     When ``valid_nodes`` is given, tokens are filtered to exact matches. Returns []
@@ -100,9 +100,8 @@ def parse_path(
     if not text or not isinstance(text, str):
         return []
     nodes: List[str] = []
-    route_text = text.replace("<->", " ").replace("<-", " ")  # drop edge arrows
-    if "->" in route_text:
-        chains = _ARROW_CHAIN.findall(route_text)
+    if "->" in text:
+        chains = _ARROW_CHAIN.findall(text)
         if chains:
             best = chains[-1] if prefer_last else max(chains, key=lambda c: c.count("->"))
             nodes = _NODE_TOKEN.findall(best)
@@ -395,7 +394,7 @@ def write_path_with_judge(
 # positionality / reachability / navigability
 # --------------------------------------------------------------------------
 # Structural tasks are graded against the graph itself, not a yes/no regex or the
-# LLM judge: a correct answer must STATE the relevant edges (``u <-> v``) and, for
+# LLM judge: a correct answer must STATE the relevant edges (``u <=> v``) and, for
 # reachability/navigability, give a valid route to the goal. The goal, waypoints
 # and avoid-set are read from the task's ``answer`` regex + ``acceptance_criterion``
 # (which already name the node ids), so no new data schema is needed.
@@ -403,12 +402,12 @@ def write_path_with_judge(
 # A node id: lowercase type prefix + one-or-more ``_<int>`` tails (grid ids like
 # ``bay_3_26_1`` carry several).
 _NODE_ID = re.compile(r"[a-z][a-z_]*(?:_\d+)+")
-# An edge may be stated as ``u <-> v`` (spec form) or in SPINE's native pair forms
+# An edge may be stated as ``u <=> v`` (spec form) or in SPINE's native pair forms
 # ``[u, v]`` / ``(u, v)`` that the planner emits in its ``answer(...)`` — and the
 # pair nodes are often quoted (``['u', 'v']``). Accept all.
 _Q = r"['\"]?"
 _EDGE_STMTS = (
-    re.compile(rf"({_NODE_ID.pattern})\s*<->\s*({_NODE_ID.pattern})"),
+    re.compile(rf"({_NODE_ID.pattern})\s*<=>\s*({_NODE_ID.pattern})"),
     re.compile(rf"\[\s*{_Q}({_NODE_ID.pattern}){_Q}\s*,\s*{_Q}({_NODE_ID.pattern}){_Q}\s*\]"),
     re.compile(rf"\(\s*{_Q}({_NODE_ID.pattern}){_Q}\s*,\s*{_Q}({_NODE_ID.pattern}){_Q}\s*\)"),
 )
@@ -442,7 +441,7 @@ def _ordered_subseq(sub: List[str], seq: List[str]) -> bool:
 
 
 def parse_edges(text: str, valid_nodes: Optional[set] = None) -> set:
-    """Undirected edges stated in ``text`` (``u <-> v``, ``[u, v]`` or ``(u, v)``)
+    """Undirected edges stated in ``text`` (``u <=> v``, ``[u, v]`` or ``(u, v)``)
     as frozenset pairs. Self-loops (``u == v``) are dropped."""
     out = set()
     for pat in _EDGE_STMTS:
@@ -533,7 +532,7 @@ def validate_structured(
         rescue_response=(full_response if kind == "path" else None), task=task)
     parsed = m["parsed_nodes"]
     stated = parse_edges(generated_text, set(build_graph(graph_dict, directed=directed).nodes))
-    # A containment edge counts as present if stated (`u <-> v`) OR traversed
+    # A containment edge counts as present if stated (`u <=> v`) OR traversed
     # (a reach-object route ends goal_region→object, expressing containment implicitly).
     path_edges = {frozenset((parsed[k], parsed[k + 1])) for k in range(len(parsed) - 1)}
     m["goal"] = goal

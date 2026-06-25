@@ -40,7 +40,7 @@ def make_llm():
 def make_gt():
     return GraphTransformer(num_layers=2, pe_hidden_channels=16, pe_num_layers=2,
                             d_model=D, heads=2, num_samples=4, k_pe=2, k_gt=2,
-                            eps=1e-6, m_test=4, spectral_norm_linears=False,
+                            eps=1e-6, spectral_norm_linears=False,
                             pe_readout="second_moment")
 
 def make_model(inject_v=True, injection_mode="interpolate", gate_init=0.5):
