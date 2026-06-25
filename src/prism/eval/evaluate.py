@@ -731,6 +731,37 @@ def _graph_node_count(graph: dict) -> int:
     return len(graph.get("objects", {})) + len(graph.get("regions", {}))
 
 
+def render_path_metrics_figure(
+    results: Dict[str, GraphEvalResultSummary],
+    out_dir: str,
+    run_name: str,
+    *,
+    architecture: Optional[str] = None,
+) -> Optional[str]:
+    """Render the path-metrics figure from in-memory results into ``<out_dir>/visuals/``.
+
+    Feeds the live ``GraphEvalResultSummary.samples`` straight to
+    ``prism.eval.render.render_from_samples`` — no JSON round-trip — so the figure
+    always matches the results just written. ``run_name`` becomes the figure's model
+    label (its trailing ``_<wandbid>`` token is shown in parens and as the corner
+    tag) and ``architecture`` is stamped into the provenance badge. ``render`` (and
+    its matplotlib import) is loaded lazily so plain eval runs stay light.
+    Best-effort: plotting never breaks an eval run. Returns the figure path or None.
+    """
+    try:
+        samples_by_graph = {name: r.samples for name, r in results.items()}
+        if not any(samples_by_graph.values()):
+            return None
+        from prism.eval import render
+        out = render.render_from_samples(
+            run_name, samples_by_graph, os.path.join(out_dir, "visuals"),
+            architecture=architecture)
+        return str(out) if out is not None else None
+    except Exception as e:
+        print(f"[eval] path-metrics figure skipped: {type(e).__name__}: {e}")
+        return None
+
+
 # ----------------------------------------------------------------------------
 # Training-time eval orchestration
 # ----------------------------------------------------------------------------
@@ -780,6 +811,12 @@ def run_post_train_cross_eval(model, tokenizer, config: "TrainConfig", output_di
             architecture=architecture,
             text_edge_list=config.text_edge_list,
         )
+
+    # Path-metrics figure into <cross_eval>/visuals/; arch shown is the specific
+    # train-time architecture (e.g. composite_graph_gt), tag from the run dir name.
+    render_path_metrics_figure(
+        results, out_dir, os.path.basename(os.path.normpath(output_dir)),
+        architecture=config.architecture)
 
     print_summary_table(list(results.values()))
 

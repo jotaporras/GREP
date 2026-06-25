@@ -356,6 +356,13 @@ def main() -> None:
                 )
                 print(f"  Saved: {out_file}")
 
+        # Path-metrics figure for this run into <out_dir>/visuals/. ckpt_name carries
+        # the trailing WandB tag; architecture is the graph-augmented/llm kind.
+        fig_path = evaluate.render_path_metrics_figure(
+            results, out_dir, ckpt_name, architecture=architecture)
+        if fig_path:
+            print(f"  Figure: {fig_path}")
+
         evaluate.print_summary_table(list(results.values()))
 
 
