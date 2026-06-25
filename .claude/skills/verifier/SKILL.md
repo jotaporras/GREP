@@ -239,14 +239,16 @@ Test-code style rules (consistent with `AGENTS.md`):
 - Keep fixtures small and inline (helper factories like `_tiny_llm`, `_graph`), mirroring the suite.
 
 ### 6. Run and triage
-Run with the project env. Use `conda` to enter the env, but **inside conda invoke everything through
-`uv run --active`** — never call `python` directly. The `--active` flag makes `uv run` use the
-activated conda env instead of an ephemeral venv; the module form is `uv run -m`:
+Run with the project env. Enter it with **`conda activate`** (not `conda run` — only `activate`
+exports the env state `uv run --active` keys off), then invoke through **`uv run --active`** so it
+uses the activated conda env instead of an ephemeral venv. **Always try `pytest` first:**
 ```bash
 conda activate GREP-PRISM && uv run --active -m pytest tests/test_<target>.py -v
 ```
-If `conda` isn't on PATH in this shell, fall back to `uv run -m pytest tests/test_<target>.py -v`
-(still via `uv run`, and note the env caveat). For each failure, determine whether it's a **test bug** (fix the test and
+If that fails because `pytest` isn't installed in the env, fall back to running the file as a script
+via its runner footer: `uv run --active python tests/test_<target>.py`.
+If `conda` isn't on PATH in this shell, drop the `conda activate` prefix but keep `uv run --active`
+(and note the env caveat). For each failure, determine whether it's a **test bug** (fix the test and
 rerun) or a **real break** in the target (keep the test red, record it). Never weaken an assertion to
 make a real failure pass — a red test that pins a true bug is the deliverable working.
 
