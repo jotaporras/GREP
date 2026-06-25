@@ -240,9 +240,10 @@ Test-code style rules (consistent with `AGENTS.md`):
 
 ### 6. Run and triage
 Run with the project env. Use `conda` to enter the env, but **inside conda invoke everything through
-`uv run`** — never call `python` directly. The module form is `uv run -m`:
+`uv run --active`** — never call `python` directly. The `--active` flag makes `uv run` use the
+activated conda env instead of an ephemeral venv; the module form is `uv run -m`:
 ```bash
-conda run -n GREP-PRISM uv run -m pytest tests/test_<target>.py -v
+conda activate GREP-PRISM && uv run --active -m pytest tests/test_<target>.py -v
 ```
 If `conda` isn't on PATH in this shell, fall back to `uv run -m pytest tests/test_<target>.py -v`
 (still via `uv run`, and note the env caveat). For each failure, determine whether it's a **test bug** (fix the test and
