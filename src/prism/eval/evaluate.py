@@ -70,6 +70,7 @@ def _fixed_get_base_prompt(request, scene_graph, use_icl=True):
 spine_prompts.get_base_prompt_update_graph = _fixed_get_base_prompt
 
 from prism.models import gnn_llm
+from prism.models import composite_graph_llm
 from prism.models import inference
 from prism.models import utils as model_utils
 from prism.data import graph_sim
@@ -719,7 +720,7 @@ _aggregate_path_metrics = path_validator.aggregate_path_metrics
 
 def _is_graph_augmented(model) -> bool:
     """True if `model` is (or wraps) a GraphAugmentedLLM / GraphMaskLLM / CompositeGraphLLM (including PEFT)."""
-    graph_types = (gnn_llm.GraphAugmentedLLM, gnn_llm.GraphMaskLLM, gnn_llm.CompositeGraphLLM)
+    graph_types = (gnn_llm.GraphAugmentedLLM, gnn_llm.GraphMaskLLM, composite_graph_llm.CompositeGraphLLM)
     if isinstance(model, graph_types):
         return True
     inner = getattr(getattr(model, "base_model", None), "model", None)

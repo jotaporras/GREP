@@ -276,7 +276,7 @@ def train_model(config: "TrainConfig", config_file: str = None):
             config, "c_bias", False
         ):
             trainer.add_callback(
-                callbacks.LamCWarmupCallback(config.lam_c_warmup_steps)
+                callbacks.CBiasWarmupCallback(config.lam_c_warmup_steps)
             )
 
     # no_train: evaluate the untrained base model zero-shot instead of training.

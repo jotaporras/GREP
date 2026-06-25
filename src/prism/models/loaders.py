@@ -9,6 +9,7 @@ from safetensors.torch import load_file
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, PreTrainedTokenizer
 
 from prism.models import gnn_llm
+from prism.models import composite_graph_llm
 from prism.models import r_pearl
 from prism.models import gt as gt_module
 
@@ -217,7 +218,7 @@ def graph_augmented_llm_from_pretrained(
                 or gnn_cfg.get("c_bias", False)):
             # In-attention injection variants: pe_qk_injection adds GT code to q/k/v;
             # c_per_layer replaces q/k; c_bias (Design D) is an additive logit bias.
-            model = gnn_llm.InjectedCompositeGraphLLM(
+            model = composite_graph_llm.InjectedCompositeGraphLLM(
                 llm, gt_model, d_model=gnn_cfg["d_model"],
                 inject_v=gnn_cfg.get("pe_inject_v", True),
                 c_per_layer=gnn_cfg.get("c_per_layer", False),
@@ -227,7 +228,7 @@ def graph_augmented_llm_from_pretrained(
                 **composite_kwargs,
             )
         else:
-            model = gnn_llm.CompositeGraphLLM(llm, gt_model, d_model=gnn_cfg["d_model"], **composite_kwargs)
+            model = composite_graph_llm.CompositeGraphLLM(llm, gt_model, d_model=gnn_cfg["d_model"], **composite_kwargs)
         gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
         model.gt_model.load_state_dict(gnn_weights["gt_model"], strict=False)
         model.injection.load_state_dict(gnn_weights["injection"])

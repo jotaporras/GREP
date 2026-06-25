@@ -84,6 +84,7 @@ if "liger_kernel" not in sys.modules:
         sys.modules[_name] = _m
 
 from prism.models import gnn_llm
+from prism.models import composite_graph_llm
 from prism.models import r_pearl as r_pearl_module
 from prism.models import gt as gt_module
 from prism.training.train_v3 import GraphSFTTrainer
@@ -147,9 +148,9 @@ def _build(arch, seed, use_pe_norm=True):
                    crosslink_weight=1.0, crosslink_mention_to_node=True,
                    crosslink_mention_clique=True)
     if arch == "composite_plain":
-        return gnn_llm.CompositeGraphLLM(_tiny_llm(seed), _gt(seed), d_model=24, **_common)
+        return composite_graph_llm.CompositeGraphLLM(_tiny_llm(seed), _gt(seed), d_model=24, **_common)
     if arch == "composite_c_bias":
-        return gnn_llm.InjectedCompositeGraphLLM(
+        return composite_graph_llm.InjectedCompositeGraphLLM(
             _tiny_llm(seed), _gt(seed), d_model=24, inject_v=True, c_per_layer=False,
             c_bias=True, use_scene_bias=True, c_kernel="sampled", **_common)
     raise ValueError(arch)

@@ -9,13 +9,15 @@ from spine import models as spine_models
 from prism.data import compact_prompt
 from prism.data import utils
 from prism.models.gnn_llm import (
-    CompositeGraphLLM,
     GraphAugmentedLLM,
     GraphMaskLLM,
-    InjectedCompositeGraphLLM,
     build_injection_map,
     find_last_graph_scope,
     node_token_variants,
+)
+from prism.models.composite_graph_llm import (
+    CompositeGraphLLM,
+    InjectedCompositeGraphLLM,
 )
 
 

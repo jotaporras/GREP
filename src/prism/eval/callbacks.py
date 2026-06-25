@@ -491,7 +491,7 @@ class LoraWarmupCallback(TrainerCallback):
                   f"re-enabled {len(self._frozen_params)} LLM tensors")
 
 
-class LamCWarmupCallback(TrainerCallback):
+class CBiasWarmupCallback(TrainerCallback):
     """Linearly ramp the c_bias covariance gain λ_C from 0→1 over the first
     ``warmup_steps`` optimizer steps. Sets ``inner._lam_c_warmup`` each step
     (read in patched attention as ``λ_C·_lam_c_warmup``); no-op when ``warmup_steps<=0``.

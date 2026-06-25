@@ -8,6 +8,7 @@ Public surface:
 
 from prism.data import data
 from prism.models import gnn_llm
+from prism.models import composite_graph_llm
 from prism.models import r_pearl as r_pearl_module
 from prism.models import gt as gt_module
 
@@ -149,10 +150,10 @@ def build_planner_model(config, llm, tokenizer):
             composite_kwargs["c_bias"] = config.c_bias
             composite_kwargs["use_scene_bias"] = config.use_scene_bias
             composite_kwargs["c_kernel"] = config.c_kernel
-            model = gnn_llm.InjectedCompositeGraphLLM(
+            model = composite_graph_llm.InjectedCompositeGraphLLM(
                 llm, gt_model, d_model=config.d_model, **composite_kwargs)
         else:
-            model = gnn_llm.CompositeGraphLLM(
+            model = composite_graph_llm.CompositeGraphLLM(
                 llm, gt_model, d_model=config.d_model, **composite_kwargs)
         collator = data.SpineDataCollator(tokenizer, mlm=False)
 

@@ -10,7 +10,7 @@ from torch_geometric.data import Data
 from prism.models.composite_graph import build_composite_graph
 from prism.models.r_pearl import RandomGNNPositionalEncodings
 from prism.models.gt import GraphTransformer
-from prism.models.gnn_llm import GatedInjection
+from prism.models.composite_graph_llm import GatedInjection
 
 torch.manual_seed(0)
 PASS, FAIL = [], []

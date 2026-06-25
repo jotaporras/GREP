@@ -17,7 +17,7 @@ from torch_geometric.data import Data
 from transformers import LlamaConfig, LlamaForCausalLM
 
 from prism.models.gt import GraphTransformer
-from prism.models.gnn_llm import InjectedCompositeGraphLLM
+from prism.models.composite_graph_llm import InjectedCompositeGraphLLM
 from prism.models.llama import disable_rope, _IdentityRotaryEmbedding
 
 torch.manual_seed(0)
