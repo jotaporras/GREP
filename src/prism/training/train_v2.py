@@ -279,11 +279,21 @@ def train_model(config: "TrainConfig", config_file: str = None):
                 callbacks.CBiasWarmupCallback(config.lam_c_warmup_steps)
             )
 
-    # no_train: evaluate the untrained base model zero-shot instead of training.
+    cross_eval_dir = os.path.join(sft_args.output_dir, "eval_logs", "cross_eval")
+
+    # no_train: evaluate the untrained base model zero-shot instead of training. The
+    # capped eval set carries no graph-file provenance, so the JSONs record graph_file=null.
     if config.no_train:
         print("[no_train] Skipping optimization — evaluating the base model zero-shot.")
-        evaluate.run_zero_shot_eval(
-            trainer.model, tokenizer, config, sft_args.output_dir, eval_samples_by_graph
+        evaluate.evaluate_model(
+            trainer.model,
+            tokenizer,
+            eval_samples_by_graph,
+            output_dir=cross_eval_dir,
+            text_edge_list=config.text_edge_list,
+            use_icl=config.eval_use_icl,
+            architecture=config.architecture,
+            checkpoint_label=sft_args.output_dir,
         )
     else:
         trainer.train()
@@ -292,12 +302,22 @@ def train_model(config: "TrainConfig", config_file: str = None):
     trainer.save_model()
     tokenizer.save_pretrained(sft_args.output_dir)
 
+    # Post-training cross-eval on the in-memory (as-trained) model. (train_v3 reloads
+    # from disk to also exercise the save→load boundary; this legacy path does not.)
     if config.post_train_eval_graphs:
-        evaluate.run_post_train_cross_eval(
+        samples_by_graph, graph_file_by_name = data.load_samples_by_graph(
+            config.post_train_eval_graphs
+        )
+        evaluate.evaluate_model(
             trainer.model,
             tokenizer,
-            config,
-            sft_args.output_dir,
+            samples_by_graph,
+            graph_file_by_name,
+            output_dir=cross_eval_dir,
+            text_edge_list=config.text_edge_list,
+            use_icl=config.eval_use_icl,
+            architecture=config.architecture,
+            checkpoint_label=sft_args.output_dir,
         )
 
     return trainer

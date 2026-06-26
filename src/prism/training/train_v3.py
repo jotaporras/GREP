@@ -4,8 +4,8 @@ import warnings
 
 from prism.data import data
 from prism.eval import callbacks
+from prism.eval import checkpoint
 from prism.eval import evaluate
-from prism.eval import scalability_evaluation
 from prism.models import architectures
 from prism.models import composite_graph
 from prism.models import loaders as model_loaders
@@ -278,11 +278,22 @@ def train_model(config: omegaconf.DictConfig):
                 callbacks.CBiasWarmupCallback(config.lam_c_warmup_steps)
             )
 
-    # no_train: evaluate the untrained base model zero-shot instead of training.
+    cross_eval_dir = os.path.join(sft_args.output_dir, "eval_logs", "cross_eval")
+
+    # no_train: evaluate the untrained base model zero-shot instead of training. Uses
+    # the in-memory base model over the train-time eval set (no graph-file provenance
+    # is carried for that capped set, so the JSONs record graph_file=null).
     if config.no_train:
         print("[no_train] Skipping optimization — evaluating the base model zero-shot.")
-        evaluate.run_zero_shot_eval(
-            trainer.model, tokenizer, config, sft_args.output_dir, eval_samples_by_graph
+        evaluate.evaluate_model(
+            trainer.model,
+            tokenizer,
+            eval_samples_by_graph,
+            output_dir=cross_eval_dir,
+            text_edge_list=config.text_edge_list,
+            use_icl=config.eval_use_icl,
+            architecture=config.architecture,
+            checkpoint_label=sft_args.output_dir,
         )
     else:
         trainer.train()
@@ -291,26 +302,27 @@ def train_model(config: omegaconf.DictConfig):
     trainer.save_model()
     tokenizer.save_pretrained(sft_args.output_dir)
 
+    # Post-training cross-eval. Reload the just-saved checkpoint from disk (not the
+    # in-memory model) so this doubles as a save→load round-trip check of the adapter
+    # + gnn weights — the boundary an in-memory eval would never exercise.
     if config.post_train_eval_graphs:
-        evaluate.run_post_train_cross_eval(
-            trainer.model,
-            tokenizer,
-            config,
-            sft_args.output_dir,
+        samples_by_graph, graph_file_by_name = data.load_samples_by_graph(
+            config.post_train_eval_graphs
         )
-    
-    eval_graphs_dir = (
-        config.eval_data
-        if os.path.isdir(config.eval_data)
-        else os.path.dirname(config.eval_data)
-    )
-    scalability_evaluation.main([
-        "--checkpoint", sft_args.output_dir,
-        "--graphs", eval_graphs_dir,
-        "--four-bit",
-        "--text-edge-list", config.text_edge_list,
-        "--device", str(config.device),
-    ])
+        eval_model, eval_tokenizer, _ = checkpoint.load_checkpoint(
+            sft_args.output_dir, four_bit=config.bit4, device=config.device
+        )
+        evaluate.evaluate_model(
+            eval_model,
+            eval_tokenizer,
+            samples_by_graph,
+            graph_file_by_name,
+            output_dir=cross_eval_dir,
+            text_edge_list=config.text_edge_list,
+            use_icl=config.eval_use_icl,
+            architecture=config.architecture,
+            checkpoint_label=sft_args.output_dir,
+        )
 
     return trainer
 

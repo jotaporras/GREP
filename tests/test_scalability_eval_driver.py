@@ -1,14 +1,15 @@
-"""DL-mode verification of the END-OF-TRAINING scalability-eval driver.
+"""DL-mode verification of the standalone post-hoc scalability-eval driver.
 
-`train_v3.train_model` finishes by calling
-``scalability_evaluation.main([... --checkpoint --graphs --four-bit ...])``, which
-loads the checkpoint and drives ``evaluate.eval_model_multiple_graphs`` over the
-graph set, then writes per-graph JSON. The sibling suite
+``scalability_evaluation.main([... --checkpoint --graphs --four-bit ...])`` loads a
+checkpoint and drives ``evaluate.eval_model_multiple_graphs`` over the graph set,
+then writes per-graph JSON. It is a standalone driver for size/transferability
+sweeps (train_v3's own post-train eval now goes through
+``evaluate.evaluate_model``, not this module). The sibling suite
 (`tests/test_eval_inference_path.py`) already proves the per-architecture inference
 FORWARD runs on a real tiny model. This file closes the remaining gap: the
 orchestration glue that wraps that forward —
 
-  * the train_v3 → scalability_evaluation **argv contract** (the exact flags emitted),
+  * the driver's CLI **argv parsing** (the flags it accepts and routes),
   * ``_resolve_text_edge_list`` / ``_is_gnn_checkpoint`` (fail-loud policy recovery),
   * ``evaluate.eval_model_multiple_graphs`` **aggregation arithmetic** (folding the
     per-sample dicts into a ``GraphEvalResultSummary``),
@@ -98,14 +99,15 @@ def _canned_summary(name="g_test", *, with_samples=True):
 
 
 # ===========================================================================
-# Group 1 — train_v3 → scalability_evaluation ARGV CONTRACT (IFACE)
+# Group 1 — scalability_evaluation CLI PARSER (standalone driver)
 # ===========================================================================
+# NOTE: train_v3 no longer shells out to scalability_evaluation.main — post-train
+# eval now goes through prism.eval.evaluate.evaluate_model. scalability_evaluation
+# is once again a standalone post-hoc driver (size/transferability sweeps); these
+# tests pin its own parser, not any train_v3 argv contract.
 
-def test_trainv3_argv_parses_exactly():
-    """train_v3 ends with scalability_evaluation.main([... fixed flags ...]). The driver's
-    parser MUST accept that exact argv and route every value (regression guard on the
-    cross-module interface between the two named targets)."""
-    # The literal argv train_v3.train_model builds (train_v3.py lines 307-313).
+def test_full_argv_parses_and_routes():
+    """The driver's parser accepts a fully-specified argv and routes every value."""
     argv = [
         "--checkpoint", "/run/out",
         "--graphs", "/run/graphs",
@@ -119,14 +121,13 @@ def test_trainv3_argv_parses_exactly():
     assert ns.four_bit is True
     assert ns.text_edge_list == "present"
     assert ns.device == 0
-    # train_v3 never passes seeds -> non-seeded cross_eval layout must be selected.
+    # No seeds -> non-seeded cross_eval layout must be selected.
     assert ns.permutation_seed is None
     assert ns.use_icl == "true"  # documented default
 
 
 def test_text_edge_list_none_also_parses():
-    """text_edge_list is forwarded verbatim from config; 'none' must be an accepted choice
-    (train_v3 passes config.text_edge_list, which is 'present' or 'none')."""
+    """'none' must be an accepted --text-edge-list choice (the other valid policy)."""
     ns = se._parse_args(["--checkpoint", "c", "--graphs", "g", "--text-edge-list", "none"])
     assert ns.text_edge_list == "none"
 
