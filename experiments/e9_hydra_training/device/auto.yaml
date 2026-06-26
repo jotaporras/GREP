@@ -1,3 +1,0 @@
-# @package _global_
-# -1 = let device_map="auto" place the model. The merged default.
-device: -1

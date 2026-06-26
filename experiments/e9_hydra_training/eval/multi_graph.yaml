@@ -1,9 +1,0 @@
-# @package _global_
-# Multi-graph eval (e9): eval_data is a DIRECTORY of {graph, tasks} JSONs, capped to
-# eval_num_graphs each interval. The merged default.
-eval_data: data/revised/gen/nav100_n30_gemma_data/split/test_graphs
-eval_num_graphs: 5
-eval_epoch_interval: 1.0
-eval_use_icl: true
-n_icl_examples: 2
-post_train_eval_graphs: null

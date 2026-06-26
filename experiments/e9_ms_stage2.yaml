@@ -1,0 +1,31 @@
+# e9 multistage training — STAGE 2: freeze the SFT'd LLM, train ONLY the PE.
+#
+# The Stage-1 LoRA adapter is carried forward (trainer.init_lora_from=<stage1 dir>) and
+# FROZEN (trainer.freeze_lora=true); only the PE module trains. The objective is masked to
+# the edge-list tokens (trainer.loss_target=edge_list), so the encoder is trained as an
+# edge-list reconstructor — it must surface adjacency for the (frozen) LLM to emit the
+# `• Region Edges:` / `• Object Edges:` bullets. Edges MUST be in the text
+# (data.text_edge_list=present) so those target tokens exist. "As long as it takes": many
+# epochs, no overfit risk (LLM is fixed). The saved checkpoint is self-contained (frozen
+# adapter + trained PE) so it can be evaluated AND fed whole into Stage 3.
+#
+#   python -m prism.training.train_v3 --config-name=e9_ms_stage2 \
+#       trainer.init_lora_from=<resolved Stage-1 checkpoint dir>
+defaults:
+  - base_config
+  - _self_
+
+name: e9_ms_s2
+wandb:
+  run_name: e9_ms_stage2_pe
+eval:
+  # Bound eval cost over the long PE-only run (eval every 2 epochs).
+  epoch_interval: 2.0
+trainer:
+  learning_rate: 0.005
+  # "As long as it takes" — generous; bump or pass trainer.max_steps as needed.
+  epochs: 8
+  loss_target: edge_list
+  # Stage-2 freeze regime: LLM + carried adapter frozen, PE trains.
+  freeze_lora: true
+  # init_lora_from: <resolved Stage-1 checkpoint dir>   # supply on the CLI

@@ -1,5 +1,5 @@
 """Verification suite for ``prism.training.train_v3`` and its integration with the
-Hydra config tree under ``experiments/e9_hydra_training/``.
+nested Hydra config at ``experiments/base_config.yaml``.
 
 CS-ONLY scope (no ``DEEP-LEARNING`` flag): this file verifies *deterministic
 orchestration* only — config composition/plumbing, output-dir construction, model-name
@@ -9,6 +9,12 @@ forward/backward, gradients, or any learned/stochastic behaviour.
 
 The oracle for each contract is restated independently from the docstrings/spec of the
 target — never copied from its body.
+
+Config note: the former group tree (``experiments/e9_hydra_training/`` with overview/data/
+training/... groups) was flattened into a single nested ``experiments/base_config.yaml``
+(sections model/gnn/data/lora/trainer/eval/wandb). Per-experiment files inherit it via
+``defaults: [base_config, _self_]``. Group selections (``multistage=stage1_sft``) are gone;
+runs are reconstructed with flat key overrides (``gnn.arch=...``, ``trainer.freeze_pe=true``).
 
 Environment note: ``train_v3`` imports ``hydra``/``omegaconf``, which live in the conda
 env (``GREP-PRISM``) but NOT in the ``uv`` project env. Run this file with:
@@ -69,113 +75,164 @@ from prism.training.train_v3 import (
 from prism.eval.evaluate import GraphTokenAccuracyMixin
 from prism.models import composite_graph
 
-_CFG_DIR = os.path.abspath("experiments/e9_hydra_training")
+_CFG_DIR = os.path.abspath("experiments")
+
+# Per-experiment files that inherit base_config via `defaults: [base_config, _self_]`.
+_EXPERIMENT_CONFIGS = (
+    "e9_ms_stage1", "e9_ms_stage2", "e9_ms_stage3",
+    "e9_baseline_llm", "e9_baseline_llm_no_edges",
+)
 
 
-def _compose(overrides):
-    """Compose the e9 config with the given CLI-style overrides (fresh Hydra each call)."""
+def _compose(overrides, config_name="base_config"):
+    """Compose ``config_name`` with the given CLI-style overrides (fresh Hydra each call)."""
     with initialize_config_dir(version_base=None, config_dir=_CFG_DIR):
-        return compose(config_name="config", overrides=list(overrides))
+        return compose(config_name=config_name, overrides=list(overrides))
+
+
+_MISSING = object()
+
+
+def _present(cfg, dotted):
+    """True if a dotted path resolves to a present node (None counts as present)."""
+    return OmegaConf.select(cfg, dotted, default=_MISSING) is not _MISSING
 
 
 # ==========================================================================
-# Config integration — the e9 config tree must provide every field train_v3 reads
+# Config integration — base_config must provide every field train_v3 reads
 # ==========================================================================
-# Independent restatement of the flat keys train_v3.train_model() / its trainers read
-# off the composed config (config.<name>). Derived by reading the source, NOT by
-# importing it. Every default group composes unconditionally, so all of these must be
-# present in the default composition regardless of architecture.
+# Independent restatement of the keys train_v3.train_model() / its trainers read off the
+# composed config (config.<section>.<name>). Derived by reading the source, NOT by importing
+# it. Every section composes unconditionally, so all of these must be present in the default
+# composition regardless of architecture.
 _FIELDS_TRAIN_V3_READS = [
     # wandb / output-dir / overwrite
-    "wandb_project", "wandb_run_name", "wandb_tag", "checkpoint_dir", "save_name",
-    "name", "report_to", "overwrite_ok", "enable_visualizer",
+    "wandb.project", "wandb.run_name", "wandb.tag", "trainer.checkpoint_dir",
+    "trainer.save_name", "name", "trainer.report_to", "trainer.overwrite_ok",
+    "trainer.enable_visualizer",
     # model / device / quant
-    "base_model", "device", "bit4", "architecture",
+    "model.path", "trainer.device", "trainer.bit4", "gnn.arch",
     # data
-    "dataset_num_proc", "dataloader_num_workers", "max_seq_length", "text_edge_list",
+    "trainer.dataset_num_proc", "trainer.dataloader_num_workers", "data.max_seq_length",
+    "data.text_edge_list",
     # training hyperparams (plumbed into SFTConfig)
-    "per_device_train_batch_size", "per_device_eval_batch_size",
-    "gradient_accumulation_steps", "warmup_steps", "epochs", "max_steps",
-    "learning_rate", "weight_decay", "gradient_checkpointing", "no_train",
+    "trainer.per_device_train_batch_size", "trainer.per_device_eval_batch_size",
+    "trainer.gradient_accumulation_steps", "trainer.warmup_steps", "trainer.epochs",
+    "trainer.max_steps", "trainer.learning_rate", "trainer.weight_decay",
+    "trainer.gradient_checkpointing", "trainer.no_train",
     # lora
-    "r", "lora_alpha", "lora_dropout", "target_modules",
-    # multistage
-    "freeze_llm", "freeze_lora", "freeze_pe", "init_lora_from", "init_pe_from",
-    "loss_target", "lora_warmup_steps", "lam_c_warmup_steps",
+    "lora.r", "lora.alpha", "lora.dropout", "lora.target_modules",
+    # multistage (folded into trainer)
+    "trainer.freeze_llm", "trainer.freeze_lora", "trainer.freeze_pe",
+    "trainer.init_lora_from", "trainer.init_pe_from", "trainer.loss_target",
+    "trainer.lora_warmup_steps", "trainer.lam_c_warmup_steps",
     # structural / r-pearl
-    "d_model", "dropout", "use_layer_norm", "eps", "pe_gain_init", "use_pe_norm",
-    "pe_hidden_channels", "pe_num_layers", "num_samples", "k_pe", "pe_node_features",
+    "gnn.d_model", "gnn.dropout", "gnn.use_layer_norm", "gnn.eps", "gnn.pe_gain_init",
+    "gnn.use_pe_norm", "gnn.pe_hidden_channels", "gnn.pe_num_layers", "gnn.num_samples",
+    "gnn.k_pe", "gnn.pe_node_features",
     # gt
-    "k_gt", "gt_num_layers", "gt_heads",
+    "gnn.k_gt", "gnn.gt_num_layers", "gnn.gt_heads",
     # graph mask
-    "mask_k_hops", "mask_symmetrize", "mask_use_edges",
+    "gnn.mask_k_hops", "gnn.mask_symmetrize", "gnn.mask_use_edges",
     # eval / post-train
-    "eval_data", "eval_num_graphs", "eval_use_icl", "eval_epoch_interval",
-    "post_train_eval_graphs",
+    "eval.data", "eval.num_graphs", "eval.use_icl", "eval.epoch_interval",
+    "eval.post_train_graphs",
 ]
 
 
 def test_default_compose_provides_every_field_train_v3_reads():
-    """Integration: default composition supplies every flat key train_v3 accesses."""
+    """Integration: default composition supplies every key train_v3 accesses."""
     cfg = _compose([])
-    missing = [k for k in _FIELDS_TRAIN_V3_READS if k not in cfg]
-    assert not missing, f"default config is missing fields train_v3 reads: {missing}"
+    missing = [k for k in _FIELDS_TRAIN_V3_READS if not _present(cfg, k)]
+    assert not missing, f"base_config is missing fields train_v3 reads: {missing}"
 
 
 def test_default_compose_passes_validation():
-    """``_validate_config`` accepts the default composition and coerces ``eps`` to float."""
+    """``_validate_config`` accepts the default composition and coerces ``gnn.eps`` to float."""
     cfg = _compose([])
     _validate_config(cfg)
-    assert isinstance(cfg.eps, float)
+    assert isinstance(cfg.gnn.eps, float)
 
 
 def test_every_architecture_passes_validation_and_provides_its_fields():
-    """Each ``architecture`` value composes and validates; arch-specific groups are present."""
+    """Each ``gnn.arch`` value composes and validates; arch-specific keys are present."""
     for arch in ("llm", "rpearl_llm", "rpearl_gt_llm", "gt_llm", "graph_mask_llm"):
-        cfg = _compose([f"architecture={arch}"])
+        cfg = _compose([f"gnn.arch={arch}"])
         _validate_config(cfg)
-        # gt_* and mask_* always compose (their groups are in the default list), so the
-        # arch-conditional gnn_config reads in train_v3 never hit a missing key.
-        for k in ("k_gt", "gt_num_layers", "gt_heads", "mask_k_hops",
-                  "mask_symmetrize", "mask_use_edges"):
-            assert k in cfg, f"architecture={arch}: missing {k}"
+        # gt_* and mask_* always compose (one flat gnn section), so the arch-conditional
+        # gnn_config reads in train_v3 never hit a missing key.
+        for k in ("gnn.k_gt", "gnn.gt_num_layers", "gnn.gt_heads", "gnn.mask_k_hops",
+                  "gnn.mask_symmetrize", "gnn.mask_use_edges"):
+            assert _present(cfg, k), f"gnn.arch={arch}: missing {k}"
 
 
-def test_composite_graph_rebuild_params_for_every_design_option():
-    """Integration contract: for ``architecture=composite_graph_gt``, EVERY ``composite_graphs``
-    design option must compose into a config from which train_v3 can build ``gnn_config``.
-
-    train_v3 calls ``composite_graph.composite_graph_gnn_rebuild_params(config)`` unconditionally
-    when building ``gnn_config`` for ``composite_graph_gt`` (train_v3.py:204). The README lists
-    ``centered`` / ``c_bias`` / ``c_per_layer`` as first-class recipes, so each must work.
-    """
+def test_experiment_files_compose_and_validate():
+    """Every per-experiment file inherits base_config and passes validation."""
     failures = {}
-    for opt in ("default", "centered", "c_bias", "c_per_layer"):
-        cfg = _compose(["architecture=composite_graph_gt", f"composite_graphs={opt}"])
+    for name in _EXPERIMENT_CONFIGS:
+        try:
+            cfg = _compose([], config_name=name)
+            _validate_config(cfg)
+            # Each experiment still resolves every field train_v3 reads.
+            missing = [k for k in _FIELDS_TRAIN_V3_READS if not _present(cfg, k)]
+            assert not missing, f"missing {missing}"
+        except Exception as e:  # noqa: BLE001 — record the break, don't swallow it
+            failures[name] = f"{type(e).__name__}: {e}"
+    assert not failures, f"experiment configs fail to compose/validate: {failures}"
+
+
+def test_stage_experiment_overrides_take_effect():
+    """The multistage stage files actually carry their distinguishing overrides."""
+    s1 = _compose([], config_name="e9_ms_stage1")
+    assert s1.trainer.freeze_pe is True and s1.gnn.arch == "rpearl_llm"
+    s2 = _compose([], config_name="e9_ms_stage2")
+    assert s2.trainer.freeze_lora is True and s2.trainer.loss_target == "edge_list"
+    assert s2.data.text_edge_list == "present"  # edge_list target needs edges present
+    s3 = _compose([], config_name="e9_ms_stage3")
+    assert s3.data.text_edge_list == "none" and s3.trainer.loss_target == "responses"
+
+
+def test_composite_graph_rebuild_params_for_representative_variants():
+    """Integration contract: for ``gnn.arch=composite_graph_gt``, train_v3 builds gnn_config
+    via ``composite_graph.composite_graph_gnn_rebuild_params(config)`` (unconditionally for
+    that arch). It must return a non-empty rebuild dict across the injection variants the e7
+    designs exercise (plain / c_bias / c_per_layer / pe_qk_injection)."""
+    variants = {
+        "plain": ["gnn.arch=composite_graph_gt"],
+        "c_bias": ["gnn.arch=composite_graph_gt", "gnn.c_bias=true",
+                   "gnn.pe_readout=second_moment", "gnn.structural_lr_mult=3.0"],
+        "c_per_layer": ["gnn.arch=composite_graph_gt", "gnn.c_per_layer=true",
+                        "gnn.injection_mode=none"],
+        "pe_qk_injection": ["gnn.arch=composite_graph_gt", "gnn.pe_qk_injection=true"],
+    }
+    failures = {}
+    for label, ov in variants.items():
+        cfg = _compose(ov)
         try:
             params = composite_graph.composite_graph_gnn_rebuild_params(cfg)
             assert isinstance(params, dict) and params, "expected a non-empty rebuild dict"
         except Exception as e:  # noqa: BLE001 — record the break, don't swallow it
-            failures[opt] = f"{type(e).__name__}: {e}"
+            failures[label] = f"{type(e).__name__}: {e}"
     assert not failures, (
-        "composite_graphs options fail to build gnn_config for composite_graph_gt "
+        "composite variants fail to build gnn_config for composite_graph_gt "
         f"(train_v3 would crash before training): {failures}"
     )
 
 
-def test_readme_recipe_overrides_compose_and_validate():
-    """A spread of documented README recipes compose and pass ``_validate_config``."""
+def test_flat_override_recipes_compose_and_validate():
+    """A spread of documented flat-override recipes compose and pass ``_validate_config``."""
     recipes = [
-        ["architecture=llm"],
-        ["architecture=llm", "text_edge_list=none"],
-        ["architecture=rpearl_llm", "multistage=stage1_sft", "training=default"],
-        ["architecture=gt_llm", "gt=L5_d4096", "pe_node_features=word_embeddings"],
-        ["architecture=graph_mask_llm", "mask_k_hops=2", "mask_use_edges=false",
-         "freeze_llm=true"],
-        ["architecture=rpearl_gt_llm", "llm=gemma4_31b", "overview=e8",
-         "eval=single_graph", "bit4=true"],
-        ["architecture=llm", "training=zeroshot", "overview=e8", "eval=single_graph",
-         "data=legacy", "device=cuda0"],
+        ["gnn.arch=llm"],
+        ["gnn.arch=llm", "data.text_edge_list=none"],
+        ["gnn.arch=rpearl_llm", "trainer.freeze_pe=true"],                       # stage-1 SFT
+        ["gnn.arch=gt_llm", "gnn.gt_num_layers=5", "gnn.gt_heads=32", "gnn.k_gt=1",
+         "gnn.d_model=4096", "gnn.pe_node_features=word_embeddings"],            # gt L5_d4096
+        ["gnn.arch=graph_mask_llm", "gnn.mask_k_hops=2", "gnn.mask_use_edges=false",
+         "trainer.freeze_llm=true"],
+        ["gnn.arch=rpearl_gt_llm", "model.path=google/gemma-4-31B-it",
+         "eval.data=data/x/test_graphs/data_gen_023.json", "trainer.bit4=true"],
+        ["gnn.arch=llm", "trainer.no_train=true", "trainer.bit4=true",
+         "data.dataset_proportion=0.01", "data.text_edge_list=none", "trainer.device=0"],
     ]
     for ov in recipes:
         cfg = _compose(ov)
@@ -186,30 +243,30 @@ def test_readme_recipe_overrides_compose_and_validate():
 # structural_lr_mult plumbing — the bridge between config and create_optimizer
 # ==========================================================================
 # create_optimizer reads the boost factor from gnn_config: mult = gnn_config.get(
-# "structural_lr_mult", 1.0) (train_v3.py:494). The ONLY conduit that injects it into
-# gnn_config is composite_graph_gnn_rebuild_params(config) (train_v3.py:204) — and that
-# helper returns {} for any architecture != composite_graph_gt. So the boosted LR group
-# is reachable ONLY for composite_graph_gt; for every other graph arch the override is
-# silently dropped and create_optimizer falls back to 1.0. These two tests pin both halves
-# of that observed contract so a future change to the conduit is caught.
+# "structural_lr_mult", 1.0). The ONLY conduit that injects it into gnn_config is
+# composite_graph_gnn_rebuild_params(config) — and that helper returns {} for any
+# architecture != composite_graph_gt. So the boosted LR group is reachable ONLY for
+# composite_graph_gt; for every other graph arch the override is silently dropped and
+# create_optimizer falls back to 1.0. These two tests pin both halves of that observed
+# contract so a future change to the conduit is caught.
 def test_structural_lr_mult_carried_into_gnn_config_for_composite():
-    """For composite_graph_gt, config.structural_lr_mult survives into the rebuild params
+    """For composite_graph_gt, config.gnn.structural_lr_mult survives into the rebuild params
     create_optimizer reads — so the boosted-LR group actually engages with the configured
-    multiplier (here c_bias ships 3.0)."""
-    cfg = _compose(["architecture=composite_graph_gt", "composite_graphs=c_bias"])
+    multiplier."""
+    cfg = _compose(["gnn.arch=composite_graph_gt", "gnn.structural_lr_mult=3.0"])
     params = composite_graph.composite_graph_gnn_rebuild_params(cfg)
-    assert params.get("structural_lr_mult") == cfg.structural_lr_mult == 3.0
+    assert params.get("structural_lr_mult") == cfg.gnn.structural_lr_mult == 3.0
 
 
 def test_structural_lr_mult_override_dropped_for_non_composite_arch():
-    """REGRESSION GUARD on a known integration gap: a CLI structural_lr_mult override on a
+    """REGRESSION GUARD on a known integration gap: a structural_lr_mult override on a
     non-composite graph arch (gt_llm) is NOT plumbed into gnn_config — the sole conduit
     returns {} — so create_optimizer silently uses 1.0 despite config carrying 8.0. This
     documents current behaviour; if structural_lr_mult is ever made to apply to gt_llm,
     flip this assertion. (create_optimizer's docstring frames the structural group as
     'GT + R-PEARL + gate', which gt_llm has, so the silent drop is a latent foot-gun.)"""
-    cfg = _compose(["architecture=gt_llm", "structural_lr_mult=8.0"])
-    assert cfg.structural_lr_mult == 8.0  # the field IS set and validated...
+    cfg = _compose(["gnn.arch=gt_llm", "gnn.structural_lr_mult=8.0"])
+    assert cfg.gnn.structural_lr_mult == 8.0  # the field IS set and validated...
     params = composite_graph.composite_graph_gnn_rebuild_params(cfg)
     assert "structural_lr_mult" not in params  # ...but never reaches gnn_config → dropped
 
@@ -217,16 +274,20 @@ def test_structural_lr_mult_override_dropped_for_non_composite_arch():
 # ==========================================================================
 # _validate_config — coercion + domain rejection (loud failure on bad input)
 # ==========================================================================
-def _validation_cfg(**kw):
-    base = {"eps": "1e-6", "loss_target": "all", "text_edge_list": "present"}
-    base.update(kw)
-    return OmegaConf.create(base)
+def _validation_cfg(eps="1e-6", loss_target="all", text_edge_list="present"):
+    """A minimal NESTED config carrying just the fields ``_validate_config`` reads:
+    ``config.gnn.eps``, ``config.trainer.loss_target``, ``config.data.text_edge_list``."""
+    return OmegaConf.create({
+        "gnn": {"eps": eps},
+        "trainer": {"loss_target": loss_target},
+        "data": {"text_edge_list": text_edge_list},
+    })
 
 
 def test_validate_config_coerces_string_eps_to_float():
     cfg = _validation_cfg(eps="1e-5")
     _validate_config(cfg)
-    assert cfg.eps == 1e-5 and isinstance(cfg.eps, float)
+    assert cfg.gnn.eps == 1e-5 and isinstance(cfg.gnn.eps, float)
 
 
 def test_validate_config_rejects_unknown_loss_target():
@@ -251,7 +312,7 @@ def test_validate_config_accepts_all_valid_targets():
     for tgt in ("all", "responses", "edge_list"):
         cfg = _validation_cfg(loss_target=tgt, text_edge_list="present")
         _validate_config(cfg)
-        assert cfg.loss_target == tgt
+        assert cfg.trainer.loss_target == tgt
 
 
 # ==========================================================================
@@ -263,7 +324,7 @@ def test_model_short_name_documented_examples():
 
 
 def test_model_short_name_on_e9_base_models():
-    # The actual bases in the llm/ group must slug cleanly (used in the checkpoint dir).
+    # The actual bases in the model.path comments must slug cleanly (used in the ckpt dir).
     assert _model_short_name("google/gemma-4-12B-it") == "gemma-4-12b-it"
     assert _model_short_name("google/gemma-4-31B-it") == "gemma-4-31b-it"
 
@@ -276,13 +337,17 @@ def test_model_short_name_strips_instruct_and_collapses_hyphens():
 # ==========================================================================
 # _construct_output_dir — {checkpoint_dir}/{subdir}, wandb id always appended
 # ==========================================================================
-def _outdir_cfg(**kw):
-    base = {
-        "save_name": None, "checkpoint_dir": "ckpts", "base_model": "org/Llama-3.1-8B-Instruct",
-        "name": "run", "architecture": "rpearl_llm", "r": 16, "bit4": False,
-    }
-    base.update(kw)
-    return OmegaConf.create(base)
+def _outdir_cfg(save_name=None, checkpoint_dir="ckpts", path="org/Llama-3.1-8B-Instruct",
+                name="run", arch="rpearl_llm", r=16, bit4=False):
+    """A NESTED config carrying just the fields ``_construct_output_dir`` reads:
+    trainer.{save_name,checkpoint_dir,bit4}, model.path, name, gnn.arch, lora.r."""
+    return OmegaConf.create({
+        "name": name,
+        "model": {"path": path},
+        "gnn": {"arch": arch},
+        "lora": {"r": r},
+        "trainer": {"save_name": save_name, "checkpoint_dir": checkpoint_dir, "bit4": bit4},
+    })
 
 
 def test_construct_output_dir_auto_name():
@@ -304,8 +369,8 @@ def test_construct_output_dir_save_name_override_still_appends_wandb_id():
 # _bf16_supported / _fp16_supported — precision-capability flags
 # ==========================================================================
 def test_precision_flags_are_mutually_exclusive():
-    # Contract: fp16 helper returns False whenever bf16 is supported (train_v3.py:317),
-    # so the two SFTConfig precision flags can never both be True.
+    # Contract: fp16 helper returns False whenever bf16 is supported, so the two SFTConfig
+    # precision flags can never both be True.
     assert not (_bf16_supported() and _fp16_supported())
 
 

@@ -1,0 +1,17 @@
+# e9 reference baseline: plain LLM (LoRA SFT, no graph PE), edges REMOVED.
+#
+# The no-connectivity floor: a plain LLM with neither edge text NOR a graph PE. Pairs with
+# e9_baseline_llm.yaml (edges) to bracket the e9 PE model.
+#
+#   python -m prism.training.train_v3 --config-name=e9_baseline_llm_no_edges
+defaults:
+  - base_config
+  - _self_
+
+name: e9_baseline
+gnn:
+  arch: llm
+data:
+  text_edge_list: none
+wandb:
+  run_name: e9_baseline_llm_no_edges

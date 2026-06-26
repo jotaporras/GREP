@@ -33,12 +33,12 @@ from trl import SFTConfig, SFTTrainer
 
 def train_model(config: omegaconf.DictConfig):
     wandb_run_id = _setup_wandb(
-        config.wandb_project, config.wandb_run_name, config.wandb_tag
+        config.wandb.project, config.wandb.run_name, config.wandb.tag
     )
     # Dir: {name}_{architecture}_{model_slug}_r{r}[_4bit]
     output_dir = _construct_output_dir(config, wandb_run_id)
 
-    if os.path.isdir(output_dir) and os.listdir(output_dir) and not config.overwrite_ok:
+    if os.path.isdir(output_dir) and os.listdir(output_dir) and not config.trainer.overwrite_ok:
         raise RuntimeError(
             f"Checkpoint directory already exists and is non-empty: {output_dir}\n"
             f"Set overwrite_ok: true in your config to allow overwriting, "
@@ -47,7 +47,7 @@ def train_model(config: omegaconf.DictConfig):
 
     # Quantization / dtype
     bnb_config = None
-    if config.bit4:
+    if config.trainer.bit4:
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.bfloat16
@@ -58,14 +58,14 @@ def train_model(config: omegaconf.DictConfig):
         )
 
     # Model & tokenizer
-    device_map = {"": 0} if config.device >= 0 else "auto"
+    device_map = {"": 0} if config.trainer.device >= 0 else "auto"
     llm = AutoModelForCausalLM.from_pretrained(
-        config.base_model,
+        config.model.path,
         torch_dtype="auto",
         quantization_config=bnb_config,  # None if not 4-bit
         device_map=device_map,
     )
-    tokenizer = AutoTokenizer.from_pretrained(config.base_model, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(config.model.path, use_fast=True)
     _ensure_pad_tokens(tokenizer, llm)
     tokenizer.padding_side = "right"  # ty: ignore[invalid-assignment]
 
@@ -73,33 +73,33 @@ def train_model(config: omegaconf.DictConfig):
 
     # --- Multistage init: weight-only carry-over from a prior stage (NOT HF resume). --
     # Load PE first (lives outside the LoRA adapter), then attach the carried adapter.
-    is_graph_arch = config.architecture in (
+    is_graph_arch = config.gnn.arch in (
         "rpearl_llm",
         "rpearl_gt_llm",
         "gt_llm",
         "graph_mask_llm",
         "composite_graph_gt",
     )
-    if (config.init_pe_from or config.init_lora_from) and not is_graph_arch:
+    if (config.trainer.init_pe_from or config.trainer.init_lora_from) and not is_graph_arch:
         raise ValueError(
             "init_pe_from / init_lora_from are only supported for graph architectures."
         )
-    if config.init_pe_from:
+    if config.trainer.init_pe_from:
         model_loaders.load_pe_weights_into(
-            model, config.init_pe_from, config.architecture
+            model, config.trainer.init_pe_from, config.gnn.arch
         )
-    attach_existing_adapter = config.init_lora_from is not None
+    attach_existing_adapter = config.trainer.init_lora_from is not None
     if attach_existing_adapter:
         model = PeftModel.from_pretrained(
-            model, config.init_lora_from, is_trainable=not config.freeze_lora
+            model, config.trainer.init_lora_from, is_trainable=not config.trainer.freeze_lora
         )
-        if config.gradient_checkpointing and not config.freeze_lora:
+        if config.trainer.gradient_checkpointing and not config.trainer.freeze_lora:
             # Replicate TRL's get_peft_model behavior so LoRA gradients flow back
             # through the frozen base under gradient checkpointing.
             model.enable_input_require_grads()
         print(
-            f"[multistage] attached {'frozen' if config.freeze_lora else 'trainable'} "
-            f"LoRA adapter from {config.init_lora_from}"
+            f"[multistage] attached {'frozen' if config.trainer.freeze_lora else 'trainable'} "
+            f"LoRA adapter from {config.trainer.init_lora_from}"
         )
 
     train_dataset, eval_dataset = data.load_and_split_dataset(config, tokenizer)
@@ -107,11 +107,11 @@ def train_model(config: omegaconf.DictConfig):
     # LoRA config; for multimodal bases, exclude vision/audio towers (see architectures.peft_tower_exclude).
     tower_exclude = architectures.peft_tower_exclude(model)
     lora_config = LoraConfig(
-        r=config.r,
-        lora_alpha=config.lora_alpha,
-        lora_dropout=config.lora_dropout,
+        r=config.lora.r,
+        lora_alpha=config.lora.alpha,
+        lora_dropout=config.lora.dropout,
         bias="none",
-        target_modules=config.target_modules,
+        target_modules=list(config.lora.target_modules),
         exclude_modules=tower_exclude,
         task_type="CAUSAL_LM",
     )
@@ -121,25 +121,25 @@ def train_model(config: omegaconf.DictConfig):
             f"{tower_exclude!r} (vision/audio towers)"
         )
 
-    optim = "adamw_bnb_8bit" if config.bit4 else "adamw_torch_fused"
+    optim = "adamw_bnb_8bit" if config.trainer.bit4 else "adamw_torch_fused"
 
     # SFT trainer configuration
     sft_args = SFTConfig(
-        dataset_num_proc=config.dataset_num_proc,
-        dataloader_num_workers=config.dataloader_num_workers,
+        dataset_num_proc=config.trainer.dataset_num_proc,
+        dataloader_num_workers=config.trainer.dataloader_num_workers,
         packing=False,  # packing combines multiple examples into a single input_id. Keep disabled to avoid graph contamination.
-        max_length=config.max_seq_length,
-        per_device_train_batch_size=config.per_device_train_batch_size,
-        per_device_eval_batch_size=config.per_device_eval_batch_size,
-        gradient_accumulation_steps=config.gradient_accumulation_steps,
-        warmup_steps=config.warmup_steps,
-        num_train_epochs=config.epochs,
-        max_steps=config.max_steps,
-        learning_rate=config.learning_rate,
-        weight_decay=config.weight_decay,
+        max_length=config.data.max_seq_length,
+        per_device_train_batch_size=config.trainer.per_device_train_batch_size,
+        per_device_eval_batch_size=config.trainer.per_device_eval_batch_size,
+        gradient_accumulation_steps=config.trainer.gradient_accumulation_steps,
+        warmup_steps=config.trainer.warmup_steps,
+        num_train_epochs=config.trainer.epochs,
+        max_steps=config.trainer.max_steps,
+        learning_rate=config.trainer.learning_rate,
+        weight_decay=config.trainer.weight_decay,
         lr_scheduler_type="linear",
         logging_steps=15,
-        gradient_checkpointing=config.gradient_checkpointing,
+        gradient_checkpointing=config.trainer.gradient_checkpointing,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         # precision
         fp16=_fp16_supported(),
@@ -147,61 +147,44 @@ def train_model(config: omegaconf.DictConfig):
         # misc
         seed=3407,
         output_dir=output_dir,
-        report_to=config.report_to,
-        run_name=config.wandb_run_name,
+        report_to=config.trainer.report_to,
+        run_name=config.wandb.run_name,
         optim=optim,
         remove_unused_columns=False,
         # Checkpointing / Validation: step-based when max_steps is set (dev), else epoch-based.
-        save_strategy="steps" if config.max_steps > 0 else "epoch",
-        save_steps=max(1, config.max_steps // 2) if config.max_steps > 0 else 500,
+        save_strategy="steps" if config.trainer.max_steps > 0 else "epoch",
+        save_steps=max(1, config.trainer.max_steps // 2) if config.trainer.max_steps > 0 else 500,
         save_total_limit=3,
-        eval_strategy="steps" if config.max_steps > 0 else "epoch",
-        eval_steps=max(1, config.max_steps // 2) if config.max_steps > 0 else 0.5,
+        eval_strategy="steps" if config.trainer.max_steps > 0 else "epoch",
+        eval_steps=max(1, config.trainer.max_steps // 2) if config.trainer.max_steps > 0 else 0.5,
         do_eval=True,
     )
 
-    if config.architecture in (
+    if config.gnn.arch in (
         "rpearl_llm",
         "rpearl_gt_llm",
         "gt_llm",
         "graph_mask_llm",
         "composite_graph_gt",
     ):
+        # gnn_config is dumped to gnn_config.json and read back by loaders at eval, so the
+        # on-disk key NAMES must stay stable. These keys map 1:1 onto config.gnn fields;
+        # the remapped/cross-section ones (architecture, base_model, text_edge_list) and
+        # the arch-conditional groups are spelled out.
+        _direct = (
+            "pe_hidden_channels", "pe_num_layers", "d_model", "num_samples", "dropout",
+            "k_pe", "use_layer_norm", "eps", "pe_gain_init", "use_pe_norm", "pe_node_features",
+        )
         gnn_config = {
-            "architecture": config.architecture,
-            "base_model": config.base_model,
-            "pe_hidden_channels": config.pe_hidden_channels,
-            "pe_num_layers": config.pe_num_layers,
-            "d_model": config.d_model,
-            "num_samples": config.num_samples,
-            "dropout": config.dropout,
-            "k_pe": config.k_pe,
-            "use_layer_norm": config.use_layer_norm,
-            "text_edge_list": config.text_edge_list,
-            "eps": config.eps,
-            "pe_gain_init": config.pe_gain_init,
-            "use_pe_norm": config.use_pe_norm,
-            "pe_node_features": config.pe_node_features,
-            **(
-                {
-                    "k_gt": config.k_gt,
-                    "gt_num_layers": config.gt_num_layers,
-                    "gt_heads": config.gt_heads,
-                }
-                if config.architecture
-                in ("rpearl_gt_llm", "gt_llm", "composite_graph_gt")
-                else {}
-            ),
+            "architecture": config.gnn.arch,
+            "base_model": config.model.path,
+            "text_edge_list": config.data.text_edge_list,
+            **{k: config.gnn[k] for k in _direct},
+            **({k: config.gnn[k] for k in ("k_gt", "gt_num_layers", "gt_heads")}
+               if config.gnn.arch in ("rpearl_gt_llm", "gt_llm", "composite_graph_gt") else {}),
             # graph_mask_llm rebuild params (read back by loaders for eval).
-            **(
-                {
-                    "mask_k_hops": config.mask_k_hops,
-                    "mask_symmetrize": config.mask_symmetrize,
-                    "mask_use_edges": config.mask_use_edges,
-                }
-                if config.architecture == "graph_mask_llm"
-                else {}
-            ),
+            **({k: config.gnn[k] for k in ("mask_k_hops", "mask_symmetrize", "mask_use_edges")}
+               if config.gnn.arch == "graph_mask_llm" else {}),
             **composite_graph.composite_graph_gnn_rebuild_params(config),
         }
         trainer = GraphSFTTrainer(
@@ -211,14 +194,14 @@ def train_model(config: omegaconf.DictConfig):
             # No fresh adapter when one was carried forward (it's already attached)
             # or when freeze_llm requests a PE-only run on the raw base.
             peft_config=lora_config
-            if (not config.freeze_llm and not attach_existing_adapter)
+            if (not config.trainer.freeze_llm and not attach_existing_adapter)
             else None,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             args=sft_args,
             gnn_config=gnn_config,
-            freeze_pe=config.freeze_pe,
-            loss_target=config.loss_target,
+            freeze_pe=config.trainer.freeze_pe,
+            loss_target=config.trainer.loss_target,
         )
     else:
         trainer = BaselineSFTTrainer(
@@ -230,11 +213,11 @@ def train_model(config: omegaconf.DictConfig):
             eval_dataset=eval_dataset,
             args=sft_args,
             train_config={
-                "architecture": config.architecture,
-                "base_model": config.base_model,
-                "text_edge_list": config.text_edge_list,
+                "architecture": config.gnn.arch,
+                "base_model": config.model.path,
+                "text_edge_list": config.data.text_edge_list,
             },
-            loss_target=config.loss_target,
+            loss_target=config.trainer.loss_target,
         )
 
     # Log all training config parameters to wandb
@@ -245,37 +228,37 @@ def train_model(config: omegaconf.DictConfig):
         )
 
     eval_samples_by_graph = data.load_eval_samples_by_graph(
-        config.eval_data, config.eval_num_graphs
+        config.eval.data, config.eval.num_graphs
     )
     trainer.add_callback(
         callbacks.EvalCallback(
             eval_samples_by_graph,
             tokenizer=tokenizer,
-            use_icl=config.eval_use_icl,
-            include_edge_list=(config.text_edge_list == "present"),
-            eval_epoch_interval=config.eval_epoch_interval,
+            use_icl=config.eval.use_icl,
+            include_edge_list=(config.data.text_edge_list == "present"),
+            eval_epoch_interval=config.eval.epoch_interval,
         )
     )
 
     # Per-component grad norms, GT output magnitude, gate value, injection count.
-    if config.gradient_debug:
+    if config.trainer.gradient_debug:
         trainer.add_callback(callbacks.GradientDebugCallback())
 
-    if config.architecture == "composite_graph_gt":
+    if config.gnn.arch == "composite_graph_gt":
         # Fiedler, scene-mass, gate, contrib-ratio diagnostics (+ visualizer if enabled).
         trainer.add_callback(
             callbacks.AugGraphDebugCallback(
-                enable_visualizer=config.enable_visualizer,
+                enable_visualizer=config.trainer.enable_visualizer,
                 visualizer_dir=os.path.join(output_dir, "visuals"),
             )
         )
-        if config.lora_warmup_steps > 0:
-            trainer.add_callback(callbacks.LoraWarmupCallback(config.lora_warmup_steps))
-        if getattr(config, "lam_c_warmup_steps", 0) > 0 and getattr(
-            config, "c_bias", False
+        if config.trainer.lora_warmup_steps > 0:
+            trainer.add_callback(callbacks.LoraWarmupCallback(config.trainer.lora_warmup_steps))
+        if getattr(config.trainer, "lam_c_warmup_steps", 0) > 0 and getattr(
+            config.gnn, "c_bias", False
         ):
             trainer.add_callback(
-                callbacks.CBiasWarmupCallback(config.lam_c_warmup_steps)
+                callbacks.CBiasWarmupCallback(config.trainer.lam_c_warmup_steps)
             )
 
     cross_eval_dir = os.path.join(sft_args.output_dir, "eval_logs", "cross_eval")
@@ -283,16 +266,16 @@ def train_model(config: omegaconf.DictConfig):
     # no_train: evaluate the untrained base model zero-shot instead of training. Uses
     # the in-memory base model over the train-time eval set (no graph-file provenance
     # is carried for that capped set, so the JSONs record graph_file=null).
-    if config.no_train:
+    if config.trainer.no_train:
         print("[no_train] Skipping optimization — evaluating the base model zero-shot.")
         evaluate.evaluate_model(
             trainer.model,
             tokenizer,
             eval_samples_by_graph,
             output_dir=cross_eval_dir,
-            text_edge_list=config.text_edge_list,
-            use_icl=config.eval_use_icl,
-            architecture=config.architecture,
+            text_edge_list=config.data.text_edge_list,
+            use_icl=config.eval.use_icl,
+            architecture=config.gnn.arch,
             checkpoint_label=sft_args.output_dir,
         )
     else:
@@ -305,12 +288,12 @@ def train_model(config: omegaconf.DictConfig):
     # Post-training cross-eval. Reload the just-saved checkpoint from disk (not the
     # in-memory model) so this doubles as a save→load round-trip check of the adapter
     # + gnn weights — the boundary an in-memory eval would never exercise.
-    if config.post_train_eval_graphs:
+    if config.eval.post_train_graphs:
         samples_by_graph, graph_file_by_name = data.load_samples_by_graph(
-            config.post_train_eval_graphs
+            config.eval.post_train_graphs
         )
         eval_model, eval_tokenizer, _ = checkpoint.load_checkpoint(
-            sft_args.output_dir, four_bit=config.bit4, device=config.device
+            sft_args.output_dir, four_bit=config.trainer.bit4, device=config.trainer.device
         )
         evaluate.evaluate_model(
             eval_model,
@@ -318,9 +301,9 @@ def train_model(config: omegaconf.DictConfig):
             samples_by_graph,
             graph_file_by_name,
             output_dir=cross_eval_dir,
-            text_edge_list=config.text_edge_list,
-            use_icl=config.eval_use_icl,
-            architecture=config.architecture,
+            text_edge_list=config.data.text_edge_list,
+            use_icl=config.eval.use_icl,
+            architecture=config.gnn.arch,
             checkpoint_label=sft_args.output_dir,
         )
 
@@ -393,16 +376,16 @@ def _construct_output_dir(config: omegaconf.DictConfig, wandb_run_id: str) -> st
     ``subdir`` is the ``--save_name`` override or the auto-generated
     ``{name}_{architecture}_{model_slug}_r{r}[_4bit]``. The wandb run ID is always appended.
     """
-    if config.save_name is not None:
-        subdir = f"{config.save_name}_{wandb_run_id}"
+    if config.trainer.save_name is not None:
+        subdir = f"{config.trainer.save_name}_{wandb_run_id}"
     else:
-        model_slug = _model_short_name(config.base_model)
+        model_slug = _model_short_name(config.model.path)
         subdir = (
-            f"{config.name}_{config.architecture}_{model_slug}_r{config.r}"
-            + ("_4bit" if config.bit4 else "")
+            f"{config.name}_{config.gnn.arch}_{model_slug}_r{config.lora.r}"
+            + ("_4bit" if config.trainer.bit4 else "")
             + f"_{wandb_run_id}"
         )
-    return str(os.path.join(config.checkpoint_dir, subdir))
+    return str(os.path.join(config.trainer.checkpoint_dir, subdir))
 
 
 # Maps loss_target values to their precomputed per-example index column. "all" is
@@ -679,16 +662,16 @@ class BaselineSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
 # ----------------------------
 # Config (Hydra)
 # ----------------------------
-# All fields, defaults, and per-field docs live in the experiments/e9_hydra_training
-# config tree; the composed OmegaConf object is consumed directly (no static dataclass).
+# All fields, defaults, and per-field docs live in experiments/base_config.yaml;
+# the composed OmegaConf object is consumed directly (no static dataclass).
 def _validate_config(config: omegaconf.DictConfig) -> None:
     """Coerce/validate composed fields (replaces the former TrainConfig.__post_init__)."""
-    config.eps = float(config.eps)
-    if config.loss_target not in ("all", "responses", "edge_list"):
+    config.gnn.eps = float(config.gnn.eps)
+    if config.trainer.loss_target not in ("all", "responses", "edge_list"):
         raise ValueError(
-            f"loss_target must be 'all', 'responses', or 'edge_list', got {config.loss_target!r}"
+            f"loss_target must be 'all', 'responses', or 'edge_list', got {config.trainer.loss_target!r}"
         )
-    if config.loss_target == "edge_list" and config.text_edge_list != "present":
+    if config.trainer.loss_target == "edge_list" and config.data.text_edge_list != "present":
         raise ValueError(
             "loss_target='edge_list' requires text_edge_list='present'."
         )
@@ -699,8 +682,8 @@ def _validate_config(config: omegaconf.DictConfig) -> None:
 # ----------------------------
 @hydra.main(
     version_base=None,
-    config_path="../../../experiments/e9_hydra_training",
-    config_name="config",
+    config_path="../../../experiments",
+    config_name="base_config",
 )
 def main(config: omegaconf.DictConfig) -> None:
     """Compose a run from the config groups, e.g. `... architecture=gt_llm gt=L5_d4096`."""

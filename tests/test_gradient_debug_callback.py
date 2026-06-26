@@ -365,20 +365,19 @@ def test_on_log_augmented_keys_and_gains():
 # Hydra tag — config plumbing
 # --------------------------------------------------------------------------- #
 def test_gradient_debug_tag_present_and_bool():
-    """`gradient_debug` exists and is a bool in every overview config."""
+    """`gradient_debug` exists and is a bool under trainer in the base config."""
     import yaml
-    base = Path("experiments/e9_hydra_training/overview")
-    for f in ("e7.yaml", "e8.yaml", "e9.yaml"):
-        cfg = yaml.safe_load((base / f).read_text())
-        assert "gradient_debug" in cfg, f"{f}: missing gradient_debug tag"
-        assert isinstance(cfg["gradient_debug"], bool), \
-            f"{f}: gradient_debug is {type(cfg['gradient_debug'])}, not bool"
+    cfg = yaml.safe_load(Path("experiments/base_config.yaml").read_text())
+    trainer = cfg["trainer"]
+    assert "gradient_debug" in trainer, "base_config: missing trainer.gradient_debug tag"
+    assert isinstance(trainer["gradient_debug"], bool), \
+        f"trainer.gradient_debug is {type(trainer['gradient_debug'])}, not bool"
 
 
 def test_gradient_debug_gates_callback_registration():
     """train_v3 forks callback registration on the tag (the switch is wired)."""
     src = Path("src/prism/training/train_v3.py").read_text()
-    assert "if config.gradient_debug:" in src
+    assert "if config.trainer.gradient_debug:" in src
     assert "callbacks.GradientDebugCallback()" in src
 
 

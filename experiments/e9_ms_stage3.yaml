@@ -1,0 +1,25 @@
+# e9 multistage training — STAGE 3: unfreeze, train PE + LoRA jointly, NO edges.
+#
+# Launched AFTER analyzing Stage 2. Starts from the (self-contained) Stage-2 checkpoint:
+# trainer.init_lora_from=<stage2 dir> reattaches the SFT adapter as TRAINABLE and
+# trainer.init_pe_from=<stage2 dir> loads the trained PE (incl. its learned pe_gain).
+# data.text_edge_list=none removes the edge bullets, so the model must rely on the PE for
+# connectivity. Three epochs, assistant-only loss (fair comparison with Stage 1 / baselines).
+#
+#   python -m prism.training.train_v3 --config-name=e9_ms_stage3 \
+#       trainer.init_lora_from=<stage2 dir> trainer.init_pe_from=<stage2 dir>
+defaults:
+  - base_config
+  - _self_
+
+name: e9_ms_s3
+wandb:
+  run_name: e9_ms_stage3_joint
+data:
+  # Edge list REMOVED — connectivity must come from the PE now.
+  text_edge_list: none
+trainer:
+  learning_rate: 0.003
+  epochs: 3
+  # Stage-3 regime: both the carried adapter and the PE train.
+  # init_lora_from / init_pe_from: <resolved Stage-2 checkpoint dir>   # supply on the CLI

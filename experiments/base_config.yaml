@@ -1,0 +1,194 @@
+# GREP-PRISM unified training config (Hydra) — single nested base.
+#
+# This file holds the MERGED, MOST-RECENT-WINS default (e9 > e8 > e7): gemma-4-12B,
+# revised corpus, bf16 (bit4=false), multi-graph eval, assistant-only loss, rpearl_llm.
+# Per-experiment files under experiments/ inherit this via `defaults: [base_config, _self_]`
+# and override only their deltas. Architecture / sweep / base-model variants are documented
+# inline as commented alternatives (uncomment or override on the CLI, e.g.
+# `gnn.arch=gt_llm gnn.gt_num_layers=5 gnn.k_gt=1 gnn.pe_node_features=word_embeddings`).
+#
+# Consumed directly as a flat-ish nested OmegaConf object (no static dataclass); every
+# module receives the whole `config` and reads its own section.
+
+# Run-series label; used in the auto checkpoint subdir {name}_{arch}_{model}_r{r}[_4bit].
+name: e9
+
+model:
+  # Base LLM. Default = Gemma-4 12B (e8/e9).
+  #   meta-llama/Llama-3.1-8B-Instruct   # e7 architecture experiments
+  #   google/gemma-4-31B-it              # e8 g31b runs (multimodal; LoRA tower-exclusion auto-applied)
+  path: google/gemma-4-12B-it
+  # disable_rope: replaces RoPE with the structural code in composite/injection archs;
+  # a no-op elsewhere. disable_graph_token_rope: position_id 0 on node-name tokens so
+  # RoPE is identity there (set true for the norope_graph run).
+  disable_rope: true
+  disable_graph_token_rope: false
+
+gnn:
+  # Master architecture switch — determines which gnn.* keys the code actually reads;
+  # the rest compose harmlessly.
+  #   llm | rpearl_llm | rpearl_gt_llm | gt_llm | graph_mask_llm | composite_graph_gt
+  arch: rpearl_llm
+
+  # --- Numerics shared by the R-PEARL encoder AND the Graph Transformer + PE gate ---
+  d_model: 1024
+  dropout: 0.1
+  use_layer_norm: true
+  eps: 1e-6
+  # PE-injection gate g = tanh(pe_gain). 0.0 = closed at init (Ψ ramps in; PE still
+  # trains since tanh'(0)=1). use_pe_norm rescales projected Ψ to the embedding scale.
+  pe_gain_init: 0.0
+  use_pe_norm: true
+
+  # --- R-PEARL probe positional encoder ---
+  pe_hidden_channels: 256
+  pe_num_layers: 2
+  num_samples: 40
+  k_pe: 2
+  probe_distribution: gaussian
+  max_gather_rows: 2000000
+  fixed_seed_mode: false
+  fixed_seed_value: 0
+  # "mean" = E_q[Φ(q)] (additive-injection archs); composite_graph_gt overrides to
+  # "second_moment". pe_center_moment centers the second moment into a covariance.
+  pe_readout: mean
+  pe_center_moment: true
+  # "random" = PEARL random probes; "word_embeddings" = mean node-name word-embedding
+  # (deterministic). gt_llm REQUIRES word_embeddings.
+  pe_node_features: random
+
+  # --- Graph Transformer (rpearl_gt_llm / gt_llm / composite). Default = L2 baseline. ---
+  # gt_llm depth/width sweeps (use with arch=gt_llm pe_node_features=word_embeddings):
+  #   L3:        gt_num_layers=3 gt_heads=8  k_gt=1
+  #   L4:        gt_num_layers=4 gt_heads=8  k_gt=1
+  #   L5:        gt_num_layers=5 gt_heads=8  k_gt=1
+  #   L5_d2048:  gt_num_layers=5 gt_heads=16 k_gt=1 d_model=2048
+  #   L5_d3072:  gt_num_layers=5 gt_heads=24 k_gt=1 d_model=3072
+  #   L5_d4096:  gt_num_layers=5 gt_heads=32 k_gt=1 d_model=4096
+  gt_num_layers: 2
+  gt_heads: 8
+  k_gt: 2
+
+  # --- graph_mask_llm structural attention mask (parameter-free) ---
+  mask_k_hops: 1
+  mask_symmetrize: true
+  mask_use_edges: true
+
+  # --- composite_graph_gt (read ONLY when arch=composite_graph_gt) ---
+  # The e7 designs override the structural/gt block above AND these. Representative recipes
+  # (use with arch=composite_graph_gt data=legacy model.path=...llama... bit4=true):
+  #   centered:    d_model=4096 num_samples=96  pe_readout=second_moment injection_mode=none
+  #                structural_lr_mult=5.0 lora_warmup_steps=20
+  #   c_per_layer: (centered) + c_per_layer=true
+  #   c_bias (Design D): d_model=4096 num_samples=128 injection_mode=interpolate gate_init=0.3
+  #                c_bias=true structural_lr_mult=3.0 lora_warmup_steps=20 lam_c_warmup_steps=10
+  structural_lr_mult: 1.0
+  cycle_weight: 1.0
+  cycle_directed: true
+  crosslink_weight: 1.0
+  crosslink_mention_to_node: true
+  crosslink_mention_clique: true
+  injection_mode: interpolate
+  gate_init: 0.0
+  gate_per_dim: false
+  pe_qk_injection: false
+  pe_inject_v: true
+  c_per_layer: false
+  c_bias: false
+  use_scene_bias: true
+  c_kernel: sampled
+
+data:
+  # Revised nav100 corpus (e8/e9). Legacy e7 alternative:
+  #   train_files: data/gen/nav100_n30_gemma_data/split/formatted_all_new__train.json
+  #   val_files:   data/gen/nav100_n30_gemma_data/split/formatted_all_new__val.json
+  #   text_edge_list: none
+  train_files: data/revised/gen/nav100_n30_gemma_data/split/formatted_all_new__train.json
+  val_files: data/revised/gen/nav100_n30_gemma_data/split/formatted_all_new__val.json
+  val_frac: 0.1
+  dataset_proportion: 1.0
+  max_seq_length: 8192
+  # "present" writes the edge list into the prompt; "none" removes it (connectivity must
+  # come from the graph PE — the Stage-3 / no-edges axis).
+  text_edge_list: present
+  # debug=true downsamples train+val to dataset_proportion before splitting.
+  debug: false
+
+lora:
+  r: 16
+  alpha: 16
+  dropout: 0.2
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+trainer:
+  checkpoint_dir: outputs/e9_multistage_training
+  save_name: null
+  # -1 lets device_map="auto" place the model; 0 pins the whole model to GPU 0.
+  device: -1
+  # bf16 (bit4=false) is required for the PE-only stage; set bit4=true for e7/e8 4-bit runs.
+  bit4: false
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 2
+  gradient_checkpointing: true
+  dataloader_num_workers: 4
+  dataset_num_proc: 8
+  learning_rate: 0.0002
+  warmup_steps: 5
+  weight_decay: 0.05
+  epochs: 1
+  max_steps: -1
+  no_train: false
+  report_to: wandb
+  overwrite_ok: false
+  # Per-component grad-norm logging (no-op for non-PE/GT archs).
+  gradient_debug: true
+  # Composite-graph visualizer (no-op for non-composite archs).
+  enable_visualizer: false
+
+  # --- Freeze regime + multistage weight carry-over (NOT HF resume) ---
+  freeze_llm: false
+  freeze_lora: false
+  freeze_pe: false
+  init_lora_from: null
+  init_pe_from: null
+  # "all" | "responses" (assistant-only) | "edge_list". edge_list REQUIRES
+  # data.text_edge_list=present.
+  loss_target: responses
+  # Composite-graph warmup schedules (no-op when 0 / non-composite).
+  lora_warmup_steps: 0
+  lam_c_warmup_steps: 0
+
+eval:
+  # Multi-graph eval: a DIRECTORY of {graph, tasks} JSONs, capped to num_graphs/interval.
+  # Single-graph alternative (e7/e8): a single JSON file, e.g.
+  #   data: data/revised/gen/nav100_n30_gemma_data/split/test_graphs/data_gen_023.json
+  data: data/revised/gen/nav100_n30_gemma_data/split/test_graphs
+  num_graphs: 5
+  epoch_interval: 1.0
+  use_icl: true
+  # Held-out graph set evaluated once post-training (reloaded from the saved checkpoint).
+  post_train_graphs: null
+
+wandb:
+  project: GREP-PRISM
+  run_name: e9_hydra
+  tag: e9_multistage_training
+
+# Hydra runtime: do NOT chdir (relative data:/checkpoint paths resolve against launch cwd);
+# keep Hydra's own run logs under outputs/hydra/.
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: outputs/hydra/${now:%Y-%m-%d_%H-%M-%S}
+  sweep:
+    dir: outputs/hydra/multirun/${now:%Y-%m-%d_%H-%M-%S}
+    subdir: ${hydra.job.num}

@@ -1,6 +1,0 @@
-# @package _global_
-# gt_llm depth sweep, L=5 (k_gt=1). d_model inherits 1024.
-# Use with: architecture=gt_llm pe_node_features=word_embeddings
-gt_num_layers: 5
-gt_heads: 8
-k_gt: 1

@@ -1,7 +1,0 @@
-# @package _global_
-# gt_llm width sweep, L=5, d_model=2048 (head_dim 2048/16=128). k_gt=1.
-# Use with: architecture=gt_llm pe_node_features=word_embeddings
-gt_num_layers: 5
-gt_heads: 16
-k_gt: 1
-d_model: 2048

@@ -10,7 +10,7 @@ Two goals (DL-mode verifier):
      BOTH train and eval. We pin that the `m_test` constructor arg is gone, the
      `m_train`/`m_test` attributes are gone, and train()/eval() now request the SAME
      probe count — and that no `m_test`/`m_train` token survives in src/prism/models/
-     or experiments/e9_hydra_training/.
+     or experiments/.
 
 All CPU, tiny, fp32, seeded. The oracles are derived from the docstrings/spec, not by
 copying the implementation. No LLM is needed: these are standalone graph modules.
@@ -270,10 +270,10 @@ def test_train_eval_use_same_probe_count():
 
 
 def test_no_mtest_token_in_scope_files():
-    """No `m_test`/`m_train` token survives in src/prism/models/ or experiments/e9_hydra_training/."""
+    """No `m_test`/`m_train` token survives in src/prism/models/ or experiments/."""
     roots = {
         "src/prism/models": (".py",),
-        "experiments/e9_hydra_training": (".yaml", ".yml"),
+        "experiments": (".yaml", ".yml"),
     }
     pat = re.compile(r"\bm_(test|train)\b")
     offenders = []

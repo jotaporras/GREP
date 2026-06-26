@@ -1,0 +1,16 @@
+# e9 reference baseline: plain LLM (LoRA SFT, no graph PE), edges IN the text.
+#
+# The accuracy reference for the e9 multistage PE model. Same base model / data / eval /
+# assistant-only loss as the PE stages, so the only difference vs the Stage-3 model is the
+# graph PE.
+#
+#   python -m prism.training.train_v3 --config-name=e9_baseline_llm
+defaults:
+  - base_config
+  - _self_
+
+name: e9_baseline
+gnn:
+  arch: llm
+wandb:
+  run_name: e9_baseline_llm
