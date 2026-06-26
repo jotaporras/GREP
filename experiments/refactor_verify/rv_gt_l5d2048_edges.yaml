@@ -1,0 +1,41 @@
+# @package _global_
+# refactor_verify — GT (gt_llm) best variant = e8_gt_llm_no_edges_L5_d2048, EDGES-IN-TEXT arm.
+#
+# Mirrors the e8 numerics (L5, d_model=2048, 16 heads, k_gt=1, word-embedding node
+# features, 4-bit gemma-4-12B, 2 epochs) but migrated to the nested Hydra scheme. The
+# ONLY delta vs its _noedges sibling is data.text_edge_list (present here). On THIS branch
+# text_edge_list is live for graph archs (data.py:264 gates the prompt edge bullets), so
+# this arm = GT-PE + edges in the prompt.
+#
+#   python -m prism.training.train_v3 --config-name=refactor_verify/rv_gt_l5d2048_edges
+defaults:
+  - /base_config
+  - _self_
+
+name: rv_gt_l5d2048_edges
+gnn:
+  arch: gt_llm
+  d_model: 2048
+  gt_num_layers: 5
+  gt_heads: 16
+  k_gt: 1
+  pe_node_features: word_embeddings   # gt_llm requires this (GT has no probe fallback)
+  use_pe_norm: true
+  pe_gain_init: 0.0
+data:
+  text_edge_list: present
+trainer:
+  bit4: true
+  epochs: 2
+  freeze_llm: false
+  checkpoint_dir: outputs/refactor_verify
+  overwrite_ok: false
+eval:
+  # Train-time monitoring lens mirrors e8 (single held-out graph). The refactored
+  # disk-reload cross-eval runs over the full held-out set in post_train_graphs.
+  data: data/revised/gen/nav100_n30_gemma_data/split/test_graphs/data_gen_023.json
+  num_graphs: 1
+  post_train_graphs: data/revised/gen/nav100_n30_gemma_data/split/test_graphs
+wandb:
+  run_name: rv_gt_l5d2048_edges
+  tag: refactor_verify

@@ -1,0 +1,35 @@
+# @package _global_
+# refactor_verify — GraphMask (graph_mask_llm = e8_graph_mask_llm), EDGES-IN-TEXT arm.
+#
+# The real structural-adjacency mask (gnn.mask_use_edges=true): two node tokens may attend
+# only if their nodes share an edge (k=1). This arm ALSO puts the edge list in the prompt
+# (data.text_edge_list=present), so connectivity reaches the model via BOTH the mask and the
+# text. Paired with rv_gmask_noedges (same mask, no text edges) to isolate the textual-edge
+# axis on top of the adjacency mask.
+#
+#   python -m prism.training.train_v3 --config-name=refactor_verify/rv_gmask_edges
+defaults:
+  - /base_config
+  - _self_
+
+name: rv_gmask_edges
+gnn:
+  arch: graph_mask_llm
+  mask_k_hops: 1
+  mask_symmetrize: true
+  mask_use_edges: true    # mask follows actual adjacency (the graph-mask architecture)
+data:
+  text_edge_list: present
+trainer:
+  bit4: true
+  epochs: 2
+  freeze_llm: false
+  checkpoint_dir: outputs/refactor_verify
+  overwrite_ok: false
+eval:
+  data: data/revised/gen/nav100_n30_gemma_data/split/test_graphs/data_gen_023.json
+  num_graphs: 1
+  post_train_graphs: data/revised/gen/nav100_n30_gemma_data/split/test_graphs
+wandb:
+  run_name: rv_gmask_edges
+  tag: refactor_verify

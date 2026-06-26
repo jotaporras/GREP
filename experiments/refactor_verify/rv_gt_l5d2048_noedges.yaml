@@ -1,0 +1,37 @@
+# @package _global_
+# refactor_verify — GT (gt_llm) best variant = e8_gt_llm_no_edges_L5_d2048, NO-EDGES arm.
+#
+# Identical to rv_gt_l5d2048_edges except data.text_edge_list=none (GT-PE only, no edge
+# bullets in the prompt). This is the faithful migration of the literal e8 config, whose
+# name already says "no_edges".
+#
+#   python -m prism.training.train_v3 --config-name=refactor_verify/rv_gt_l5d2048_noedges
+defaults:
+  - /base_config
+  - _self_
+
+name: rv_gt_l5d2048_noedges
+gnn:
+  arch: gt_llm
+  d_model: 2048
+  gt_num_layers: 5
+  gt_heads: 16
+  k_gt: 1
+  pe_node_features: word_embeddings
+  use_pe_norm: true
+  pe_gain_init: 0.0
+data:
+  text_edge_list: none
+trainer:
+  bit4: true
+  epochs: 2
+  freeze_llm: false
+  checkpoint_dir: outputs/refactor_verify
+  overwrite_ok: false
+eval:
+  data: data/revised/gen/nav100_n30_gemma_data/split/test_graphs/data_gen_023.json
+  num_graphs: 1
+  post_train_graphs: data/revised/gen/nav100_n30_gemma_data/split/test_graphs
+wandb:
+  run_name: rv_gt_l5d2048_noedges
+  tag: refactor_verify

@@ -1,0 +1,32 @@
+# @package _global_
+# refactor_verify — RPEARL best variant = e8_rpearl_llm (plain rpearl_llm), EDGES-IN-TEXT arm.
+#
+# base_config is ALREADY rpearl_llm with the e8 R-PEARL numerics (d_model=1024,
+# pe_hidden_channels=256, pe_num_layers=2, num_samples=40, k_pe=2), so the gnn block needs
+# no override. The e8 file's run_name said "no_edges" but set text_edge_list=present; per
+# your call this is the genuine EDGES arm (text_edge_list=present → edge bullets + R-PEARL PE).
+#
+#   python -m prism.training.train_v3 --config-name=refactor_verify/rv_rpearl_edges
+defaults:
+  - /base_config
+  - _self_
+
+name: rv_rpearl_edges
+gnn:
+  arch: rpearl_llm
+  pe_gain_init: 0.0   # base default; e8_rpearl_llm left it unset (assumed 0.0) — see notes
+data:
+  text_edge_list: present
+trainer:
+  bit4: true
+  epochs: 2
+  freeze_llm: false
+  checkpoint_dir: outputs/refactor_verify
+  overwrite_ok: false
+eval:
+  data: data/revised/gen/nav100_n30_gemma_data/split/test_graphs/data_gen_023.json
+  num_graphs: 1
+  post_train_graphs: data/revised/gen/nav100_n30_gemma_data/split/test_graphs
+wandb:
+  run_name: rv_rpearl_edges
+  tag: refactor_verify
