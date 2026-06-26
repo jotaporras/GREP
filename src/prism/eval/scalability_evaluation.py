@@ -64,7 +64,7 @@ from prism.models import utils as model_utils
 # CLI
 # ----------------------------------------------------------------------------
 
-def _parse_args() -> argparse.Namespace:
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -90,7 +90,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--use-icl", choices=["true", "false"], default="true",
                    help="Include SPINE in-context-learning examples in the planner prompt. "
                         "Default: true (matches historical behavior).")
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
 # ----------------------------------------------------------------------------
@@ -277,8 +277,8 @@ def _make_progress_printer(samples_by_graph: dict[str, list[evaluate.EvalSample]
 # Main
 # ----------------------------------------------------------------------------
 
-def main() -> None:
-    args = _parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = _parse_args(argv)
     checkpoint = os.path.abspath(args.checkpoint.rstrip("/"))
     ckpt_name = os.path.basename(checkpoint)
 

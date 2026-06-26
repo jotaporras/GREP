@@ -5,6 +5,7 @@ import warnings
 from prism.data import data
 from prism.eval import callbacks
 from prism.eval import evaluate
+from prism.eval import scalability_evaluation
 from prism.models import architectures
 from prism.models import composite_graph
 from prism.models import loaders as model_loaders
@@ -297,6 +298,19 @@ def train_model(config: omegaconf.DictConfig):
             config,
             sft_args.output_dir,
         )
+    
+    eval_graphs_dir = (
+        config.eval_data
+        if os.path.isdir(config.eval_data)
+        else os.path.dirname(config.eval_data)
+    )
+    scalability_evaluation.main([
+        "--checkpoint", sft_args.output_dir,
+        "--graphs", eval_graphs_dir,
+        "--four-bit",
+        "--text-edge-list", config.text_edge_list,
+        "--device", str(config.device),
+    ])
 
     return trainer
 
