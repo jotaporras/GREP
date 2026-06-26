@@ -56,6 +56,7 @@ hf_transfer
 httpcore
 httpx
 huggingface-hub
+hydra-core
 idna
 importlib_metadata
 ipykernel
@@ -102,6 +103,7 @@ networkx
 notebook
 notebook_shim
 numpy
+omegaconf
 openai
 opt_einsum
 optype
