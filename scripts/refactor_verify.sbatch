@@ -8,16 +8,11 @@
 #SBATCH --mem=256G
 #SBATCH --array=0-5%3
 #
-# refactor_verify — rerun the "best" e8 architectures (GT / RPEARL / GraphMask, each
-# with and without the textual edge list) under the NEW nested Hydra config scheme, to
-# verify the eval refactor end-to-end (train -> save -> RELOAD-from-disk -> evaluate_model).
 #
-# === SUBMIT AS A JOB ARRAY, NOT A for-LOOP ==================================
-# This replaces the earlier `for c in ...; do CONFIG=$c sbatch ...; done` approach.
-# That flooded the scheduler with 6+ independent jobs which got packed onto the same
-# B200 nodes; the over-committed co-tenants were killed mid-eval (see reports/). A job
-# array with a `%N` concurrency cap (here %3) throttles how many run at once and lets
-# SLURM schedule the set as one managed unit.
+# This slurm script reruns some of the e8 best runs  (GT / RPEARL / GraphMask, each
+# with and without the textual edge list) to replicate after refactoring to support 
+# Hydra and include eval into training. Eval is run based on checkpoints to ensure
+# that loading is also functional.
 #
 #   idx  config                  arch            text_edge_list
 #   0    rv_gt_l5d2048_edges     gt_llm          present
@@ -26,22 +21,6 @@
 #   3    rv_rpearl_noedges       rpearl_llm      none
 #   4    rv_gmask_edges          graph_mask_llm  present  (real adjacency mask)
 #   5    rv_gmask_noedges        graph_mask_llm  none     (real adjacency mask)
-#
-# Each config (experiments/refactor_verify/rv_*.yaml) inherits base_config and sets
-# eval.post_train_graphs, so the refactored disk-reload cross-eval actually fires (it is a
-# no-op when post_train_graphs is null). This script OWNS the wandb run name and the
-# checkpoint save_name (one per task) via Hydra overrides, so neither falls back to the
-# base_config default `wandb.run_name: e9_hydra` — every run is named for its arch+edge arm.
-#
-# Submit:
-#   sbatch scripts/refactor_verify.sbatch                  # all 6, 3 at a time
-#   sbatch --array=0,2,4 scripts/refactor_verify.sbatch    # subset
-#   sbatch --array=2 scripts/refactor_verify.sbatch        # single arm (smoke the wrapper)
-#   TASK_ID=2 bash scripts/refactor_verify.sbatch          # local single-task run (no SLURM)
-#
-# Mirrors the working e8/e9 pattern: `srun python -m prism.training.train_v3 ...` with
-# SRUN_CPUS_PER_TASK exported (SLURM 22.05+ no longer propagates --cpus-per-task to steps)
-# and srun required so the step gets the GPU cgroup/device binding.
 
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/..}"
