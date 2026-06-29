@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=e9-multistage
 #SBATCH --output=/vast/home/j/jporras/sourcecode/GREP/slurm-%A_%a.out
-    #SBATCH --time=24:00:00
+#SBATCH --time=24:00:00
 #SBATCH --partition=dgx-b200
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=14
@@ -87,6 +87,6 @@ if [[ "$RUN_STAGE3" == "1" ]]; then
         trainer.freeze_lora=false \
         trainer.freeze_pe=false \
         data.text_edge_list="$TEXT_EDGE_LIST" \
-        trainer.learning_rate=0.0001 \
-        trainer.epochs=2
+        trainer.learning_rate=0.00025 \
+        trainer.epochs=3
 fi
