@@ -30,6 +30,6 @@ srun python -m prism.training.train_v3 \
     data.text_edge_list=present \
     trainer.freeze_pe=true \
     trainer.freeze_lora=false \
-    triner.loss_target=assistant_only \
+    trainer.loss_target=assistant_only \
     trainer.learning_rate=0.0002 \
     trainer.epochs=2
