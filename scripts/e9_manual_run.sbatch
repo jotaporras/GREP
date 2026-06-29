@@ -21,8 +21,8 @@ STAGE3_INIT_FROM="$CHECKPOINT_STAGE2_DIR/e9_ms_stage2_wd9gbmoj/checkpoint-200"
 CHECKPOINT_STAGE3_DIR="$ALELAB_DRIVE/GREP-PRISM/outputs/e9_multistage_training/e9_ms_stage3"
 
 RUN_STAGE1=${RUN_STAGE1:-0}
-RUN_STAGE2=${RUN_STAGE2:-1}
-RUN_STAGE3=${RUN_STAGE3:-0}
+RUN_STAGE2=${RUN_STAGE2:-0}
+RUN_STAGE3=${RUN_STAGE3:-1}
 
 # Loading env stuff
 module load anaconda3 2>/dev/null || true
@@ -30,7 +30,6 @@ source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate /vast/projects/aribeiro/alelab/jporras/envs/GREP-PRISM-v3
 
 # Stage 1 - SFT LLM for 0.5 epochs with usual LR.
-# TODO add skip eval flag.
 if [[ "$RUN_STAGE1" == "1" ]]; then
     srun python -m prism.training.train_v3 \
         --config-name="$BASE_CONFIG" \
@@ -42,9 +41,7 @@ if [[ "$RUN_STAGE1" == "1" ]]; then
         trainer.epochs=0.5
 fi
 
-
 # Stage 2 - PE-only on edge-list loss with LLM+adapter frozen. High LR.
-
 if [[ "$RUN_STAGE2" == "1" ]]; then
     srun python -m prism.training.train_v3 \
         --config-name="$BASE_CONFIG" \
@@ -62,15 +59,30 @@ fi
 # Stage 3 - joint PE + LoRA, edges removed. Small LR for both, smaller for PE. 
 
 if [[ "$RUN_STAGE3" == "1" ]]; then
+    # without edge list
     srun python -m prism.training.train_v3 \
         --config-name="$BASE_CONFIG" \
-        trainer.save_name="e9_ms_stage3" \
-        wandb.run_name="e9_ms_stage3" \
+        trainer.save_name="e9_ms_stage3__no_edge_list" \
+        wandb.run_name="e9_ms_stage3__no_edge_list" \
         trainer.init_lora_from="$STAGE3_INIT_FROM" \
         trainer.init_pe_from="$STAGE3_INIT_FROM" \
         trainer.checkpoint_dir="$CHECKPOINT_STAGE3_DIR" \
         trainer.freeze_lora=false \
         trainer.freeze_pe=false \
-        trainer.learning_rate=0.0002 \
-        trainer.epochs=1.5
+        data.text_edge_list=none \
+        trainer.learning_rate=0.0001 \
+        trainer.epochs=2
+    # With edge list
+    srun python -m prism.training.train_v3 \
+        --config-name="$BASE_CONFIG" \
+        trainer.save_name="e9_ms_stage3__with_edge_list" \
+        wandb.run_name="e9_ms_stage3__with_edge_list" \
+        trainer.init_lora_from="$STAGE3_INIT_FROM" \
+        trainer.init_pe_from="$STAGE3_INIT_FROM" \
+        trainer.checkpoint_dir="$CHECKPOINT_STAGE3_DIR" \
+        trainer.freeze_lora=false \
+        trainer.freeze_pe=false \
+        data.text_edge_list=present \
+        trainer.learning_rate=0.0001 \
+        trainer.epochs=2
 fi
