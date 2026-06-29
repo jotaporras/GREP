@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=e9-multistage
 #SBATCH --output=/vast/home/j/jporras/sourcecode/GREP/slurm-%j.out
-#SBATCH --time=24:00:00
+#SBATCH --time=3:00:00
 #SBATCH --partition=dgx-b200
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=14

@@ -36,3 +36,4 @@ results_old/
 shared/
 eval/*
 data_store/*
+slurm/
