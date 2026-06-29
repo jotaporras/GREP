@@ -16,6 +16,8 @@ BASE_CONFIG=e9_base_config
 #CHECKPOINT_STAGE1_DIR="$ALELAB_DRIVE/GREP-PRISM/outputs/e9_multistage_training/e9_ms_stage1"
 CHECKPOINT_STAGE1_DIR="$ALELAB_DRIVE/GREP-PRISM/outputs/refactor_verify/rv_rpearl_edges_hdkca8ed"
 CHECKPOINT_STAGE2_DIR="$ALELAB_DRIVE/GREP-PRISM/outputs/e9_multistage_training/e9_ms_stage2"
+# Stage 3 inits from this specific stage-2 epoch checkpoint (not the run root).
+STAGE3_INIT_FROM="$CHECKPOINT_STAGE2_DIR/e9_ms_stage2_wd9gbmoj/checkpoint-200"
 CHECKPOINT_STAGE3_DIR="$ALELAB_DRIVE/GREP-PRISM/outputs/e9_multistage_training/e9_ms_stage3"
 
 RUN_STAGE1=${RUN_STAGE1:-0}
@@ -64,8 +66,8 @@ if [[ "$RUN_STAGE3" == "1" ]]; then
         --config-name="$BASE_CONFIG" \
         trainer.save_name="e9_ms_stage3" \
         wandb.run_name="e9_ms_stage3" \
-        trainer.init_lora_from="$CHECKPOINT_STAGE2_DIR" \
-        trainer.init_pe_from="$CHECKPOINT_STAGE2_DIR" \
+        trainer.init_lora_from="$STAGE3_INIT_FROM" \
+        trainer.init_pe_from="$STAGE3_INIT_FROM" \
         trainer.checkpoint_dir="$CHECKPOINT_STAGE3_DIR" \
         trainer.freeze_lora=false \
         trainer.freeze_pe=false \
