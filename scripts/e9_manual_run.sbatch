@@ -13,7 +13,8 @@
 # So let's have a base cofig.
 BASE_CONFIG=e9_base_config
 # TODO make sure they get created
-CHECKPOINT_STAGE1_DIR="$ALELAB_DRIVE/GREP-PRISM/outputs/e9_multistage_training/e9_ms_stage1"
+#CHECKPOINT_STAGE1_DIR="$ALELAB_DRIVE/GREP-PRISM/outputs/e9_multistage_training/e9_ms_stage1"
+CHECKPOINT_STAGE1_DIR="$ALELAB_DRIVE/GREP-PRISM/outputs/refactor_verify/rv_rpearl_edges_hdkca8ed"
 CHECKPOINT_STAGE2_DIR="$ALELAB_DRIVE/GREP-PRISM/outputs/e9_multistage_training/e9_ms_stage2"
 CHECKPOINT_STAGE3_DIR="$ALELAB_DRIVE/GREP-PRISM/outputs/e9_multistage_training/e9_ms_stage3"
 
