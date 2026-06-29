@@ -18,7 +18,7 @@ CHECKPOINT_STAGE1_DIR="$ALELAB_DRIVE/GREP-PRISM/outputs/e9_multistage_training/e
 CHECKPOINT_STAGE2_DIR="$ALELAB_DRIVE/GREP-PRISM/outputs/e9_multistage_training/e9_ms_stage2"
 CHECKPOINT_STAGE3_DIR="$ALELAB_DRIVE/GREP-PRISM/outputs/e9_multistage_training/e9_ms_stage3"
 
-RUN_STAGE1=${RUN_STAGE1:-1}
+RUN_STAGE1=${RUN_STAGE1:-0}
 RUN_STAGE2=${RUN_STAGE2:-1}
 RUN_STAGE3=${RUN_STAGE3:-1}
 
@@ -87,7 +87,7 @@ if [[ "$RUN_STAGE2" == "1" ]]; then
         trainer.freeze_pe=false \
         trainer.loss_target=edge_list \
         trainer.learning_rate=0.005 \
-        trainer.epochs=4
+        trainer.epochs=2
 fi
 
 # Stage 3 - joint PE + LoRA, edges removed. Small LR for both, smaller for PE.
