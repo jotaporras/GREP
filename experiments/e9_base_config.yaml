@@ -1,0 +1,10 @@
+# To be extended by each training stage
+defaults:
+  - base_config
+  - _self_
+
+name: e9_base_config
+wandb:
+    project: GREP-PRISM
+    run_name: e9_base_config
+    tag: e9_multistage_training

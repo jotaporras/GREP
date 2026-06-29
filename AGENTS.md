@@ -31,12 +31,12 @@ Used to fill in placeholders in `~/.claude/skills/cluster-slurm/template.sbatch`
 
 - `PROJECT`: `GREP-PRISM`
 - `ENTITY`: `alelab` (wandb)
-- `ENV_NAME`: `/vast/projects/aribeiro/alelab/jporras/envs/GREP-PRISM`
-- `OUTPUT_BASE`: `/vast/projects/aribeiro/alelab/jporras/GREP-PRISM`
-- SLURM output dir: `/vast/projects/aribeiro/alelab/jporras/GREP-PRISM/slurm-%A_%a.out`
-- Repo path on cluster: `/vast/projects/aribeiro/alelab/jporras/GREP-PRISM`
+- `ENV_NAME`: `/vast/projects/aribeiro/alelab/jporras/envs/GREP-PRISM-v3`
+- `OUTPUT_BASE` (artifact root — checkpoints, outputs, logs): `$ALELAB_DRIVE/GREP-PRISM`, where `$ALELAB_DRIVE=/vast/projects/aribeiro/alelab/jporras`
+- SLURM output dir: `$ALELAB_DRIVE/GREP-PRISM/slurm-%A_%a.out`
+- Repo path on cluster (code only): `~/sourcecode/GREP` (`/vast/home/j/jporras/sourcecode/GREP`). Code reaches the cluster via `git pull`, never rsync; artifacts live under `OUTPUT_BASE`, never in the repo.
 - Default partition: `dgx-b200`
-- Entry: `python -m prism.training.train_v2 <yaml> [--key value ...]` (yaml + CLI overrides supported since the e4 sweep)
+- Entry: `python -m prism.training.train_v3 --config-name=<config> [key=value ...]` (nested Hydra configs under `experiments/`; CLI `key=value` overrides supported)
 
 
 ## Project Structure & Module Organization
@@ -45,26 +45,7 @@ Used to fill in placeholders in `~/.claude/skills/cluster-slurm/template.sbatch`
 - `data/` stores seed eval graphs and generated corpora; keep new experiments under `data/eval/` or sibling folders.
 
 ## Environment Setup
-- Empirically stable dependency set:
-  ```
-  torch
-  transformers==4.51.2
-  datasets==3.5.0
-  accelerate==1.6.0
-  peft==0.15.2
-  trl==0.15.2
-  unsloth==2025.3.19
-  unsloth_zoo==2025.3.17
-  safetensors==0.5.3
-  sentencepiece==0.2.0
-  tokenizers==0.21.1
-  numpy==1.26.4
-  tqdm==4.67.1
-  wandb==0.19.9
-  openai==1.70.0
-  bitsandbytes
-  tiktoken
-  ```
+- `requirements.txt` is the source of truth for dependencies.
 - Clone the PRISM branch of SPINE for planner interoperability:
   ```bash
   git clone git@github.com:KumarRobotics/SPINE.git
@@ -75,11 +56,11 @@ Used to fill in placeholders in `~/.claude/skills/cluster-slurm/template.sbatch`
   Ensure SPINE is importable (editable install or `PYTHONPATH`).
 
 ## Build, Test, and Development Commands
-- `python -m pip install -r requirements.txt` restores the broader CUDA-ready toolchain after the minimal set above.
+- `python -m pip install -r requirements.txt` installs the dependency set (`requirements.txt` is the source of truth).
 - `python -m pip install -e .` enables `prism.*` imports in scripts and notebooks.
 - `python scripts/generate_data_spine.py --n-samples 10 --n-tasks 3 --name demo` creates SPINE training data; other generators share similar flags.
-- `python scripts/train_llama3_llora.py --name llama3_demo --data data/gpt_gen_formatted.json` launches LoRA SFT; adjust `--bit4`/`--r` as needed.
-- `python scripts/eval.py` scores checkpoints against `data/eval/` tasks; capture accuracy for review.
+- `python -m prism.training.train_v3 --config-name=<config> [key=value ...]` launches training (LoRA SFT) from a nested Hydra config under `experiments/`.
+- Evaluation runs as part of `train_v3` via the Hydra `eval.*` block: set `eval.post_train_graphs` to reload the saved checkpoint from disk and cross-evaluate the held-out set.
 
 ## Coding Style & Naming Conventions
 - Use Black/Isort/Flake8 (see README); run `pre-commit install`, then `pre-commit run --all-files` before committing.
@@ -89,7 +70,7 @@ Used to fill in placeholders in `~/.claude/skills/cluster-slurm/template.sbatch`
 - Imports: always `from pkg import mod; mod.name`, never `from pkg.mod import name`.
 
 ## Testing Guidelines
-- Tests live under `tests/`; run with `conda run -n GREP-PRISM python -m pytest tests/ -v`.
+- Tests live under `tests/`; run with `conda run -n GREP-PRISM-v3 python -m pytest tests/ -v`.
 - Existing suites: `test_scene_graph_parser.py`, `test_sim.py`, `test_bucketize_prompt.py`, `test_remove_edge_list.py`.
 - `test_sim.py` covers `GraphSim.take_action` and SPINE plan parsing; uses an inline `_DummyClient` to avoid LLM calls.
 - Keep repro artifacts small; expand `data/eval/` fixtures for new eval scenarios.
@@ -113,7 +94,7 @@ General principles for verification:
 
 ## Package Management
 - NEVER install, upgrade, or remove packages without explicitly telling the user first and getting approval.
-- The full working conda env is `GREP-PRISM`. Always activate it before running Python.
+- The full working conda env is `GREP-PRISM-v3`. Always activate it before running Python.
 
 ## Security & Configuration Tips
 - Keep API keys (OpenAI, Hugging Face, WANDB) and filesystem paths in environment variables or `.env`; never commit secrets.
