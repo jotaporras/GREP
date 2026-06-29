@@ -28,8 +28,6 @@ srun python -m prism.training.train_v3 \
     model.path="$MODEL_PATH" \
     gnn.arch=llm \
     data.text_edge_list=present \
-    trainer.freeze_pe=true \
     trainer.freeze_lora=false \
-    trainer.loss_target=assistant_only \
     trainer.learning_rate=0.0002 \
     trainer.epochs=2
