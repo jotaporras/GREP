@@ -10,7 +10,7 @@
 # This runs 2-epoch gemma 31B baseline after the refactors to have as a reference vs multistage.
 # We expect this to be close to 100%
 BASE_CONFIG=e9_base_config
-CHECKPOINT_DIR="$ALELAB_DRIVE/GREP-PRISM/outputs/e9_llm_baseline_noedges"
+CHECKPOINT_DIR="$ALELAB_DRIVE/GREP-PRISM/outputs/e9_rpearl_llm_edges"
 
 # Base LLM for all stages.
 MODEL_PATH="google/gemma-4-31B-it"
@@ -26,9 +26,10 @@ srun python -m prism.training.train_v3 \
     wandb.run_name="e9_llm_baseline_noedges__gemma31b" \
     trainer.checkpoint_dir="$CHECKPOINT_DIR" \
     model.path="$MODEL_PATH" \
-    gnn.arch=llm \
-    #data.text_edge_list=present \
-    data.text_edge_list=none \
+    gnn.arch=rpearl_llm \
+    pe_gain_init=0.0 \
+    data.text_edge_list=present \
+    #data.text_edge_list=none \
     trainer.freeze_lora=false \
     trainer.learning_rate=0.0002 \
     trainer.epochs=2
