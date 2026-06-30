@@ -27,7 +27,7 @@ srun python -m prism.training.train_v3 \
     trainer.checkpoint_dir="$CHECKPOINT_DIR" \
     model.path="$MODEL_PATH" \
     gnn.arch=rpearl_llm \
-    pe_gain_init=0.0 \
+    gnn.pe_gain_init=0.0 \
     data.text_edge_list=present \
     #data.text_edge_list=none \
     trainer.freeze_lora=false \
