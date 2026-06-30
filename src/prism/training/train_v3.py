@@ -78,6 +78,7 @@ def train_model(config: omegaconf.DictConfig):
         "rpearl_gt_llm",
         "gt_llm",
         "graph_mask_llm",
+        "learnable_graph_mask",
         "composite_graph_gt",
     )
     if (config.trainer.init_pe_from or config.trainer.init_lora_from) and not is_graph_arch:
@@ -165,6 +166,7 @@ def train_model(config: omegaconf.DictConfig):
         "rpearl_gt_llm",
         "gt_llm",
         "graph_mask_llm",
+        "learnable_graph_mask",
         "composite_graph_gt",
     ):
         # gnn_config is dumped to gnn_config.json and read back by loaders at eval, so the
@@ -181,10 +183,14 @@ def train_model(config: omegaconf.DictConfig):
             "text_edge_list": config.data.text_edge_list,
             **{k: config.gnn[k] for k in _direct},
             **({k: config.gnn[k] for k in ("k_gt", "gt_num_layers", "gt_heads")}
-               if config.gnn.arch in ("rpearl_gt_llm", "gt_llm", "composite_graph_gt") else {}),
-            # graph_mask_llm rebuild params (read back by loaders for eval).
+               if config.gnn.arch in ("rpearl_gt_llm", "gt_llm", "composite_graph_gt",
+                                       "learnable_graph_mask") else {}),
+            # graph_mask_llm / learnable_graph_mask adjacency (A) rebuild params.
             **({k: config.gnn[k] for k in ("mask_k_hops", "mask_symmetrize", "mask_use_edges")}
-               if config.gnn.arch == "graph_mask_llm" else {}),
+               if config.gnn.arch in ("graph_mask_llm", "learnable_graph_mask") else {}),
+            # learnable_graph_mask extra params (read back by loaders for eval).
+            **({k: config.gnn[k] for k in ("mask_alpha", "mask_layer_scope", "mask_psi_scale")}
+               if config.gnn.arch == "learnable_graph_mask" else {}),
             **composite_graph.composite_graph_gnn_rebuild_params(config),
         }
         trainer = GraphSFTTrainer(
@@ -591,6 +597,13 @@ class GraphSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
         elif self.gnn_config.get("architecture") == "graph_mask_llm":
             # Parameter-free: mask rebuilt from config; gnn_config.json + LoRA adapter suffice.
             pass
+        elif self.gnn_config.get("architecture") == "learnable_graph_mask":
+            # Save the standalone GraphTransformer (Psi producer); the mask + adjacency
+            # rebuild from gnn_config and the LoRA adapter is saved below.
+            torch.save(
+                {"pe_model": self.model.pe_model.state_dict()},
+                os.path.join(output_dir, "gnn_weights.pt"),
+            )
         elif self.gnn_config.get("architecture") == "rpearl_gt_llm":
             # Full GT: save the whole GraphTransformer (includes R-PEARL inside) + projection head.
             torch.save(
@@ -667,6 +680,21 @@ class BaselineSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
 def _validate_config(config: omegaconf.DictConfig) -> None:
     """Coerce/validate composed fields (replaces the former TrainConfig.__post_init__)."""
     config.gnn.eps = float(config.gnn.eps)
+    if config.gnn.arch == "learnable_graph_mask":
+        if not 0.0 <= float(config.gnn.mask_alpha) < 1.0:
+            raise ValueError(
+                f"gnn.mask_alpha must be in [0, 1) (alpha=1 kills the GT gradient), "
+                f"got {config.gnn.mask_alpha}")
+        if config.gnn.mask_layer_scope not in ("all", "dense"):
+            raise ValueError(
+                f"gnn.mask_layer_scope must be 'all' or 'dense', got {config.gnn.mask_layer_scope!r}")
+        if config.gnn.mask_psi_scale not in ("cosine", "inv_sqrt_d"):
+            raise ValueError(
+                f"gnn.mask_psi_scale must be 'cosine' or 'inv_sqrt_d', got {config.gnn.mask_psi_scale!r}")
+        if config.gnn.mask_psi_scale == "cosine" and not config.gnn.mask_use_edges:
+            raise ValueError(
+                "gnn.mask_psi_scale='cosine' with gnn.mask_use_edges=false is degenerate "
+                "(constant mask, zero GT gradient). Use mask_psi_scale='inv_sqrt_d' or keep edges.")
     if config.trainer.loss_target not in ("all", "responses", "edge_list"):
         raise ValueError(
             f"loss_target must be 'all', 'responses', or 'edge_list', got {config.trainer.loss_target!r}"

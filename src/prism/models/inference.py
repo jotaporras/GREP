@@ -11,6 +11,7 @@ from prism.data import utils
 from prism.models.gnn_llm import (
     GraphAugmentedLLM,
     GraphMaskLLM,
+    LearnableGraphMaskLLM,
     build_injection_map,
     find_last_graph_scope,
     node_token_variants,
@@ -36,7 +37,8 @@ def _core_graph_model(model):
     """
     inner = model
     for _ in range(5):
-        if isinstance(inner, (CompositeGraphLLM, GraphAugmentedLLM, GraphMaskLLM)):
+        if isinstance(inner, (CompositeGraphLLM, GraphAugmentedLLM, GraphMaskLLM,
+                              LearnableGraphMaskLLM)):
             return inner
         nxt = getattr(inner, "base_model", None)
         if nxt is None or nxt is inner:
@@ -183,8 +185,9 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
 
         injection_map = build_injection_map(input_ids_list, node_token_seqs, scope_start=scope_start)
 
-        if isinstance(graph_model, GraphMaskLLM):
-            # Build and arm [1, 1, seq, seq] additive adjacency bias; cleared in finally.
+        if isinstance(graph_model, (GraphMaskLLM, LearnableGraphMaskLLM)):
+            # Build and arm [1, 1, seq, seq] additive (adjacency or learned-relative-PE) bias;
+            # both classes share build_structural_mask + _struct_bias; cleared in finally.
             graph_model._struct_bias = graph_model.build_structural_mask(
                 input_ids.shape[1], [pyg_graph], [injection_map], input_ids.device)
             try:

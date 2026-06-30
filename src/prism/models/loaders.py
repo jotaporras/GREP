@@ -181,6 +181,35 @@ def graph_augmented_llm_from_pretrained(
             symmetrize=gnn_cfg.get("mask_symmetrize", True),
             use_edges=gnn_cfg.get("mask_use_edges", True),
         )
+    elif architecture == "learnable_graph_mask":
+        # Learnable relative-PE mask: rebuild the standalone GraphTransformer (Psi
+        # producer) and load it; adjacency + mask rebuild from gnn_config. The LoRA
+        # adapter was already merged into `llm` above.
+        pe_model = gt_module.GraphTransformer(
+            num_layers=gnn_cfg["gt_num_layers"],
+            pe_hidden_channels=gnn_cfg["pe_hidden_channels"],
+            pe_num_layers=gnn_cfg["pe_num_layers"],
+            d_model=gnn_cfg["d_model"],
+            heads=gnn_cfg["gt_heads"],
+            num_samples=gnn_cfg["num_samples"],
+            dropout=gnn_cfg["dropout"],
+            k_pe=gnn_cfg["k_pe"],
+            k_gt=gnn_cfg["k_gt"],
+            eps=gnn_cfg["eps"],
+            use_layer_norm=gnn_cfg["use_layer_norm"],
+            node_feature_dim=node_feature_dim,
+        )
+        model = gnn_llm.LearnableGraphMaskLLM(
+            llm, pe_model,
+            alpha=gnn_cfg.get("mask_alpha", 0.7),
+            layer_scope=gnn_cfg.get("mask_layer_scope", "dense"),
+            k_hops=gnn_cfg.get("mask_k_hops", 1),
+            symmetrize=gnn_cfg.get("mask_symmetrize", True),
+            use_edges=gnn_cfg.get("mask_use_edges", True),
+            psi_scale=gnn_cfg.get("mask_psi_scale", "cosine"),
+        )
+        gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
+        model.pe_model.load_state_dict(gnn_weights["pe_model"], strict=False)
     elif architecture == "composite_graph_gt":
         # Composite-graph model: Graph Transformer (R-PEARL inside) + cold-start gate
         # over a RoPE-disabled LLM. Rebuild from gnn_config and load the saved weights.

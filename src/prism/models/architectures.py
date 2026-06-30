@@ -109,6 +109,38 @@ def build_planner_model(config, llm, tokenizer):
 
         if config.trainer.freeze_llm:
             model.llm.requires_grad_(False)
+    elif config.gnn.arch == "learnable_graph_mask":
+        # Learnable relative-PE attention mask: M = alpha*A + (1-alpha)*sim(Psi Psi^T),
+        # with Psi from a STANDALONE Graph Transformer (independent of the additive
+        # pe_model; reuses the gt_*/pe_* config block). Mask-only — no q/k/v injection.
+        if config.gnn.pe_node_features != "random":
+            raise ValueError(
+                "architecture 'learnable_graph_mask' currently supports only "
+                "pe_node_features='random' (the mask GT samples probes; word-embedding "
+                f"feature prep is not wired). Got {config.gnn.pe_node_features!r}.")
+        pe_model = gt_module.GraphTransformer(
+            num_layers=config.gnn.gt_num_layers,
+            pe_hidden_channels=config.gnn.pe_hidden_channels,
+            pe_num_layers=config.gnn.pe_num_layers,
+            d_model=config.gnn.d_model,
+            heads=config.gnn.gt_heads,
+            num_samples=config.gnn.num_samples,
+            dropout=config.gnn.dropout,
+            k_pe=config.gnn.k_pe,
+            k_gt=config.gnn.k_gt,
+            eps=config.gnn.eps,
+            use_layer_norm=config.gnn.use_layer_norm,
+            node_feature_dim=_node_feature_dim,
+        )
+        model = gnn_llm.LearnableGraphMaskLLM(
+            llm, pe_model, alpha=config.gnn.mask_alpha,
+            layer_scope=config.gnn.mask_layer_scope,
+            k_hops=config.gnn.mask_k_hops, symmetrize=config.gnn.mask_symmetrize,
+            use_edges=config.gnn.mask_use_edges, psi_scale=config.gnn.mask_psi_scale)
+        collator = data.SpineDataCollator(tokenizer, mlm=False)
+
+        if config.trainer.freeze_llm:
+            model.llm.requires_grad_(False)
     elif config.gnn.arch == "composite_graph_gt":
         # Composite-graph pipeline: token-cycle + scene graph + cross-links; R-PEARL +
         # GT refine it; cold-start gate injects into the RoPE-disabled LLM.
@@ -168,7 +200,7 @@ def build_planner_model(config, llm, tokenizer):
         raise ValueError(
             f"Unknown architecture: {config.gnn.arch!r}. "
             "Choose 'rpearl_llm', 'rpearl_gt_llm', 'gt_llm', 'graph_mask_llm', "
-            "'composite_graph_gt', or 'llm'.")
+            "'learnable_graph_mask', 'composite_graph_gt', or 'llm'.")
 
     return model, collator
 
