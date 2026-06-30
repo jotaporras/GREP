@@ -181,6 +181,10 @@ def train_model(config: omegaconf.DictConfig):
             "architecture": config.gnn.arch,
             "base_model": config.model.path,
             "text_edge_list": config.data.text_edge_list,
+            # Two-group LR: structural (GT / PE) params train at structural_lr_mult × base LR
+            # (GraphSFTTrainer.create_optimizer). Default 1.0 = no boost; composite re-sets
+            # the same value below.
+            "structural_lr_mult": config.gnn.structural_lr_mult,
             **{k: config.gnn[k] for k in _direct},
             **({k: config.gnn[k] for k in ("k_gt", "gt_num_layers", "gt_heads")}
                if config.gnn.arch in ("rpearl_gt_llm", "gt_llm", "composite_graph_gt",

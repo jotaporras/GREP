@@ -343,6 +343,37 @@ def test_forward_runs_differs_and_grad_flows():
     assert wrap._struct_bias is None
 
 
+def test_gradient_debug_callback_handles_learnable_mask():
+    """Regression for the on_train_begin AttributeError: GradientDebugCallback must not
+    assume GraphAugmented's pe_proj/pe_gain. LearnableGraphMaskLLM has a GT `pe_model` but
+    no pe_proj, so the callback must install hooks, capture grad norms, and log without crashing."""
+    from prism.eval.callbacks import GradientDebugCallback
+    from prism.models import gt as gt_module
+    torch.manual_seed(0)
+    llm = _tiny_llm()
+    gt = gt_module.GraphTransformer(num_layers=2, pe_hidden_channels=16, pe_num_layers=2,
+                                    d_model=24, heads=4, num_samples=8, dropout=0.0,
+                                    k_pe=2, k_gt=2, node_feature_dim=None)
+    model = LearnableGraphMaskLLM(llm, gt, layer_scope="all")
+
+    cb = GradientDebugCallback()
+    assert cb._supported(cb._unwrap_peft(model))
+    cb.on_train_begin(None, None, None, model=model)   # was the crash site
+
+    g = _graph(3, edges=[(0, 1), (1, 2)])
+    ids = torch.randint(1, 64, (1, 8), device=DEVICE)
+    imap = [{0: [(1, 2)], 1: [(3, 4)], 2: [(5, 6)]}]
+    out = model(input_ids=ids, graphs=[g], injection_maps=imap, labels=ids)
+    out.loss.backward()
+    cb._capture_grad_norms(model)
+    assert cb._captured_grad_norms.get("gnn", 0.0) > 0    # GT (pe_model) grad captured
+
+    class _State:
+        log_history = []
+        global_step = 1
+    cb.on_log(None, _State(), None, model=model)          # must not raise (no pe_gain access)
+
+
 if __name__ == "__main__":
     print(f"device: {DEVICE}")
     for name, fn in list(globals().items()):

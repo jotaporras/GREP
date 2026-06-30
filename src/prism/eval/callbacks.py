@@ -156,6 +156,7 @@ class GradientDebugCallback(TrainerCallback):
             inner = inner.base_model
         if hasattr(inner, 'model') and (
             hasattr(inner.model, 'pe_proj') or hasattr(inner.model, 'gt_model')
+            or hasattr(inner.model, 'pe_model')  # LearnableGraphMaskLLM: GT but no pe_proj
         ):
             inner = inner.model
         return inner
@@ -182,29 +183,37 @@ class GradientDebugCallback(TrainerCallback):
         self._hooked = True
 
     def _install_legacy_hooks(self, inner):
-        """GraphAugmentedLLM: pe_proj output norm + ``_augment_embeddings`` wrap."""
+        """GraphAugmentedLLM (pe_proj output norm + ``_augment_embeddings`` wrap) OR
+        LearnableGraphMaskLLM (pe_model/GT output norm only — no pe_proj, and the PE feeds
+        the attention mask rather than the embeddings, so the emb-norm/injection wrap is skipped).
+        """
         callback = self
 
-        # Hook 1: capture PE norm from pe_proj output via a forward hook.
-        def _pe_proj_hook(_module, _input, output):
+        # Hook 1: capture PE norm from the pe_proj output (GraphAugmentedLLM) or, when there is
+        # no pe_proj (LearnableGraphMaskLLM), from the PE/GT module output directly.
+        def _pe_norm_hook(_module, _input, output):
             callback._pe_norm = output.detach().norm().item()
             callback._pe_has_nan = bool(output.detach().isnan().any())
 
-        inner.pe_proj.register_forward_hook(_pe_proj_hook)
+        pe_proj = getattr(inner, "pe_proj", None)
+        (pe_proj if pe_proj is not None else inner.pe_model).register_forward_hook(_pe_norm_hook)
 
-        # Hook 2: wrap _augment_embeddings to capture emb_norm and injection count.
-        orig_augment = inner._augment_embeddings
+        # Hook 2 (GraphAugmentedLLM only): wrap _augment_embeddings to capture emb_norm and
+        # injection count. LearnableGraphMaskLLM has no such method, so _emb_norm/_num_injections
+        # stay at their NaN/0 defaults.
+        if hasattr(inner, "_augment_embeddings"):
+            orig_augment = inner._augment_embeddings
 
-        def _wrapped_augment(input_ids, graphs, injection_maps):
-            with torch.no_grad():
-                emb_table = inner.llm.get_input_embeddings()
-                callback._emb_norm = emb_table(input_ids.to(emb_table.weight.device)).norm().item()
-            callback._num_injections = sum(
-                len(spans) for imap in injection_maps for spans in imap.values()
-            )
-            return orig_augment(input_ids, graphs, injection_maps)
+            def _wrapped_augment(input_ids, graphs, injection_maps):
+                with torch.no_grad():
+                    emb_table = inner.llm.get_input_embeddings()
+                    callback._emb_norm = emb_table(input_ids.to(emb_table.weight.device)).norm().item()
+                callback._num_injections = sum(
+                    len(spans) for imap in injection_maps for spans in imap.values()
+                )
+                return orig_augment(input_ids, graphs, injection_maps)
 
-        inner._augment_embeddings = _wrapped_augment
+            inner._augment_embeddings = _wrapped_augment
 
     def _install_augmented_hooks(self, inner):
         """CompositeGraphLLM: GT output (Y) norm + ``_fuse_embeddings`` wrap."""
@@ -260,10 +269,13 @@ class GradientDebugCallback(TrainerCallback):
             self._captured_grad_norms["gate"] = self._grad_norm([inner.injection.gate])
             return
 
-        # Legacy GraphAugmentedLLM: pe_model (+ optional GT) + pe_proj + pe_gain.
+        # Legacy GraphAugmentedLLM / LearnableGraphMaskLLM: pe_model (+ optional inner GT/
+        # R-PEARL). pe_proj + pe_gain exist only on GraphAugmentedLLM (embedding-injection path).
         self._captured_grad_norms["gnn"] = self._grad_norm(inner.pe_model.parameters())
-        self._captured_grad_norms["pe_proj"] = self._grad_norm(inner.pe_proj.parameters())
-        self._captured_grad_norms["pe_gain"] = self._grad_norm([inner.pe_gain])
+        if hasattr(inner, "pe_proj"):
+            self._captured_grad_norms["pe_proj"] = self._grad_norm(inner.pe_proj.parameters())
+        if hasattr(inner, "pe_gain"):
+            self._captured_grad_norms["pe_gain"] = self._grad_norm([inner.pe_gain])
         if hasattr(inner.pe_model, "blocks"):
             self._captured_grad_norms["gt_blocks"] = self._grad_norm(inner.pe_model.blocks.parameters())
             # rpearl_gt_llm wraps an R-PEARL inside the GT; gt_llm (SemanticGraphTransformer)
@@ -323,23 +335,27 @@ class GradientDebugCallback(TrainerCallback):
             # c_bias Ĉ scale (composite_graph_gt only).
             metrics.update(self._filter_norm_metrics(inner))
         else:
-            # GraphAugmentedLLM (rpearl_llm / rpearl_gt_llm).
+            # GraphAugmentedLLM (rpearl_llm / rpearl_gt_llm) OR LearnableGraphMaskLLM.
             metrics = {
                 "debug/grad_norm_gnn": g.get("gnn", 0.0),
-                "debug/grad_norm_pe_proj": g.get("pe_proj", 0.0),
                 "debug/grad_norm_lora": g.get("lora", 0.0),
                 "debug/pe_output_norm": self._pe_norm,
                 "debug/pe_has_nan": int(self._pe_has_nan),
                 "debug/embedding_norm": self._emb_norm,
                 "debug/num_injections": self._num_injections,
                 "debug/lr": lr,
-                "debug/pe_gain": inner.pe_gain.item(),
-                "debug/grad_norm_pe_gain": g.get("pe_gain", 0.0),
             }
-            # rpearl_gt_llm / gt_llm: split gradient norms by GT sub-component.
+            # pe_proj / pe_gain exist only on GraphAugmentedLLM (embedding-injection path);
+            # LearnableGraphMaskLLM has neither.
+            if hasattr(inner, "pe_proj"):
+                metrics["debug/grad_norm_pe_proj"] = g.get("pe_proj", 0.0)
+            if hasattr(inner, "pe_gain"):
+                metrics["debug/pe_gain"] = inner.pe_gain.item()
+                metrics["debug/grad_norm_pe_gain"] = g.get("pe_gain", 0.0)
+            # rpearl_gt_llm / learnable_graph_mask: split gradient norms by GT sub-component.
             if hasattr(inner.pe_model, "blocks"):
                 metrics["debug/grad_norm_gt_blocks"] = g.get("gt_blocks", 0.0)
-                if hasattr(inner.pe_model, "pe_model"):  # only rpearl_gt_llm has inner R-PEARL
+                if hasattr(inner.pe_model, "pe_model"):  # inner R-PEARL
                     metrics["debug/grad_norm_rpearl"] = g.get("rpearl", 0.0)
 
         if wandb.run is not None:

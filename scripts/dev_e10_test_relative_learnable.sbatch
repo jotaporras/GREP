@@ -73,5 +73,6 @@ srun python -m prism.training.train_v3 \
     gnn.mask_alpha=0.7 \
     gnn.mask_layer_scope=dense \
     gnn.mask_psi_scale=cosine \
+    gnn.structural_lr_mult=5.0 \
     trainer.save_name="e10_relative_pe__learnable" \
     wandb.run_name="e10_relative_pe__learnable"
