@@ -1,8 +1,9 @@
 # @package _global_
 # refactor_verify — GT (gt_llm) best variant = e8_gt_llm_no_edges_L5_d2048, EDGES-IN-TEXT arm.
 #
-# Mirrors the e8 numerics (L5, d_model=2048, 16 heads, k_gt=1, word-embedding node
-# features, 4-bit gemma-4-12B, 2 epochs) but migrated to the nested Hydra scheme. The
+# Mirrors the e8 GT numerics (L5, d_model=2048, 16 heads, k_gt=1, word-embedding node
+# features, 4-bit, 2 epochs) but migrated to the nested Hydra scheme. NOTE: the base model
+# follows base_config (now gemma-4-31B) — NOT the gemma-4-12B e8 originally ran on. The
 # ONLY delta vs its _noedges sibling is data.text_edge_list (present here). On THIS branch
 # text_edge_list is live for graph archs (data.py:264 gates the prompt edge bullets), so
 # this arm = GT-PE + edges in the prompt.

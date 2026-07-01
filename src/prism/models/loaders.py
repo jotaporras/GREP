@@ -336,16 +336,45 @@ def graph_augmented_llm_from_pretrained(
 def load_pe_weights_into(model, init_pe_from: str, architecture: str) -> None:
     """Load a saved PE module (``gnn_weights.pt``) from a prior stage into ``model``.
 
-    Operates on a training model (no merge, no eval). Only rpearl_llm /
-    rpearl_gt_llm PE layouts are supported.
+    Operates on a training model (no merge, no eval). Supports the
+    GraphAugmentedLLM PE layouts (rpearl_llm / rpearl_gt_llm; pe_model + pe_proj
+    [+ optional pe_gain / pe_norm]) and the mask-only ``learnable_graph_mask``
+    (a standalone GraphTransformer as ``pe_model``, no pe_proj/pe_gain/pe_norm).
 
     Args:
-        model: GraphAugmentedLLM training model with pe_model / pe_proj / pe_gain attributes.
+        model: training model exposing ``pe_model`` (and, for the GraphAugmented
+            layouts, ``pe_proj`` / ``pe_gain`` / ``pe_norm``).
         init_pe_from: path to a checkpoint directory containing ``gnn_weights.pt``.
-        architecture: one of ``"rpearl_llm"`` or ``"rpearl_gt_llm"``.
+        architecture: ``"rpearl_llm"``, ``"rpearl_gt_llm"``, or
+            ``"learnable_graph_mask"``.
     """
     weights_path = os.path.join(init_pe_from, "gnn_weights.pt")
     gnn_weights = torch.load(weights_path, map_location="cpu")
+
+    if architecture == "learnable_graph_mask":
+        # Mask-only relative PE: the standalone GraphTransformer *is* the whole PE
+        # (the mask uses Psi Psi^T directly — there is no pe_proj/pe_gain/pe_norm).
+        # Accept an rpearl_gt_llm / edge-detector checkpoint ("gt_model") or another
+        # learnable_graph_mask / postfusion checkpoint ("pe_model"). Strict on keys:
+        # a missing/unexpected key means the gnn.* GT hyperparameters did NOT
+        # reproduce the pretrained GT (silent strict=False drop is exactly the
+        # config-drift failure we want to make loud).
+        gt_state = gnn_weights.get("gt_model", gnn_weights.get("pe_model"))
+        if gt_state is None:
+            raise KeyError(
+                f"{weights_path} has neither 'gt_model' nor 'pe_model'; cannot "
+                "initialise a learnable_graph_mask GT from it.")
+        missing, unexpected = model.pe_model.load_state_dict(gt_state, strict=False)
+        if missing or unexpected:
+            raise RuntimeError(
+                "learnable_graph_mask GT init did not match the checkpoint "
+                f"(missing={list(missing)}, unexpected={list(unexpected)}). The "
+                "gnn.* GT hyperparameters (gt_num_layers/pe_num_layers/num_samples/"
+                "k_pe/k_gt/d_model/pe_hidden_channels/gt_heads) must reproduce the "
+                "pretrained GT exactly.")
+        print(f"[multistage] loaded GT (relative-PE) weights from {weights_path}")
+        return
+
     if architecture == "rpearl_gt_llm":
         model.pe_model.load_state_dict(gnn_weights["gt_model"], strict=False)
     elif architecture == "rpearl_llm":
