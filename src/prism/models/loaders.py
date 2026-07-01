@@ -180,6 +180,8 @@ def graph_augmented_llm_from_pretrained(
             k_hops=gnn_cfg.get("mask_k_hops", 1),
             symmetrize=gnn_cfg.get("mask_symmetrize", True),
             use_edges=gnn_cfg.get("mask_use_edges", True),
+            buggy_causal_fold=gnn_cfg.get("mask_buggy_causal_fold", False),
+            layer_scope=gnn_cfg.get("mask_layer_scope", "all"),
         )
     elif architecture == "learnable_graph_mask":
         # Learnable relative-PE mask: rebuild the standalone GraphTransformer (Psi
@@ -207,6 +209,7 @@ def graph_augmented_llm_from_pretrained(
             symmetrize=gnn_cfg.get("mask_symmetrize", True),
             use_edges=gnn_cfg.get("mask_use_edges", True),
             psi_scale=gnn_cfg.get("mask_psi_scale", "cosine"),
+            buggy_causal_fold=gnn_cfg.get("mask_buggy_causal_fold", False),
         )
         gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
         model.pe_model.load_state_dict(gnn_weights["pe_model"], strict=False)

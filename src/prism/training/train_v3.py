@@ -189,11 +189,12 @@ def train_model(config: omegaconf.DictConfig):
             **({k: config.gnn[k] for k in ("k_gt", "gt_num_layers", "gt_heads")}
                if config.gnn.arch in ("rpearl_gt_llm", "gt_llm", "composite_graph_gt",
                                        "learnable_graph_mask") else {}),
-            # graph_mask_llm / learnable_graph_mask adjacency (A) rebuild params.
-            **({k: config.gnn[k] for k in ("mask_k_hops", "mask_symmetrize", "mask_use_edges")}
+            # graph_mask_llm / learnable_graph_mask adjacency (A) + fold + scope rebuild params.
+            **({k: config.gnn[k] for k in ("mask_k_hops", "mask_symmetrize", "mask_use_edges",
+                                           "mask_buggy_causal_fold", "mask_layer_scope")}
                if config.gnn.arch in ("graph_mask_llm", "learnable_graph_mask") else {}),
             # learnable_graph_mask extra params (read back by loaders for eval).
-            **({k: config.gnn[k] for k in ("mask_alpha", "mask_layer_scope", "mask_psi_scale")}
+            **({k: config.gnn[k] for k in ("mask_alpha", "mask_psi_scale")}
                if config.gnn.arch == "learnable_graph_mask" else {}),
             **composite_graph.composite_graph_gnn_rebuild_params(config),
         }

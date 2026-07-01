@@ -104,7 +104,9 @@ def build_planner_model(config, llm, tokenizer):
         # edges. Reuses SpineDataCollator so graphs + injection_maps reach the model.
         model = gnn_llm.GraphMaskLLM(
             llm, k_hops=config.gnn.mask_k_hops, symmetrize=config.gnn.mask_symmetrize,
-            use_edges=config.gnn.mask_use_edges)
+            use_edges=config.gnn.mask_use_edges,
+            buggy_causal_fold=config.gnn.mask_buggy_causal_fold,
+            layer_scope=config.gnn.mask_layer_scope)
         collator = data.SpineDataCollator(tokenizer, mlm=False)
 
         if config.trainer.freeze_llm:
@@ -136,7 +138,8 @@ def build_planner_model(config, llm, tokenizer):
             llm, pe_model, alpha=config.gnn.mask_alpha,
             layer_scope=config.gnn.mask_layer_scope,
             k_hops=config.gnn.mask_k_hops, symmetrize=config.gnn.mask_symmetrize,
-            use_edges=config.gnn.mask_use_edges, psi_scale=config.gnn.mask_psi_scale)
+            use_edges=config.gnn.mask_use_edges, psi_scale=config.gnn.mask_psi_scale,
+            buggy_causal_fold=config.gnn.mask_buggy_causal_fold)
         collator = data.SpineDataCollator(tokenizer, mlm=False)
 
         if config.trainer.freeze_llm:

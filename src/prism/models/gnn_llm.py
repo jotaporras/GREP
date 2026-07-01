@@ -82,12 +82,14 @@ def _graph_mask_attention_forward(module, query, key, value, attention_mask,
             attention_mask = bias + causal[None, None]
         else:
             am = attention_mask[..., :k_len]
-            if am.dtype == torch.bool:
-                # SDPA/flex build a BOOLEAN mask (True = attend). The real Gemma-4 default
-                # is SDPA, so without this conversion the boolean→float cast would map
-                # blocked (False) positions to additive 0.0 (attendable) instead of −inf,
-                # silently leaking future/padding tokens. Convert to the additive 0/−inf
-                # convention before folding the structural bias.
+            # buggy_fold reproduces the ORIGINAL pre-fix behavior for an A/B ablation: a
+            # BOOLEAN mask (SDPA's True=attend) is cast bool→float so False→0.0, making
+            # blocked positions additive 0.0 (attendable). At the sliding-window layers HF
+            # supplies an explicit boolean mask even at batch=1, so this leaks future and
+            # out-of-window tokens (near-bidirectional attention). Default (False) converts
+            # bool→0/−inf, the correct additive convention.
+            buggy_fold = getattr(module, "_graph_mask_buggy_fold", False)
+            if am.dtype == torch.bool and not buggy_fold:
                 am = torch.zeros_like(am, dtype=query.dtype).masked_fill(
                     ~am, torch.finfo(query.dtype).min)
             else:
@@ -152,7 +154,8 @@ class GraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
     """
 
     def __init__(self, llm: nn.Module, k_hops: int = 1, symmetrize: bool = True,
-                 use_edges: bool = True):
+                 use_edges: bool = True, buggy_causal_fold: bool = False,
+                 layer_scope: str = "all"):
         # Wrapper is not a registered HF architecture or MoE class; force "eager" so
         # PreTrainedModel doesn't reject SDPA/flash or expert-impl validation.
         config = copy.copy(llm.config)
@@ -165,6 +168,14 @@ class GraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             raise ValueError(f"k_hops must be >= 1, got {k_hops}")
         self._mask_symmetrize = bool(symmetrize)
         self._mask_use_edges = bool(use_edges)
+        # "all" = every self-attn layer (default, historical behavior); "dense" = only Gemma
+        # full_attention (global) layers — the non-learnable control matching the learnable mask.
+        if layer_scope not in ("all", "dense"):
+            raise ValueError(f"layer_scope must be 'all' or 'dense', got {layer_scope!r}")
+        self._mask_layer_scope = layer_scope
+        # A/B ablation knob: reproduce the pre-fix causal/sliding-mask leak (see
+        # _graph_mask_attention_forward). Default False = correct masking.
+        self._mask_buggy_fold = bool(buggy_causal_fold)
         # Per-forward additive attention bias [B, 1, seq, seq]; read by the patched
         # attention layers, set in forward / inference, disarmed afterwards.
         self._struct_bias: torch.Tensor | None = None
@@ -218,6 +229,10 @@ class GraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             # Bypass nn.Module.__setattr__ to avoid registering a submodule cycle (attn→wrapper→llm→attn).
             object.__setattr__(attn, "_graph_mask_model", self)
             attn._graph_mask_orig_attn_fn = orig_attn_fn
+            attn._graph_mask_buggy_fold = self._mask_buggy_fold
+            # Layer scope: 'dense' ⇒ only Gemma full_attention (global) layers carry the mask.
+            attn._graph_mask_active = bool(
+                self._mask_layer_scope == "all" or not getattr(attn, "is_sliding", False))
             attn.config._attn_implementation = _GRAPH_MASK_IMPL
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
@@ -348,7 +363,8 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
 
     def __init__(self, llm: nn.Module, pe_model: nn.Module, alpha: float = 0.7,
                  layer_scope: str = "dense", k_hops: int = 1, symmetrize: bool = True,
-                 use_edges: bool = True, psi_scale: str = "cosine", eps: float = 1e-8):
+                 use_edges: bool = True, psi_scale: str = "cosine", eps: float = 1e-8,
+                 buggy_causal_fold: bool = False):
         # Wrapper is not a registered HF architecture or MoE class; force "eager" so
         # PreTrainedModel doesn't reject SDPA/flash or expert-impl validation.
         config = copy.copy(llm.config)
@@ -382,6 +398,8 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             raise ValueError(f"k_hops must be >= 1, got {k_hops}")
         self._mask_symmetrize = bool(symmetrize)
         self._mask_use_edges = bool(use_edges)
+        # A/B ablation knob (shared with GraphMaskLLM): reproduce the pre-fix mask leak.
+        self._mask_buggy_fold = bool(buggy_causal_fold)
         if self._mask_psi_scale == "cosine" and not self._mask_use_edges:
             # Edgeless ⇒ adjacency is self-loops only; cosine self-similarity is the constant
             # 1, so every allowed entry is constant ⇒ the whole bias is constant ⇒ the GT gets
@@ -448,6 +466,7 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             # Dense-only scope deactivates sliding-window layers (they delegate untouched).
             attn._graph_mask_active = bool(
                 self._mask_layer_scope == "all" or not getattr(attn, "is_sliding", False))
+            attn._graph_mask_buggy_fold = self._mask_buggy_fold
             attn.config._attn_implementation = _GRAPH_MASK_IMPL
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):

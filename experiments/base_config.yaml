@@ -74,6 +74,9 @@ gnn:
   mask_k_hops: 1
   mask_symmetrize: true
   mask_use_edges: true
+  # A/B ablation: true reproduces the pre-fix causal/sliding-mask leak (blocked positions
+  # become attendable at the sliding layers ⇒ near-bidirectional attention). false = correct.
+  mask_buggy_causal_fold: false
 
   # --- learnable_graph_mask (relative PE: learnable outer-product attention bias) ---
   # M = alpha*A + (1-alpha)*scaled(Psi Psi^T); A hard-blocks non-edges; Psi from a
