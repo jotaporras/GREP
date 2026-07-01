@@ -1,6 +1,6 @@
 # GREP-PRISM unified training config (Hydra) — single nested base.
 #
-# This file holds the MERGED, MOST-RECENT-WINS default (e9 > e8 > e7): gemma-4-12B,
+# This file holds the MERGED, MOST-RECENT-WINS default (e9 > e8 > e7): gemma-4-31B,
 # revised corpus, bf16 (bit4=false), multi-graph eval, assistant-only loss, rpearl_llm.
 # Per-experiment files under experiments/ inherit this via `defaults: [base_config, _self_]`
 # and override only their deltas. Architecture / sweep / base-model variants are documented
@@ -14,10 +14,12 @@
 name: e9
 
 model:
-  # Base LLM. Default = Gemma-4 12B (e8/e9).
+  # Base LLM. DEFAULT = Gemma-4 31B (multimodal; LoRA vision/audio-tower exclusion is
+  # auto-applied). 31B is the default ON PURPOSE so a confirmatory run is never silently
+  # downsized to 12B — override explicitly for the smaller/cheaper bases:
+  #   google/gemma-4-12B-it              # text-only 12B (fast dev only; NOT the confirmatory base)
   #   meta-llama/Llama-3.1-8B-Instruct   # e7 architecture experiments
-  #   google/gemma-4-31B-it              # e8 g31b runs (multimodal; LoRA tower-exclusion auto-applied)
-  path: google/gemma-4-12B-it
+  path: google/gemma-4-31B-it
   # disable_rope: replaces RoPE with the structural code in composite/injection archs;
   # a no-op elsewhere. disable_graph_token_rope: position_id 0 on node-name tokens so
   # RoPE is identity there (set true for the norope_graph run).
@@ -27,7 +29,7 @@ model:
 gnn:
   # Master architecture switch — determines which gnn.* keys the code actually reads;
   # the rest compose harmlessly.
-  #   llm | rpearl_llm | rpearl_gt_llm | gt_llm | graph_mask_llm | learnable_graph_mask | composite_graph_gt
+  #   llm | rpearl_llm | rpearl_gt_llm | gt_llm | graph_mask_llm | learnable_graph_mask | postfusion_graph_llm | composite_graph_gt
   arch: rpearl_llm
 
   # --- Numerics shared by the R-PEARL encoder AND the Graph Transformer + PE gate ---
@@ -85,6 +87,14 @@ gnn:
   mask_alpha: 0.7            # edge value = alpha + (1-alpha)*sim; non-edge = blocked (alpha in [0,1))
   mask_layer_scope: dense    # "all" = every self-attn layer | "dense" = Gemma full_attention (global) layers only
   mask_psi_scale: cosine     # "cosine" (row-normalized, sim in [-1,1]) | "inv_sqrt_d" (Gemma-style raw/sqrt(D))
+
+  # --- postfusion_graph_llm (EXPERIMENTAL late/output fusion) ---
+  # Y_tilde = Y + tanh(gate)*CrossAttn(Q=Y, K,V=Psi) folded in just before the vocab head;
+  # Psi from a STANDALONE GraphTransformer (reuses the gt_*/pe_* block). Every output token
+  # (incl. each generated one) cross-attends the N node embeddings. Requires
+  # pe_node_features=random. Self-contained in models/postfusion_graph_llm.py (clean delete).
+  postfusion_num_heads: 8    # cross-attention heads (must divide the LLM hidden size)
+  postfusion_gate_init: 0.0  # scalar gate g=tanh(gate); 0.0 = cold start (fusion off at init)
 
   # --- composite_graph_gt (read ONLY when arch=composite_graph_gt) ---
   # The e7 designs override the structural/gt block above AND these. Representative recipes

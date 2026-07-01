@@ -79,6 +79,7 @@ def train_model(config: omegaconf.DictConfig):
         "gt_llm",
         "graph_mask_llm",
         "learnable_graph_mask",
+        "postfusion_graph_llm",
         "composite_graph_gt",
     )
     if (config.trainer.init_pe_from or config.trainer.init_lora_from) and not is_graph_arch:
@@ -167,6 +168,7 @@ def train_model(config: omegaconf.DictConfig):
         "gt_llm",
         "graph_mask_llm",
         "learnable_graph_mask",
+        "postfusion_graph_llm",
         "composite_graph_gt",
     ):
         # gnn_config is dumped to gnn_config.json and read back by loaders at eval, so the
@@ -188,7 +190,7 @@ def train_model(config: omegaconf.DictConfig):
             **{k: config.gnn[k] for k in _direct},
             **({k: config.gnn[k] for k in ("k_gt", "gt_num_layers", "gt_heads")}
                if config.gnn.arch in ("rpearl_gt_llm", "gt_llm", "composite_graph_gt",
-                                       "learnable_graph_mask") else {}),
+                                       "learnable_graph_mask", "postfusion_graph_llm") else {}),
             # graph_mask_llm / learnable_graph_mask adjacency (A) + fold + scope rebuild params.
             **({k: config.gnn[k] for k in ("mask_k_hops", "mask_symmetrize", "mask_use_edges",
                                            "mask_buggy_causal_fold", "mask_layer_scope")}
@@ -196,6 +198,9 @@ def train_model(config: omegaconf.DictConfig):
             # learnable_graph_mask extra params (read back by loaders for eval).
             **({k: config.gnn[k] for k in ("mask_alpha", "mask_psi_scale")}
                if config.gnn.arch == "learnable_graph_mask" else {}),
+            # postfusion_graph_llm cross-attention head count + gate init (read back by loaders).
+            **({k: config.gnn[k] for k in ("postfusion_num_heads", "postfusion_gate_init")}
+               if config.gnn.arch == "postfusion_graph_llm" else {}),
             **composite_graph.composite_graph_gnn_rebuild_params(config),
         }
         trainer = GraphSFTTrainer(
@@ -609,6 +614,18 @@ class GraphSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
                 {"pe_model": self.model.pe_model.state_dict()},
                 os.path.join(output_dir, "gnn_weights.pt"),
             )
+        elif self.gnn_config.get("architecture") == "postfusion_graph_llm":
+            # Save the standalone GraphTransformer (Psi producer), the output cross-attention
+            # fusion, and the scalar cold-start gate. Head count / gate init rebuild from
+            # gnn_config; the LoRA adapter is saved below.
+            torch.save(
+                {
+                    "pe_model": self.model.pe_model.state_dict(),
+                    "fusion": self.model.fusion.state_dict(),
+                    "gate": self.model.gate.data,
+                },
+                os.path.join(output_dir, "gnn_weights.pt"),
+            )
         elif self.gnn_config.get("architecture") == "rpearl_gt_llm":
             # Full GT: save the whole GraphTransformer (includes R-PEARL inside) + projection head.
             torch.save(
@@ -700,6 +717,14 @@ def _validate_config(config: omegaconf.DictConfig) -> None:
             raise ValueError(
                 "gnn.mask_psi_scale='cosine' with gnn.mask_use_edges=false is degenerate "
                 "(constant mask, zero GT gradient). Use mask_psi_scale='inv_sqrt_d' or keep edges.")
+    if config.gnn.arch == "postfusion_graph_llm":
+        if int(config.gnn.postfusion_num_heads) <= 0:
+            raise ValueError(
+                f"gnn.postfusion_num_heads must be >= 1, got {config.gnn.postfusion_num_heads}")
+        if config.gnn.pe_node_features != "random":
+            raise ValueError(
+                "gnn.arch='postfusion_graph_llm' requires pe_node_features='random' "
+                f"(the GT samples probes), got {config.gnn.pe_node_features!r}.")
     if config.trainer.loss_target not in ("all", "responses", "edge_list"):
         raise ValueError(
             f"loss_target must be 'all', 'responses', or 'edge_list', got {config.trainer.loss_target!r}"

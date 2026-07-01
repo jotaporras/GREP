@@ -9,6 +9,7 @@ Public surface:
 from prism.data import data
 from prism.models import gnn_llm
 from prism.models import composite_graph_llm
+from prism.models import postfusion_graph_llm  # postfusion: experimental standalone arch
 from prism.models import r_pearl as r_pearl_module
 from prism.models import gt as gt_module
 
@@ -144,6 +145,39 @@ def build_planner_model(config, llm, tokenizer):
 
         if config.trainer.freeze_llm:
             model.llm.requires_grad_(False)
+    elif config.gnn.arch == "postfusion_graph_llm":
+        # postfusion: EXPERIMENTAL late/output fusion. Every LLM output token cross-attends
+        # the graph node embeddings Psi (from a STANDALONE GraphTransformer, reusing the
+        # gt_*/pe_* block) just before the vocab head: Y + tanh(gate)*CrossAttn(Q=Y, K,V=Psi).
+        # Self-contained in postfusion_graph_llm.py so the whole idea is a clean delete.
+        if config.gnn.pe_node_features != "random":
+            raise ValueError(
+                "architecture 'postfusion_graph_llm' currently supports only "
+                "pe_node_features='random' (the GT samples probes; word-embedding feature "
+                f"prep is not wired). Got {config.gnn.pe_node_features!r}.")
+        pe_model = gt_module.GraphTransformer(
+            num_layers=config.gnn.gt_num_layers,
+            pe_hidden_channels=config.gnn.pe_hidden_channels,
+            pe_num_layers=config.gnn.pe_num_layers,
+            d_model=config.gnn.d_model,
+            heads=config.gnn.gt_heads,
+            num_samples=config.gnn.num_samples,
+            dropout=config.gnn.dropout,
+            k_pe=config.gnn.k_pe,
+            k_gt=config.gnn.k_gt,
+            eps=config.gnn.eps,
+            use_layer_norm=config.gnn.use_layer_norm,
+            node_feature_dim=_node_feature_dim,
+        )
+        model = postfusion_graph_llm.PostFusionGraphLLM(
+            llm, pe_model, pe_dim=config.gnn.d_model,
+            num_heads=config.gnn.postfusion_num_heads,
+            gate_init=config.gnn.postfusion_gate_init,
+            dropout=config.gnn.dropout)
+        collator = data.SpineDataCollator(tokenizer, mlm=False)
+
+        if config.trainer.freeze_llm:
+            model.llm.requires_grad_(False)
     elif config.gnn.arch == "composite_graph_gt":
         # Composite-graph pipeline: token-cycle + scene graph + cross-links; R-PEARL +
         # GT refine it; cold-start gate injects into the RoPE-disabled LLM.
@@ -203,7 +237,7 @@ def build_planner_model(config, llm, tokenizer):
         raise ValueError(
             f"Unknown architecture: {config.gnn.arch!r}. "
             "Choose 'rpearl_llm', 'rpearl_gt_llm', 'gt_llm', 'graph_mask_llm', "
-            "'learnable_graph_mask', 'composite_graph_gt', or 'llm'.")
+            "'learnable_graph_mask', 'postfusion_graph_llm', 'composite_graph_gt', or 'llm'.")
 
     return model, collator
 

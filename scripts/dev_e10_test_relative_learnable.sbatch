@@ -26,7 +26,7 @@
 #   sbatch --array=4 scripts/dev_e10_test_relative_learnable.sbatch   # just alpha=0.5
 
 BASE_CONFIG=e9_base_config
-MODEL_PATH="google/gemma-4-12B-it"
+MODEL_PATH="google/gemma-4-31B-it"   # confirmatory base (was wrongly 12B in the botched sweep)
 CHECKPOINT_DIR="$ALELAB_DRIVE/GREP-PRISM/outputs/dev_e10/alpha_sweep"
 
 # Loading env stuff

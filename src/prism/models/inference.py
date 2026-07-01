@@ -20,6 +20,7 @@ from prism.models.composite_graph_llm import (
     CompositeGraphLLM,
     InjectedCompositeGraphLLM,
 )
+from prism.models.postfusion_graph_llm import PostFusionGraphLLM
 
 
 # Decode is deterministic GREEDY for confirmatory eval (reproducible, no seed needed).
@@ -38,7 +39,7 @@ def _core_graph_model(model):
     inner = model
     for _ in range(5):
         if isinstance(inner, (CompositeGraphLLM, GraphAugmentedLLM, GraphMaskLLM,
-                              LearnableGraphMaskLLM)):
+                              LearnableGraphMaskLLM, PostFusionGraphLLM)):
             return inner
         nxt = getattr(inner, "base_model", None)
         if nxt is None or nxt is inner:
@@ -199,6 +200,22 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
                 return outputs[:, input_ids.shape[-1]:]
             finally:
                 graph_model._struct_bias = None
+
+        if isinstance(graph_model, PostFusionGraphLLM):
+            # postfusion: arm the graph context (per-node Psi + mask) once; the persistent
+            # lm_head pre-hook cross-attends it on every decode step (prefill + each generated
+            # token). No injection map needed — every output token reads the whole graph.
+            graph_model._graph_ctx = graph_model.build_graph_context(
+                [pyg_graph], input_ids.device)
+            try:
+                outputs = graph_model.llm.generate(
+                    input_ids=input_ids, attention_mask=attention_mask,
+                    max_new_tokens=max_new_tokens, **DECODE_KWARGS,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                )
+                return outputs[:, input_ids.shape[-1]:]
+            finally:
+                graph_model._graph_ctx = None
 
         if isinstance(graph_model, InjectedCompositeGraphLLM):
             # GT code injected post-RoPE into q/k/v per layer via prepare_generation.

@@ -282,6 +282,11 @@ class GradientDebugCallback(TrainerCallback):
             # has no inner pe_model — guard so the debug callback doesn't crash.
             if hasattr(inner.pe_model, "pe_model"):
                 self._captured_grad_norms["rpearl"] = self._grad_norm(inner.pe_model.pe_model.parameters())
+        # postfusion_graph_llm: output cross-attention fusion + scalar cold-start gate
+        # (unique to this arch; guards keep every other family untouched).
+        if hasattr(inner, "fusion") and hasattr(inner, "gate"):
+            self._captured_grad_norms["fusion"] = self._grad_norm(inner.fusion.parameters())
+            self._captured_grad_norms["postfusion_gate"] = self._grad_norm([inner.gate])
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
         if model is not None and self._supported(self._unwrap_peft(model)):
@@ -357,6 +362,12 @@ class GradientDebugCallback(TrainerCallback):
                 metrics["debug/grad_norm_gt_blocks"] = g.get("gt_blocks", 0.0)
                 if hasattr(inner.pe_model, "pe_model"):  # inner R-PEARL
                     metrics["debug/grad_norm_rpearl"] = g.get("rpearl", 0.0)
+            # postfusion_graph_llm: cross-attention fusion grad, gate grad, and the effective
+            # gate value g=tanh(gate) ∈ (-1,1) (0 at cold start; watch it ramp).
+            if hasattr(inner, "fusion") and hasattr(inner, "gate"):
+                metrics["debug/grad_norm_fusion"] = g.get("fusion", 0.0)
+                metrics["debug/grad_norm_postfusion_gate"] = g.get("postfusion_gate", 0.0)
+                metrics["debug/postfusion_gate"] = float(torch.tanh(inner.gate.detach().float()).item())
 
         if wandb.run is not None:
             wandb.log(metrics, step=state.global_step)

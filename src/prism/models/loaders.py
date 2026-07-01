@@ -10,6 +10,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from prism.models import gnn_llm
 from prism.models import composite_graph_llm
+from prism.models import postfusion_graph_llm  # postfusion: experimental standalone arch
 from prism.models import r_pearl
 from prism.models import gt as gt_module
 
@@ -213,6 +214,35 @@ def graph_augmented_llm_from_pretrained(
         )
         gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
         model.pe_model.load_state_dict(gnn_weights["pe_model"], strict=False)
+    elif architecture == "postfusion_graph_llm":
+        # postfusion: rebuild the standalone GraphTransformer (Psi producer) + the output
+        # cross-attention fusion, then load GT / fusion / gate. The LoRA adapter was already
+        # merged into `llm` above.
+        pe_model = gt_module.GraphTransformer(
+            num_layers=gnn_cfg["gt_num_layers"],
+            pe_hidden_channels=gnn_cfg["pe_hidden_channels"],
+            pe_num_layers=gnn_cfg["pe_num_layers"],
+            d_model=gnn_cfg["d_model"],
+            heads=gnn_cfg["gt_heads"],
+            num_samples=gnn_cfg["num_samples"],
+            dropout=gnn_cfg["dropout"],
+            k_pe=gnn_cfg["k_pe"],
+            k_gt=gnn_cfg["k_gt"],
+            eps=gnn_cfg["eps"],
+            use_layer_norm=gnn_cfg["use_layer_norm"],
+            node_feature_dim=node_feature_dim,
+        )
+        model = postfusion_graph_llm.PostFusionGraphLLM(
+            llm, pe_model, pe_dim=gnn_cfg["d_model"],
+            num_heads=gnn_cfg.get("postfusion_num_heads", 8),
+            gate_init=gnn_cfg.get("postfusion_gate_init", 0.0),
+            dropout=gnn_cfg.get("dropout", 0.0),
+        )
+        gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
+        model.pe_model.load_state_dict(gnn_weights["pe_model"], strict=False)
+        model.fusion.load_state_dict(gnn_weights["fusion"])
+        if "gate" in gnn_weights:
+            model.gate.data.copy_(gnn_weights["gate"])
     elif architecture == "composite_graph_gt":
         # Composite-graph model: Graph Transformer (R-PEARL inside) + cold-start gate
         # over a RoPE-disabled LLM. Rebuild from gnn_config and load the saved weights.
