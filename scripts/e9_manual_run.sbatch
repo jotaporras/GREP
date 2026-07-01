@@ -71,7 +71,7 @@ if [[ "$RUN_STAGE1" == "1" ]]; then
         trainer.checkpoint_dir="$CHECKPOINT_STAGE1_DIR" \
         trainer.freeze_pe=true \
         trainer.learning_rate=0.0002 \
-        trainer.epochs=0.5
+        trainer.epochs=1
 fi
 
 # Stage 2 - PE-only on edge-list loss with LLM+adapter frozen. High LR.
