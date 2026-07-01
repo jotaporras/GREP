@@ -29,9 +29,13 @@ export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-14}"
 PROJECT=${PROJECT:-GREP-PRISM}
 ENTITY=${ENTITY:-alelab}
 export WANDB_ENTITY=${WANDB_ENTITY:-$ENTITY}
-EXPERIMENT_TAG=${EXPERIMENT_TAG:-refactor_verify}
+EXPERIMENT_TAG=${EXPERIMENT_TAG:-refactor_verify_fulltest}
 ENV_NAME=${ENV_NAME:-/vast/projects/aribeiro/alelab/jporras/envs/GREP-PRISM-v3}
-CHECKPOINT_DIR=${CHECKPOINT_DIR:-/vast/projects/aribeiro/alelab/jporras/GREP-PRISM/outputs/refactor_verify}
+CHECKPOINT_DIR=${CHECKPOINT_DIR:-/vast/projects/aribeiro/alelab/jporras/GREP-PRISM/outputs/refactor_verify_fulltest}
+# Eval on the WHOLE held-out set (all 10 graphs), NOT the single data_gen_023.json the
+# rv_*.yaml configs hardcode. num_graphs=-1 keeps every graph (data.py: <=0 => no cap).
+TEST_GRAPHS=${TEST_GRAPHS:-data/revised/gen/nav100_n30_gemma_data/split/test_graphs}
+EVAL_NUM_GRAPHS=${EVAL_NUM_GRAPHS:--1}
 
 # config-name (Hydra) per array task, and the descriptive name used for BOTH the wandb
 # run and the checkpoint save_name (kept identical so W&B and the on-disk dir line up).
@@ -70,4 +74,6 @@ srun python -m prism.training.train_v3 --config-name="$CONFIG" \
     trainer.checkpoint_dir="$CHECKPOINT_DIR" \
     wandb.project="$PROJECT" \
     wandb.run_name="$NAME" \
-    wandb.tag="$EXPERIMENT_TAG"
+    wandb.tag="$EXPERIMENT_TAG" \
+    eval.data="$TEST_GRAPHS" \
+    eval.num_graphs="$EVAL_NUM_GRAPHS"

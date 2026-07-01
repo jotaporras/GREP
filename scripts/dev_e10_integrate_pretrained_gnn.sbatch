@@ -53,6 +53,9 @@ GNN_ARGS=(
     gnn.k_gt=2
     gnn.eps=1e-6
     gnn.use_layer_norm=true
+    # Eval on the WHOLE held-out set (all 10 graphs), not the num_graphs=5 default.
+    eval.data=data/revised/gen/nav100_n30_gemma_data/split/test_graphs
+    eval.num_graphs=-1
 )
 
 # Stage 3 - joint PE + LoRA. Both variants run sequentially, each initialised from

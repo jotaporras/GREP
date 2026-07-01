@@ -56,6 +56,9 @@ GNN_ARGS=(
     gnn.gt_num_layers=5
     gnn.gt_heads=8
     gnn.k_gt=2
+    # Eval on the WHOLE held-out set (all 10 graphs), not the num_graphs=5 default.
+    eval.data=data/revised/gen/nav100_n30_gemma_data/split/test_graphs
+    eval.num_graphs=-1
 )
 
 # Stage 1 - SFT LLM for 0.5 epochs with usual LR.

@@ -47,6 +47,9 @@ COMMON=(
     gnn.mask_k_hops=1
     gnn.mask_symmetrize=true
     gnn.mask_use_edges=true
+    # Eval on the WHOLE held-out set (all 10 graphs), not the num_graphs=5 default.
+    eval.data=data/revised/gen/nav100_n30_gemma_data/split/test_graphs
+    eval.num_graphs=-1
 )
 
 # GT / learnable-only args (arm 4).
