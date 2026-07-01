@@ -87,11 +87,14 @@ MASK_ARGS=(
     gnn.structural_lr_mult=5.0
 )
 
-# Both edge-list variants run sequentially, each initialised from the SAME stage-1
-# LoRA checkpoint and the SAME pretrained-GT folder.
+# Both edge-list variants normally run sequentially, each initialised from the SAME
+# stage-1 LoRA checkpoint and the SAME pretrained-GT folder.
 #   no_edge_list   = connectivity must come from the graph (mask)
 #   with_edge_list = edge list kept in the prompt (control)
-for VARIANT_SPEC in "no_edge_list:none" "with_edge_list:present"; do
+# TEMP: no_edge_list arm commented out to get with_edge_list results faster.
+# Restore both arms before treating this as the confirmatory e10 run.
+for VARIANT_SPEC in "with_edge_list:present"; do
+# for VARIANT_SPEC in "no_edge_list:none" "with_edge_list:present"; do
     VARIANT="${VARIANT_SPEC%%:*}"
     TEXT_EDGE_LIST="${VARIANT_SPEC##*:}"
     srun python -m prism.training.train_v3 \
