@@ -948,6 +948,26 @@ def build_injection_map(
     return injection_map
 
 
+def clamp_injection_map(
+    injection_map: dict[int, list[tuple[int, int]]],
+    scope_end: int,
+) -> dict[int, list[tuple[int, int]]]:
+    """Truncate an injection map to token positions strictly below ``scope_end``.
+
+    Spans starting at/after ``scope_end`` are dropped; spans straddling the boundary
+    are cut at it; nodes left with no spans are removed. Used by
+    ``injection_scope='prompt_only'`` training (only prompt mentions carry the graph
+    channel, matching generation, where decode steps receive no injection) and by
+    the injection-ablation diagnostic (``prism.eval.injection_diag``).
+    """
+    clamped: dict[int, list[tuple[int, int]]] = {}
+    for nid, spans in injection_map.items():
+        kept = [(start, min(end, scope_end)) for start, end in spans if start < scope_end]
+        if kept:
+            clamped[nid] = sorted(kept)
+    return clamped
+
+
 def bucketize_prompt(input_ids_b: list, node_token_seqs : list) -> defaultdict:
     """Map each node to the set of start positions where its token sequence appears.
 

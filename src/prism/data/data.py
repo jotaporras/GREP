@@ -12,7 +12,12 @@ from transformers.data.data_collator import DataCollatorForLanguageModeling
 from prism.data import compact_prompt
 from prism.data import utils
 from prism.eval import evaluate
-from prism.models.gnn_llm import build_injection_map, find_last_graph_scope, node_token_variants
+from prism.models.gnn_llm import (
+    build_injection_map,
+    clamp_injection_map,
+    find_last_graph_scope,
+    node_token_variants,
+)
 
 
 def load_eval_samples_by_graph(eval_data: str, num_graphs: int) -> Dict[str, List[evaluate.EvalSample]]:
@@ -423,7 +428,19 @@ class TokenIndexCollator(DataCollatorForLanguageModeling):
 
 
 class SpineDataCollator(TokenIndexCollator):
-    """Collator that builds PyG graphs and injection maps per example, then delegates to TokenIndexCollator."""
+    """Collator that builds PyG graphs and injection maps per example, then delegates to TokenIndexCollator.
+
+    ``injection_scope`` (set by the trainer from ``config.data.injection_scope``)
+    controls which token positions carry the graph channel during TRAINING forwards:
+
+    - ``"full_sequence"`` (historical behavior): node mentions in the assistant
+      answer are injected too — the positions being predicted carry the ground-truth
+      node's PE/mask row, a channel that does not exist at generation (decode steps
+      receive no injection; ``inference.py`` builds prompt-only maps).
+    - ``"prompt_only"``: maps clamped at ``answer_start``, matching generation exactly.
+    """
+
+    injection_scope = "full_sequence"
 
     def _extract_graph(self, example):
         """Build PyG graph and injection map from a preprocessed example."""
@@ -434,6 +451,8 @@ class SpineDataCollator(TokenIndexCollator):
         injection_map = build_injection_map(
             example["input_ids"], node_token_seqs, scope_start=scope_start
         )
+        if self.injection_scope == "prompt_only":
+            injection_map = clamp_injection_map(injection_map, example["answer_start"])
         return pyg_graph, injection_map
 
     def __call__(self, features, return_tensors: Optional[str] = None):

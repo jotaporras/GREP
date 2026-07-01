@@ -71,6 +71,17 @@ def train_model(config: omegaconf.DictConfig):
 
     model, collator = architectures.build_planner_model(config, llm, tokenizer)
 
+    # Which token positions carry the graph channel during training forwards:
+    # 'full_sequence' (historical) injects answer-side node mentions too — a channel
+    # generation never has; 'prompt_only' clamps maps at answer_start to match
+    # generation exactly. See SpineDataCollator.injection_scope.
+    if config.data.injection_scope not in ("full_sequence", "prompt_only"):
+        raise ValueError(
+            f"data.injection_scope must be 'full_sequence' or 'prompt_only', "
+            f"got {config.data.injection_scope!r}")
+    collator.injection_scope = config.data.injection_scope
+    print(f"[data] injection_scope={config.data.injection_scope}")
+
     # --- Multistage init: weight-only carry-over from a prior stage (NOT HF resume). --
     # Load PE first (lives outside the LoRA adapter), then attach the carried adapter.
     is_graph_arch = config.gnn.arch in (
@@ -183,6 +194,7 @@ def train_model(config: omegaconf.DictConfig):
             "architecture": config.gnn.arch,
             "base_model": config.model.path,
             "text_edge_list": config.data.text_edge_list,
+            "injection_scope": config.data.injection_scope,
             # Two-group LR: structural (GT / PE) params train at structural_lr_mult × base LR
             # (GraphSFTTrainer.create_optimizer). Default 1.0 = no boost; composite re-sets
             # the same value below.
