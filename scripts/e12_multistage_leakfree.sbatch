@@ -81,11 +81,11 @@ GNN_ARGS=(
     gnn.gt_num_layers=5
     gnn.gt_heads=8
     gnn.k_gt=2
+    # FULL held-out set (all 10 graphs) at every stage — e11 reporting convention.
+    # (Paired e9 chain evaluated 5 graphs; superset, so the A/B still reads.)
     eval.data="$TEST_GRAPHS"
+    eval.num_graphs=-1
 )
-# Stage 2 keeps the default 5-graph eval (matches 3bitwckz); stage 3 evaluates the
-# FULL held-out set, the e11 reporting convention (kfuu2djo used 5 — superset, so
-# the A/B still reads; floor there was 0.10).
 
 # Stage 2 — PE-only edge-list reconstruction, LLM+adapter frozen. ONLY delta vs
 # e9_ms_stage2_3bitwckz: injection_scope=exclude_supervised (edge-bullet tokens
@@ -128,7 +128,6 @@ if [[ "$RUN_STAGE3" == "1" ]]; then
             trainer.freeze_pe=false \
             data.text_edge_list="$TEXT_EDGE_LIST" \
             data.injection_scope=prompt_only \
-            eval.num_graphs=-1 \
             trainer.learning_rate=0.00025 \
             trainer.epochs=3
     done
