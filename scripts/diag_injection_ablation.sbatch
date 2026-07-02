@@ -29,6 +29,12 @@ ENV_NAME=${ENV_NAME:-/vast/projects/aribeiro/alelab/jporras/envs/GREP-PRISM-v3}
 OUTPUTS=/vast/projects/aribeiro/alelab/jporras/GREP-PRISM/outputs
 VAL_FILE=${VAL_FILE:-data/revised/gen/nav100_n30_gemma_data/split/formatted_all_new__val.json}
 
+# Home dir sits at its quota; HF caches must not create locks/files there.
+# Datasets cache goes to node-local scratch; hub reads the existing ~/.cache
+# model snapshots without lock/etag writes (offline mode).
+export HF_DATASETS_CACHE="${TMPDIR:-/tmp}/hf_datasets_${SLURM_JOB_ID:-manual}"
+export HF_HUB_OFFLINE=1
+
 CHECKPOINTS=(
     "$OUTPUTS/refactor_verify_fulltest/rv_gmask_noedges_ror8gtet"
     "$OUTPUTS/refactor_verify_fulltest/rv_rpearl_noedges_8yav2y2h"
