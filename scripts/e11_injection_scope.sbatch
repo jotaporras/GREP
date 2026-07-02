@@ -31,9 +31,11 @@ CHECKPOINT_DIR=$ALELAB/GREP-PRISM/outputs/e11_injection_scope
 TEST_GRAPHS=data/revised/gen/nav100_n30_gemma_data/split/test_graphs
 
 export WANDB_ENTITY=${WANDB_ENTITY:-alelab}
-# Home dir sits at its quota; HF caches must not create locks/files there.
+# Home dir sits at its quota and its model caches were purged; the hub cache
+# lives on vast (shared across jobs, downloads once), datasets cache on
+# node-local scratch.
+export HF_HOME=/vast/projects/aribeiro/alelab/jporras/hf_cache
 export HF_DATASETS_CACHE="${TMPDIR:-/tmp}/hf_datasets_${SLURM_JOB_ID:-manual}"
-export HF_HUB_OFFLINE=1
 
 module load anaconda3
 source activate "$ENV_NAME"
