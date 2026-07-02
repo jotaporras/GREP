@@ -161,14 +161,32 @@ conversations — scale LLM-side alignment (leak-free edge-list reconstruction o
 synthetic graphs, graded by *generation-time* reconstruction F1) before more
 architecture work.
 
-## 6. Falsifiable predictions
+## 6. Falsifiable predictions → outcomes (2026-07-02)
 
-1. e11 arm (a) generation accuracy: any real gain over the 0.10–0.16 floor means the
-   prompt-side readout is learnable; parity with floor + healthy training loss means
-   sample-starved readout → go to (c).
-2. `e10_integ_rpe` diagnostic (pending) shows the gmask-shaped leak signature.
-3. `e9_ms_stage3` (gate 0.27) shows a small train_style > prompt_only gap — the only
-   additive checkpoint where it's possible.
+1. e11 arm (a) generation accuracy beats the 0.10–0.16 floor if the prompt-side
+   readout is learnable. → **CONFIRMED, strongly.** Full 10-graph generation eval,
+   only `injection_scope` changed vs the paired historical run:
+
+   | arm | full_sequence (historical) | **prompt_only (e11)** | halluc. rate |
+   |---|---|---|---|
+   | gmask, param-free (`bznw3x9p` vs `ror8gtet`) | 0.13 | **0.39** | 0.65 → 0.22 |
+   | learnable mask + pretrained GT (`22lq43i6` vs `tyvhwlmx`) | 0.14 | **0.48** | 0.63 → 0.17 |
+
+   First no-edge-list result above the floor in the project. The leak was not just
+   useless at decode — it *suppressed* the generation-compatible circuit (classic
+   shortcut learning). Ordering is coherent with §4: the arch with the larger
+   prompt-side diagnostic residual (−0.92 nats) wins (0.48 > 0.39).
+2. `e10_integ_rpe` diagnostic shows the gmask-shaped leak signature. → **CONFIRMED**
+   (0.865/0.52 → 0.646/1.99 → 0.592/2.92).
+3. `e9_ms_stage3` (gate 0.27) shows a small additive channel. → **CONFIRMED**
+   (−0.20 nats, mostly generation-compatible, too weak to flip decisions).
+
+> [!todo] Verification before trusting §6.1 (owner)
+> Single runs; per-graph rates are ±0.1-grained (though 0.14→0.48 ≫ noise). To do:
+> seed replicates for CIs; `/judge-eval` on the step eval JSONs; `/red-teaming` the
+> A/B (e.g. confirm the prompt_only collator path was active — `[data]
+> injection_scope=prompt_only` printed in both slurm logs); with-edges parity rerun
+> under prompt_only to check nothing regressed.
 
 ## 7. Provenance
 
