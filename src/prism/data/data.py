@@ -15,6 +15,7 @@ from prism.eval import evaluate
 from prism.models.gnn_llm import (
     build_injection_map,
     clamp_injection_map,
+    exclude_positions_from_injection_map,
     find_last_graph_scope,
     node_token_variants,
 )
@@ -438,9 +439,17 @@ class SpineDataCollator(TokenIndexCollator):
       node's PE/mask row, a channel that does not exist at generation (decode steps
       receive no injection; ``inference.py`` builds prompt-only maps).
     - ``"prompt_only"``: maps clamped at ``answer_start``, matching generation exactly.
+    - ``"exclude_supervised"`` (e12): subtract the loss-target positions (the
+      per-example index column named by ``supervised_positions_key``, e.g.
+      ``edge_list_idx`` for ``loss_target='edge_list'``) so no supervised token
+      carries its own node's channel. Enforces injection ∩ loss-target = ∅ even
+      when the supervised block lives in the prompt (edge-list reconstruction).
     """
 
     injection_scope = "full_sequence"
+    # Index column holding the supervised positions; the trainer sets it from
+    # trainer.loss_target when injection_scope='exclude_supervised'.
+    supervised_positions_key = None
 
     def _extract_graph(self, example):
         """Build PyG graph and injection map from a preprocessed example."""
@@ -453,6 +462,15 @@ class SpineDataCollator(TokenIndexCollator):
         )
         if self.injection_scope == "prompt_only":
             injection_map = clamp_injection_map(injection_map, example["answer_start"])
+        elif self.injection_scope == "exclude_supervised":
+            if self.supervised_positions_key is None:
+                raise ValueError(
+                    "injection_scope='exclude_supervised' requires "
+                    "supervised_positions_key to be set (from trainer.loss_target)."
+                )
+            injection_map = exclude_positions_from_injection_map(
+                injection_map, set(example[self.supervised_positions_key])
+            )
         return pyg_graph, injection_map
 
     def __call__(self, features, return_tensors: Optional[str] = None):

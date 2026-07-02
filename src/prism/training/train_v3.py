@@ -74,13 +74,29 @@ def train_model(config: omegaconf.DictConfig):
     # Which token positions carry the graph channel during training forwards:
     # 'full_sequence' (historical) injects answer-side node mentions too — a channel
     # generation never has; 'prompt_only' clamps maps at answer_start to match
-    # generation exactly. See SpineDataCollator.injection_scope.
-    if config.data.injection_scope not in ("full_sequence", "prompt_only"):
+    # generation exactly; 'exclude_supervised' (e12) subtracts the loss-target
+    # positions (from trainer.loss_target's index column) so no supervised token
+    # carries its own node's channel — needed when the supervised block is inside
+    # the prompt (loss_target='edge_list'), where prompt_only doesn't reach.
+    valid_scopes = ("full_sequence", "prompt_only", "exclude_supervised")
+    if config.data.injection_scope not in valid_scopes:
         raise ValueError(
-            f"data.injection_scope must be 'full_sequence' or 'prompt_only', "
+            f"data.injection_scope must be one of {valid_scopes}, "
             f"got {config.data.injection_scope!r}")
     collator.injection_scope = config.data.injection_scope
-    print(f"[data] injection_scope={config.data.injection_scope}")
+    if config.data.injection_scope == "exclude_supervised":
+        if config.trainer.loss_target not in _LOSS_TARGET_COLUMN:
+            raise ValueError(
+                "injection_scope='exclude_supervised' requires a masked loss_target "
+                f"('responses' or 'edge_list'), got {config.trainer.loss_target!r} — "
+                "with loss_target='all' every position is supervised and the "
+                "exclusion would empty the injection map."
+            )
+        collator.supervised_positions_key = _LOSS_TARGET_COLUMN[config.trainer.loss_target]
+        print(f"[data] injection_scope=exclude_supervised "
+              f"(excluding {collator.supervised_positions_key})")
+    else:
+        print(f"[data] injection_scope={config.data.injection_scope}")
 
     # --- Multistage init: weight-only carry-over from a prior stage (NOT HF resume). --
     # Load PE first (lives outside the LoRA adapter), then attach the carried adapter.

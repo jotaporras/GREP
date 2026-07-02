@@ -968,6 +968,42 @@ def clamp_injection_map(
     return clamped
 
 
+def exclude_positions_from_injection_map(
+    injection_map: dict[int, list[tuple[int, int]]],
+    excluded: set[int],
+) -> dict[int, list[tuple[int, int]]]:
+    """Remove a set of token positions from every span of an injection map.
+
+    Spans overlapping ``excluded`` are split into the maximal remaining sub-spans
+    (a mention partially inside the excluded block keeps its outside tokens);
+    nodes left with no spans are removed. Used by
+    ``injection_scope='exclude_supervised'`` (e12): the graph channel must never
+    be attached to loss-target positions, otherwise the supervised token's own
+    query/key carries its label (e.g. edge-list reconstruction reading the target
+    node's own psi at the predicted position instead of inferring the neighbor
+    from the anchor node's features).
+    """
+    if not excluded:
+        return {nid: sorted(spans) for nid, spans in injection_map.items()}
+    result: dict[int, list[tuple[int, int]]] = {}
+    for nid, spans in injection_map.items():
+        kept: list[tuple[int, int]] = []
+        for start, end in spans:
+            run_start = None
+            for pos in range(start, end):
+                if pos in excluded:
+                    if run_start is not None:
+                        kept.append((run_start, pos))
+                        run_start = None
+                elif run_start is None:
+                    run_start = pos
+            if run_start is not None:
+                kept.append((run_start, end))
+        if kept:
+            result[nid] = sorted(kept)
+    return result
+
+
 def bucketize_prompt(input_ids_b: list, node_token_seqs : list) -> defaultdict:
     """Map each node to the set of start positions where its token sequence appears.
 

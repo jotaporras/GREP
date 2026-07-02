@@ -137,7 +137,10 @@ data:
   # "full_sequence" (historical) also injects node mentions inside the assistant answer —
   # the predicted positions carry the ground-truth node's channel, which generation never
   # has (decode steps receive no injection). "prompt_only" clamps injection maps at
-  # answer_start so training matches generation exactly.
+  # answer_start so training matches generation exactly. "exclude_supervised" (e12)
+  # subtracts the loss-target positions (trainer.loss_target's index column, e.g.
+  # edge_list_idx) — use for loss_target='edge_list', where the supervised block is in
+  # the PROMPT and prompt_only would not remove the leak.
   injection_scope: full_sequence
   # debug=true downsamples train+val to dataset_proportion before splitting.
   debug: false
