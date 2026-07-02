@@ -108,25 +108,32 @@ $$
 | `rv_gmask_noedges` (**mask, param-free**, 12B) | **0.705 / 0.92** | 0.595 / 1.93 | 0.584 / 1.96 |
 | `rv_rpearl_noedges` (additive, 12B) | 0.574 / 1.72 | 0.578 / 1.72 | 0.578 / 1.72 |
 | `rv_gt_l5d2048_noedges` (additive GT, 12B) | 0.578 / 1.70 | 0.574 / 1.70 | 0.574 / 1.70 |
-| `e10_integ_rpe` (learnable mask + pretrained GT, 31B) | *pending* | *pending* | *pending* |
-| `e9_ms_stage3` (additive, gate 0.27, 31B) | *pending* | *pending* | *pending* |
-| `e9_llm_baseline_noedges` (floor, 31B) | — | — | *pending* |
+| `e10_integ_rpe` (**learnable mask + pretrained GT**, 31B) | **0.865 / 0.52** | **0.646 / 1.99** | 0.592 / 2.92 |
+| `e9_ms_stage3` (additive, gate 0.27, 31B) | 0.588 / 1.81 | 0.595 / 1.85 | 0.592 / 2.01 |
+| `e9_llm_baseline_noedges` (floor, 31B) | — | — | 0.505 / 4.91 |
 
 Completion/repeat tokens: ≈0.99 in every condition, every model (the saturation).
+Condition deltas are within-checkpoint (same weights); rows across checkpoints mix
+base sizes and training, so only the deltas are clean comparisons.
 
 > [!important] Reading
-> - **Mask family — leak confirmed.** Answer-side masking triples the probability on
->   the correct next node ($e^{-0.92}\!\approx\!0.40$ vs $e^{-1.96}\!\approx\!0.14$);
->   in perplexity terms ~2.5 effective candidates (≈ knowing the neighbor set,
->   degree ≈ 4.4) vs ~7 (broad guess). Prompt-only — all generation gets — retains
->   ~1 pt. The model *learned to use adjacency*; it learned it on a channel that
->   doesn't exist at decode.
-> - **Additive family — channel never engaged.** All conditions identical; causal
->   confirmation of the `pe_gain` cold-start (gates ended at ~0.001–0.005; only
->   stage-2 pretraining moved one to 0.27). Those "no-edge PE runs" were effectively
->   baseline runs.
-> - The ~0.58 floor includes easy decisions (start node = `Robot location:` copy,
->   goal named in the task); the leak's effect concentrates on intermediate hops.
+> - **Mask family — leak confirmed, twice.** Param-free gmask: answer-side masking
+>   triples the probability on the correct next node ($e^{-0.92}\!\approx\!0.40$ vs
+>   $e^{-1.96}\!\approx\!0.14$); prompt-only retains ~1 pt. `e10_integ_rpe` (pretrained
+>   GT, warm LoRA) is more extreme: 0.865/0.52 train-style — near-solved under the
+>   leak — dropping to 0.646/1.99 prompt-only.
+> - **BUT the pretrained learnable mask also learned a real prompt-side channel:**
+>   prompt_only vs no_injection = **+5.4 pts / −0.92 nats** (prob of correct node
+>   2.5×: 0.136 vs 0.054). This is the first generation-compatible signal observed
+>   in any arm — the readout exists; it's the *weaker* of the two channels the
+>   optimizer found, because the leak was available. e11 arm 1 retrains this exact
+>   config with the leak removed.
+> - **Additive family — channel never engaged from scratch** (all conditions
+>   identical; `pe_gain` gates ended ~0.001–0.005). With stage-2 pretraining
+>   (gate 0.27), a small genuine channel appears (−0.17 nats), mostly
+>   generation-compatible but an order of magnitude too weak to flip decisions.
+> - The ~0.59 floor includes easy decisions (start node = `Robot location:` copy,
+>   goal named in the task); leak/channel effects concentrate on intermediate hops.
 
 ## 5. The fix(es)
 
