@@ -58,7 +58,7 @@ Used to fill in placeholders in `~/.claude/skills/cluster-slurm/template.sbatch`
 ## Build, Test, and Development Commands
 - `python -m pip install -r requirements.txt` installs the dependency set (`requirements.txt` is the source of truth).
 - `python -m pip install -e .` enables `prism.*` imports in scripts and notebooks.
-- `python scripts/generate_data_spine.py --n-samples 10 --n-tasks 3 --name demo` creates SPINE training data; other generators share similar flags.
+- `python scripts/training_data_generation/generate_data_spine.py --n-samples 10 --n-tasks 3 --name demo` creates SPINE training data; other generators share similar flags.
 - `python -m prism.training.train_v3 --config-name=<config> [key=value ...]` launches training (LoRA SFT) from a nested Hydra config under `experiments/`.
 - Evaluation runs as part of `train_v3` via the Hydra `eval.*` block: set `eval.post_train_graphs` to reload the saved checkpoint from disk and cross-evaluate the held-out set.
 

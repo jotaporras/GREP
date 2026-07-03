@@ -40,7 +40,8 @@ from trl import SFTConfig, SFTTrainer
 
 def train_model(config: omegaconf.DictConfig):
     wandb_run_id = _setup_wandb(
-        config.wandb.project, config.wandb.run_name, config.wandb.tag
+        config.wandb.project, config.wandb.run_name, config.wandb.tag,
+        report_to=config.trainer.report_to,
     )
     # Dir: {name}_{architecture}_{model_slug}_r{r}[_4bit]
     output_dir = _construct_output_dir(config, wandb_run_id)
@@ -385,7 +386,17 @@ def _ensure_pad_tokens(tokenizer: PreTrainedTokenizer, model: PreTrainedModel) -
         model.config.pad_token_id = tokenizer.pad_token_id
 
 
-def _setup_wandb(wandb_project: str, wandb_run_name: str, wandb_tag: str) -> str:
+def _setup_wandb(wandb_project: str, wandb_run_name: str, wandb_tag: str,
+                 report_to: str = "wandb") -> str:
+    """Create the tracked wandb run (its id names the run dir).
+
+    ``report_to != 'wandb'`` (e.g. smoke runs) creates NO remote run — a local
+    random id names the dir instead, and ``wandb.run`` stays None so every
+    downstream ``if wandb.run is not None`` guard no-ops.
+    """
+    if report_to != "wandb":
+        import uuid
+        return uuid.uuid4().hex[:8]
     os.environ["WANDB_PROJECT"] = wandb_project
     os.environ["WANDB_RUN_GROUP"] = wandb_tag
     os.environ["WANDB_TAGS"] = wandb_tag

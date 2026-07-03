@@ -1,17 +1,23 @@
 # GREP-PRISM
 
-Work-in-progress research code for a new paper extending [PRISM](PRISM_README.md) with graph-augmented LLM planning.
+Research code for **graph-augmented LLM planners** on scene-graph navigation
+tasks. A Gemma-4 language model plans routes over a scene graph described in its
+prompt; the graph's structure is additionally delivered through a *graph
+channel* — either node-level positional encodings added into the token stream,
+or a structural bias on the attention logits — and we study when that channel
+lets the model plan without a textual edge list.
 
-The core idea is to augment a small language model (SLM) planner with structural information from the scene graph. Rather than relying solely on the text serialization of the graph, we compute node-level positional encodings via a GNN (R-PEARL) and inject them directly into the LLM's token embeddings at the positions of matching node names. This lets the model reason over graph topology without changing the prompt format.
+Architectures (select with `gnn.arch=...`):
 
-Two architectures are supported:
+| arch | graph channel |
+|---|---|
+| `llm` | none — text-only baseline |
+| `rpearl_llm`, `rpearl_gt_llm`, `gt_llm` | additive: GNN/Graph-Transformer node encodings Ψ injected at node-name token positions |
+| `graph_mask_llm` | parameter-free adjacency mask on attention logits |
+| `learnable_graph_mask` | learnable relative-PE attention bias `α·A + (1−α)·sim(ΨΨᵀ)` |
 
-- `rpearl_llm` — graph-augmented LLM: R-PEARL GNN encodings are injected into token embeddings at training and inference time.
-- `llm` — text-only baseline: standard LoRA SFT on the same data, no graph injection.
-
-The planner is evaluated on multi-turn SPINE planning tasks using scene graphs from the SPINE simulator.
-
----
+Tasks and scene graphs follow the SPINE navigation setting; answers are graded
+by a deterministic path-validity walk over the graph.
 
 ## Installation
 
@@ -23,17 +29,51 @@ uv pip install -r requirements.txt
 uv pip install -e .
 ```
 
----
+Models are pulled from the HuggingFace Hub (Gemma-4 requires accepting the
+license). Training data ships with the repo under
+`data/revised/gen/nav100_n30_gemma_data/`.
 
-## Usage
+## Running
 
-Runs are driven by a YAML config in `experiments/`; override any field with `--key value`.
+Runs are Hydra-driven; every parameter (with docs) lives in
+`experiments/base_config.yaml`, experiment files override deltas, and any field
+can be overridden on the CLI.
 
 ```bash
-# Train (smoke config: tiny Qwen-0.5B, runs locally)
-python -m prism.training.train_v2 experiments/smoke/e2_qwen05b_smoke.yaml
+# Smoke test the stack (Gemma-4-12B, 4 optimizer steps, 1 eval graph, no wandb)
+python -m prism.training.train_v3 --config-name=smoke/smoke_gemma12b
 
-# Evaluate only — zero-shot accuracy, no training
-python -m prism.training.train_v2 experiments/smoke/e2_qwen05b_smoke.yaml --no_train true
+# Main result: adjacency-mask planner WITHOUT a textual edge list, trained with
+# generation-consistent injection (prompt_only) — vs. the text-only baseline.
+python -m prism.training.train_v3 --config-name=refactor_verify/rv_gmask_noedges \
+    data.injection_scope=prompt_only eval.num_graphs=-1
+python -m prism.training.train_v3 --config-name=e9_baseline_llm_no_edges eval.num_graphs=-1
 ```
 
+Each run writes a checkpoint dir (`train_config.json`, adapter/PE weights) and
+its generation-eval results under `<run_dir>/eval_logs/`. `eval/accuracy` in the
+logs is the headline metric: fraction of held-out navigation tasks answered with
+a valid route.
+
+To re-evaluate a saved checkpoint on other graphs:
+
+```bash
+python -m prism.eval.scalability_evaluation --checkpoint <run_dir> \
+    --graphs data/revised/gen/nav100_n30_gemma_data/split/test_graphs
+```
+
+## Layout
+
+```
+src/prism/        the package: models/ (architectures), data/ (prompting +
+                  collators + generation), training/ (train_v3 entrypoint),
+                  eval/ (grading, metrics, checkpoint reload)
+experiments/      Hydra configs (base_config.yaml = the documented schema;
+                  old/ = frozen legacy series)
+scripts/          current launchers + diagnostics (old/ = frozen legacy)
+data/             navigation corpora and held-out eval graphs
+docs/             internal documentation (metrics catalog, ...)
+notebooks/        lab notes for the experiment series
+```
+
+Built on PRISM-style planner training and the SPINE task setting.

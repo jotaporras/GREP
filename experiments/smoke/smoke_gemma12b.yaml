@@ -1,3 +1,4 @@
+# @package _global_
 # Smoke config: fastest end-to-end check of the CURRENT training stack.
 # Gemma-4-12B + parameter-free adjacency mask, 4 optimizer steps, 1 eval graph,
 # no wandb. Exercises: Hydra compose, preprocessing/injection maps, the graph-mask
@@ -19,7 +20,7 @@ data:
 trainer:
   checkpoint_dir: outputs/smoke
   save_name: smoke_gemma12b
-  device: 0
+  device: -1        # shard across available GPUs (12B + activations > one 48GB card)
   max_steps: 4
   report_to: none
   overwrite_ok: true
