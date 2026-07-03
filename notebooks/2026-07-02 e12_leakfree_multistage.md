@@ -105,3 +105,37 @@ mask family ([[e11_decode_time_injection_design]]; e11-diagnostic train_style
 baseline); scaled leak-free alignment graded by *generation-time* reconstruction
 (teacher-forced reconstruction NLL demonstrably does not transfer); additive-as-
 content only if some new interface idea changes the delivery mechanism.
+
+## 5. Follow-up: gate sweep — "do we even need the gate?" (job 6919222)
+
+Question: is the trained gate value (tanh(pe_gain) ≈ 0.23) amplitude-limiting —
+would removing/pinning the gate turn the −0.34-nat channel into a usable one?
+Method: `diag_injection_ablation.py --gate-sweep` on the e12 no-edge checkpoint —
+prompt_only map, pe_gain temporarily set to atanh(g), decision-token grading,
+identical probes across conditions (commit `c589b1e`).
+
+| g | decision NLL | decision acc | completion NLL | repeat NLL |
+|---|---|---|---|---|
+| 0.00 | 2.414 | 0.603 | 0.013 | 0.016 |
+| 0.10 | 2.158 | 0.595 | 0.013 | 0.017 |
+| **trained 0.229** | **2.074** | 0.597 | 0.013 | 0.017 |
+| 0.25 | **2.066** | 0.593 | 0.012 | 0.017 |
+| 0.50 | 2.300 | 0.545 | 0.020 | 0.027 |
+| 0.75 | 3.605 | 0.401 | 0.092 | 0.129 |
+| 1.00 | 4.916 | 0.183 | 0.226 | 0.545 |
+
+> [!important] Answer: no — the gate is exonerated, and the mechanism is now visible.
+> Textbook inverted-U with the minimum AT the trained value (Adam parked pe_gain
+> within 0.02 of it — the near-zero stage-3 gate gradient meant "at the optimum",
+> not "stuck"). Past g≈0.25 the injection corrupts its own medium: by g=1.0,
+> decision NLL equals the no-graph baseline (4.916 vs 4.91) and name-copying
+> itself degrades (repeat NLL ×34). The additive interface is **self-limiting**:
+> ψ shares the residual stream with the text, so amplitude buys signal only until
+> it erases the lexical identity the readout needs to bind mentions by name. The
+> mask interface pays no such tax (bias on attention logits, orthogonal to
+> content) — sharpening the §4 interface verdict. Decision accuracy is flat
+> (~0.60) across the whole useful range: no volume setting flips argmax.
+> Caveat: sweep evaluates the g≈0.23-trained circuit off-distribution; a
+> gate-free *training* run could in principle adapt, but this demotes it to a
+> long shot not worth a training slot.
+> JSON: `injection_diag_gate_sweep.json` in the `wh0537au` run dir.
