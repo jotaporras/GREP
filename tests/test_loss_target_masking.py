@@ -7,11 +7,11 @@ separately by ``scripts/verify_loss_masking.py`` against the gemma stack):
 * ``data.assistant_token_positions`` — multi-turn assistant span location, template-agnostic.
 * ``data.edge_list_token_positions`` / ``_find_subsequence`` — the ``• Region/Object Edges:``
   block, including special-token exclusion at the span boundary.
-* ``train_v2.LossTargetMixin`` — masks ``labels`` to the configured span, pops the index
+* ``train_v3.LossTargetMixin`` — masks ``labels`` to the configured span, pops the index
   columns before the forward, and flips ``model_accepts_loss_kwargs`` so the masked CE is
   mean-over-kept (not under-normalized by the full-sequence ``num_items_in_batch``).
-* MRO composition (mask BEFORE the pure-diagnostic accuracy mixin) and ``TrainConfig``
-  validation.
+* MRO composition (mask BEFORE the pure-diagnostic accuracy mixin) and config validation
+  (``train_v3._validate_config``).
 
 All deterministic, CPU, no model weights.
 """
@@ -31,12 +31,14 @@ from prism.data.data import (
     TokenIndexCollator,
 )
 from prism.eval.evaluate import GraphTokenAccuracyMixin
-from prism.training.train_v2 import (
+import omegaconf
+
+from prism.training.train_v3 import (
     _LOSS_TARGET_COLUMN,
+    _validate_config,
     BaselineSFTTrainer,
     GraphSFTTrainer,
     LossTargetMixin,
-    TrainConfig,
 )
 
 
@@ -345,7 +347,7 @@ def test_real_trainers_order_mask_before_diagnostic():
 
 
 # ==========================================================================
-# Cross-module invariants and TrainConfig validation
+# Cross-module invariants and config validation
 # ==========================================================================
 def test_loss_target_columns_are_carried_by_the_collator():
     # every column a loss target masks on MUST be passed through batching, else the
@@ -357,20 +359,25 @@ def test_loss_target_column_map_is_stable():
     assert _LOSS_TARGET_COLUMN == {"responses": "assistant_idx", "edge_list": "edge_list_idx"}
 
 
-def _cfg(**kw):
-    return TrainConfig(name="t", checkpoint_dir="/tmp/x", data="d.json", **kw)
+def _cfg(loss_target="responses", text_edge_list="present"):
+    # Minimal config slice covering everything _validate_config reads.
+    return omegaconf.OmegaConf.create({
+        "gnn": {"eps": 1e-6, "arch": "rpearl_llm"},
+        "trainer": {"loss_target": loss_target},
+        "data": {"text_edge_list": text_edge_list},
+    })
 
 
 def test_config_rejects_unknown_loss_target():
     with pytest.raises(ValueError, match="loss_target"):
-        _cfg(loss_target="bogus")
+        _validate_config(_cfg(loss_target="bogus"))
 
 
 def test_config_edge_list_requires_text_edges_present():
     with pytest.raises(ValueError, match="text_edge_list"):
-        _cfg(loss_target="edge_list", text_edge_list="none")
+        _validate_config(_cfg(loss_target="edge_list", text_edge_list="none"))
 
 
 def test_config_accepts_all_valid_targets():
     for tgt in ("all", "responses", "edge_list"):
-        assert _cfg(loss_target=tgt, text_edge_list="present").loss_target == tgt
+        _validate_config(_cfg(loss_target=tgt))

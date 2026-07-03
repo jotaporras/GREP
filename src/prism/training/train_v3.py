@@ -7,7 +7,6 @@ from prism.eval import callbacks
 from prism.eval import checkpoint
 from prism.eval import evaluate
 from prism.models import architectures
-from prism.models import composite_graph
 from prism.models import loaders as model_loaders
 
 import json
@@ -106,8 +105,6 @@ def train_model(config: omegaconf.DictConfig):
         "gt_llm",
         "graph_mask_llm",
         "learnable_graph_mask",
-        "postfusion_graph_llm",
-        "composite_graph_gt",
     )
     if (config.trainer.init_pe_from or config.trainer.init_lora_from) and not is_graph_arch:
         raise ValueError(
@@ -189,15 +186,7 @@ def train_model(config: omegaconf.DictConfig):
         do_eval=True,
     )
 
-    if config.gnn.arch in (
-        "rpearl_llm",
-        "rpearl_gt_llm",
-        "gt_llm",
-        "graph_mask_llm",
-        "learnable_graph_mask",
-        "postfusion_graph_llm",
-        "composite_graph_gt",
-    ):
+    if is_graph_arch:
         # gnn_config is dumped to gnn_config.json and read back by loaders at eval, so the
         # on-disk key NAMES must stay stable. These keys map 1:1 onto config.gnn fields;
         # the remapped/cross-section ones (architecture, base_model, text_edge_list) and
@@ -212,13 +201,11 @@ def train_model(config: omegaconf.DictConfig):
             "text_edge_list": config.data.text_edge_list,
             "injection_scope": config.data.injection_scope,
             # Two-group LR: structural (GT / PE) params train at structural_lr_mult × base LR
-            # (GraphSFTTrainer.create_optimizer). Default 1.0 = no boost; composite re-sets
-            # the same value below.
+            # (GraphSFTTrainer.create_optimizer). Default 1.0 = no boost.
             "structural_lr_mult": config.gnn.structural_lr_mult,
             **{k: config.gnn[k] for k in _direct},
             **({k: config.gnn[k] for k in ("k_gt", "gt_num_layers", "gt_heads")}
-               if config.gnn.arch in ("rpearl_gt_llm", "gt_llm", "composite_graph_gt",
-                                       "learnable_graph_mask", "postfusion_graph_llm") else {}),
+               if config.gnn.arch in ("rpearl_gt_llm", "gt_llm", "learnable_graph_mask") else {}),
             # graph_mask_llm / learnable_graph_mask adjacency (A) + fold + scope rebuild params.
             **({k: config.gnn[k] for k in ("mask_k_hops", "mask_symmetrize", "mask_use_edges",
                                            "mask_buggy_causal_fold", "mask_layer_scope")}
@@ -226,10 +213,6 @@ def train_model(config: omegaconf.DictConfig):
             # learnable_graph_mask extra params (read back by loaders for eval).
             **({k: config.gnn[k] for k in ("mask_alpha", "mask_psi_scale")}
                if config.gnn.arch == "learnable_graph_mask" else {}),
-            # postfusion_graph_llm cross-attention head count + gate init (read back by loaders).
-            **({k: config.gnn[k] for k in ("postfusion_num_heads", "postfusion_gate_init")}
-               if config.gnn.arch == "postfusion_graph_llm" else {}),
-            **composite_graph.composite_graph_gnn_rebuild_params(config),
         }
         trainer = GraphSFTTrainer(
             model=model,
@@ -287,23 +270,6 @@ def train_model(config: omegaconf.DictConfig):
     # Per-component grad norms, GT output magnitude, gate value, injection count.
     if config.trainer.gradient_debug:
         trainer.add_callback(callbacks.GradientDebugCallback())
-
-    if config.gnn.arch == "composite_graph_gt":
-        # Fiedler, scene-mass, gate, contrib-ratio diagnostics (+ visualizer if enabled).
-        trainer.add_callback(
-            callbacks.AugGraphDebugCallback(
-                enable_visualizer=config.trainer.enable_visualizer,
-                visualizer_dir=os.path.join(output_dir, "visuals"),
-            )
-        )
-        if config.trainer.lora_warmup_steps > 0:
-            trainer.add_callback(callbacks.LoraWarmupCallback(config.trainer.lora_warmup_steps))
-        if getattr(config.trainer, "lam_c_warmup_steps", 0) > 0 and getattr(
-            config.gnn, "c_bias", False
-        ):
-            trainer.add_callback(
-                callbacks.CBiasWarmupCallback(config.trainer.lam_c_warmup_steps)
-            )
 
     cross_eval_dir = os.path.join(sft_args.output_dir, "eval_logs", "cross_eval")
 
@@ -379,8 +345,8 @@ def _model_short_name(base_model: str) -> str:
     """Extract a short filesystem-safe slug from a HuggingFace model ID.
 
     Examples:
-        meta-llama/Llama-3.1-8B-Instruct → llama-3.1-8b
-        Qwen/Qwen2.5-0.5B-Instruct       → qwen2.5-0.5b
+        google/gemma-4-31B-it → gemma-4-31b
+        google/gemma-4-12B-it → gemma-4-12b
     """
     name = base_model.split("/")[-1]  # drop org prefix
     name = re.sub(r"-[Ii]nstruct$", "", name)  # drop -Instruct suffix
@@ -606,33 +572,7 @@ class GraphSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
         os.makedirs(output_dir, exist_ok=True)
         with open(os.path.join(output_dir, "gnn_config.json"), "w") as f:
             json.dump(self.gnn_config, f, indent=2)
-        if self.gnn_config.get("architecture") == "composite_graph_gt":
-            # Save the Graph Transformer (R-PEARL inside) and the cold-start gate.
-            gnn_state = {
-                "gt_model": self.model.gt_model.state_dict(),
-                "injection": self.model.injection.state_dict(),
-            }
-            # In-attention injection variant: persist the dedicated q/k(/v) projections.
-            if hasattr(self.model, "pe_q_proj"):
-                gnn_state["pe_q_proj"] = self.model.pe_q_proj.state_dict()
-                gnn_state["pe_k_proj"] = self.model.pe_k_proj.state_dict()
-                if getattr(self.model, "pe_v_proj", None) is not None:
-                    gnn_state["pe_v_proj"] = self.model.pe_v_proj.state_dict()
-            # c_bias: persist scalar gains λ_C/λ_S/λ_V.
-            if getattr(self.model, "c_bias", False):
-                gnn_state["c_bias_gains"] = {
-                    name: getattr(self.model, name).detach().cpu()
-                    for name in ("lam_c", "lam_psi", "lam_v")
-                    if getattr(self.model, name, None) is not None
-                }
-            torch.save(gnn_state, os.path.join(output_dir, "gnn_weights.pt"))
-            torch.save(
-                {
-                    "rpearl": self.model.gt_model.pe_model.state_dict(),
-                },
-                os.path.join(output_dir, "rpearl_weights.pt"),
-            )
-        elif self.gnn_config.get("architecture") == "graph_mask_llm":
+        if self.gnn_config.get("architecture") == "graph_mask_llm":
             # Parameter-free: mask rebuilt from config; gnn_config.json + LoRA adapter suffice.
             pass
         elif self.gnn_config.get("architecture") == "learnable_graph_mask":
@@ -640,18 +580,6 @@ class GraphSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
             # rebuild from gnn_config and the LoRA adapter is saved below.
             torch.save(
                 {"pe_model": self.model.pe_model.state_dict()},
-                os.path.join(output_dir, "gnn_weights.pt"),
-            )
-        elif self.gnn_config.get("architecture") == "postfusion_graph_llm":
-            # Save the standalone GraphTransformer (Psi producer), the output cross-attention
-            # fusion, and the scalar cold-start gate. Head count / gate init rebuild from
-            # gnn_config; the LoRA adapter is saved below.
-            torch.save(
-                {
-                    "pe_model": self.model.pe_model.state_dict(),
-                    "fusion": self.model.fusion.state_dict(),
-                    "gate": self.model.gate.data,
-                },
                 os.path.join(output_dir, "gnn_weights.pt"),
             )
         elif self.gnn_config.get("architecture") == "rpearl_gt_llm":
@@ -745,14 +673,6 @@ def _validate_config(config: omegaconf.DictConfig) -> None:
             raise ValueError(
                 "gnn.mask_psi_scale='cosine' with gnn.mask_use_edges=false is degenerate "
                 "(constant mask, zero GT gradient). Use mask_psi_scale='inv_sqrt_d' or keep edges.")
-    if config.gnn.arch == "postfusion_graph_llm":
-        if int(config.gnn.postfusion_num_heads) <= 0:
-            raise ValueError(
-                f"gnn.postfusion_num_heads must be >= 1, got {config.gnn.postfusion_num_heads}")
-        if config.gnn.pe_node_features != "random":
-            raise ValueError(
-                "gnn.arch='postfusion_graph_llm' requires pe_node_features='random' "
-                f"(the GT samples probes), got {config.gnn.pe_node_features!r}.")
     if config.trainer.loss_target not in ("all", "responses", "edge_list"):
         raise ValueError(
             f"loss_target must be 'all', 'responses', or 'edge_list', got {config.trainer.loss_target!r}"

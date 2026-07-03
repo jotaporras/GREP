@@ -18,18 +18,15 @@ model:
   # auto-applied). 31B is the default ON PURPOSE so a confirmatory run is never silently
   # downsized to 12B — override explicitly for the smaller/cheaper bases:
   #   google/gemma-4-12B-it              # text-only 12B (fast dev only; NOT the confirmatory base)
-  #   meta-llama/Llama-3.1-8B-Instruct   # e7 architecture experiments
   path: google/gemma-4-31B-it
-  # disable_rope: replaces RoPE with the structural code in composite/injection archs;
-  # a no-op elsewhere. disable_graph_token_rope: position_id 0 on node-name tokens so
-  # RoPE is identity there (set true for the norope_graph run).
-  disable_rope: true
+  # disable_graph_token_rope: position_id 0 on node-name tokens so RoPE is identity
+  # there (set true for the norope_graph run).
   disable_graph_token_rope: false
 
 gnn:
   # Master architecture switch — determines which gnn.* keys the code actually reads;
   # the rest compose harmlessly.
-  #   llm | rpearl_llm | rpearl_gt_llm | gt_llm | graph_mask_llm | learnable_graph_mask | postfusion_graph_llm | composite_graph_gt
+  #   llm | rpearl_llm | rpearl_gt_llm | gt_llm | graph_mask_llm | learnable_graph_mask
   arch: rpearl_llm
 
   # --- Numerics shared by the R-PEARL encoder AND the Graph Transformer + PE gate ---
@@ -47,19 +44,13 @@ gnn:
   pe_num_layers: 2
   num_samples: 40
   k_pe: 2
-  probe_distribution: gaussian
-  max_gather_rows: 2000000
-  fixed_seed_mode: false
-  fixed_seed_value: 0
-  # "mean" = E_q[Φ(q)] (additive-injection archs); composite_graph_gt overrides to
-  # "second_moment". pe_center_moment centers the second moment into a covariance.
-  pe_readout: mean
-  pe_center_moment: true
+  # (R-PEARL probe distribution / fixed-seed / gather-cap knobs live as module
+  # defaults in models/r_pearl.py — no live architecture overrides them.)
   # "random" = PEARL random probes; "word_embeddings" = mean node-name word-embedding
   # (deterministic). gt_llm REQUIRES word_embeddings.
   pe_node_features: random
 
-  # --- Graph Transformer (rpearl_gt_llm / gt_llm / composite). Default = L2 baseline. ---
+  # --- Graph Transformer (rpearl_gt_llm / gt_llm / learnable_graph_mask). Default = L2 baseline. ---
   # gt_llm depth/width sweeps (use with arch=gt_llm pe_node_features=word_embeddings):
   #   L3:        gt_num_layers=3 gt_heads=8  k_gt=1
   #   L4:        gt_num_layers=4 gt_heads=8  k_gt=1
@@ -88,37 +79,9 @@ gnn:
   mask_layer_scope: dense    # "all" = every self-attn layer | "dense" = Gemma full_attention (global) layers only
   mask_psi_scale: cosine     # "cosine" (row-normalized, sim in [-1,1]) | "inv_sqrt_d" (Gemma-style raw/sqrt(D))
 
-  # --- postfusion_graph_llm (EXPERIMENTAL late/output fusion) ---
-  # Y_tilde = Y + tanh(gate)*CrossAttn(Q=Y, K,V=Psi) folded in just before the vocab head;
-  # Psi from a STANDALONE GraphTransformer (reuses the gt_*/pe_* block). Every output token
-  # (incl. each generated one) cross-attends the N node embeddings. Requires
-  # pe_node_features=random. Self-contained in models/postfusion_graph_llm.py (clean delete).
-  postfusion_num_heads: 8    # cross-attention heads (must divide the LLM hidden size)
-  postfusion_gate_init: 0.0  # scalar gate g=tanh(gate); 0.0 = cold start (fusion off at init)
-
-  # --- composite_graph_gt (read ONLY when arch=composite_graph_gt) ---
-  # The e7 designs override the structural/gt block above AND these. Representative recipes
-  # (use with arch=composite_graph_gt data=legacy model.path=...llama... bit4=true):
-  #   centered:    d_model=4096 num_samples=96  pe_readout=second_moment injection_mode=none
-  #                structural_lr_mult=5.0 lora_warmup_steps=20
-  #   c_per_layer: (centered) + c_per_layer=true
-  #   c_bias (Design D): d_model=4096 num_samples=128 injection_mode=interpolate gate_init=0.3
-  #                c_bias=true structural_lr_mult=3.0 lora_warmup_steps=20 lam_c_warmup_steps=10
+  # Two-group LR: structural (GT/PE) params train at structural_lr_mult x base LR
+  # (GraphSFTTrainer.create_optimizer). 1.0 = no boost.
   structural_lr_mult: 1.0
-  cycle_weight: 1.0
-  cycle_directed: true
-  crosslink_weight: 1.0
-  crosslink_mention_to_node: true
-  crosslink_mention_clique: true
-  injection_mode: interpolate
-  gate_init: 0.0
-  gate_per_dim: false
-  pe_qk_injection: false
-  pe_inject_v: true
-  c_per_layer: false
-  c_bias: false
-  use_scene_bias: true
-  c_kernel: sampled
 
 data:
   # Revised nav100 corpus (e8/e9). Legacy e7 alternative:
@@ -181,8 +144,6 @@ trainer:
   overwrite_ok: false
   # Per-component grad-norm logging (no-op for non-PE/GT archs).
   gradient_debug: true
-  # Composite-graph visualizer (no-op for non-composite archs).
-  enable_visualizer: false
 
   # --- Freeze regime + multistage weight carry-over (NOT HF resume) ---
   freeze_llm: false
@@ -193,9 +154,6 @@ trainer:
   # "all" | "responses" (assistant-only) | "edge_list". edge_list REQUIRES
   # data.text_edge_list=present.
   loss_target: responses
-  # Composite-graph warmup schedules (no-op when 0 / non-composite).
-  lora_warmup_steps: 0
-  lam_c_warmup_steps: 0
 
 eval:
   # Multi-graph eval: a DIRECTORY of {graph, tasks} JSONs, capped to num_graphs/interval.

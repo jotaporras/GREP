@@ -69,8 +69,6 @@ def _fixed_get_base_prompt(request, scene_graph, use_icl=True):
 spine_prompts.get_base_prompt_update_graph = _fixed_get_base_prompt
 
 from prism.models import gnn_llm
-from prism.models import composite_graph_llm
-from prism.models import postfusion_graph_llm  # postfusion: experimental standalone arch
 from prism.models import inference
 from prism.models import utils as model_utils
 from prism.data import graph_sim
@@ -719,11 +717,10 @@ _aggregate_path_metrics = path_validator.aggregate_path_metrics
 
 
 def _is_graph_augmented(model) -> bool:
-    """True if `model` is (or wraps) a GraphAugmentedLLM / GraphMaskLLM / LearnableGraphMaskLLM /
-    CompositeGraphLLM (including PEFT)."""
+    """True if `model` is (or wraps) a GraphAugmentedLLM / GraphMaskLLM /
+    LearnableGraphMaskLLM (including PEFT)."""
     graph_types = (gnn_llm.GraphAugmentedLLM, gnn_llm.GraphMaskLLM,
-                   gnn_llm.LearnableGraphMaskLLM, composite_graph_llm.CompositeGraphLLM,
-                   postfusion_graph_llm.PostFusionGraphLLM)
+                   gnn_llm.LearnableGraphMaskLLM)
     if isinstance(model, graph_types):
         return True
     inner = getattr(getattr(model, "base_model", None), "model", None)
@@ -776,7 +773,6 @@ def render_path_metrics_figure(
 # Architectures whose checkpoints carry a graph PE; everything else is a plain LLM.
 _GNN_ARCHITECTURES = (
     "rpearl_llm", "rpearl_gt_llm", "gt_llm", "graph_mask_llm", "learnable_graph_mask",
-    "postfusion_graph_llm", "composite_graph_gt",
 )
 
 

@@ -73,7 +73,6 @@ from prism.training.train_v3 import (
     _validate_config,
 )
 from prism.eval.evaluate import GraphTokenAccuracyMixin
-from prism.models import composite_graph
 
 _CFG_DIR = os.path.abspath("experiments")
 
@@ -109,7 +108,6 @@ _FIELDS_TRAIN_V3_READS = [
     # wandb / output-dir / overwrite
     "wandb.project", "wandb.run_name", "wandb.tag", "trainer.checkpoint_dir",
     "trainer.save_name", "name", "trainer.report_to", "trainer.overwrite_ok",
-    "trainer.enable_visualizer",
     # model / device / quant
     "model.path", "trainer.device", "trainer.bit4", "gnn.arch",
     # data
@@ -125,7 +123,6 @@ _FIELDS_TRAIN_V3_READS = [
     # multistage (folded into trainer)
     "trainer.freeze_llm", "trainer.freeze_lora", "trainer.freeze_pe",
     "trainer.init_lora_from", "trainer.init_pe_from", "trainer.loss_target",
-    "trainer.lora_warmup_steps", "trainer.lam_c_warmup_steps",
     # structural / r-pearl
     "gnn.d_model", "gnn.dropout", "gnn.use_layer_norm", "gnn.eps", "gnn.pe_gain_init",
     "gnn.use_pe_norm", "gnn.pe_hidden_channels", "gnn.pe_num_layers", "gnn.num_samples",
@@ -192,33 +189,6 @@ def test_stage_experiment_overrides_take_effect():
     assert s3.data.text_edge_list == "none" and s3.trainer.loss_target == "responses"
 
 
-def test_composite_graph_rebuild_params_for_representative_variants():
-    """Integration contract: for ``gnn.arch=composite_graph_gt``, train_v3 builds gnn_config
-    via ``composite_graph.composite_graph_gnn_rebuild_params(config)`` (unconditionally for
-    that arch). It must return a non-empty rebuild dict across the injection variants the e7
-    designs exercise (plain / c_bias / c_per_layer / pe_qk_injection)."""
-    variants = {
-        "plain": ["gnn.arch=composite_graph_gt"],
-        "c_bias": ["gnn.arch=composite_graph_gt", "gnn.c_bias=true",
-                   "gnn.pe_readout=second_moment", "gnn.structural_lr_mult=3.0"],
-        "c_per_layer": ["gnn.arch=composite_graph_gt", "gnn.c_per_layer=true",
-                        "gnn.injection_mode=none"],
-        "pe_qk_injection": ["gnn.arch=composite_graph_gt", "gnn.pe_qk_injection=true"],
-    }
-    failures = {}
-    for label, ov in variants.items():
-        cfg = _compose(ov)
-        try:
-            params = composite_graph.composite_graph_gnn_rebuild_params(cfg)
-            assert isinstance(params, dict) and params, "expected a non-empty rebuild dict"
-        except Exception as e:  # noqa: BLE001 — record the break, don't swallow it
-            failures[label] = f"{type(e).__name__}: {e}"
-    assert not failures, (
-        "composite variants fail to build gnn_config for composite_graph_gt "
-        f"(train_v3 would crash before training): {failures}"
-    )
-
-
 def test_flat_override_recipes_compose_and_validate():
     """A spread of documented flat-override recipes compose and pass ``_validate_config``."""
     recipes = [
@@ -240,45 +210,14 @@ def test_flat_override_recipes_compose_and_validate():
 
 
 # ==========================================================================
-# structural_lr_mult plumbing — the bridge between config and create_optimizer
-# ==========================================================================
-# create_optimizer reads the boost factor from gnn_config: mult = gnn_config.get(
-# "structural_lr_mult", 1.0). The ONLY conduit that injects it into gnn_config is
-# composite_graph_gnn_rebuild_params(config) — and that helper returns {} for any
-# architecture != composite_graph_gt. So the boosted LR group is reachable ONLY for
-# composite_graph_gt; for every other graph arch the override is silently dropped and
-# create_optimizer falls back to 1.0. These two tests pin both halves of that observed
-# contract so a future change to the conduit is caught.
-def test_structural_lr_mult_carried_into_gnn_config_for_composite():
-    """For composite_graph_gt, config.gnn.structural_lr_mult survives into the rebuild params
-    create_optimizer reads — so the boosted-LR group actually engages with the configured
-    multiplier."""
-    cfg = _compose(["gnn.arch=composite_graph_gt", "gnn.structural_lr_mult=3.0"])
-    params = composite_graph.composite_graph_gnn_rebuild_params(cfg)
-    assert params.get("structural_lr_mult") == cfg.gnn.structural_lr_mult == 3.0
-
-
-def test_structural_lr_mult_override_dropped_for_non_composite_arch():
-    """REGRESSION GUARD on a known integration gap: a structural_lr_mult override on a
-    non-composite graph arch (gt_llm) is NOT plumbed into gnn_config — the sole conduit
-    returns {} — so create_optimizer silently uses 1.0 despite config carrying 8.0. This
-    documents current behaviour; if structural_lr_mult is ever made to apply to gt_llm,
-    flip this assertion. (create_optimizer's docstring frames the structural group as
-    'GT + R-PEARL + gate', which gt_llm has, so the silent drop is a latent foot-gun.)"""
-    cfg = _compose(["gnn.arch=gt_llm", "gnn.structural_lr_mult=8.0"])
-    assert cfg.gnn.structural_lr_mult == 8.0  # the field IS set and validated...
-    params = composite_graph.composite_graph_gnn_rebuild_params(cfg)
-    assert "structural_lr_mult" not in params  # ...but never reaches gnn_config → dropped
-
-
-# ==========================================================================
 # _validate_config — coercion + domain rejection (loud failure on bad input)
 # ==========================================================================
 def _validation_cfg(eps="1e-6", loss_target="all", text_edge_list="present"):
     """A minimal NESTED config carrying just the fields ``_validate_config`` reads:
-    ``config.gnn.eps``, ``config.trainer.loss_target``, ``config.data.text_edge_list``."""
+    ``config.gnn.eps``, ``config.gnn.arch``, ``config.trainer.loss_target``,
+    ``config.data.text_edge_list``."""
     return OmegaConf.create({
-        "gnn": {"eps": eps},
+        "gnn": {"eps": eps, "arch": "rpearl_llm"},
         "trainer": {"loss_target": loss_target},
         "data": {"text_edge_list": text_edge_list},
     })

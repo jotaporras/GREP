@@ -5,6 +5,7 @@ during a forward pass.
 Run from repo root:
     python tests/test_attention_impl.py
 """
+import os
 import sys, types
 sys.path.insert(0, "src")
 
@@ -14,7 +15,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from prism.models.gnn_llm import GraphAugmentedLLM
 from prism.models import r_pearl
 
-BASE_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+BASE_MODEL = os.environ.get("GREP_TEST_MODEL", "google/gemma-4-12B-it")
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +74,10 @@ def test_config_mutation():
 # Part 2: live attention-dispatch trace (requires the model on GPU)
 # ---------------------------------------------------------------------------
 def test_live_dispatch():
+    # Loads the full base model — opt-in only (heavy: download + VRAM).
+    if os.environ.get("GREP_HEAVY_TESTS") != "1":
+        print("  [skip] test_live_dispatch: set GREP_HEAVY_TESTS=1 to run (loads the full base model)")
+        return
     print("\n" + "="*60)
     print("PART 2: live attention dispatch trace  (loads real model)")
     print("="*60)

@@ -9,8 +9,8 @@ node mentions, split into decision / completion / repeat positions
                  (answer-side node mentions carry the graph channel).
   prompt_only  — map clamped at answer_start: exactly what generation sees (only
                  prompt mentions carry the channel; decode steps receive nothing).
-  no_injection — empty map (additive/mask archs) or graphs=None (postfusion/llm):
-                 plain causal LLM.
+  no_injection — empty map (mask archs) / gate zeroed (additive archs): plain
+                 causal LLM.
 
 How to read the decision-token row:
   train_style >> prompt_only ≈ no_injection  → a label-side (leak) channel was
@@ -91,12 +91,8 @@ def build_conditions(arch, pyg_graph, full_map, prompt_map):
       would break gt_llm's word_embeddings feature prep, which requires every
       node to have a mention span.
     - mask archs: empty map → all-zero structural bias (no gate parameter exists).
-    - postfusion ignores injection maps (every token cross-attends all nodes), so
-      train_style and prompt_only coincide; contrast is graph on / graphs=None.
     """
     graphs = Batch.from_data_list([pyg_graph])
-    if arch == "postfusion_graph_llm":
-        return [("train_style", graphs, [full_map], None), ("no_injection", None, None, None)]
     if arch in ADDITIVE_ARCHS:
         return [
             ("train_style", graphs, [full_map], None),
@@ -151,7 +147,7 @@ def main():
     device = next(model.parameters()).device
 
     ds = datasets.load_dataset("json", data_files=[args.val_file], split="train")
-    ds = data_mod.preprocess_dataset(ds, tokenizer, architecture=arch, text_edge_list=text_edge_list)
+    ds = data_mod.preprocess_dataset(ds, tokenizer, text_edge_list=text_edge_list)
     if args.max_examples > 0:
         ds = ds.select(range(min(args.max_examples, len(ds))))
 
@@ -168,9 +164,8 @@ def main():
     if gate_sweep is not None:
         condition_names = [name for name, _ in gate_sweep]
     else:
-        condition_names = ["no_injection"] if arch == "llm" else (
-            ["train_style", "no_injection"] if arch == "postfusion_graph_llm"
-            else ["train_style", "prompt_only", "no_injection"])
+        condition_names = (["no_injection"] if arch == "llm"
+                           else ["train_style", "prompt_only", "no_injection"])
     totals = {
         cond: {s: {"n": 0, "correct": 0, "nll_sum": 0.0} for s in injection_diag.POSITION_SETS}
         for cond in condition_names

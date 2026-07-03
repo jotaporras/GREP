@@ -278,7 +278,8 @@ def test_no_mtest_token_in_scope_files():
     pat = re.compile(r"\bm_(test|train)\b")
     offenders = []
     for root, exts in roots.items():
-        for dp, _, files in os.walk(root):
+        for dp, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d != "old"]  # frozen legacy configs
             for f in files:
                 if f.endswith(exts):
                     path = os.path.join(dp, f)
@@ -315,7 +316,7 @@ def test_gt_fusion_mean_shape_and_gate():
 
 
 def test_gt_fusion_second_moment_shape():
-    """pe_readout='second_moment' fusion runs over the composite graph, [N,d] finite."""
+    """pe_readout='second_moment' fusion runs over the token+scene graph, [N,d] finite."""
     g = _gt(pe_readout="second_moment", fixed_seed_mode=True).eval()
     n, c = 6, 3
     tok = torch.randn(c, 16)
@@ -451,33 +452,44 @@ def test_semantic_gt_forward_and_guards():
 
 
 # --------------------------------------------------------------------------- #
-# END-TO-END: fully-instantiated untrained GT over a REAL composite graph
+# END-TO-END: fully-instantiated untrained GT over a mixed token+scene graph
 # --------------------------------------------------------------------------- #
-def _composite():
-    """Real composite graph via the production builder (token cycle + scene + crosslinks)."""
-    from prism.models.composite_graph import build_composite_graph
+def _mixed_graph():
+    """Token chain + scene graph + mention cross-links, built inline (the legacy
+    composite-graph production builder was removed; this reproduces the same
+    union-graph SHAPE the GT must handle: heterogeneous nodes via ``is_token``)."""
+    from types import SimpleNamespace
     c, n_scene = 16, 6
     inj = {0: [(2, 4)], 3: [(9, 11)]}
-    scene_ei = torch.tensor([[0, 1, 2, 3, 4], [1, 2, 3, 4, 5]])
-    scene_ew = torch.ones(scene_ei.shape[1])
-    cg = build_composite_graph(c, scene_ei, scene_ew, n_scene, inj, cycle_directed=True)
-    pe_data = Data(x=torch.zeros(cg.num_nodes, 1), edge_index=cg.edge_index)
+    edges = [(i, i + 1) for i in range(c - 1)]                      # token chain
+    edges += [(c + a, c + b) for a, b in
+              [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)]]             # scene edges
+    edges += [(p, c + nid) for nid, spans in inj.items()
+              for a, b in spans for p in range(a, b)]               # mention cross-links
+    ei = torch.tensor(edges, dtype=torch.long).t().contiguous()
+    ei = torch.cat([ei, ei.flip(0)], dim=1)                        # symmetrize
+    num_nodes = c + n_scene
+    is_token = torch.zeros(num_nodes, dtype=torch.bool)
+    is_token[:c] = True
+    cg = SimpleNamespace(num_nodes=num_nodes, is_token=is_token,
+                         edge_index=ei, edge_weight=torch.ones(ei.shape[1]))
+    pe_data = Data(x=torch.zeros(num_nodes, 1), edge_index=cg.edge_index)
     pe_data.edge_weight = cg.edge_weight
     return cg, pe_data, c
 
 
-def test_e2e_full_gt_over_composite_graph():
-    """Fully-instantiated untrained GT runs forward+backward on a real composite graph.
+def test_e2e_full_gt_over_token_scene_graph():
+    """Fully-instantiated untrained GT runs forward+backward on a mixed token+scene graph.
 
     CS-viability: both readouts (mean / second_moment), fp32 + bf16, finite outputs of
     the correct shape, and gradients reaching R-PEARL + the GT blocks + the gate with no
     NaNs. Output magnitude must be sane (non-zero, non-exploding) — NOT pinned to the
     embedding scale (the spectral/Lipschitz magnitude-pinning was removed).
     """
-    cg, pe_data, c = _composite()
+    cg, pe_data, c = _mixed_graph()
     d_model = 64
     X = torch.randn(c, d_model)
-    X = X / X.norm(dim=-1, keepdim=True) * 24.0  # Llama-like embedding scale
+    X = X / X.norm(dim=-1, keepdim=True) * 24.0  # text-embedding-like scale
     for mode in ("mean", "second_moment"):
         torch.manual_seed(0)
         gt = gtmod.GraphTransformer(num_layers=3, pe_hidden_channels=32, pe_num_layers=3,

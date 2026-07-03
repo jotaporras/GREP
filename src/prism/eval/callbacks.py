@@ -125,19 +125,14 @@ class GradientDebugCallback(TrainerCallback):
     """Logs per-component gradient norms, structural-signal magnitudes, and
     injection counts to W&B.
 
-    Covers both graph-augmented LLM families:
-
-    - ``GraphAugmentedLLM`` (``rpearl_llm`` / ``rpearl_gt_llm``): logs grad norms
-      for the GNN/PE, pe_proj, pe_gain, LoRA, and (GT variant) inner R-PEARL +
-      GT blocks; plus pe_proj output magnitude.
-    - ``CompositeGraphLLM`` (``composite_graph_gt``): logs grad norms for the inner
-      R-PEARL, GT blocks, GT output norm, whole GT, gate, and LoRA; plus GT output
-      ``Y`` magnitude, gate value, and tanh output-gain scalars.
+    Covers the graph-augmented LLM family: ``GraphAugmentedLLM`` (``rpearl_llm`` /
+    ``rpearl_gt_llm`` / ``gt_llm``) — grad norms for the GNN/PE, pe_proj, pe_gain,
+    LoRA, and (GT variant) inner R-PEARL + GT blocks; plus pe_proj output
+    magnitude — and ``LearnableGraphMaskLLM`` (PE/GT norms only).
 
     Grad norms are captured by ``_capture_grad_norms`` (called after backward,
     before zero_grad) — HF Trainer zeroes grads before ``on_log``, so ``.grad``
-    reads 0 there. Spectral diagnostics (Fiedler, scene-mass) live in
-    ``AugGraphDebugCallback``.
+    reads 0 there.
     """
 
     def __init__(self):
@@ -150,39 +145,30 @@ class GradientDebugCallback(TrainerCallback):
 
     @staticmethod
     def _unwrap_peft(model):
-        """Navigate PeftModel → LoraModel → GraphAugmentedLLM / CompositeGraphLLM."""
+        """Navigate PeftModel → LoraModel → GraphAugmentedLLM / LearnableGraphMaskLLM."""
         inner = model
         if hasattr(inner, 'base_model'):
             inner = inner.base_model
         if hasattr(inner, 'model') and (
-            hasattr(inner.model, 'pe_proj') or hasattr(inner.model, 'gt_model')
+            hasattr(inner.model, 'pe_proj')
             or hasattr(inner.model, 'pe_model')  # LearnableGraphMaskLLM: GT but no pe_proj
         ):
             inner = inner.model
         return inner
 
     @staticmethod
-    def _is_augmented(inner):
-        """True for the composite-graph ``CompositeGraphLLM`` (``gt_model`` + gate ``injection``)."""
-        return hasattr(inner, "gt_model") and hasattr(inner, "injection")
-
-    @staticmethod
     def _supported(inner):
-        """Either graph-augmented family — has a PE source we can introspect."""
-        return hasattr(inner, "pe_model") or hasattr(inner, "gt_model")
+        """Graph-augmented family — has a PE source we can introspect."""
+        return hasattr(inner, "pe_model")
 
     def _install_hooks(self, model):
         """Install forward hooks on the unwrapped graph-augmented instance."""
         if self._hooked:
             return
-        inner = self._unwrap_peft(model)
-        if self._is_augmented(inner):
-            self._install_augmented_hooks(inner)
-        else:
-            self._install_legacy_hooks(inner)
+        self._install_pe_hooks(self._unwrap_peft(model))
         self._hooked = True
 
-    def _install_legacy_hooks(self, inner):
+    def _install_pe_hooks(self, inner):
         """GraphAugmentedLLM (pe_proj output norm + ``_augment_embeddings`` wrap) OR
         LearnableGraphMaskLLM (pe_model/GT output norm only — no pe_proj, and the PE feeds
         the attention mask rather than the embeddings, so the emb-norm/injection wrap is skipped).
@@ -215,30 +201,6 @@ class GradientDebugCallback(TrainerCallback):
 
             inner._augment_embeddings = _wrapped_augment
 
-    def _install_augmented_hooks(self, inner):
-        """CompositeGraphLLM: GT output (Y) norm + ``_fuse_embeddings`` wrap."""
-        callback = self
-
-        def _gt_hook(_module, _input, output):
-            callback._pe_norm = output.detach().norm().item()
-            callback._pe_has_nan = bool(output.detach().isnan().any())
-
-        inner.gt_model.register_forward_hook(_gt_hook)
-
-        orig_fuse = inner._fuse_embeddings
-
-        def _wrapped_fuse(input_ids, graphs, injection_maps, permutation=None, **kwargs):
-            with torch.no_grad():
-                emb_table = inner.llm.get_input_embeddings()
-                callback._emb_norm = emb_table(input_ids.to(emb_table.weight.device)).norm().item()
-            callback._num_injections = sum(
-                len(spans) for imap in injection_maps for spans in imap.values()
-            )
-            # Forward extra kwargs (e.g. return_c_tok for the c_per_layer path) untouched.
-            return orig_fuse(input_ids, graphs, injection_maps, permutation=permutation, **kwargs)
-
-        inner._fuse_embeddings = _wrapped_fuse
-
     @staticmethod
     def _grad_norm(params):
         sq_sum = 0.0
@@ -260,16 +222,7 @@ class GradientDebugCallback(TrainerCallback):
             p for _, p in inner.llm.named_parameters() if p.requires_grad
         )
 
-        if self._is_augmented(inner):
-            # CompositeGraphLLM: GraphTransformer (R-PEARL + blocks) + cold-start gate.
-            gt = inner.gt_model
-            self._captured_grad_norms["gt"] = self._grad_norm(gt.parameters())
-            self._captured_grad_norms["rpearl"] = self._grad_norm(gt.pe_model.parameters())
-            self._captured_grad_norms["gt_blocks"] = self._grad_norm(gt.blocks.parameters())
-            self._captured_grad_norms["gate"] = self._grad_norm([inner.injection.gate])
-            return
-
-        # Legacy GraphAugmentedLLM / LearnableGraphMaskLLM: pe_model (+ optional inner GT/
+        # GraphAugmentedLLM / LearnableGraphMaskLLM: pe_model (+ optional inner GT/
         # R-PEARL). pe_proj + pe_gain exist only on GraphAugmentedLLM (embedding-injection path).
         self._captured_grad_norms["gnn"] = self._grad_norm(inner.pe_model.parameters())
         if hasattr(inner, "pe_proj"):
@@ -282,32 +235,10 @@ class GradientDebugCallback(TrainerCallback):
             # has no inner pe_model — guard so the debug callback doesn't crash.
             if hasattr(inner.pe_model, "pe_model"):
                 self._captured_grad_norms["rpearl"] = self._grad_norm(inner.pe_model.pe_model.parameters())
-        # postfusion_graph_llm: output cross-attention fusion + scalar cold-start gate
-        # (unique to this arch; guards keep every other family untouched).
-        if hasattr(inner, "fusion") and hasattr(inner, "gate"):
-            self._captured_grad_norms["fusion"] = self._grad_norm(inner.fusion.parameters())
-            self._captured_grad_norms["postfusion_gate"] = self._grad_norm([inner.gate])
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
         if model is not None and self._supported(self._unwrap_peft(model)):
             self._install_hooks(model)
-
-    @staticmethod
-    def _filter_norm_metrics(inner):
-        """Log the c_bias Ĉ scale (composite_graph_gt only)."""
-        out = {}
-        if getattr(inner, "c_bias", False):
-            try:
-                # no_grad: Ĉ is built from grad-carrying taps; float() without it warns.
-                with torch.no_grad():
-                    C_hat, c_row = inner._analytic_c_tok(64, next(inner.parameters()).device)
-                    out["grep/c_bias/c_hat_diag"] = float(C_hat.diagonal().max())  # =1 (normalized)
-                    out["grep/c_bias/c_row_min"] = float(c_row.min())             # off-peak decay
-                    out["grep/c_bias/lam_c"] = float(inner.lam_c)
-                    out["grep/c_bias/lam_v"] = float(inner.lam_v)
-            except Exception:
-                pass
-        return out
 
     def on_log(self, args, state, control, model=None, logs=None, **kwargs):
         if model is None:
@@ -319,226 +250,28 @@ class GradientDebugCallback(TrainerCallback):
         lr = state.log_history[-1].get("learning_rate", float("nan")) if state.log_history else float("nan")
         g = self._captured_grad_norms
 
-        if self._is_augmented(inner):
-            # CompositeGraphLLM (composite_graph_gt): R-PEARL + GT + cold-start gate.
-            metrics = {
-                "debug/grad_norm_lora": g.get("lora", 0.0),
-                "debug/grad_norm_gt": g.get("gt", 0.0),
-                "debug/grad_norm_rpearl": g.get("rpearl", 0.0),
-                "debug/grad_norm_gt_blocks": g.get("gt_blocks", 0.0),
-                "debug/grad_norm_gate": g.get("gate", 0.0),
-                "debug/gt_output_norm": self._pe_norm,
-                "debug/gt_has_nan": int(self._pe_has_nan),
-                "debug/embedding_norm": self._emb_norm,
-                "debug/num_injections": self._num_injections,
-                "debug/gate_value": float(inner.injection.gate.detach().float().mean().item()),
-                # Learnable tanh(g) output-gain scalars for GT output and R-PEARL output.
-                "debug/gt_output_gain": float(inner.gt_model.output_gain.detach().tanh().item()),
-                "debug/rpearl_output_gain": float(inner.gt_model.pe_model.output_gain.detach().tanh().item()),
-                "debug/lr": lr,
-            }
-            # c_bias Ĉ scale (composite_graph_gt only).
-            metrics.update(self._filter_norm_metrics(inner))
-        else:
-            # GraphAugmentedLLM (rpearl_llm / rpearl_gt_llm) OR LearnableGraphMaskLLM.
-            metrics = {
-                "debug/grad_norm_gnn": g.get("gnn", 0.0),
-                "debug/grad_norm_lora": g.get("lora", 0.0),
-                "debug/pe_output_norm": self._pe_norm,
-                "debug/pe_has_nan": int(self._pe_has_nan),
-                "debug/embedding_norm": self._emb_norm,
-                "debug/num_injections": self._num_injections,
-                "debug/lr": lr,
-            }
-            # pe_proj / pe_gain exist only on GraphAugmentedLLM (embedding-injection path);
-            # LearnableGraphMaskLLM has neither.
-            if hasattr(inner, "pe_proj"):
-                metrics["debug/grad_norm_pe_proj"] = g.get("pe_proj", 0.0)
-            if hasattr(inner, "pe_gain"):
-                metrics["debug/pe_gain"] = inner.pe_gain.item()
-                metrics["debug/grad_norm_pe_gain"] = g.get("pe_gain", 0.0)
-            # rpearl_gt_llm / learnable_graph_mask: split gradient norms by GT sub-component.
-            if hasattr(inner.pe_model, "blocks"):
-                metrics["debug/grad_norm_gt_blocks"] = g.get("gt_blocks", 0.0)
-                if hasattr(inner.pe_model, "pe_model"):  # inner R-PEARL
-                    metrics["debug/grad_norm_rpearl"] = g.get("rpearl", 0.0)
-            # postfusion_graph_llm: cross-attention fusion grad, gate grad, and the effective
-            # gate value g=tanh(gate) ∈ (-1,1) (0 at cold start; watch it ramp).
-            if hasattr(inner, "fusion") and hasattr(inner, "gate"):
-                metrics["debug/grad_norm_fusion"] = g.get("fusion", 0.0)
-                metrics["debug/grad_norm_postfusion_gate"] = g.get("postfusion_gate", 0.0)
-                metrics["debug/postfusion_gate"] = float(torch.tanh(inner.gate.detach().float()).item())
+        # GraphAugmentedLLM (rpearl_llm / rpearl_gt_llm / gt_llm) OR LearnableGraphMaskLLM.
+        metrics = {
+            "debug/grad_norm_gnn": g.get("gnn", 0.0),
+            "debug/grad_norm_lora": g.get("lora", 0.0),
+            "debug/pe_output_norm": self._pe_norm,
+            "debug/pe_has_nan": int(self._pe_has_nan),
+            "debug/embedding_norm": self._emb_norm,
+            "debug/num_injections": self._num_injections,
+            "debug/lr": lr,
+        }
+        # pe_proj / pe_gain exist only on GraphAugmentedLLM (embedding-injection path);
+        # LearnableGraphMaskLLM has neither.
+        if hasattr(inner, "pe_proj"):
+            metrics["debug/grad_norm_pe_proj"] = g.get("pe_proj", 0.0)
+        if hasattr(inner, "pe_gain"):
+            metrics["debug/pe_gain"] = inner.pe_gain.item()
+            metrics["debug/grad_norm_pe_gain"] = g.get("pe_gain", 0.0)
+        # rpearl_gt_llm / learnable_graph_mask: split gradient norms by GT sub-component.
+        if hasattr(inner.pe_model, "blocks"):
+            metrics["debug/grad_norm_gt_blocks"] = g.get("gt_blocks", 0.0)
+            if hasattr(inner.pe_model, "pe_model"):  # inner R-PEARL
+                metrics["debug/grad_norm_rpearl"] = g.get("rpearl", 0.0)
 
         if wandb.run is not None:
             wandb.log(metrics, step=state.global_step)
-
-
-class AugGraphDebugCallback(TrainerCallback):
-    """Log composite-graph diagnostics for the ``composite_graph_gt`` model.
-
-    Logs to W&B:
-      - ``aug_graph/fiedler``     — λ₂ of the augmented Laplacian (sparse LOBPCG /
-                                    eigsh; never densified). Trending → 0: layers disconnecting.
-      - ``aug_graph/scene_mass``  — fraction of a cross-linked token's k-hop mass on
-                                    scene nodes. Collapsing: scene swamped by the cycle.
-      - ``grep/structural_gate``  — the cold-start gate value.
-      - ``grep/contrib_ratio``    — ‖gate·Y[V_Tx]‖ / ‖X‖, injected-signal energy ratio.
-
-    Path-validity metrics are logged separately by ``EvalCallback``. No-op for
-    models without the cold-start gate ``injection`` attribute.
-    """
-
-    def __init__(self, enable_visualizer: bool = False, visualizer_dir: str | None = None):
-        self._last_aug = None
-        self._contrib_ratio = float("nan")
-        self._hooked = False
-        self._enable_visualizer = enable_visualizer
-        self._visualizer_dir = visualizer_dir
-        self._visualized = False
-
-    @staticmethod
-    def _unwrap_peft(model):
-        """Navigate PeftModel → LoraModel → CompositeGraphLLM (which owns ``injection``)."""
-        inner = model
-        if hasattr(inner, "base_model"):
-            inner = inner.base_model
-        if hasattr(inner, "model") and hasattr(inner.model, "injection"):
-            inner = inner.model
-        return inner
-
-    def _install_hooks(self, model):
-        if self._hooked:
-            return
-        callback = self
-        inner = self._unwrap_peft(model)
-
-        # Hook 1: capture the last composite graph for Fiedler / scene-mass in on_log.
-        orig_aug = inner._composite_graph
-
-        def _wrapped_aug(scene, injection_map, c, device, permutation=None):
-            aug = orig_aug(scene, injection_map, c, device, permutation=permutation)
-            callback._last_aug = aug
-            return aug
-
-        inner._composite_graph = _wrapped_aug
-
-        # Hook 2: contrib_ratio = ‖gate·Y[V_Tx]‖ / ‖X‖ from the gate's own inputs
-        # (GatedInjection.forward(X, Y_tx)).
-        def _inj_hook(module, inputs, _output):
-            X, Y_tx = inputs[0], inputs[1]
-            with torch.no_grad():
-                num = (module.gate * Y_tx).detach().float().norm().item()
-                den = X.detach().float().norm().item()
-            callback._contrib_ratio = num / den if den > 0 else float("nan")
-
-        inner.injection.register_forward_hook(_inj_hook)
-        self._hooked = True
-
-    def on_train_begin(self, args, state, control, model=None, **kwargs):
-        if hasattr(model, "injection"):
-            self._install_hooks(model)
-
-    def on_log(self, args, state, control, model=None, logs=None, **kwargs):
-        if not hasattr(model, "injection"):
-            return
-        inner = self._unwrap_peft(model)
-        aug = self._last_aug
-
-        if wandb.run is not None:
-            metrics = {
-                "grep/structural_gate": float(inner.injection.gate.detach().float().mean().item()),
-                "grep/contrib_ratio": self._contrib_ratio,
-            }
-            if aug is not None:
-                # Sparse solvers only: fiedler() uses LOBPCG/eigsh, scene_mass()
-                # uses sparse mat-mat — the N×N matrix is never densified.
-                try:
-                    metrics["aug_graph/fiedler"] = aug.fiedler()
-                except Exception as e:
-                    print(f"[diagnostics] fiedler computation failed: {type(e).__name__}: {e}")
-                try:
-                    metrics["aug_graph/scene_mass"] = aug.scene_mass()
-                except Exception as e:
-                    print(f"[diagnostics] scene_mass computation failed: {type(e).__name__}: {e}")
-            wandb.log(metrics, step=state.global_step)
-
-        # One-shot composite-graph + spectral-clustering render on the first
-        # logging step after a graph is captured, when enabled.
-        if self._enable_visualizer and not self._visualized and aug is not None:
-            self._visualized = True
-            try:
-                from prism.eval import visualizer
-                out_dir = self._visualizer_dir or (str(Path(args.output_dir) / "visuals"))
-                visualizer.visualize(aug, out_dir,
-                                     source=f"{Path(args.output_dir).name} @ step {state.global_step}")
-            except Exception as e:
-                print(f"[visualizer] failed: {type(e).__name__}: {e}")
-
-
-class LoraWarmupCallback(TrainerCallback):
-    """Freeze LLM/LoRA parameters for the first ``warmup_steps`` optimizer steps
-    so the structural path (GT, R-PEARL, gate) gets an isolated learning signal.
-    Re-enables LoRA at step ``warmup_steps`` (optimizer already holds them).
-    """
-
-    def __init__(self, warmup_steps: int):
-        self.warmup_steps = int(warmup_steps)
-        self._frozen_params = []
-        self._restored = False
-
-    @staticmethod
-    def _unwrap_peft(model):
-        inner = model
-        if hasattr(inner, "base_model"):
-            inner = inner.base_model
-        if hasattr(inner, "model") and (
-            hasattr(inner.model, "injection") or hasattr(inner.model, "pe_proj")
-        ):
-            inner = inner.model
-        return inner
-
-    def on_train_begin(self, args, state, control, model=None, **kwargs):
-        if self.warmup_steps <= 0 or model is None:
-            return
-        inner = self._unwrap_peft(model)
-        # Capture and freeze the currently-trainable LLM params (LoRA adapters).
-        self._frozen_params = [p for p in inner.llm.parameters() if p.requires_grad]
-        for p in self._frozen_params:
-            p.requires_grad_(False)
-        print(f"[train] LoRA warmup: froze {len(self._frozen_params)} LLM tensors "
-              f"for the first {self.warmup_steps} steps (structure learns first)")
-
-    def on_step_begin(self, args, state, control, model=None, **kwargs):
-        if (self._frozen_params and not self._restored
-                and state.global_step >= self.warmup_steps):
-            for p in self._frozen_params:
-                p.requires_grad_(True)
-            self._restored = True
-            print(f"[train] LoRA warmup complete at step {state.global_step}: "
-                  f"re-enabled {len(self._frozen_params)} LLM tensors")
-
-
-class CBiasWarmupCallback(TrainerCallback):
-    """Linearly ramp the c_bias covariance gain λ_C from 0→1 over the first
-    ``warmup_steps`` optimizer steps. Sets ``inner._lam_c_warmup`` each step
-    (read in patched attention as ``λ_C·_lam_c_warmup``); no-op when ``warmup_steps<=0``.
-    """
-
-    def __init__(self, warmup_steps: int):
-        self.warmup_steps = int(warmup_steps)
-
-    def _set(self, model, value: float):
-        inner = LoraWarmupCallback._unwrap_peft(model)
-        buf = getattr(inner, "_lam_c_warmup", None)
-        if buf is not None:
-            buf.fill_(value)
-
-    def on_train_begin(self, args, state, control, model=None, **kwargs):
-        if self.warmup_steps > 0 and model is not None:
-            self._set(model, 0.0)
-            print(f"[train] λ_C warmup: ramping the covariance bias 0→1 over the first "
-                  f"{self.warmup_steps} steps (content-selection learns first)")
-
-    def on_step_begin(self, args, state, control, model=None, **kwargs):
-        if self.warmup_steps > 0 and model is not None:
-            self._set(model, min(1.0, state.global_step / self.warmup_steps))

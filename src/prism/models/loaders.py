@@ -9,8 +9,6 @@ from safetensors.torch import load_file
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, PreTrainedTokenizer
 
 from prism.models import gnn_llm
-from prism.models import composite_graph_llm
-from prism.models import postfusion_graph_llm  # postfusion: experimental standalone arch
 from prism.models import r_pearl
 from prism.models import gt as gt_module
 
@@ -214,95 +212,10 @@ def graph_augmented_llm_from_pretrained(
         )
         gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
         model.pe_model.load_state_dict(gnn_weights["pe_model"], strict=False)
-    elif architecture == "postfusion_graph_llm":
-        # postfusion: rebuild the standalone GraphTransformer (Psi producer) + the output
-        # cross-attention fusion, then load GT / fusion / gate. The LoRA adapter was already
-        # merged into `llm` above.
-        pe_model = gt_module.GraphTransformer(
-            num_layers=gnn_cfg["gt_num_layers"],
-            pe_hidden_channels=gnn_cfg["pe_hidden_channels"],
-            pe_num_layers=gnn_cfg["pe_num_layers"],
-            d_model=gnn_cfg["d_model"],
-            heads=gnn_cfg["gt_heads"],
-            num_samples=gnn_cfg["num_samples"],
-            dropout=gnn_cfg["dropout"],
-            k_pe=gnn_cfg["k_pe"],
-            k_gt=gnn_cfg["k_gt"],
-            eps=gnn_cfg["eps"],
-            use_layer_norm=gnn_cfg["use_layer_norm"],
-            node_feature_dim=node_feature_dim,
-        )
-        model = postfusion_graph_llm.PostFusionGraphLLM(
-            llm, pe_model, pe_dim=gnn_cfg["d_model"],
-            num_heads=gnn_cfg.get("postfusion_num_heads", 8),
-            gate_init=gnn_cfg.get("postfusion_gate_init", 0.0),
-            dropout=gnn_cfg.get("dropout", 0.0),
-        )
-        gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
-        model.pe_model.load_state_dict(gnn_weights["pe_model"], strict=False)
-        model.fusion.load_state_dict(gnn_weights["fusion"])
-        if "gate" in gnn_weights:
-            model.gate.data.copy_(gnn_weights["gate"])
-    elif architecture == "composite_graph_gt":
-        # Composite-graph model: Graph Transformer (R-PEARL inside) + cold-start gate
-        # over a RoPE-disabled LLM. Rebuild from gnn_config and load the saved weights.
-        gt_model = gt_module.GraphTransformer(
-            num_layers=gnn_cfg["gt_num_layers"],
-            pe_hidden_channels=gnn_cfg["pe_hidden_channels"],
-            pe_num_layers=gnn_cfg["pe_num_layers"],
-            d_model=gnn_cfg["d_model"],
-            heads=gnn_cfg["gt_heads"],
-            num_samples=gnn_cfg["num_samples"],
-            dropout=gnn_cfg["dropout"],
-            k_pe=gnn_cfg["k_pe"],
-            k_gt=gnn_cfg["k_gt"],
-            eps=gnn_cfg["eps"],
-            use_layer_norm=gnn_cfg["use_layer_norm"],
-            probe_distribution=gnn_cfg.get("probe_distribution", "gaussian"),
-            max_gather_rows=gnn_cfg.get("max_gather_rows", 2_000_000),
-            fixed_seed_mode=gnn_cfg.get("fixed_seed_mode", False),
-            fixed_seed_value=gnn_cfg.get("fixed_seed_value", 0),
-            pe_readout=gnn_cfg.get("pe_readout", "mean"),
-            center_second_moment=gnn_cfg.get("pe_center_moment", True),
-        )
-        composite_kwargs = dict(
-            gate_init=gnn_cfg.get("gate_init", 0.0),
-            gate_per_dim=gnn_cfg.get("gate_per_dim", False),
-            injection_mode=gnn_cfg.get("injection_mode", "interpolate"),
-            disable_llm_rope=gnn_cfg.get("disable_rope", True),
-            cycle_weight=gnn_cfg.get("cycle_weight", 1.0),
-            cycle_directed=gnn_cfg.get("cycle_directed", True),
-            crosslink_weight=gnn_cfg.get("crosslink_weight", 1.0),
-            crosslink_mention_to_node=gnn_cfg.get("crosslink_mention_to_node", True),
-            crosslink_mention_clique=gnn_cfg.get("crosslink_mention_clique", True),
-        )
-        if (gnn_cfg.get("pe_qk_injection", False) or gnn_cfg.get("c_per_layer", False)
-                or gnn_cfg.get("c_bias", False)):
-            # In-attention injection variants: pe_qk_injection adds GT code to q/k/v;
-            # c_per_layer replaces q/k; c_bias (Design D) is an additive logit bias.
-            model = composite_graph_llm.InjectedCompositeGraphLLM(
-                llm, gt_model, d_model=gnn_cfg["d_model"],
-                inject_v=gnn_cfg.get("pe_inject_v", True),
-                c_per_layer=gnn_cfg.get("c_per_layer", False),
-                c_bias=gnn_cfg.get("c_bias", False),
-                use_scene_bias=gnn_cfg.get("use_scene_bias", True),
-                c_kernel=gnn_cfg.get("c_kernel", "sampled"),
-                **composite_kwargs,
-            )
-        else:
-            model = composite_graph_llm.CompositeGraphLLM(llm, gt_model, d_model=gnn_cfg["d_model"], **composite_kwargs)
-        gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
-        model.gt_model.load_state_dict(gnn_weights["gt_model"], strict=False)
-        model.injection.load_state_dict(gnn_weights["injection"])
-        if hasattr(model, "pe_q_proj") and "pe_q_proj" in gnn_weights:
-            model.pe_q_proj.load_state_dict(gnn_weights["pe_q_proj"])
-            model.pe_k_proj.load_state_dict(gnn_weights["pe_k_proj"])
-            if getattr(model, "pe_v_proj", None) is not None and "pe_v_proj" in gnn_weights:
-                model.pe_v_proj.load_state_dict(gnn_weights["pe_v_proj"])
-        if getattr(model, "c_bias", False) and "c_bias_gains" in gnn_weights:
-            for k, v in gnn_weights["c_bias_gains"].items():
-                if hasattr(model, k):                  # skip retired gains (e.g. lam_s)
-                    getattr(model, k).data.copy_(v)
+    elif architecture in ("postfusion_graph_llm", "composite_graph_gt"):
+        raise ValueError(
+            f"architecture {architecture!r} was removed from the codebase (legacy "
+            "e7/e10 experiments); check out an older commit to reload this checkpoint.")
     else:
         pe_model = r_pearl.RandomGNNPositionalEncodings(
             pe_hidden_channels=gnn_cfg["pe_hidden_channels"],
@@ -355,7 +268,7 @@ def load_pe_weights_into(model, init_pe_from: str, architecture: str) -> None:
         # Mask-only relative PE: the standalone GraphTransformer *is* the whole PE
         # (the mask uses Psi Psi^T directly — there is no pe_proj/pe_gain/pe_norm).
         # Accept an rpearl_gt_llm / edge-detector checkpoint ("gt_model") or another
-        # learnable_graph_mask / postfusion checkpoint ("pe_model"). Strict on keys:
+        # learnable_graph_mask checkpoint ("pe_model"). Strict on keys:
         # a missing/unexpected key means the gnn.* GT hyperparameters did NOT
         # reproduce the pretrained GT (silent strict=False drop is exactly the
         # config-drift failure we want to make loud).

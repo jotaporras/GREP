@@ -7,8 +7,7 @@ learned quantity. Everything is driven by stub ``nn.Module`` parameter-bags whos
 
 Contracts under test (derived from the docstring / call sites, not the body):
   - _unwrap_peft        : PeftModel→LoraModel→inner attribute navigation
-  - _is_augmented       : True iff (gt_model AND injection)
-  - _supported          : True iff (pe_model OR gt_model)
+  - _supported          : True iff pe_model present
   - _grad_norm          : global L2 norm over the params' grads, skipping grad=None
   - _capture_grad_norms : per-component dict keyed correctly per architecture branch
   - _install_hooks      : idempotent; legacy wrap forwards args & counts injections
@@ -116,18 +115,13 @@ def test_grad_norm_skips_none_grads():
 # --------------------------------------------------------------------------- #
 # Predicates
 # --------------------------------------------------------------------------- #
-def test_supported_and_augmented_predicates():
-    """_supported: pe_model OR gt_model. _is_augmented: gt_model AND injection."""
-    legacy = Bag(pe_model=nn.Linear(2, 2))
-    aug = Bag(gt_model=nn.Linear(2, 2),
-              injection=Bag(gate=nn.Parameter(torch.zeros(2))))
-    gt_only = Bag(gt_model=nn.Linear(2, 2))            # gt but no injection
+def test_supported_predicate():
+    """_supported: pe_model present (the graph-augmented family's common attribute)."""
+    graph = Bag(pe_model=nn.Linear(2, 2))
     plain = SimpleNamespace(foo=1)
 
-    assert GDC._supported(legacy) and not GDC._is_augmented(legacy)
-    assert GDC._supported(aug) and GDC._is_augmented(aug)
-    assert GDC._supported(gt_only) and not GDC._is_augmented(gt_only)
-    assert not GDC._supported(plain) and not GDC._is_augmented(plain)
+    assert GDC._supported(graph)
+    assert not GDC._supported(plain)
 
 
 def test_unwrap_peft_navigates_nesting():
@@ -136,10 +130,10 @@ def test_unwrap_peft_navigates_nesting():
     peft = SimpleNamespace(base_model=SimpleNamespace(model=target))
     assert GDC._unwrap_peft(peft) is target
 
-    # gt_model also triggers the `.model` descent.
-    gt_target = SimpleNamespace(gt_model=object())
-    peft2 = SimpleNamespace(base_model=SimpleNamespace(model=gt_target))
-    assert GDC._unwrap_peft(peft2) is gt_target
+    # pe_model (LearnableGraphMaskLLM) also triggers the `.model` descent.
+    mask_target = SimpleNamespace(pe_model=object())
+    peft2 = SimpleNamespace(base_model=SimpleNamespace(model=mask_target))
+    assert GDC._unwrap_peft(peft2) is mask_target
 
     # LoraModel: base_model IS the inner (no further `.model`).
     lora = SimpleNamespace(base_model=target)
@@ -186,24 +180,6 @@ def test_capture_grad_norms_legacy_gt():
     assert abs(g["rpearl"] - _global_norm(list(pe.pe_model.parameters()))) < 1e-5
     # gnn is the whole pe_model (blocks + inner pe_model + trunk).
     assert abs(g["gnn"] - _global_norm(list(pe.parameters()))) < 1e-5
-
-
-def test_capture_grad_norms_augmented():
-    """composite_graph_gt: keys {lora,gt,rpearl,gt_blocks,gate}, none legacy."""
-    gt = Bag(pe_model=nn.Linear(2, 2), blocks=nn.Linear(2, 2), trunk=nn.Linear(2, 2))
-    inj = Bag(gate=nn.Parameter(torch.tensor([0.1, 0.2, 0.3])))
-    inner = Bag(llm=nn.Linear(2, 2), gt_model=gt, injection=inj)
-    _set_grads(inner.llm, gt, seed=4)
-    inj.gate.grad = torch.randn(3)
-
-    cb = GDC()
-    cb._capture_grad_norms(inner)
-    g = cb._captured_grad_norms
-    assert set(g) == {"lora", "gt", "rpearl", "gt_blocks", "gate"}
-    assert abs(g["gt"] - _global_norm(list(gt.parameters()))) < 1e-5
-    assert abs(g["rpearl"] - _global_norm(list(gt.pe_model.parameters()))) < 1e-5
-    assert abs(g["gt_blocks"] - _global_norm(list(gt.blocks.parameters()))) < 1e-5
-    assert abs(g["gate"] - _global_norm([inj.gate])) < 1e-6
 
 
 def test_capture_grad_norms_gt_llm_no_inner_rpearl():
@@ -330,35 +306,6 @@ def test_on_log_lr_nan_when_no_history():
     fake = FakeWandb(); cbmod.wandb = fake
     cb.on_log(None, _state(lr=None), None, model=inner)
     assert math.isnan(fake.logged[-1][1]["debug/lr"])
-
-
-def test_on_log_augmented_keys_and_gains():
-    gt = Bag(pe_model=Bag(output_gain=nn.Parameter(torch.tensor(0.2))),
-             output_gain=nn.Parameter(torch.tensor(0.3)), blocks=nn.Linear(2, 2))
-    inj = Bag(gate=nn.Parameter(torch.tensor([0.1, 0.2])))
-    inner = Bag(llm=nn.Linear(2, 2), gt_model=gt, injection=inj)
-    cb = GDC()
-    cb._captured_grad_norms = {"lora": 1.0, "gt": 2.0, "rpearl": 3.0,
-                               "gt_blocks": 4.0, "gate": 5.0}
-    cb._pe_norm, cb._emb_norm, cb._num_injections, cb._pe_has_nan = 0.9, 0.4, 7, False
-
-    fake = FakeWandb(); cbmod.wandb = fake
-    cb.on_log(None, _state(lr=2e-4), None, model=inner)
-    m = fake.logged[-1][1]
-
-    expected = {"debug/grad_norm_lora", "debug/grad_norm_gt", "debug/grad_norm_rpearl",
-                "debug/grad_norm_gt_blocks", "debug/grad_norm_gate", "debug/gt_output_norm",
-                "debug/gt_has_nan", "debug/embedding_norm", "debug/num_injections",
-                "debug/gate_value", "debug/gt_output_gain", "debug/rpearl_output_gain",
-                "debug/lr"}
-    assert expected <= set(m)
-    assert m["debug/grad_norm_gt"] == 2.0
-    assert m["debug/num_injections"] == 7
-    assert m["debug/gt_has_nan"] == 0
-    assert abs(m["debug/gt_output_gain"] - math.tanh(0.3)) < 1e-5
-    assert abs(m["debug/rpearl_output_gain"] - math.tanh(0.2)) < 1e-5
-    assert abs(m["debug/gate_value"] - 0.15) < 1e-5     # mean([0.1, 0.2])
-    assert not any(k.startswith("grep/c_bias") for k in m)  # no c_bias attr
 
 
 # --------------------------------------------------------------------------- #

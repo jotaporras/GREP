@@ -16,11 +16,6 @@ from prism.models.gnn_llm import (
     find_last_graph_scope,
     node_token_variants,
 )
-from prism.models.composite_graph_llm import (
-    CompositeGraphLLM,
-    InjectedCompositeGraphLLM,
-)
-from prism.models.postfusion_graph_llm import PostFusionGraphLLM
 
 
 # Decode is deterministic GREEDY for confirmatory eval (reproducible, no seed needed).
@@ -31,15 +26,14 @@ DECODE_KWARGS = {"do_sample": False, "use_cache": True}
 
 
 def _core_graph_model(model):
-    """Peel PEFT wrappers to reach the CompositeGraphLLM / GraphAugmentedLLM / GraphMaskLLM core.
+    """Peel PEFT wrappers to reach the GraphAugmentedLLM / GraphMaskLLM core.
 
     PEFT-wrapped models fail isinstance checks; unwrapping ensures the correct injection branch runs.
     LoRA adapters remain live inside the graph model's .llm (PEFT patches it in place).
     """
     inner = model
     for _ in range(5):
-        if isinstance(inner, (CompositeGraphLLM, GraphAugmentedLLM, GraphMaskLLM,
-                              LearnableGraphMaskLLM, PostFusionGraphLLM)):
+        if isinstance(inner, (GraphAugmentedLLM, GraphMaskLLM, LearnableGraphMaskLLM)):
             return inner
         nxt = getattr(inner, "base_model", None)
         if nxt is None or nxt is inner:
@@ -67,7 +61,7 @@ class InMemoryLLM(spine_models.InMemoryLLM):
         self.include_edges = include_edges
 
     def _decode(self, outputs) -> str:
-        # clean_up_tokenization_spaces=False: WordPiece post-process corrupts BPE (Llama) plan text.
+        # clean_up_tokenization_spaces=False: WordPiece post-process corrupts BPE plan text.
         return self.tokenizer.batch_decode(
             outputs, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )[0].strip()
@@ -103,7 +97,7 @@ class InMemoryLLM(spine_models.InMemoryLLM):
 
 
 class GraphAugmentedInMemoryLLM(InMemoryLLM):
-    """SPINE-compatible client for GraphAugmentedLLM / CompositeGraphLLM inference.
+    """SPINE-compatible client for GraphAugmentedLLM / graph-mask inference.
 
     GNN always parses the ORIGINAL message for full structural edges; ``include_edges``
     toggles only the LLM-facing text (enabling "PE + text edges" vs "PE only" ablation).
@@ -200,72 +194,6 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
                 return outputs[:, input_ids.shape[-1]:]
             finally:
                 graph_model._struct_bias = None
-
-        if isinstance(graph_model, PostFusionGraphLLM):
-            # postfusion: arm the graph context (per-node Psi + mask) once; the persistent
-            # lm_head pre-hook cross-attends it on every decode step (prefill + each generated
-            # token). No injection map needed — every output token reads the whole graph.
-            graph_model._graph_ctx = graph_model.build_graph_context(
-                [pyg_graph], input_ids.device)
-            try:
-                outputs = graph_model.llm.generate(
-                    input_ids=input_ids, attention_mask=attention_mask,
-                    max_new_tokens=max_new_tokens, **DECODE_KWARGS,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                )
-                return outputs[:, input_ids.shape[-1]:]
-            finally:
-                graph_model._graph_ctx = None
-
-        if isinstance(graph_model, InjectedCompositeGraphLLM):
-            # GT code injected post-RoPE into q/k/v per layer via prepare_generation.
-            # Injection skips cached decode steps (prompt only); disarmed in finally.
-            inputs_embeds = graph_model.prepare_generation(
-                input_ids, [pyg_graph], [injection_map], permutation=self.permutation)
-            hook_handle = None
-            try:
-                # Decode-time graph extension: pre-hook extends composite graph and computes
-                # new token's kernel row before each decode attention step.
-                if getattr(graph_model, "c_bias", False):
-                    c = input_ids.shape[1]
-                    aug = graph_model._composite_graph(
-                        pyg_graph, injection_map, c, inputs_embeds.device,
-                        permutation=self.permutation)
-                    nts = [(i, seq) for i, variants in enumerate(node_token_seqs)
-                           for seq in variants]
-                    graph_model.decode_setup(aug, nts, c, c + max_new_tokens,
-                                             device=inputs_embeds.device)
-
-                    def _extend_hook(module, args, kwargs):
-                        ids = kwargs.get("input_ids")
-                        if ids is not None and ids.dim() == 2 and ids.shape[1] == 1:
-                            graph_model.decode_extend(int(ids[0, -1]))
-                    hook_handle = graph_model.llm.register_forward_pre_hook(
-                        _extend_hook, with_kwargs=True)
-                return graph_model.llm.generate(
-                    inputs_embeds=inputs_embeds, attention_mask=attention_mask,
-                    max_new_tokens=max_new_tokens, **DECODE_KWARGS,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                )
-            finally:
-                if hook_handle is not None:
-                    hook_handle.remove()
-                graph_model.decode_disarm()
-                graph_model._pe_signal = None
-                graph_model._pe_C = None
-                graph_model._pe_Psi = None
-                graph_model._pe_c_row = None
-                graph_model._pe_taps = None
-
-        if isinstance(graph_model, CompositeGraphLLM):
-            # Build composite graph (token cycle + scene + cross-links), fuse embeddings via GT + gate.
-            inputs_embeds = graph_model._fuse_embeddings(
-                input_ids, [pyg_graph], [injection_map], permutation=self.permutation)
-            return graph_model.llm.generate(
-                inputs_embeds=inputs_embeds, attention_mask=attention_mask,
-                max_new_tokens=max_new_tokens, **DECODE_KWARGS,
-                pad_token_id=self.tokenizer.eos_token_id,
-            )
 
         # Base R-PEARL: build_pe_signal places Ψ at scoped node spans (tanh gate);
         # attention layers add it post-RoPE. Injection skips cached decode steps; disarmed in finally.

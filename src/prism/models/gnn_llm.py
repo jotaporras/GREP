@@ -186,7 +186,7 @@ class GraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         return []
 
     def _decoder_layers(self):
-        """Return the LLM's decoder layer list (Llama/Qwen2: ``<CausalLM>.model.layers``)."""
+        """Return the decoder layer list (Gemma text-only: ``model.layers``; multimodal: ``get_decoder().layers``)."""
         base = getattr(self.llm, "model", None)
         if base is not None and hasattr(base, "layers"):
             return base.layers
@@ -578,7 +578,7 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         v =      W_v · h  + W_v · Ψ
 
     Ψ projected through each layer's own (LoRA-adapted) q/k/v_proj. Architecture-agnostic
-    (Llama, Qwen2, gemma-4). ``self._pe_signal`` [B, seq, hidden]; injection skipped on
+    (Gemma-4 text-only and multimodal). ``self._pe_signal`` [B, seq, hidden]; injection skipped on
     cached decode steps (seq mismatch).
 
     Args:
@@ -656,7 +656,7 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         )
 
     def _decoder_layers(self):
-        """Return the LLM's decoder layer list (Llama/Qwen2: ``<CausalLM>.model.layers``), Gemma llm.get_decoder().layers"""
+        """Return the decoder layer list (Gemma text-only: ``model.layers``; multimodal: ``get_decoder().layers``)."""
         base = getattr(self.llm, "model", None)
         if base is not None and hasattr(base, "layers"):
             return base.layers

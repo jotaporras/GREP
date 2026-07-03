@@ -24,8 +24,6 @@ THE ORACLE (independent of save_model's body)
     rpearl_gt_llm  : key 'gt_model' -> model.pe_model ; 'pe_proj','pe_gain', opt 'pe_norm'
     gt_llm         : key 'pe_model' -> model.pe_model ; 'pe_proj','pe_gain', opt 'pe_norm'
     graph_mask_llm : NO weights; rebuilt from gnn_config.json (mask_* keys)
-    composite_gt   : 'gt_model'->model.gt_model, 'injection'->model.injection,
-                     opt 'pe_q_proj/k/v', opt 'c_bias_gains' (lam_c/lam_psi/lam_v)
 
 FIXTURE
   Tiny random-init Gemma4Unified base (q/k-norm, single-tensor RoPE, sliding windows, KV-shared
@@ -35,13 +33,6 @@ FIXTURE
   un-PEFT-wrapped, so getattr returns None and the branch is skipped; the adapter save is a PEFT
   boundary, separate from the GNN-weight serialisation under test.
 
-  Composite uses ``disable_llm_rope=False``: the production RoPE-disable helper (llama.py) is
-  Llama-specific and AttributeErrors on a Gemma4 rotary-emb (composite recipes pin llm=llama31_8b).
-  That path touches only ``self.llm``, never the gt_model/injection weights save_model serialises,
-  so disabling it does not affect the round-trip contract under test. (Flagged in the report.)
-
-Run:  conda activate GREP-PRISM && uv run python tests/verify_train_v3/test_save_model_roundtrip.py
-      (pytest is absent from the env; standalone runner footer. uv resolves to the conda env.)
 """
 import json
 import os
@@ -84,7 +75,6 @@ if "liger_kernel" not in sys.modules:
         sys.modules[_name] = _m
 
 from prism.models import gnn_llm
-from prism.models import composite_graph_llm
 from prism.models import r_pearl as r_pearl_module
 from prism.models import gt as gt_module
 from prism.training.train_v3 import GraphSFTTrainer
@@ -143,16 +133,6 @@ def _build(arch, seed, use_pe_norm=True):
                                          pe_node_features="word_embeddings")
     if arch == "graph_mask_llm":
         return gnn_llm.GraphMaskLLM(_tiny_llm(seed), k_hops=1, symmetrize=True, use_edges=True)
-    _common = dict(gate_init=0.0, gate_per_dim=False, injection_mode="interpolate",
-                   disable_llm_rope=False, cycle_weight=1.0, cycle_directed=True,
-                   crosslink_weight=1.0, crosslink_mention_to_node=True,
-                   crosslink_mention_clique=True)
-    if arch == "composite_plain":
-        return composite_graph_llm.CompositeGraphLLM(_tiny_llm(seed), _gt(seed), d_model=24, **_common)
-    if arch == "composite_c_bias":
-        return composite_graph_llm.InjectedCompositeGraphLLM(
-            _tiny_llm(seed), _gt(seed), d_model=24, inject_v=True, c_per_layer=False,
-            c_bias=True, use_scene_bias=True, c_kernel="sampled", **_common)
     raise ValueError(arch)
 
 
@@ -207,7 +187,7 @@ def _roundtrip_pe_model_key(arch):
 
     assert os.path.exists(os.path.join(out, "gnn_weights.pt"))
     assert not os.path.exists(os.path.join(out, "rpearl_weights.pt")), \
-        f"{arch} must not emit rpearl_weights.pt (only rpearl_gt_llm/composite do)"
+        f"{arch} must not emit rpearl_weights.pt (only rpearl_gt_llm does)"
     w = torch.load(os.path.join(out, "gnn_weights.pt"), map_location="cpu")
     assert set(w.keys()) == {"pe_model", "pe_proj", "pe_gain", "pe_norm"}, \
         f"{arch} unexpected gnn_weights keys: {sorted(w.keys())}"
@@ -268,63 +248,6 @@ def test_roundtrip_rpearl_gt_llm():
     assert _sd_equal(A.pe_model.state_dict(), B.pe_model.state_dict()), "GT failed to round-trip via 'gt_model'"
     # rpearl_weights.pt carries the inner R-PEARL (model.pe_model.pe_model) for analysis/reuse.
     assert _sd_equal(A.pe_model.pe_model.state_dict(), rp["rpearl"]), "inner R-PEARL mismatch in rpearl_weights.pt"
-
-
-# ==========================================================================
-# Round-trip: composite_graph_gt — plain (gt_model + injection) and c_bias (+ gains)
-# ==========================================================================
-def test_roundtrip_composite_plain():
-    """CompositeGraphLLM: save 'gt_model'->gt_model, 'injection'->injection; no pe_q_proj, no
-    c_bias_gains; rpearl_weights.pt = gt_model.pe_model. Mirrors loaders.py:232-243."""
-    if _gemma4_missing():
-        return _skip(_gemma4_missing())
-    A = _build("composite_plain", seed=0)
-    _perturb_structural(A)
-    out = _outdir("composite_plain")
-    _trainer_for(A, {"architecture": "composite_graph_gt"}, out).save_model(output_dir=out)
-
-    w = torch.load(os.path.join(out, "gnn_weights.pt"), map_location="cpu")
-    assert set(w.keys()) == {"gt_model", "injection"}, f"unexpected keys: {sorted(w.keys())}"
-    rp = torch.load(os.path.join(out, "rpearl_weights.pt"), map_location="cpu")
-    assert set(rp.keys()) == {"rpearl"}
-
-    B = _build("composite_plain", seed=1)
-    assert not _sd_equal(A.gt_model.state_dict(), B.gt_model.state_dict())  # no-op guard
-    B.gt_model.load_state_dict(w["gt_model"], strict=False)
-    B.injection.load_state_dict(w["injection"])
-    assert _sd_equal(A.gt_model.state_dict(), B.gt_model.state_dict()), "gt_model failed to round-trip"
-    assert _sd_equal(A.injection.state_dict(), B.injection.state_dict()), "injection failed to round-trip"
-    assert _sd_equal(A.gt_model.pe_model.state_dict(), rp["rpearl"]), "inner R-PEARL mismatch"
-
-
-def test_roundtrip_composite_c_bias():
-    """InjectedCompositeGraphLLM (c_bias=True): additionally persists c_bias_gains
-    {lam_c,lam_psi,lam_v}; loader copies each back (loaders.py:240-243). No pe_q_proj on this
-    variant (pe_qk_injection=False), so that key must be ABSENT."""
-    if _gemma4_missing():
-        return _skip(_gemma4_missing())
-    A = _build("composite_c_bias", seed=0)
-    _perturb_structural(A)
-    with torch.no_grad():                                  # perturb the scalar gains too
-        for name in ("lam_c", "lam_psi", "lam_v"):
-            getattr(A, name).add_(0.5)
-    out = _outdir("composite_c_bias")
-    _trainer_for(A, {"architecture": "composite_graph_gt"}, out).save_model(output_dir=out)
-
-    w = torch.load(os.path.join(out, "gnn_weights.pt"), map_location="cpu")
-    assert set(w.keys()) == {"gt_model", "injection", "c_bias_gains"}, \
-        f"unexpected keys: {sorted(w.keys())}"
-    assert "pe_q_proj" not in w, "c_bias-only variant must not persist pe_q_proj"
-    assert set(w["c_bias_gains"].keys()) == {"lam_c", "lam_psi", "lam_v"}
-
-    B = _build("composite_c_bias", seed=1)
-    B.gt_model.load_state_dict(w["gt_model"], strict=False)
-    B.injection.load_state_dict(w["injection"])
-    for k, v in w["c_bias_gains"].items():                 # loader protocol
-        getattr(B, k).data.copy_(v)
-    assert _sd_equal(A.gt_model.state_dict(), B.gt_model.state_dict()), "gt_model failed to round-trip"
-    for name in ("lam_c", "lam_psi", "lam_v"):
-        assert torch.equal(getattr(A, name).data, getattr(B, name).data), f"{name} gain failed to round-trip"
 
 
 # ==========================================================================

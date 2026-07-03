@@ -52,7 +52,7 @@ COMPACT_PY = SRC / "prism/data/compact_prompt.py"
 
 # The five graph architectures + the plain LLM baseline. Every one of these must
 # thread the edge flag through ``spine_to_compact_messages``.
-GRAPH_ARCHS = ("rpearl_llm", "rpearl_gt_llm", "gt_llm", "graph_mask_llm", "composite_graph_gt")
+GRAPH_ARCHS = ("rpearl_llm", "rpearl_gt_llm", "gt_llm", "graph_mask_llm", "learnable_graph_mask")
 ALL_ARCHS = GRAPH_ARCHS + ("llm",)
 
 
@@ -238,50 +238,19 @@ def test_data_preprocess_resolves_include_edges_from_text_edge_list():
     assert found, "no `include_edges = (text_edge_list == 'present')` assignment in preprocess_dataset"
 
 
-def test_data_preprocess_passes_flag_in_both_branches():
-    """Both the is_graph_arch branch AND the else/LLM branch call
-    ``spine_to_compact_messages(..., include_edges=include_edges)`` — never a
+def test_data_preprocess_passes_flag_to_every_translate_call():
+    """Every ``spine_to_compact_messages`` call in the (now arch-agnostic)
+    ``preprocess_dataset`` passes the resolved ``include_edges`` bool — never a
     hardcoded True, never a bare call."""
     tree = _parse(DATA_PY)
     func = _find_func(tree, "preprocess_dataset")
-    if_node = _find_if_on(func, "is_graph_arch")
-    assert if_node is not None, "no `if is_graph_arch:` branch in preprocess_dataset"
-    assert if_node.orelse, "is_graph_arch must have an else (LLM) branch"
-
-    def _assert_branch(stmts, label):
-        calls = [c for s in stmts for c in _calls_to(s, "spine_to_compact_messages")]
-        assert calls, f"{label} branch has no spine_to_compact_messages call"
-        for call in calls:
-            v = _kw(call, "include_edges")
-            assert v is not None, f"{label}: call missing include_edges kwarg"
-            assert _is_name(v, "include_edges"), f"{label}: include_edges not passed as the resolved bool"
-            assert not _is_const_true(v), f"{label}: include_edges hardcoded True"
-
-    _assert_branch(if_node.body, "graph-arch")
-    _assert_branch(if_node.orelse, "else/LLM")
-
-    # And no call ANYWHERE in preprocess_dataset hardcodes include_edges=True.
-    for call in _calls_to(func, "spine_to_compact_messages"):
+    calls = _calls_to(func, "spine_to_compact_messages")
+    assert calls, "preprocess_dataset has no spine_to_compact_messages call"
+    for call in calls:
         v = _kw(call, "include_edges")
-        assert v is not None and not _is_const_true(v), "hardcoded include_edges=True in preprocess_dataset"
-
-
-def test_is_graph_arch_tuple_lists_five_graph_archs():
-    """The is_graph_arch membership tuple is exactly the five graph archs."""
-    tree = _parse(DATA_PY)
-    func = _find_func(tree, "preprocess_dataset")
-    tup = None
-    for node in ast.walk(func):
-        if isinstance(node, ast.Assign) and any(
-                _is_name(t, "is_graph_arch") for t in node.targets):
-            comp = node.value
-            assert isinstance(comp, ast.Compare) and isinstance(comp.ops[0], ast.In), \
-                "is_graph_arch must be `architecture in (...)`"
-            assert _is_name(comp.left, "architecture")
-            tup = comp.comparators[0]
-    assert tup is not None, "no is_graph_arch assignment found"
-    archs = {e.value for e in tup.elts if isinstance(e, ast.Constant)}
-    assert archs == set(GRAPH_ARCHS), f"is_graph_arch={sorted(archs)} != {sorted(GRAPH_ARCHS)}"
+        assert v is not None, "call missing include_edges kwarg"
+        assert _is_name(v, "include_edges"), "include_edges not passed as the resolved bool"
+        assert not _is_const_true(v), "include_edges hardcoded True"
 
 
 def test_inference_clients_take_include_edges_with_no_default():
@@ -355,31 +324,6 @@ def test_no_strip_edges_anywhere_in_src():
 
 
 # ---------------------------------------------------------------------------
-# 3. ALL-ARCHITECTURE COVERAGE  (torch-free: which verified path each arch uses)
-# ---------------------------------------------------------------------------
-
-def test_all_six_architectures_route_through_the_flag():
-    """Every arch reaches ``spine_to_compact_messages`` with the resolved flag:
-    the five graph archs through the is_graph_arch branch, the plain ``llm``
-    through the else branch. Both branches were proven to pass include_edges in
-    ``test_data_preprocess_passes_flag_in_both_branches``; here we confirm the
-    routing classification per architecture is consistent with the tuple."""
-    tree = _parse(DATA_PY)
-    func = _find_func(tree, "preprocess_dataset")
-    tup = None
-    for node in ast.walk(func):
-        if isinstance(node, ast.Assign) and any(_is_name(t, "is_graph_arch") for t in node.targets):
-            tup = node.value.comparators[0]
-    graph_set = {e.value for e in tup.elts}
-    for arch in ALL_ARCHS:
-        routed_graph_branch = arch in graph_set
-        if arch == "llm":
-            assert not routed_graph_branch, "plain llm must route through the else branch"
-        else:
-            assert routed_graph_branch, f"{arch} must route through the is_graph_arch branch"
-
-
-# ---------------------------------------------------------------------------
 # Optional model-level integration (real tokenizer + preprocess_dataset).
 # Skipped where torch / a tokenizer are unavailable (locally); RUNS on cluster.
 # ---------------------------------------------------------------------------
@@ -402,7 +346,7 @@ def test_preprocess_dataset_toggles_edges_end_to_end():
     from transformers import AutoTokenizer
     from prism.data import data as data_mod
 
-    tok_id = os.environ.get("GREP_TEST_TOKENIZER", "meta-llama/Llama-3.1-8B-Instruct")
+    tok_id = os.environ.get("GREP_TEST_TOKENIZER", "google/gemma-4-12B-it")
     try:
         tokenizer = AutoTokenizer.from_pretrained(tok_id)
     except Exception as e:  # noqa: BLE001
@@ -416,7 +360,7 @@ def test_preprocess_dataset_toggles_edges_end_to_end():
     for arch in ("llm", "rpearl_llm"):
         for text_edge_list, want_edges in (("present", True), ("none", False)):
             ds = data_mod.preprocess_dataset(
-                base, tokenizer, architecture=arch, text_edge_list=text_edge_list)
+                base, tokenizer, text_edge_list=text_edge_list)
             sys_msgs = [m["content"] for ex in ds for m in ex["messages"] if m["role"] == "system"]
             assert sys_msgs, f"{arch}/{text_edge_list}: no system message produced"
             for content in sys_msgs:

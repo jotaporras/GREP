@@ -124,7 +124,7 @@ def edge_list_token_positions(full_text, input_ids, tokenizer):
 
     input_ids = list(input_ids)
     # The edge bullets are plain text, but the char-span end can spill onto the
-    # chat-template turn terminator (and on Llama the next role-header), which the
+    # chat-template turn terminator, which the
     # tokenizer emits as SPECIAL ids — never part of the edge list. Drop those so
     # the supervised span is exactly the edge tokens.
     special = set(getattr(tokenizer, "all_special_ids", []) or [])
@@ -210,7 +210,6 @@ def assistant_token_positions(messages, input_ids, tokenizer):
 def preprocess_dataset(
     ds: datasets.Dataset,
     tokenizer,
-    architecture: str,
     text_edge_list: str,
 ) -> datasets.Dataset:
     """Prepare a raw JSON dataset for training.
@@ -269,26 +268,17 @@ def preprocess_dataset(
     # the GNN always reads structural edges from the ORIGINAL messages.
     include_edges = (text_edge_list == "present")
 
-    is_graph_arch = architecture in ("rpearl_llm", "rpearl_gt_llm", "gt_llm", "graph_mask_llm", "composite_graph_gt")
-    if is_graph_arch:
-        ds = ds.map(_parse_scene_graph)
-        # Translate SPINE text to compact format; include_edges gates LLM-facing edge bullets only.
-        def _translate_to_compact(example):
-            example["messages"] = compact_prompt.spine_to_compact_messages(
-                example["conversations"], include_edges=include_edges
-            )
-            return example
-        ds = ds.map(_translate_to_compact)
-    else:
-        # Plain-LLM: same compact format; include_edges gates text edge bullets.
-        # Parse scene graph for the graph_acc/* metric even though the LLM ingests no graph.
-        ds = ds.map(_parse_scene_graph)
-        def _translate_to_compact_llm(example):
-            example["messages"] = compact_prompt.spine_to_compact_messages(
-                example["conversations"], include_edges=include_edges
-            )
-            return example
-        ds = ds.map(_translate_to_compact_llm)
+    # Same pipeline for every architecture: the scene graph is parsed even for the
+    # plain LLM (the graph_acc/* metrics need it), and include_edges gates only the
+    # LLM-facing edge bullets — graph archs read structural edges from the original
+    # messages via the collator.
+    ds = ds.map(_parse_scene_graph)
+    def _translate_to_compact(example):
+        example["messages"] = compact_prompt.spine_to_compact_messages(
+            example["conversations"], include_edges=include_edges
+        )
+        return example
+    ds = ds.map(_translate_to_compact)
     ds = ds.map(_tokenize)
     ds = ds.filter(lambda e: any(m.get("role") == "assistant" for m in e["messages"]))
 
@@ -349,10 +339,7 @@ def load_and_split_dataset(config, tokenizer):
         full_dataset = full_dataset.select(range(round(len(full_dataset) * config.data.dataset_proportion)))
 
     full_dataset = preprocess_dataset(
-        full_dataset, tokenizer,
-        architecture=config.gnn.arch,
-        text_edge_list=config.data.text_edge_list,
-    )
+        full_dataset, tokenizer, text_edge_list=config.data.text_edge_list)
 
     if config.data.val_files:
         train_dataset = full_dataset
@@ -360,10 +347,7 @@ def load_and_split_dataset(config, tokenizer):
         if config.data.debug:
             eval_dataset = eval_dataset.select(range(round(len(eval_dataset) * config.data.dataset_proportion)))
         eval_dataset = preprocess_dataset(
-            eval_dataset, tokenizer,
-            architecture=config.gnn.arch,
-            text_edge_list=config.data.text_edge_list,
-        )
+            eval_dataset, tokenizer, text_edge_list=config.data.text_edge_list)
         print(f"Using pre-split val file: {len(train_dataset)} train / {len(eval_dataset)} eval")
     elif config.data.val_frac and config.data.val_frac > 0.0:
         dataset_size = len(full_dataset)
