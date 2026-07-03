@@ -77,7 +77,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--checkpoint", required=True,
-                   help="Checkpoint dir (run dir or subdir with adapter_config.json / gnn_config.json).")
+                   help="Checkpoint dir (run dir or subdir with adapter_config.json / train_config.json).")
     p.add_argument("--graphs", required=True,
                    help="A test-graph JSON file, a directory of them, or a glob pattern.")
     p.add_argument("--permutation-seed", type=int, nargs="+", default=None,
@@ -92,7 +92,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Physical GPU index (default 0). Use -1 for device_map='auto'.")
     p.add_argument("--text-edge-list", choices=["present", "none"], default=None,
                    help="Override the textual-edge-list mode. Default: read from "
-                        "gnn_config.json for graph-augmented checkpoints, train_config.json "
+                        "train_config.json (legacy graph checkpoints: gnn_config.json) "
                         "for plain LLMs. Required if a plain-LLM checkpoint has neither.")
     p.add_argument("--use-icl", choices=["true", "false"], default="true",
                    help="Include SPINE in-context-learning examples in the planner prompt. "

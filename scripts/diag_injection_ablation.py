@@ -55,7 +55,7 @@ from prism.models import gnn_llm
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--checkpoint", required=True, help="Trained run dir (gnn_config.json or adapter_config.json).")
+    p.add_argument("--checkpoint", required=True, help="Trained run dir (train_config.json / legacy gnn_config.json, or adapter_config.json).")
     p.add_argument("--val-file", default="data/revised/gen/nav100_n30_gemma_data/split/formatted_all_new__val.json",
                    help="Held-out conversations JSON (same format as training data).")
     p.add_argument("--text-edge-list", default=None, choices=["present", "none"],
@@ -134,11 +134,7 @@ def parse_gate_sweep(spec, trained_raw):
 def main():
     args = parse_args()
     is_gnn = ckpt_mod.is_gnn_checkpoint(args.checkpoint)
-    if is_gnn:
-        with open(os.path.join(args.checkpoint, "gnn_config.json")) as f:
-            arch = json.load(f)["architecture"]
-    else:
-        arch = "llm"
+    arch = ckpt_mod.load_gnn_config(args.checkpoint)["architecture"] if is_gnn else "llm"
     text_edge_list = ckpt_mod.resolve_text_edge_list(args.checkpoint, is_gnn, args.text_edge_list)
     print(f"[diag] checkpoint={args.checkpoint}")
     print(f"[diag] arch={arch} text_edge_list={text_edge_list} val_file={args.val_file}")

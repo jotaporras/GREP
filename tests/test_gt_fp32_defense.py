@@ -329,7 +329,8 @@ def test_blackbox_real_checkpoint_fp32_defense():
         print(f"[SKIP] checkpoint not present: {_CKPT}")
         return
 
-    cfg = json.load(open(os.path.join(_CKPT, "gnn_config.json")))
+    from prism.models.loaders import load_gnn_config
+    cfg = load_gnn_config(_CKPT)
     gt = gt_module.GraphTransformer(
         num_layers=cfg["gt_num_layers"], pe_hidden_channels=cfg["pe_hidden_channels"],
         pe_num_layers=cfg["pe_num_layers"], d_model=cfg["d_model"], heads=cfg["gt_heads"],

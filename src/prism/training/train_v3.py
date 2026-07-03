@@ -187,8 +187,8 @@ def train_model(config: omegaconf.DictConfig):
     )
 
     if is_graph_arch:
-        # gnn_config is dumped to gnn_config.json and read back by loaders at eval, so the
-        # on-disk key NAMES must stay stable. These keys map 1:1 onto config.gnn fields;
+        # gnn_config is dumped into train_config.json (metadata top-level, params under
+        # "gnn") and read back by loaders at eval, so the on-disk key NAMES must stay stable. These keys map 1:1 onto config.gnn fields;
         # the remapped/cross-section ones (architecture, base_model, text_edge_list) and
         # the arch-conditional groups are spelled out.
         _direct = (
@@ -567,13 +567,22 @@ class GraphSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
                 break
         return loss
 
+    # Shared run-metadata keys stored at the TOP LEVEL of train_config.json; every
+    # other gnn_config entry (the arch hyperparameters) nests under "gnn". Loaders
+    # flatten this back (and still read legacy flat gnn_config.json checkpoints).
+    _RUN_META_KEYS = ("architecture", "base_model", "text_edge_list", "injection_scope")
+
     def save_model(self, output_dir=None, _internal_call=False):
         output_dir = output_dir or self.args.output_dir
         os.makedirs(output_dir, exist_ok=True)
-        with open(os.path.join(output_dir, "gnn_config.json"), "w") as f:
-            json.dump(self.gnn_config, f, indent=2)
+        run_config = {k: self.gnn_config[k] for k in self._RUN_META_KEYS
+                      if k in self.gnn_config}
+        run_config["gnn"] = {k: v for k, v in self.gnn_config.items()
+                             if k not in self._RUN_META_KEYS}
+        with open(os.path.join(output_dir, "train_config.json"), "w") as f:
+            json.dump(run_config, f, indent=2)
         if self.gnn_config.get("architecture") == "graph_mask_llm":
-            # Parameter-free: mask rebuilt from config; gnn_config.json + LoRA adapter suffice.
+            # Parameter-free: mask rebuilt from config; train_config.json + LoRA adapter suffice.
             pass
         elif self.gnn_config.get("architecture") == "learnable_graph_mask":
             # Save the standalone GraphTransformer (Psi producer); the mask + adjacency
@@ -631,8 +640,8 @@ class BaselineSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
     :class:`prism.data.data.TokenIndexCollator`, which carries the precomputed
     graph-token index columns the metric needs.
 
-    Persists a ``train_config.json`` (the plain-LLM analogue of the graph trainer's
-    ``gnn_config.json``) so the standalone eval boundary can recover the train-time
+    Persists the same ``train_config.json`` the graph trainer writes (minus the
+    ``"gnn"`` section) so the standalone eval boundary can recover the train-time
     ``text_edge_list`` policy. Without it an LLM trained with ``text_edge_list=none``
     would be silently evaluated with edge bullets re-added (train/eval mismatch).
     """

@@ -70,6 +70,25 @@ def from_pretrained(
     return model, tokenizer
 
 
+def load_gnn_config(path: str) -> dict:
+    """Flat GNN rebuild config for a graph-augmented checkpoint.
+
+    Current checkpoints store ONE ``train_config.json`` with shared run metadata
+    (architecture / base_model / text_edge_list / injection_scope) at the top
+    level and the architecture hyperparameters nested under ``"gnn"``. Legacy
+    checkpoints store a single flat ``gnn_config.json`` instead. Returns the FLAT
+    merged dict either way — the shape the rebuild branches below consume.
+    """
+    tc_path = os.path.join(path, "train_config.json")
+    if os.path.exists(tc_path):
+        with open(tc_path) as f:
+            tc = json.load(f)
+        if "gnn" in tc:
+            return {**tc["gnn"], **{k: v for k, v in tc.items() if k != "gnn"}}
+    with open(os.path.join(path, "gnn_config.json")) as f:
+        return json.load(f)
+
+
 def graph_augmented_llm_from_pretrained(
     path: str,
     load_in_4bit: bool = False,
@@ -78,7 +97,8 @@ def graph_augmented_llm_from_pretrained(
     """Load a GraphAugmentedLLM checkpoint saved by GraphSFTTrainer.
 
     Expects the checkpoint directory to contain:
-      - gnn_config.json      GNN hyperparameters + base_model path
+      - train_config.json    run metadata + "gnn" hyperparameters (legacy
+                             checkpoints: a flat gnn_config.json instead)
       - gnn_weights.pt       pe_model and pe_proj state dicts
       - adapter_config.json  (optional — present when freeze_llm=False)
       - tokenizer files
@@ -88,8 +108,7 @@ def graph_augmented_llm_from_pretrained(
     """
     device_map = {"": 0} if device >= 0 else "auto"
 
-    with open(os.path.join(path, "gnn_config.json")) as f:
-        gnn_cfg = json.load(f)
+    gnn_cfg = load_gnn_config(path)
 
     base_model_path = gnn_cfg["base_model"]
 

@@ -4,7 +4,7 @@
 
 WHAT IS UNDER TEST
   ``GraphSFTTrainer.save_model`` (train_v3.py:551-624) serialises the graph-side weights to
-  ``gnn_weights.pt`` (+ ``rpearl_weights.pt`` where applicable) and ``gnn_config.json``,
+  ``gnn_weights.pt`` (+ ``rpearl_weights.pt`` where applicable) and ``train_config.json``,
   branching by ``gnn_config['architecture']``. The eval boundary later reloads those files via
   ``prism.models.loaders.graph_augmented_llm_from_pretrained``. The contract is the SAVE↔LOAD
   ROUND-TRIP: the keys ``save_model`` writes, and the live submodules it reads them from, must
@@ -23,7 +23,7 @@ THE ORACLE (independent of save_model's body)
     rpearl_llm     : key 'pe_model' -> model.pe_model ; 'pe_proj','pe_gain', opt 'pe_norm'
     rpearl_gt_llm  : key 'gt_model' -> model.pe_model ; 'pe_proj','pe_gain', opt 'pe_norm'
     gt_llm         : key 'pe_model' -> model.pe_model ; 'pe_proj','pe_gain', opt 'pe_norm'
-    graph_mask_llm : NO weights; rebuilt from gnn_config.json (mask_* keys)
+    graph_mask_llm : NO weights; rebuilt from the saved config (mask_* keys)
 
 FIXTURE
   Tiny random-init Gemma4Unified base (q/k-norm, single-tensor RoPE, sliding windows, KV-shared
@@ -75,6 +75,7 @@ if "liger_kernel" not in sys.modules:
         sys.modules[_name] = _m
 
 from prism.models import gnn_llm
+from prism.models import loaders as model_loaders
 from prism.models import r_pearl as r_pearl_module
 from prism.models import gt as gt_module
 from prism.training.train_v3 import GraphSFTTrainer
@@ -167,7 +168,7 @@ def _outdir(name):
     d = os.path.join(_SCRATCH, "save_model_rt", name)
     os.makedirs(d, exist_ok=True)
     # clean any prior artifacts so absence-assertions are meaningful
-    for f in ("gnn_config.json", "gnn_weights.pt", "rpearl_weights.pt"):
+    for f in ("train_config.json", "gnn_config.json", "gnn_weights.pt", "rpearl_weights.pt"):
         p = os.path.join(d, f)
         if os.path.exists(p):
             os.remove(p)
@@ -251,12 +252,12 @@ def test_roundtrip_rpearl_gt_llm():
 
 
 # ==========================================================================
-# graph_mask_llm — parameter-free: only gnn_config.json, NO weight files
+# graph_mask_llm — parameter-free: only the config file, NO weight files
 # ==========================================================================
 def test_graph_mask_writes_only_config_no_weights():
     """save_model graph_mask branch is a no-op for weights; the mask is rebuilt from
-    gnn_config.json's mask_* keys (loaders.py:177-182). With no LoRA adapter attached, the only
-    artifact is gnn_config.json."""
+    the saved mask_* keys. With no LoRA adapter attached, the only artifact is
+    train_config.json (metadata top-level, params under "gnn")."""
     if _gemma4_missing():
         return _skip(_gemma4_missing())
     A = _build("graph_mask_llm", seed=0)
@@ -267,20 +268,24 @@ def test_graph_mask_writes_only_config_no_weights():
 
     assert not os.path.exists(os.path.join(out, "gnn_weights.pt")), "graph_mask must emit no weights"
     assert not os.path.exists(os.path.join(out, "rpearl_weights.pt"))
-    with open(os.path.join(out, "gnn_config.json")) as f:
+    assert not os.path.exists(os.path.join(out, "gnn_config.json")), \
+        "new saves must not write the legacy gnn_config.json"
+    with open(os.path.join(out, "train_config.json")) as f:
         loaded = json.load(f)
-    # the loader rebuilds the mask purely from these keys — they must survive the JSON round-trip
-    assert loaded == cfg
-    for k in ("mask_k_hops", "mask_symmetrize", "mask_use_edges"):
-        assert k in loaded, f"loader needs {k} to rebuild the mask, but it's absent"
+    assert loaded == {"architecture": "graph_mask_llm",
+                      "gnn": {"mask_k_hops": 2, "mask_symmetrize": True,
+                              "mask_use_edges": False}}
+    # ...and the production reader flattens it back to exactly the trainer's dict.
+    assert model_loaders.load_gnn_config(out) == cfg
 
 
 # ==========================================================================
-# gnn_config.json is always written and round-trips, regardless of architecture
+# train_config.json is always written and round-trips through the production reader
 # ==========================================================================
-def test_gnn_config_json_roundtrips_for_graph_arch():
-    """Every save_model branch writes gnn_config.json first; it must parse back identically (the
-    eval boundary reads base_model/architecture/rebuild hyperparams from it)."""
+def test_saved_config_roundtrips_through_load_gnn_config():
+    """Every save_model branch writes train_config.json first; loaders.load_gnn_config
+    must flatten it back to exactly the trainer's gnn_config dict (the eval boundary
+    reads base_model/architecture/rebuild hyperparams from it)."""
     if _gemma4_missing():
         return _skip(_gemma4_missing())
     A = _build("rpearl_llm", seed=0)
@@ -288,8 +293,18 @@ def test_gnn_config_json_roundtrips_for_graph_arch():
            "d_model": 24, "pe_hidden_channels": 16, "eps": 1e-6, "use_pe_norm": True}
     out = _outdir("cfgjson")
     _trainer_for(A, cfg, out).save_model(output_dir=out)
-    with open(os.path.join(out, "gnn_config.json")) as f:
-        assert json.load(f) == cfg
+    assert model_loaders.load_gnn_config(out) == cfg
+
+
+def test_load_gnn_config_reads_legacy_flat_format(tmp_path=None):
+    """Legacy checkpoints (flat gnn_config.json, no train_config.json) still load."""
+    import tempfile
+    d = tempfile.mkdtemp(prefix="legacy_cfg_")
+    cfg = {"architecture": "rpearl_gt_llm", "base_model": "google/gemma-4-31B-it",
+           "d_model": 2048, "text_edge_list": "none"}
+    with open(os.path.join(d, "gnn_config.json"), "w") as f:
+        json.dump(cfg, f)
+    assert model_loaders.load_gnn_config(d) == cfg
 
 
 # ==========================================================================

@@ -1,17 +1,20 @@
 """Checkpoint discovery + loading shared by every eval path.
 
-A trained PRISM run dir is one of two kinds, told apart by which marker file the
-trainer wrote:
+Every trained run dir carries a single ``train_config.json`` with the shared run
+metadata (``architecture``, ``base_model``, ``text_edge_list``,
+``injection_scope``) at the top level; **graph-augmented** checkpoints
+additionally nest their architecture hyperparameters under a ``"gnn"`` key (and
+ship ``gnn_weights.pt`` / the LoRA adapter), while **plain-LLM** checkpoints have
+no ``"gnn"`` key (only the PEFT ``adapter_config.json``).
 
-* **graph-augmented** — has ``gnn_config.json`` (+ ``gnn_weights.pt`` / the LoRA
-  adapter). Loaded via :func:`prism.models.loaders.graph_augmented_llm_from_pretrained`.
-* **plain LLM** — has only the PEFT ``adapter_config.json`` (+ ``train_config.json``).
-  Loaded via :func:`prism.models.loaders.from_pretrained`.
+Legacy checkpoints (pre-cleanup) used a separate flat ``gnn_config.json`` for
+graph runs instead; every reader here falls back to it, so old run dirs stay
+loadable.
 
 This module centralises the three operations every consumer needs — kind
 detection, train-time ``text_edge_list`` policy recovery, and the actual model
-load — so the post-hoc driver (``scalability_evaluation``) and the in-process
-post-train eval (``train_v3`` / ``train_v2``) share one implementation.
+load — so the post-hoc driver (``scalability_evaluation``), the in-process
+post-train eval (``train_v3``), and the diagnostics share one implementation.
 """
 from __future__ import annotations
 
@@ -20,9 +23,26 @@ import os
 
 from prism.models import loaders
 
+# Re-exported so eval-side consumers don't need a loaders import for config reads.
+load_gnn_config = loaders.load_gnn_config
+
+
+def _read_json(path: str) -> dict | None:
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
+
 
 def is_gnn_checkpoint(path: str) -> bool:
-    """True iff ``path`` is a graph-augmented checkpoint (has ``gnn_config.json``)."""
+    """True iff ``path`` is a graph-augmented checkpoint.
+
+    Current format: ``train_config.json`` carries a ``"gnn"`` key. Legacy format:
+    a standalone ``gnn_config.json`` marker file.
+    """
+    tc = _read_json(os.path.join(path, "train_config.json"))
+    if tc is not None and "gnn" in tc:
+        return True
     return os.path.exists(os.path.join(path, "gnn_config.json"))
 
 
@@ -30,46 +50,46 @@ def resolve_text_edge_list(checkpoint: str, is_gnn: bool, cli_override: str | No
     """Recover the train-time ``text_edge_list`` policy so eval matches training,
     i.e. if the checkpoint was trained with edge lists, eval should also use edge lists.
 
-    TO DO: it seems the only reason this exists is because configs divergesd
-    for graph-based and LLM-based checkpoints. We should consolidate the configs.
+    Reads ``train_config.json`` (both checkpoint kinds record the key at the top
+    level); legacy graph checkpoints fall back to ``gnn_config.json``. Raises
+    loudly when the policy cannot be recovered — a silent default here is a
+    train/eval mismatch.
     """
     if cli_override is not None:
         return cli_override
+
+    tc = _read_json(os.path.join(checkpoint, "train_config.json"))
+    if tc is not None and tc.get("text_edge_list") is not None:
+        return tc["text_edge_list"]
+
     if is_gnn:
-        gnn_cfg_path = os.path.join(checkpoint, "gnn_config.json")
-        with open(gnn_cfg_path) as f:
-            gnn_cfg = json.load(f)
-        text_edge_list = gnn_cfg.get("text_edge_list")
-        if text_edge_list is None:
-            raise KeyError(
-                f"{gnn_cfg_path} does not record 'text_edge_list'; pass --text-edge-list "
-                f"present|none explicitly to evaluate this checkpoint."
-            )
-        return text_edge_list
-    train_cfg_path = os.path.join(checkpoint, "train_config.json")
-    if not os.path.exists(train_cfg_path):
+        legacy = _read_json(os.path.join(checkpoint, "gnn_config.json"))
+        if legacy is not None and legacy.get("text_edge_list") is not None:
+            return legacy["text_edge_list"]
+        raise KeyError(
+            f"{checkpoint} does not record 'text_edge_list' (train_config.json / "
+            f"gnn_config.json); pass --text-edge-list present|none explicitly to "
+            f"evaluate this checkpoint."
+        )
+    if tc is None:
         raise FileNotFoundError(
             f"{checkpoint} has no train_config.json recording the train-time "
             f"text_edge_list policy. Cannot infer whether the LLM-facing scene-graph "
             f"block was trained with edge bullets; pass --text-edge-list present|none "
             f"explicitly to evaluate this checkpoint."
         )
-    with open(train_cfg_path) as f:
-        train_cfg = json.load(f)
-    text_edge_list = train_cfg.get("text_edge_list")
-    if text_edge_list is None:
-        raise KeyError(
-            f"{train_cfg_path} does not record 'text_edge_list'; pass --text-edge-list "
-            f"present|none explicitly to evaluate this checkpoint."
-        )
-    return text_edge_list
+    raise KeyError(
+        f"{os.path.join(checkpoint, 'train_config.json')} does not record "
+        f"'text_edge_list'; pass --text-edge-list present|none explicitly to "
+        f"evaluate this checkpoint."
+    )
 
 
 def load_checkpoint(checkpoint: str, four_bit: bool, device: int):
     """Load a trained checkpoint for eval. Returns ``(model, tokenizer, is_gnn)``.
 
     Dispatches on :func:`is_gnn_checkpoint`. Raises ``FileNotFoundError`` if the
-    dir has neither ``gnn_config.json`` nor ``adapter_config.json`` (not a
+    dir has neither a graph config nor ``adapter_config.json`` (not a
     recognisable checkpoint).
     """
     if is_gnn_checkpoint(checkpoint):
@@ -79,8 +99,8 @@ def load_checkpoint(checkpoint: str, four_bit: bool, device: int):
         return model, tok, True
     if not os.path.exists(os.path.join(checkpoint, "adapter_config.json")):
         raise FileNotFoundError(
-            f"{checkpoint} has neither gnn_config.json nor adapter_config.json — "
-            "not a recognisable checkpoint dir."
+            f"{checkpoint} has neither a graph config (train_config.json with 'gnn' / "
+            "gnn_config.json) nor adapter_config.json — not a recognisable checkpoint dir."
         )
     model, tok = loaders.from_pretrained(checkpoint, load_in_4bit=four_bit, device=device)
     return model, tok, False
