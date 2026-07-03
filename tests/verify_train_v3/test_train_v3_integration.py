@@ -117,7 +117,7 @@ _FIELDS_TRAIN_V3_READS = [
     "trainer.per_device_train_batch_size", "trainer.per_device_eval_batch_size",
     "trainer.gradient_accumulation_steps", "trainer.warmup_steps", "trainer.epochs",
     "trainer.max_steps", "trainer.learning_rate", "trainer.weight_decay",
-    "trainer.gradient_checkpointing", "trainer.no_train",
+    "trainer.gradient_checkpointing", "trainer.no_train", "trainer.sft",
     # lora
     "lora.r", "lora.alpha", "lora.dropout", "lora.target_modules",
     # multistage (folded into trainer)

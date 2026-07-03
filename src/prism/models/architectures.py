@@ -12,146 +12,149 @@ from prism.models import r_pearl as r_pearl_module
 from prism.models import gt as gt_module
 
 
-def build_planner_model(config, llm, tokenizer):
+def build_planner_model(gnn, llm, tokenizer, *, disable_graph_token_rope=False,
+                        freeze_llm=False):
     """Instantiate the model and data collator for the given architecture.
 
     Args:
-        config: the full experiment config (OmegaConf; read-only). Reads the
-            ``gnn``, ``model.disable_graph_token_rope`` and ``trainer.freeze_llm`` fields.
+        gnn: the ``gnn`` config section (OmegaConf; read-only) — the architecture
+            switch plus its hyperparameters.
         llm: base AutoModelForCausalLM already loaded on the target device.
         tokenizer: corresponding tokenizer with pad token set.
+        disable_graph_token_rope: identity-RoPE (position_id 0) on node-name tokens.
+        freeze_llm: freeze the base LLM (PE-only training; no LoRA adapter added).
 
     Returns:
         (model, collator) — model is the architecture wrapper (or ``llm`` itself
         for the plain-LLM baseline); collator is the matching data collator.
     """
     _text_hidden = llm.config.get_text_config().hidden_size
-    _node_feature_dim = _text_hidden if config.gnn.pe_node_features == "word_embeddings" else None
+    _node_feature_dim = _text_hidden if gnn.pe_node_features == "word_embeddings" else None
 
-    if config.gnn.arch == "rpearl_llm":
+    if gnn.arch == "rpearl_llm":
         # R-PEARL only: GCN positional encodings, no GT attention blocks.
         pe_model = r_pearl_module.RandomGNNPositionalEncodings(
-            pe_hidden_channels=config.gnn.pe_hidden_channels,
-            pe_num_layers=config.gnn.pe_num_layers,
-            d_model=config.gnn.d_model,
-            num_samples=config.gnn.num_samples,
-            dropout=config.gnn.dropout,
-            k=config.gnn.k_pe,
-            eps=config.gnn.eps,
-            use_layer_norm=config.gnn.use_layer_norm,
+            pe_hidden_channels=gnn.pe_hidden_channels,
+            pe_num_layers=gnn.pe_num_layers,
+            d_model=gnn.d_model,
+            num_samples=gnn.num_samples,
+            dropout=gnn.dropout,
+            k=gnn.k_pe,
+            eps=gnn.eps,
+            use_layer_norm=gnn.use_layer_norm,
             node_feature_dim=_node_feature_dim,
         )
-        model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=config.gnn.d_model,
-                                          eps=config.gnn.eps, pe_gain_init=config.gnn.pe_gain_init,
-                                          disable_graph_token_rope=config.model.disable_graph_token_rope,
-                                          use_pe_norm=config.gnn.use_pe_norm,
-                                          pe_node_features=config.gnn.pe_node_features)
+        model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=gnn.d_model,
+                                          eps=gnn.eps, pe_gain_init=gnn.pe_gain_init,
+                                          disable_graph_token_rope=disable_graph_token_rope,
+                                          use_pe_norm=gnn.use_pe_norm,
+                                          pe_node_features=gnn.pe_node_features)
         collator = data.SpineDataCollator(tokenizer, mlm=False)
 
-        if config.trainer.freeze_llm:
+        if freeze_llm:
             model.llm.requires_grad_(False)
-    elif config.gnn.arch == "rpearl_gt_llm":
+    elif gnn.arch == "rpearl_gt_llm":
         # Full Graph Transformer: R-PEARL inside Sparse Attention blocks.
         pe_model = gt_module.GraphTransformer(
-            num_layers=config.gnn.gt_num_layers,
-            pe_hidden_channels=config.gnn.pe_hidden_channels,
-            pe_num_layers=config.gnn.pe_num_layers,
-            d_model=config.gnn.d_model,
-            heads=config.gnn.gt_heads,
-            num_samples=config.gnn.num_samples,
-            dropout=config.gnn.dropout,
-            k_pe=config.gnn.k_pe,
-            k_gt=config.gnn.k_gt,
-            eps=config.gnn.eps,
-            use_layer_norm=config.gnn.use_layer_norm,
+            num_layers=gnn.gt_num_layers,
+            pe_hidden_channels=gnn.pe_hidden_channels,
+            pe_num_layers=gnn.pe_num_layers,
+            d_model=gnn.d_model,
+            heads=gnn.gt_heads,
+            num_samples=gnn.num_samples,
+            dropout=gnn.dropout,
+            k_pe=gnn.k_pe,
+            k_gt=gnn.k_gt,
+            eps=gnn.eps,
+            use_layer_norm=gnn.use_layer_norm,
             node_feature_dim=_node_feature_dim,
         )
-        model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=config.gnn.d_model,
-                                          eps=config.gnn.eps, pe_gain_init=config.gnn.pe_gain_init,
-                                          disable_graph_token_rope=config.model.disable_graph_token_rope,
-                                          use_pe_norm=config.gnn.use_pe_norm,
-                                          pe_node_features=config.gnn.pe_node_features)
+        model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=gnn.d_model,
+                                          eps=gnn.eps, pe_gain_init=gnn.pe_gain_init,
+                                          disable_graph_token_rope=disable_graph_token_rope,
+                                          use_pe_norm=gnn.use_pe_norm,
+                                          pe_node_features=gnn.pe_node_features)
         collator = data.SpineDataCollator(tokenizer, mlm=False)
 
-        if config.trainer.freeze_llm:
+        if freeze_llm:
             model.llm.requires_grad_(False)
-    elif config.gnn.arch == "gt_llm":
+    elif gnn.arch == "gt_llm":
         # Pure Graph Transformer over semantic node features — no R-PEARL, no probes.
-        if config.gnn.pe_node_features != "word_embeddings":
+        if gnn.pe_node_features != "word_embeddings":
             raise ValueError(
                 "architecture 'gt_llm' requires pe_node_features='word_embeddings' "
-                f"(got {config.gnn.pe_node_features!r}); the GT has no random-probe input."
+                f"(got {gnn.pe_node_features!r}); the GT has no random-probe input."
             )
         pe_model = gt_module.SemanticGraphTransformer(
             node_feature_dim=_text_hidden,
-            d_model=config.gnn.d_model,
-            num_layers=config.gnn.gt_num_layers,
-            heads=config.gnn.gt_heads,
-            dropout=config.gnn.dropout,
-            k_gt=config.gnn.k_gt,
+            d_model=gnn.d_model,
+            num_layers=gnn.gt_num_layers,
+            heads=gnn.gt_heads,
+            dropout=gnn.dropout,
+            k_gt=gnn.k_gt,
         )
-        model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=config.gnn.d_model,
-                                          eps=config.gnn.eps, pe_gain_init=config.gnn.pe_gain_init,
-                                          disable_graph_token_rope=config.model.disable_graph_token_rope,
-                                          use_pe_norm=config.gnn.use_pe_norm,
-                                          pe_node_features=config.gnn.pe_node_features)
+        model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=gnn.d_model,
+                                          eps=gnn.eps, pe_gain_init=gnn.pe_gain_init,
+                                          disable_graph_token_rope=disable_graph_token_rope,
+                                          use_pe_norm=gnn.use_pe_norm,
+                                          pe_node_features=gnn.pe_node_features)
         collator = data.SpineDataCollator(tokenizer, mlm=False)
 
-        if config.trainer.freeze_llm:
+        if freeze_llm:
             model.llm.requires_grad_(False)
-    elif config.gnn.arch == "graph_mask_llm":
+    elif gnn.arch == "graph_mask_llm":
         # Parameter-free structural attention mask: node tokens attend only along graph
         # edges. Reuses SpineDataCollator so graphs + injection_maps reach the model.
         model = gnn_llm.GraphMaskLLM(
-            llm, k_hops=config.gnn.mask_k_hops, symmetrize=config.gnn.mask_symmetrize,
-            use_edges=config.gnn.mask_use_edges,
-            buggy_causal_fold=config.gnn.mask_buggy_causal_fold,
-            layer_scope=config.gnn.mask_layer_scope)
+            llm, k_hops=gnn.mask_k_hops, symmetrize=gnn.mask_symmetrize,
+            use_edges=gnn.mask_use_edges,
+            buggy_causal_fold=gnn.mask_buggy_causal_fold,
+            layer_scope=gnn.mask_layer_scope)
         collator = data.SpineDataCollator(tokenizer, mlm=False)
 
-        if config.trainer.freeze_llm:
+        if freeze_llm:
             model.llm.requires_grad_(False)
-    elif config.gnn.arch == "learnable_graph_mask":
+    elif gnn.arch == "learnable_graph_mask":
         # Learnable relative-PE attention mask: M = alpha*A + (1-alpha)*sim(Psi Psi^T),
         # with Psi from a STANDALONE Graph Transformer (independent of the additive
         # pe_model; reuses the gt_*/pe_* config block). Mask-only — no q/k/v injection.
-        if config.gnn.pe_node_features != "random":
+        if gnn.pe_node_features != "random":
             raise ValueError(
                 "architecture 'learnable_graph_mask' currently supports only "
                 "pe_node_features='random' (the mask GT samples probes; word-embedding "
-                f"feature prep is not wired). Got {config.gnn.pe_node_features!r}.")
+                f"feature prep is not wired). Got {gnn.pe_node_features!r}.")
         pe_model = gt_module.GraphTransformer(
-            num_layers=config.gnn.gt_num_layers,
-            pe_hidden_channels=config.gnn.pe_hidden_channels,
-            pe_num_layers=config.gnn.pe_num_layers,
-            d_model=config.gnn.d_model,
-            heads=config.gnn.gt_heads,
-            num_samples=config.gnn.num_samples,
-            dropout=config.gnn.dropout,
-            k_pe=config.gnn.k_pe,
-            k_gt=config.gnn.k_gt,
-            eps=config.gnn.eps,
-            use_layer_norm=config.gnn.use_layer_norm,
+            num_layers=gnn.gt_num_layers,
+            pe_hidden_channels=gnn.pe_hidden_channels,
+            pe_num_layers=gnn.pe_num_layers,
+            d_model=gnn.d_model,
+            heads=gnn.gt_heads,
+            num_samples=gnn.num_samples,
+            dropout=gnn.dropout,
+            k_pe=gnn.k_pe,
+            k_gt=gnn.k_gt,
+            eps=gnn.eps,
+            use_layer_norm=gnn.use_layer_norm,
             node_feature_dim=_node_feature_dim,
         )
         model = gnn_llm.LearnableGraphMaskLLM(
-            llm, pe_model, alpha=config.gnn.mask_alpha,
-            layer_scope=config.gnn.mask_layer_scope,
-            k_hops=config.gnn.mask_k_hops, symmetrize=config.gnn.mask_symmetrize,
-            use_edges=config.gnn.mask_use_edges, psi_scale=config.gnn.mask_psi_scale,
-            buggy_causal_fold=config.gnn.mask_buggy_causal_fold)
+            llm, pe_model, alpha=gnn.mask_alpha,
+            layer_scope=gnn.mask_layer_scope,
+            k_hops=gnn.mask_k_hops, symmetrize=gnn.mask_symmetrize,
+            use_edges=gnn.mask_use_edges, psi_scale=gnn.mask_psi_scale,
+            buggy_causal_fold=gnn.mask_buggy_causal_fold)
         collator = data.SpineDataCollator(tokenizer, mlm=False)
 
-        if config.trainer.freeze_llm:
+        if freeze_llm:
             model.llm.requires_grad_(False)
-    elif config.gnn.arch == "llm":
+    elif gnn.arch == "llm":
         # Pure LLM baseline; TokenIndexCollator carries graph-token index columns so
         # graph_acc/* metrics are comparable to graph architectures.
         model = llm
         collator = data.TokenIndexCollator(tokenizer, mlm=False)
     else:
         raise ValueError(
-            f"Unknown architecture: {config.gnn.arch!r}. "
+            f"Unknown architecture: {gnn.arch!r}. "
             "Choose 'rpearl_llm', 'rpearl_gt_llm', 'gt_llm', 'graph_mask_llm', "
             "'learnable_graph_mask', or 'llm'.")
 

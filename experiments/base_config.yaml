@@ -109,9 +109,10 @@ data:
   debug: false
 
 lora:
-  r: 16
-  alpha: 16
+  r: 16          # LoRA rank
+  alpha: 16      # LoRA scaling (alpha/r multiplies the update)
   dropout: 0.2
+  # Adapted projections (attention + MLP); multimodal towers are auto-excluded.
   target_modules:
     - q_proj
     - k_proj
@@ -122,28 +123,34 @@ lora:
     - down_proj
 
 trainer:
+  # Run dir = {checkpoint_dir}/{save_name}_{wandb_id}; save_name=null derives
+  # {name}_{arch}_{model_slug}_r{r}[_4bit] automatically.
   checkpoint_dir: outputs/e9_multistage_training
   save_name: null
   # -1 lets device_map="auto" place the model; 0 pins the whole model to GPU 0.
   device: -1
-  # bf16 (bit4=false) is required for the PE-only stage; set bit4=true for e7/e8 4-bit runs.
+  # bf16 (bit4=false) is required for the PE-only stage; set bit4=true for 4-bit QLoRA.
   bit4: false
   per_device_train_batch_size: 1
   per_device_eval_batch_size: 1
-  gradient_accumulation_steps: 2
-  gradient_checkpointing: true
+  gradient_accumulation_steps: 2   # effective batch = per_device x this
+  gradient_checkpointing: true     # trade compute for VRAM (required at 31B)
   dataloader_num_workers: 4
-  dataset_num_proc: 8
+  dataset_num_proc: 8              # workers for dataset .map preprocessing
   learning_rate: 0.0002
   warmup_steps: 5
   weight_decay: 0.05
   epochs: 1
-  max_steps: -1
-  no_train: false
-  report_to: wandb
-  overwrite_ok: false
+  max_steps: -1     # >0 caps optimizer steps (dev) and switches save/eval to step-based
+  no_train: false   # true = skip optimization, zero-shot eval the base model
+  report_to: wandb  # "none" disables tracking (smoke runs)
+  overwrite_ok: false  # allow reusing a non-empty run dir
   # Per-component grad-norm logging (no-op for non-PE/GT archs).
   gradient_debug: true
+  # Free-form passthrough merged LAST into SFTConfig — set ANY SFTConfig /
+  # TrainingArguments field without a dedicated code path, e.g.
+  #   +trainer.sft.lr_scheduler_type=cosine +trainer.sft.logging_steps=5
+  sft: {}
 
   # --- Freeze regime + multistage weight carry-over (NOT HF resume) ---
   freeze_llm: false
@@ -157,19 +164,19 @@ trainer:
 
 eval:
   # Multi-graph eval: a DIRECTORY of {graph, tasks} JSONs, capped to num_graphs/interval.
-  # Single-graph alternative (e7/e8): a single JSON file, e.g.
+  # Single-graph alternative: a single JSON file, e.g.
   #   data: data/revised/gen/nav100_n30_gemma_data/split/test_graphs/data_gen_023.json
   data: data/revised/gen/nav100_n30_gemma_data/split/test_graphs
-  num_graphs: 5
-  epoch_interval: 1.0
-  use_icl: true
+  num_graphs: 5       # cap on evaluated graphs; -1 = the whole directory
+  epoch_interval: 1.0 # run the generation eval every this many epochs
+  use_icl: true       # keep the one-shot ICL example in eval prompts
   # Held-out graph set evaluated once post-training (reloaded from the saved checkpoint).
   post_train_graphs: null
 
 wandb:
   project: GREP-PRISM
-  run_name: e9_hydra
-  tag: e9_multistage_training
+  run_name: e9_hydra          # display name; also SFTConfig.run_name
+  tag: e9_multistage_training # groups the runs of one experiment series
 
 # Hydra runtime: do NOT chdir (relative data:/checkpoint paths resolve against launch cwd);
 # keep Hydra's own run logs under outputs/hydra/.
