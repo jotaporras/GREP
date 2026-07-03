@@ -20,7 +20,6 @@ outputs/
 outputs_dev/
 extra/
 results/
-docs/
 .idea/
 .cursor/
 .vscode/
