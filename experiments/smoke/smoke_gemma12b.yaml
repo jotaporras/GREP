@@ -1,0 +1,31 @@
+# Smoke config: fastest end-to-end check of the CURRENT training stack.
+# Gemma-4-12B + parameter-free adjacency mask, 4 optimizer steps, 1 eval graph,
+# no wandb. Exercises: Hydra compose, preprocessing/injection maps, the graph-mask
+# attention path, loss masking, checkpoint save.
+#
+#   python -m prism.training.train_v3 --config-name=smoke/smoke_gemma12b
+defaults:
+  - /base_config
+  - _self_
+
+name: smoke
+model:
+  path: google/gemma-4-12B-it
+gnn:
+  arch: graph_mask_llm
+data:
+  debug: true               # downsample train+val to dataset_proportion
+  dataset_proportion: 0.05
+trainer:
+  checkpoint_dir: outputs/smoke
+  save_name: smoke_gemma12b
+  device: 0
+  max_steps: 4
+  report_to: none
+  overwrite_ok: true
+eval:
+  num_graphs: 1
+  epoch_interval: 999.0     # skip in-training generation eval; post-train only
+wandb:
+  run_name: smoke
+  tag: smoke
