@@ -2,6 +2,7 @@ import torch
 from torch import nn
 from torch_geometric.data import Data
 from torch_geometric.nn import TAGConv
+from torch_geometric.utils import scatter
 
 
 class GCN(nn.Module):
@@ -25,6 +26,7 @@ class GCN(nn.Module):
         hidden_channels,
         num_layers,
         skip_connection=False,
+        use_random_walk=False,
         dropout=0.5,
         k: int = 3,
     ):
@@ -34,12 +36,13 @@ class GCN(nn.Module):
 
         self.convs = nn.ModuleList()
         self.k = k
-        self.convs.append(TAGConv(in_channels, hidden_channels, K=self.k))
+        self.use_random_walk = use_random_walk
+        self.convs.append(TAGConv(in_channels, hidden_channels, K=self.k, normalize=use_random_walk))
         self.norms = nn.ModuleList()
         for _ in range(num_layers - 2):
-            self.convs.append(TAGConv(hidden_channels, hidden_channels, K=self.k))
+            self.convs.append(TAGConv(hidden_channels, hidden_channels, K=self.k, normalize=use_random_walk))
             self.norms.append(nn.LayerNorm(hidden_channels))
-        self.convs.append(TAGConv(hidden_channels, hidden_channels, K=self.k))
+        self.convs.append(TAGConv(hidden_channels, hidden_channels, K=self.k, normalize=use_random_walk))
         self.relu = nn.LeakyReLU()
         self.dropout = nn.Dropout(p=dropout)
         self.skip_connection = skip_connection
@@ -62,7 +65,14 @@ class GCN(nn.Module):
             device = data.x.device
         data.x = data.x.to(device)
         data.edge_index = data.edge_index.to(device)
-        edge_weight = getattr(data, "edge_weight", None)
+        if getattr(self, 'use_random_walk', False):
+            row, col = data.edge_index
+            deg = scatter(data.edge_weight, row, dim=0, reduce='sum')
+            deg_inv = 1.0 / deg
+            deg_inv[deg_inv == float('inf')] = 0
+            edge_weight = deg_inv[col]
+        else:
+            edge_weight = getattr(data, "edge_weight", None)
         if edge_weight is not None:
             edge_weight = edge_weight.to(device)
         x0, edge_index = data.x, data.edge_index

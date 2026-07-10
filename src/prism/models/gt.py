@@ -50,7 +50,7 @@ class SparseGraphAttention(nn.Module):
 
         values = torch.ones(edge_index.shape[1], device=x.device, dtype=x.dtype)
         A = torch.sparse_coo_tensor(
-            indices=edge_index, values=values, size=(N, N)
+            indices=edge_index, values=values, size=(N, N), device=x.device
         ).coalesce().to_sparse_csr()
 
         out = self._mha_sparse_attention(q, k, v, A)
