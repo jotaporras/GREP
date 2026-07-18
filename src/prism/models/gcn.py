@@ -66,8 +66,10 @@ class GCN(nn.Module):
         data.x = data.x.to(device)
         data.edge_index = data.edge_index.to(device)
         if getattr(self, 'use_random_walk', False):
+            edge_weight = getattr(data, "distance_m", data.edge_weight)
+            edge_weight = edge_weight.to(device)
             row, col = data.edge_index
-            deg = scatter(data.edge_weight, row, dim=0, reduce='sum')
+            deg = scatter(edge_weight, row, dim=0, reduce='sum')
             deg_inv = 1.0 / deg
             deg_inv[deg_inv == float('inf')] = 0
             edge_weight = deg_inv[col]
