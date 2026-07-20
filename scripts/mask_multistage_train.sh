@@ -30,7 +30,7 @@ resolve_run_dir() { ls -dt "$1/${2}_"*/ 2>/dev/null | head -n1 | sed 's:/*$::' \
 # the freeze regime, loss_target, LR, epochs, text_edge_list come from base_config + stage configs.
 MODEL_ARGS=(
     gnn.arch=learnable_graph_mask
-    gnn.pe_gt_from="$PE_GT" gnn.semantic_gt_from="$SEM_GT"
+    ++gnn.pe_gt_from="$PE_GT" ++gnn.semantic_gt_from="$SEM_GT"
     gnn.d_model=1024 gnn.dropout=0.1 gnn.eps=1e-6 gnn.use_layer_norm=true
     gnn.pe_hidden_channels=256 gnn.pe_num_layers=5 gnn.num_samples=320 gnn.k_pe=3
     gnn.gt_num_layers=3 gnn.gt_heads=8 gnn.k_gt=2
