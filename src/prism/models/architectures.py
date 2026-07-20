@@ -123,20 +123,35 @@ def build_planner_model(gnn, llm, tokenizer, *, disable_graph_token_rope=False,
                 "architecture 'learnable_graph_mask' currently supports only "
                 "pe_node_features='random' (the mask GT samples probes; word-embedding "
                 f"feature prep is not wired). Got {gnn.pe_node_features!r}.")
-        pe_model = gt_module.GraphTransformer(
-            num_layers=gnn.gt_num_layers,
-            pe_hidden_channels=gnn.pe_hidden_channels,
-            pe_num_layers=gnn.pe_num_layers,
-            d_model=gnn.d_model,
-            heads=gnn.gt_heads,
-            num_samples=gnn.num_samples,
-            dropout=gnn.dropout,
-            k_pe=gnn.k_pe,
-            k_gt=gnn.k_gt,
-            eps=gnn.eps,
-            use_layer_norm=gnn.use_layer_norm,
-            node_feature_dim=_node_feature_dim,
-        )
+        if gnn.pe_gt_from or gnn.semantic_gt_from:
+            # Navigator Ψ producer: the notebook's pretrained PE GT + Semantic GT composed
+            # sequentially (Ψ = SemanticGT(PE_GT(graph)), seed 0). Weights loaded in train_v3.
+            pe_gt = gt_module.GraphTransformer(
+                num_layers=gnn.gt_num_layers, pe_hidden_channels=gnn.pe_hidden_channels,
+                pe_num_layers=gnn.pe_num_layers, d_model=gnn.d_model, heads=gnn.gt_heads,
+                num_samples=gnn.num_samples, dropout=gnn.dropout, k_pe=gnn.k_pe, k_gt=gnn.k_gt,
+                eps=gnn.eps, use_layer_norm=gnn.use_layer_norm, node_feature_dim=None,
+            )
+            semantic_gt = gt_module.SemanticGraphTransformer(
+                node_feature_dim=gnn.d_model, d_model=gnn.d_model, num_layers=gnn.gt_num_layers,
+                heads=gnn.gt_heads, dropout=gnn.dropout, k_gt=gnn.k_gt,
+            )
+            pe_model = gt_module.NavigatorPE(pe_gt, semantic_gt)
+        else:
+            pe_model = gt_module.GraphTransformer(
+                num_layers=gnn.gt_num_layers,
+                pe_hidden_channels=gnn.pe_hidden_channels,
+                pe_num_layers=gnn.pe_num_layers,
+                d_model=gnn.d_model,
+                heads=gnn.gt_heads,
+                num_samples=gnn.num_samples,
+                dropout=gnn.dropout,
+                k_pe=gnn.k_pe,
+                k_gt=gnn.k_gt,
+                eps=gnn.eps,
+                use_layer_norm=gnn.use_layer_norm,
+                node_feature_dim=_node_feature_dim,
+            )
         model = gnn_llm.LearnableGraphMaskLLM(
             llm, pe_model, alpha=gnn.mask_alpha,
             layer_scope=gnn.mask_layer_scope,

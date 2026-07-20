@@ -202,23 +202,39 @@ def graph_augmented_llm_from_pretrained(
             layer_scope=gnn_cfg.get("mask_layer_scope", "all"),
         )
     elif architecture == "learnable_graph_mask":
-        # Learnable relative-PE mask: rebuild the standalone GraphTransformer (Psi
-        # producer) and load it; adjacency + mask rebuild from gnn_config. The LoRA
-        # adapter was already merged into `llm` above.
-        pe_model = gt_module.GraphTransformer(
-            num_layers=gnn_cfg["gt_num_layers"],
-            pe_hidden_channels=gnn_cfg["pe_hidden_channels"],
-            pe_num_layers=gnn_cfg["pe_num_layers"],
-            d_model=gnn_cfg["d_model"],
-            heads=gnn_cfg["gt_heads"],
-            num_samples=gnn_cfg["num_samples"],
-            dropout=gnn_cfg["dropout"],
-            k_pe=gnn_cfg["k_pe"],
-            k_gt=gnn_cfg["k_gt"],
-            eps=gnn_cfg["eps"],
-            use_layer_norm=gnn_cfg["use_layer_norm"],
-            node_feature_dim=node_feature_dim,
-        )
+        # Learnable relative-PE mask: rebuild the Psi producer and load it; adjacency +
+        # mask rebuild from gnn_config. The LoRA adapter was already merged into `llm`.
+        # Navigator mode (pe_gt_from/semantic_gt_from) uses NavigatorPE as the Psi producer;
+        # otherwise a standalone GraphTransformer.
+        if gnn_cfg.get("pe_gt_from") or gnn_cfg.get("semantic_gt_from"):
+            pe_gt = gt_module.GraphTransformer(
+                num_layers=gnn_cfg["gt_num_layers"], pe_hidden_channels=gnn_cfg["pe_hidden_channels"],
+                pe_num_layers=gnn_cfg["pe_num_layers"], d_model=gnn_cfg["d_model"], heads=gnn_cfg["gt_heads"],
+                num_samples=gnn_cfg["num_samples"], dropout=gnn_cfg["dropout"], k_pe=gnn_cfg["k_pe"],
+                k_gt=gnn_cfg["k_gt"], eps=gnn_cfg["eps"], use_layer_norm=gnn_cfg["use_layer_norm"],
+                node_feature_dim=None,
+            )
+            semantic_gt = gt_module.SemanticGraphTransformer(
+                node_feature_dim=gnn_cfg["d_model"], d_model=gnn_cfg["d_model"],
+                num_layers=gnn_cfg["gt_num_layers"], heads=gnn_cfg["gt_heads"],
+                dropout=gnn_cfg["dropout"], k_gt=gnn_cfg["k_gt"],
+            )
+            pe_model = gt_module.NavigatorPE(pe_gt, semantic_gt)
+        else:
+            pe_model = gt_module.GraphTransformer(
+                num_layers=gnn_cfg["gt_num_layers"],
+                pe_hidden_channels=gnn_cfg["pe_hidden_channels"],
+                pe_num_layers=gnn_cfg["pe_num_layers"],
+                d_model=gnn_cfg["d_model"],
+                heads=gnn_cfg["gt_heads"],
+                num_samples=gnn_cfg["num_samples"],
+                dropout=gnn_cfg["dropout"],
+                k_pe=gnn_cfg["k_pe"],
+                k_gt=gnn_cfg["k_gt"],
+                eps=gnn_cfg["eps"],
+                use_layer_norm=gnn_cfg["use_layer_norm"],
+                node_feature_dim=node_feature_dim,
+            )
         model = gnn_llm.LearnableGraphMaskLLM(
             llm, pe_model,
             alpha=gnn_cfg.get("mask_alpha", 0.7),
@@ -263,6 +279,20 @@ def graph_augmented_llm_from_pretrained(
 
     model.eval()
     return model, tokenizer
+
+
+def load_navigator_pe_into(model, pe_gt_from: str, semantic_gt_from: str) -> None:
+    """Load the notebook's pretrained PE GT + Semantic GT (AGT) into a NavigatorPE pe_model.
+
+    Both args are plain state_dict ``.pt`` files (path_navigator_gt.pt / path_navigator_agt.pt).
+    """
+    pe = getattr(model, "pe_model", None)
+    if pe is None or not hasattr(pe, "pe_gt") or not hasattr(pe, "semantic_gt"):
+        raise RuntimeError(
+            "model.pe_model is not a NavigatorPE (gnn.pe_gt_from/semantic_gt_from set?).")
+    pe.pe_gt.load_state_dict(torch.load(pe_gt_from, map_location="cpu"), strict=False)
+    pe.semantic_gt.load_state_dict(torch.load(semantic_gt_from, map_location="cpu"), strict=False)
+    print(f"[navigator] loaded PE GT {pe_gt_from} + Semantic GT {semantic_gt_from}")
 
 
 def load_pe_weights_into(model, init_pe_from: str, architecture: str) -> None:
