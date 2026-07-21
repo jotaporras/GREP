@@ -28,7 +28,10 @@ def _prism_pe_attention_forward(module, query, key, value, attention_mask,
     # Inject only on the prompt forward whose Ψ length matches the query length;
     # cached single-token decode steps (S mismatch) fall through to stock attn.
     if psi is not None and psi.shape[0] == query.shape[0] and psi.shape[1] == query.shape[-2]:
-        psi = psi.to(query.dtype)
+        # Device too, not just dtype: under multi-GPU sharding (device_map="auto")
+        # Ψ lives on the embeddings' device while this layer may be elsewhere
+        # (mirrors _graph_mask_attention_forward's bias.to below).
+        psi = psi.to(device=query.device, dtype=query.dtype)
         b, s, hd = psi.shape[0], psi.shape[1], module.head_dim
         query = query + module.q_proj(psi).view(b, s, -1, hd).transpose(1, 2)
         # KV-shared layers (e.g. gemma-4) reuse k/v from an earlier layer that

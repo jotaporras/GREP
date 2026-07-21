@@ -201,10 +201,15 @@ def eval_model_single_graph(
     include_edge_list: bool,
     use_icl: bool,
     permutation,
+    edge_weights: str = "gaussian",
 ) -> Tuple[float, List[Dict]]:
     """Run the planning-simulation loop over `eval_samples` (all same underlying graph).
 
     For multi-graph evaluation use `eval_model_multiple_graphs`.
+
+    ``edge_weights`` ("gaussian" | "binary") sets the GNN edge weighting for the
+    parsed scene graphs and MUST match the train-time ``data.edge_weights`` policy;
+    the default is the historical Gaussian affinity.
 
     Returns `(accuracy, sample_results)`:
     - `accuracy` is the objective RegEx/NetworkX keyword accuracy (judge-free).
@@ -222,6 +227,7 @@ def eval_model_single_graph(
             tokenizer=tokenizer,
             include_edges=include_edge_list,
             permutation=permutation,
+            edge_weights=edge_weights,
         )
     else:
         client = inference.InMemoryLLM(
@@ -382,6 +388,7 @@ def eval_model_multiple_graphs(
     use_icl: bool,
     permutation,
     on_graph_done: Optional[Callable[[str, GraphEvalResultSummary], None]],
+    edge_weights: str = "gaussian",
 ) -> Dict[str, GraphEvalResultSummary]:
     """Evaluate one model over many graphs; returns per-graph GraphEvalResultSummary dicts.
 
@@ -402,6 +409,7 @@ def eval_model_multiple_graphs(
             include_edge_list=include_edge_list,
             use_icl=use_icl,
             permutation=permutation,
+            edge_weights=edge_weights,
         )
         elapsed = time.time() - t0
 
@@ -788,6 +796,7 @@ def evaluate_model(
     architecture: str,
     checkpoint_label: Optional[str] = None,
     permutation=None,
+    edge_weights: str = "gaussian",
 ) -> Dict[str, "GraphEvalResultSummary"]:
     """Score a loaded model over a graph set and write per-graph cross-eval JSONs.
 
@@ -812,6 +821,9 @@ def evaluate_model(
         checkpoint_label: provenance written into each JSON's ``checkpoint`` field and
             used (basename) as the figure's model label.
         permutation: optional node-index permutation forwarded to the scorer.
+        edge_weights: GNN edge weighting ("gaussian" | "binary") for the parsed
+            scene graphs; MUST match training (caller's responsibility, like
+            ``text_edge_list``). Default = historical Gaussian affinity.
 
     Returns the ``{graph_name: GraphEvalResultSummary}`` dict.
     """
@@ -829,6 +841,7 @@ def evaluate_model(
         use_icl=use_icl,
         permutation=permutation,
         on_graph_done=None,
+        edge_weights=edge_weights,
     )
 
     for name, result in results.items():

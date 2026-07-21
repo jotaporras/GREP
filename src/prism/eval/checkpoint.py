@@ -85,6 +85,20 @@ def resolve_text_edge_list(checkpoint: str, is_gnn: bool, cli_override: str | No
     )
 
 
+def resolve_edge_weights(checkpoint: str) -> str:
+    """Recover the train-time ``data.edge_weights`` policy ("gaussian" | "binary")
+    so eval-time graph parsing matches training.
+
+    Read from ``train_config.json``. A missing key means the checkpoint predates
+    the knob, and every such run was trained with the Gaussian affinity — so
+    "gaussian" is the exact historical value, not a guess.
+    """
+    tc = _read_json(os.path.join(checkpoint, "train_config.json"))
+    if tc is not None and tc.get("edge_weights") is not None:
+        return tc["edge_weights"]
+    return "gaussian"
+
+
 def load_checkpoint(checkpoint: str, four_bit: bool, device: int):
     """Load a trained checkpoint for eval. Returns ``(model, tokenizer, is_gnn)``.
 

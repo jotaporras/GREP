@@ -191,7 +191,8 @@ class GraphSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
     # Shared run-metadata keys stored at the TOP LEVEL of train_config.json; every
     # other gnn_config entry (the arch hyperparameters) nests under "gnn". Loaders
     # flatten this back (and still read legacy flat gnn_config.json checkpoints).
-    _RUN_META_KEYS = ("architecture", "base_model", "text_edge_list", "injection_scope")
+    _RUN_META_KEYS = ("architecture", "base_model", "text_edge_list", "injection_scope",
+                      "edge_weights")
 
     def save_model(self, output_dir=None, _internal_call=False):
         output_dir = output_dir or self.args.output_dir
