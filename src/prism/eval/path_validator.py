@@ -691,18 +691,17 @@ def gemma_regrade_path_metrics(
 def path_spl(pm: Optional[Dict]) -> float:
     """Success-weighted Path Length for the sample's route, as a percentage.
 
-    Success = a valid NetworkX path honoring start/goal, waypoints and avoid-set
-    (optimality NOT required); waypoints/avoid keys are absent on non-path tasks and
-    default open. SPL = 100·shortest/emitted = 100 / cost_optimality, capped at 100.
-    Returns -1 when the path is invalid (or unparseable / degenerate cost).
+    Three-tier: **-1** when the NetworkX path is invalid (bad/hallucinated hop);
+    **0** when the path is valid but a constraint fails — wrong goal, or a required
+    (waypoint) or avoided node crossing missed; else **SPL %** = 100·shortest/emitted
+    = 100 / cost_optimality, capped at 100. Waypoints/avoid keys are absent on
+    non-path tasks and default open.
     """
-    if not pm:
+    if not pm or not pm.get("full_path_valid"):
         return -1.0
-    correct = bool(
-        pm.get("full_path_valid") and pm.get("start_goal_ok")
-        and pm.get("waypoints_ok", True) and pm.get("avoid_ok", True))
-    if not correct:
-        return -1.0
+    if not (pm.get("start_goal_ok")
+            and pm.get("waypoints_ok", True) and pm.get("avoid_ok", True)):
+        return 0.0
     co = pm.get("cost_optimality")
     return 100.0 if not co else round(min(100.0, 100.0 / co), 1)
 
