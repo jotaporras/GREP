@@ -90,5 +90,12 @@ unguarded while `report_to=none` leaves `wandb.run` None (guard missed in the
 a12a622 "gate wandb init" refactor — every OTHER call site has it). Fixed in
 `b16b282`; smoke resubmitted as 7156540.
 
+**7156540 PASSED end-to-end**: navigator strict-load on cluster, 4 training
+steps, save, in-config 1-graph generation eval, and the from-disk
+`scalability_evaluation` reload (NavigatorPE rebuilt from `train_config.json`'s
+`pe_gt_from`/`semantic_gt_from` keys + `gnn_weights.pt`). Smoke run dirs
+deleted (6.3G freed). The e13 pipeline is fully validated; arms fire as soon as
+`path_navigator_gt.pt` lands in `$ALELAB_DRIVE/GREP-PRISM/pretrained_pe/`.
+
 Navigator-mode wiring check on a b200: 4 steps + save + 1-graph eval +
 from-disk reload eval. RANDOMINIT GT stand-in — NOT science, report_to=none.
