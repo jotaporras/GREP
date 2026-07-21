@@ -296,12 +296,22 @@ def load_navigator_pe_into(model, pe_gt_from: str, semantic_gt_from: str) -> Non
         pe.semantic_gt.load_state_dict(torch.load(semantic_gt_from, map_location="cpu"), strict=False)
         print(f"[navigator] loaded PE GT {pe_gt_from} + Semantic GT {semantic_gt_from}")
     else:
-        # GT-only: pe_model is the standalone GraphTransformer itself.
+        # GT-only: pe_model is the standalone GraphTransformer itself. Load strict (missing/
+        # unexpected keys => the gnn.* GT hyperparameters do NOT reproduce the pretrained GT;
+        # a size mismatch raises from load_state_dict regardless) so a dimension mismatch fails
+        # loudly instead of silently loading a partially-random PE.
         if semantic_gt_from:
             raise RuntimeError(
                 "semantic_gt_from set but pe_model is a standalone GraphTransformer, not a "
                 "NavigatorPE — pe_gt_from and semantic_gt_from must both be set for navigator mode.")
-        pe.load_state_dict(torch.load(pe_gt_from, map_location="cpu"), strict=False)
+        missing, unexpected = pe.load_state_dict(
+            torch.load(pe_gt_from, map_location="cpu"), strict=False)
+        if missing or unexpected:
+            raise RuntimeError(
+                f"GT-only load from {pe_gt_from} did not match the standalone GraphTransformer "
+                f"(missing={list(missing)}, unexpected={list(unexpected)}); the gnn.* GT "
+                "hyperparameters (d_model/pe_hidden_channels/pe_num_layers/k_pe/gt_num_layers/"
+                "gt_heads) must reproduce the pretrained GT exactly.")
         print(f"[navigator] loaded GT-only PE {pe_gt_from}")
 
 
