@@ -74,7 +74,21 @@ polls for the file locally + on cluster; arms fire when it lands in
   branch, so cluster now sits on `e13_nav_pe`).
 - alelab vast quota at 4.81/5.00 TB — arms use `+trainer.sft.save_total_limit=1`.
 
-## Smoke (job 7156517)
+## Known latent issue (harmless for e13, flagged by review)
+
+`NavigatorPE.forward` applies `permutation` only to the PE GT; the Semantic GT
+gets the unpermuted `edge_index` (and would raise NotImplementedError if handed
+a permutation). None of the e13 runs pass `--permutation-seed`, so this cannot
+affect them — but a future permutation/transferability sweep on this arch must
+fix it first.
+
+## Smoke (job 7156517 → crashed on a pre-existing bug; fixed; job 7156540)
+
+First smoke run validated the navigator load + 4 training steps on a b200, then
+crashed in the post-eval logging: `EvalCallback` line 106 called `wandb.log`
+unguarded while `report_to=none` leaves `wandb.run` None (guard missed in the
+a12a622 "gate wandb init" refactor — every OTHER call site has it). Fixed in
+`b16b282`; smoke resubmitted as 7156540.
 
 Navigator-mode wiring check on a b200: 4 steps + save + 1-graph eval +
 from-disk reload eval. RANDOMINIT GT stand-in — NOT science, report_to=none.
