@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# e11 injection-scope run — LearnableGraphMaskLLM on google/gemma-4-12B-it, GT-only mask Ψ.
+# e11 injection-scope run — LearnableGraphMaskLLM on google/gemma-4-31B-it, GT-only mask Ψ.
 #
 # One train_v3 run: warm-starts the newest Stage-1 LoRA adapter (resolved by glob search), loads
 # the suite navigator's pretrained GT as the STANDALONE mask Ψ producer via gnn.pe_gt_from (no
@@ -91,7 +91,7 @@ echo "[resolve] output dir          : $OUT   ($( [ -n "${CHECKPOINT_DIR:-}" ] &&
 echo "[resolve] wandb run_name/tag  : $WANDB_RUN_NAME / $WANDB_TAG   (name=stage${MS_STAGE}+${EDGE_TAG}; tag from experiments/e9_base_config.yaml)"
 
 uv run -m prism.training.train_v3 --config-name=e9_base_config \
-    model.path=google/gemma-4-12B-it \
+    model.path=google/gemma-4-31B-it \
     gnn.arch=learnable_graph_mask \
     ++gnn.pe_gt_from="$PE_GT" \
     gnn.d_model=1024 gnn.dropout=0.1 gnn.pe_hidden_channels=256 gnn.pe_num_layers=5 \

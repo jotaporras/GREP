@@ -272,9 +272,11 @@ def eval_model_single_graph(
             else:
                 print(f"incorrect formatting\n{formatted_answer}")
 
-            print(f"correct answer: {result.plan_keyword}")
-
             pm = _sample_path_metrics(planner_response, eval_sample)
+            # NetworkX-validated SPL: percentage when the route is valid (waypoints/
+            # avoid honored, optimality not required), -1 when it is not.
+            print(f"correct answer (SPL%): {path_validator.path_spl(pm)}")
+
             structured = bool(pm and pm.get("structured"))
             judge_pass = (pm or {}).get("llm_judge_pass")
             if structured:
