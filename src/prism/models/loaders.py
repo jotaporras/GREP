@@ -204,9 +204,9 @@ def graph_augmented_llm_from_pretrained(
     elif architecture == "learnable_graph_mask":
         # Learnable relative-PE mask: rebuild the Psi producer and load it; adjacency +
         # mask rebuild from gnn_config. The LoRA adapter was already merged into `llm`.
-        # Navigator mode (pe_gt_from/semantic_gt_from) uses NavigatorPE as the Psi producer;
-        # otherwise a standalone GraphTransformer.
-        if gnn_cfg.get("pe_gt_from") or gnn_cfg.get("semantic_gt_from"):
+        # Navigator mode (pe_gt_from AND semantic_gt_from) uses NavigatorPE as the Psi
+        # producer; GT-only (pe_gt_from alone) or fresh uses a standalone GraphTransformer.
+        if gnn_cfg.get("pe_gt_from") and gnn_cfg.get("semantic_gt_from"):
             pe_gt = gt_module.GraphTransformer(
                 num_layers=gnn_cfg["gt_num_layers"], pe_hidden_channels=gnn_cfg["pe_hidden_channels"],
                 pe_num_layers=gnn_cfg["pe_num_layers"], d_model=gnn_cfg["d_model"], heads=gnn_cfg["gt_heads"],
@@ -282,17 +282,27 @@ def graph_augmented_llm_from_pretrained(
 
 
 def load_navigator_pe_into(model, pe_gt_from: str, semantic_gt_from: str) -> None:
-    """Load the notebook's pretrained PE GT + Semantic GT (AGT) into a NavigatorPE pe_model.
+    """Load the notebook's pretrained PE GT (+ optional Semantic GT / AGT) into the pe_model.
 
     Both args are plain state_dict ``.pt`` files (path_navigator_gt.pt / path_navigator_agt.pt).
+    When ``semantic_gt_from`` is falsy the pe_model is a standalone ``GraphTransformer``
+    (GT-only Ψ producer) and only the PE GT is loaded, directly into it.
     """
     pe = getattr(model, "pe_model", None)
-    if pe is None or not hasattr(pe, "pe_gt") or not hasattr(pe, "semantic_gt"):
-        raise RuntimeError(
-            "model.pe_model is not a NavigatorPE (gnn.pe_gt_from/semantic_gt_from set?).")
-    pe.pe_gt.load_state_dict(torch.load(pe_gt_from, map_location="cpu"), strict=False)
-    pe.semantic_gt.load_state_dict(torch.load(semantic_gt_from, map_location="cpu"), strict=False)
-    print(f"[navigator] loaded PE GT {pe_gt_from} + Semantic GT {semantic_gt_from}")
+    if pe is None:
+        raise RuntimeError("model has no pe_model to load navigator weights into.")
+    if hasattr(pe, "pe_gt") and hasattr(pe, "semantic_gt"):
+        pe.pe_gt.load_state_dict(torch.load(pe_gt_from, map_location="cpu"), strict=False)
+        pe.semantic_gt.load_state_dict(torch.load(semantic_gt_from, map_location="cpu"), strict=False)
+        print(f"[navigator] loaded PE GT {pe_gt_from} + Semantic GT {semantic_gt_from}")
+    else:
+        # GT-only: pe_model is the standalone GraphTransformer itself.
+        if semantic_gt_from:
+            raise RuntimeError(
+                "semantic_gt_from set but pe_model is a standalone GraphTransformer, not a "
+                "NavigatorPE — pe_gt_from and semantic_gt_from must both be set for navigator mode.")
+        pe.load_state_dict(torch.load(pe_gt_from, map_location="cpu"), strict=False)
+        print(f"[navigator] loaded GT-only PE {pe_gt_from}")
 
 
 def load_pe_weights_into(model, init_pe_from: str, architecture: str) -> None:

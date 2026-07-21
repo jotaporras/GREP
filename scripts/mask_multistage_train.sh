@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Multistage training of LearnableGraphMaskLLM whose mask Ψ producer is the notebook's
-# NavigatorPE — pretrained PE GT + Semantic GT (AGT), composed as Ψ = SemanticGT(PE_GT(graph)),
-# loaded from a navigator suite dir ($1) holding path_navigator_gt.pt + path_navigator_agt.pt.
+# pretrained PE GT ONLY (no AGT/Semantic GT): Ψ = GT(graph), a standalone GraphTransformer,
+# loaded from a navigator suite dir ($1) holding path_navigator_gt.pt.
 # The per-stage regime (freeze flags, loss_target, LR, epochs, text_edge_list) is drawn from
 # experiments/:
 #   stage1  experiments/e9_ms_stage1.yaml  — SFT LoRA, PE frozen, edges in text (run only if SKIP_STAGE1=false; else reused)
@@ -21,24 +21,24 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 GT_DIR="${1:?usage: $0 <navigator_suite_dir>}"
 PE_GT="$GT_DIR/path_navigator_gt.pt"
-SEM_GT="$GT_DIR/path_navigator_agt.pt"
-for f in "$PE_GT" "$SEM_GT"; do [ -f "$f" ] || { echo "ERROR: $f not found" >&2; exit 1; }; done
+[ -f "$PE_GT" ] || { echo "ERROR: $PE_GT not found" >&2; exit 1; }
 OUT="${CHECKPOINT_DIR:-outputs/gt_pe_multistage}"
 
 # {checkpoint_dir}/{save_name}_{random wandb id}: resolve the newest matching dir.
 resolve_run_dir() { ls -dt "$1/${2}_"*/ 2>/dev/null | head -n1 | sed 's:/*$::' \
     || { echo "ERROR: no run dir $1/${2}_*" >&2; exit 1; }; }
 
-# learnable_graph_mask with NavigatorPE as the mask Ψ producer. pe_gt_from/semantic_gt_from
-# stay set every stage so load_navigator_pe_into rebuilds the NavigatorPE from the notebook's
-# pretrained tensors. Stage 3 passes NO trainer.init_pe_from, so those pretrained weights are
-# used DIRECTLY (nothing overwrites them). GT/PE hyperparameters are the navigator's from
-# notebooks/e9_gnn_navigation.ipynb (cells 29 & 73) — they must match the .pt state dicts. Mask
+# learnable_graph_mask with the pretrained PE GT (standalone GraphTransformer) as the mask Ψ
+# producer. Only gnn.pe_gt_from is set (no semantic_gt_from), so architectures builds a standalone
+# GraphTransformer and load_navigator_pe_into loads path_navigator_gt.pt directly into it every
+# stage. Stage 3 passes NO trainer.init_pe_from, so those pretrained weights are used DIRECTLY
+# (nothing overwrites them). GT/PE hyperparameters are the navigator's from
+# notebooks/e9_gnn_navigation.ipynb (cells 29 & 73) — they must match the .pt state dict. Mask
 # knobs (mask_alpha/psi_scale/…) and the freeze regime, loss_target, LR, epochs, text_edge_list
 # come from base_config + stage configs.
 MODEL_ARGS=(
     gnn.arch=learnable_graph_mask
-    ++gnn.pe_gt_from="$PE_GT" ++gnn.semantic_gt_from="$SEM_GT"
+    ++gnn.pe_gt_from="$PE_GT"
     gnn.d_model=1024 gnn.dropout=0.1 gnn.eps=1e-6 gnn.use_layer_norm=true
     gnn.pe_hidden_channels=256 gnn.pe_num_layers=5 gnn.num_samples=320 gnn.k_pe=3
     gnn.gt_num_layers=3 gnn.gt_heads=8 gnn.k_gt=2
@@ -64,9 +64,9 @@ else
     echo "[chain] Stage 1 trained: $S1"
 fi
 
-# Stage 3 (joint PE+LoRA, no edges). The NavigatorPE comes from the pretrained notebook tensors
+# Stage 3 (joint PE+LoRA, no edges). The PE GT comes from the pretrained notebook tensors
 # via load_navigator_pe_into (NO trainer.init_pe_from, so nothing overwrites them).
-# gnn.structural_lr_mult decouples the NavigatorPE LR from the LoRA LR: PE_lr =
+# gnn.structural_lr_mult decouples the GT LR from the LoRA LR: PE_lr =
 # trainer.learning_rate (0.003, stage3.yaml) x 0.001 = 3e-6 — an order below the 3e-5 notebook
 # pretraining, so the pretrained navigator is fine-tuned, not blown out.
 stage e9_ms_stage3 gt_pe_stage3 trainer.init_lora_from="$S1" gnn.structural_lr_mult=0.001

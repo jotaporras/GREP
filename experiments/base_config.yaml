@@ -64,7 +64,8 @@ gnn:
   # learnable_graph_mask navigator mode: use the notebook (e9_gnn_navigation.ipynb) pretrained
   # PE GT + Semantic GT (AGT), composed as NavigatorPE (Ψ = SemanticGT(PE_GT(graph)), seed 0),
   # as the mask's Ψ producer. Both are plain state_dict .pt files (path_navigator_gt.pt /
-  # path_navigator_agt.pt). Set together.
+  # path_navigator_agt.pt). Set together for navigator mode; set pe_gt_from ALONE (semantic_gt_from
+  # null) for a GT-only Ψ producer (standalone GraphTransformer, Ψ = GT(graph), no AGT).
   pe_gt_from: null
   semantic_gt_from: null
 

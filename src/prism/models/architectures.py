@@ -123,9 +123,11 @@ def build_planner_model(gnn, llm, tokenizer, *, disable_graph_token_rope=False,
                 "architecture 'learnable_graph_mask' currently supports only "
                 "pe_node_features='random' (the mask GT samples probes; word-embedding "
                 f"feature prep is not wired). Got {gnn.pe_node_features!r}.")
-        if gnn.pe_gt_from or gnn.semantic_gt_from:
+        if gnn.pe_gt_from and gnn.semantic_gt_from:
             # Navigator Ψ producer: the notebook's pretrained PE GT + Semantic GT composed
             # sequentially (Ψ = SemanticGT(PE_GT(graph)), seed 0). Weights loaded in train_v3.
+            # GT-only (pe_gt_from set, semantic_gt_from unset) falls through to the standalone
+            # GraphTransformer below, into which load_navigator_pe_into loads the pretrained GT.
             pe_gt = gt_module.GraphTransformer(
                 num_layers=gnn.gt_num_layers, pe_hidden_channels=gnn.pe_hidden_channels,
                 pe_num_layers=gnn.pe_num_layers, d_model=gnn.d_model, heads=gnn.gt_heads,

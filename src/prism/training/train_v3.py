@@ -463,8 +463,10 @@ def _validate_config(config: omegaconf.DictConfig) -> None:
         if config.gnn.arch != "learnable_graph_mask":
             raise ValueError(
                 "gnn.pe_gt_from / semantic_gt_from are only supported for arch='learnable_graph_mask'.")
-        if not (config.gnn.pe_gt_from and config.gnn.semantic_gt_from):
-            raise ValueError("gnn.pe_gt_from and gnn.semantic_gt_from must be set together.")
+        if config.gnn.semantic_gt_from and not config.gnn.pe_gt_from:
+            raise ValueError(
+                "gnn.semantic_gt_from requires gnn.pe_gt_from (the navigator needs both). "
+                "Set pe_gt_from alone for a GT-only Ψ producer.")
     if config.trainer.loss_target not in ("all", "responses", "edge_list"):
         raise ValueError(
             f"loss_target must be 'all', 'responses', or 'edge_list', got {config.trainer.loss_target!r}"
