@@ -1,36 +1,56 @@
 #!/usr/bin/env bash
 # e11 injection-scope run — LearnableGraphMaskLLM on google/gemma-4-12B-it, GT-only mask Ψ.
 #
-# One train_v3 run: warm-starts the fixed Stage-1 LoRA adapter, loads suite4's pretrained GT as
-# the STANDALONE mask Ψ producer via gnn.pe_gt_from (no AGT/Semantic GT), and trains PE+LoRA
-# jointly with edges removed (text_edge_list=none) under prompt-only Ψ injection. The in-config
-# eval (eval.data / eval.num_graphs) runs at the end — no separate transferability pass.
+# One train_v3 run: warm-starts the newest Stage-1 LoRA adapter (resolved by glob search), loads
+# the suite navigator's pretrained GT as the STANDALONE mask Ψ producer via gnn.pe_gt_from (no
+# AGT/Semantic GT), trains PE+LoRA jointly with edges removed (text_edge_list=none) under
+# prompt-only Ψ injection, then the in-config eval (eval.data inherited from base_config).
+#
+# No hard-coded run/checkpoint paths — every path is an ARGUMENT, an env var, or a glob SEARCH:
+#   * suite dir      — positional $1 (default: $OUTPUTS_ROOT/e9_multistage_training/suite4)
+#   * Stage-1 LoRA   — INIT_LORA env, else newest e9_ms_stage1_* run (+ its newest checkpoint-N)
+#                      under $STAGE1_BASE, via resolve_run_dir/resolve_checkpoint (as before)
+#   * output dir     — CHECKPOINT_DIR env (default $OUTPUTS_ROOT/e11_injection_scope)
+#   * roots          — OUTPUTS_ROOT env (default repo-relative ./outputs; set to /vast/… on cluster)
 #
 # Two deliberate reconciliations vs. the pasted e11 param set:
-#   * GT init  — suite4/path_navigator_gt.pt via gnn.pe_gt_from (a RAW state_dict → the GT-only
-#     path; suite4 has no gnn_weights.pt so trainer.init_pe_from cannot consume it). The pasted
-#     trainer.init_pe_from=<dev_e10 edge detector> is DROPPED: with pe_gt_from set it would
-#     overwrite the suite4 GT (train_v3.py loads pe_gt_from first, then init_pe_from clobbers it).
-#   * GT LR   — forced to 3e-6 = trainer.learning_rate(2.5e-4) × gnn.structural_lr_mult(0.012).
-#     The pasted structural_lr_mult=5.0 (=1.25e-3, a 5× BOOST) is OVERRIDDEN to honor the
-#     requested 3e-6 GT LR: the GT is gently fine-tuned, not boosted. LoRA/LLM stay at 2.5e-4.
+#   * GT init — <suite>/path_navigator_gt.pt via gnn.pe_gt_from (a RAW state_dict → the GT-only
+#     path). The pasted trainer.init_pe_from=<dev_e10 edge detector> is DROPPED: with pe_gt_from
+#     set it would overwrite the suite GT (train_v3 loads pe_gt_from first, then init_pe_from).
+#   * GT LR — forced to 3e-6 = trainer.learning_rate(2.5e-4) × gnn.structural_lr_mult(0.012); the
+#     pasted structural_lr_mult=5.0 (=1.25e-3, a boost) is OVERRIDDEN to honor the 3e-6 GT LR.
 #
-# GT/PE hyperparameters below must shape-match suite4/path_navigator_gt.pt (verified: 72-key
-# exact match — d_model=1024, pe_hidden_channels=256, pe_num_layers=5, k_pe=3, gt_num_layers=3).
-# load_navigator_pe_into now loads the GT-only PE fail-loud: any missing/unexpected key or size
-# mismatch raises, so a hyperparameter drift can never silently load a partially-random PE.
+# GT/PE hyperparameters below shape-match <suite>/path_navigator_gt.pt (verified: 72-key exact —
+# d_model=1024, pe_hidden_channels=256, pe_num_layers=5, k_pe=3, gt_num_layers=3). The GT-only
+# load in load_navigator_pe_into is fail-loud: any missing/unexpected key or size mismatch raises.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-# --- environment paths ---
-# suite4 GT is repo-relative (resolved from the repo root this script cd's into); the Stage-1
-# adapter and output dir are the cluster-absolute paths from the e11 param set.
-PE_GT="outputs/e9_multistage_training/suite4/path_navigator_gt.pt"
-INIT_LORA="/vast/projects/aribeiro/alelab/jporras/GREP-PRISM/outputs/e9_multistage_training/e9_ms_stage1/e9_ms_stage1_sqgk4o3j/checkpoint-100"
-OUT="/vast/projects/aribeiro/alelab/jporras/GREP-PRISM/outputs/e11_injection_scope"
-EVAL_DATA="data/revised/gen/nav100_n30_gemma_data/split/test_graphs"
-[ -f "$PE_GT" ]    || { echo "ERROR: suite4 GT not found: $PE_GT" >&2; exit 1; }
+# --- roots / paths (env-overridable; no hard-coded absolute paths) ---
+OUTPUTS_ROOT="${OUTPUTS_ROOT:-outputs}"
+SUITE_DIR="${1:-$OUTPUTS_ROOT/e9_multistage_training/suite4}"
+OUT="${CHECKPOINT_DIR:-$OUTPUTS_ROOT/e11_injection_scope}"
+STAGE1_BASE="${STAGE1_BASE:-$OUTPUTS_ROOT/e9_multistage_training/e9_ms_stage1}"
+
+PE_GT="$SUITE_DIR/path_navigator_gt.pt"
+[ -f "$PE_GT" ] || { echo "ERROR: suite GT not found: $PE_GT" >&2; exit 1; }
+
+# Newest matching run dir by mtime (trailing slash stripped); empty if none.
+resolve_run_dir()   { ls -dt "$1/${2}_"*/    2>/dev/null | head -n1 | sed 's:/*$::' || true; }
+# Newest checkpoint-N under a run dir; fall back to the run dir itself (adapter at its root).
+resolve_checkpoint() { local c; c=$(ls -dt "$1/checkpoint-"*/ 2>/dev/null | head -n1 | sed 's:/*$::' || true); echo "${c:-$1}"; }
+
+# Stage-1 adapter: explicit INIT_LORA env wins; otherwise search (like the original resolve_run_dir).
+if [ -z "${INIT_LORA:-}" ]; then
+    S1_RUN=$(resolve_run_dir "$STAGE1_BASE" e9_ms_stage1)
+    [ -n "$S1_RUN" ] || { echo "ERROR: no e9_ms_stage1_* run under $STAGE1_BASE (set INIT_LORA or STAGE1_BASE)" >&2; exit 1; }
+    INIT_LORA=$(resolve_checkpoint "$S1_RUN")
+fi
 [ -d "$INIT_LORA" ] || { echo "ERROR: Stage-1 LoRA checkpoint not found: $INIT_LORA" >&2; exit 1; }
+
+echo "[resolve] suite GT     : $PE_GT"
+echo "[resolve] Stage-1 LoRA : $INIT_LORA"
+echo "[resolve] output dir   : $OUT"
 
 uv run -m prism.training.train_v3 --config-name=e9_base_config \
     model.path=google/gemma-4-12B-it \
@@ -49,4 +69,4 @@ uv run -m prism.training.train_v3 --config-name=e9_base_config \
     trainer.save_name=e11_integ_rpe_noedges_promptonly \
     trainer.checkpoint_dir="$OUT" \
     wandb.run_name=e11_integ_rpe_noedges_promptonly wandb.tag=e11_injection_scope \
-    eval.data="$EVAL_DATA" eval.num_graphs=-1
+    eval.num_graphs=-1
