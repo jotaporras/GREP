@@ -6,8 +6,9 @@
 # AGT/Semantic GT), trains PE+LoRA jointly with edges removed (text_edge_list=none) under
 # prompt-only Ψ injection, then the in-config eval (eval.data inherited from base_config).
 #
-# No hard-coded run/checkpoint paths — every path is an ARGUMENT, an env var, or a glob SEARCH:
-#   * suite dir      — positional $1 (default: $OUTPUTS_ROOT/e9_multistage_training/suite4)
+# The ONLY required input is the location of the pretrained PE model (the GT); everything else is
+# resolved from env vars / glob SEARCH (exactly as before) and LOGGED below for verification:
+#   * pretrained PE  — positional $1 (REQUIRED): the path_navigator_gt.pt file, or a dir holding it
 #   * Stage-1 LoRA   — INIT_LORA env, else newest e9_ms_stage1_* run (+ its newest checkpoint-N)
 #                      under $STAGE1_BASE, via resolve_run_dir/resolve_checkpoint (as before)
 #   * output dir     — CHECKPOINT_DIR env (default $OUTPUTS_ROOT/e11_injection_scope)
@@ -26,14 +27,16 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-# --- roots / paths (env-overridable; no hard-coded absolute paths) ---
+# --- sole required input: the location of the pretrained PE model (the GT) ---
+# Accept either the path_navigator_gt.pt file directly, or a directory containing it.
+PE_ARG="${1:?usage: $0 <pretrained_PE_model_path | dir_containing_path_navigator_gt.pt>  (all else resolved from env/search)}"
+if [ -d "$PE_ARG" ]; then PE_GT="$PE_ARG/path_navigator_gt.pt"; else PE_GT="$PE_ARG"; fi
+[ -f "$PE_GT" ] || { echo "ERROR: pretrained PE model not found: $PE_GT" >&2; exit 1; }
+
+# --- everything else resolved from env vars / glob search (exactly as before) ---
 OUTPUTS_ROOT="${OUTPUTS_ROOT:-outputs}"
-SUITE_DIR="${1:-$OUTPUTS_ROOT/e9_multistage_training/suite4}"
 OUT="${CHECKPOINT_DIR:-$OUTPUTS_ROOT/e11_injection_scope}"
 STAGE1_BASE="${STAGE1_BASE:-$OUTPUTS_ROOT/e9_multistage_training/e9_ms_stage1}"
-
-PE_GT="$SUITE_DIR/path_navigator_gt.pt"
-[ -f "$PE_GT" ] || { echo "ERROR: suite GT not found: $PE_GT" >&2; exit 1; }
 
 # Newest matching run dir by mtime (trailing slash stripped); empty if none.
 resolve_run_dir()   { ls -dt "$1/${2}_"*/    2>/dev/null | head -n1 | sed 's:/*$::' || true; }
@@ -45,12 +48,20 @@ if [ -z "${INIT_LORA:-}" ]; then
     S1_RUN=$(resolve_run_dir "$STAGE1_BASE" e9_ms_stage1)
     [ -n "$S1_RUN" ] || { echo "ERROR: no e9_ms_stage1_* run under $STAGE1_BASE (set INIT_LORA or STAGE1_BASE)" >&2; exit 1; }
     INIT_LORA=$(resolve_checkpoint "$S1_RUN")
+    S1_SRC="search: newest e9_ms_stage1_* under $STAGE1_BASE"
+else
+    S1_RUN="(not searched — INIT_LORA env override)"
+    S1_SRC="env: INIT_LORA"
 fi
 [ -d "$INIT_LORA" ] || { echo "ERROR: Stage-1 LoRA checkpoint not found: $INIT_LORA" >&2; exit 1; }
 
-echo "[resolve] suite GT     : $PE_GT"
-echo "[resolve] Stage-1 LoRA : $INIT_LORA"
-echo "[resolve] output dir   : $OUT"
+# --- log every acquired path for verification ---
+echo "[resolve] pretrained PE (GT)  : $PE_GT   (from arg: $PE_ARG)"
+echo "[resolve] OUTPUTS_ROOT        : $OUTPUTS_ROOT"
+echo "[resolve] Stage-1 search base : $STAGE1_BASE"
+echo "[resolve] Stage-1 run dir     : $S1_RUN"
+echo "[resolve] Stage-1 LoRA ckpt   : $INIT_LORA   ($S1_SRC)"
+echo "[resolve] output dir          : $OUT"
 
 uv run -m prism.training.train_v3 --config-name=e9_base_config \
     model.path=google/gemma-4-12B-it \
