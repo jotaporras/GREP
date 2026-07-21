@@ -105,9 +105,16 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
     generation when no graph is found in the prompt.
     """
 
-    def __init__(self, model, tokenizer, include_edges: bool, permutation=None):
+    # "gaussian" | "binary" — MUST match the train-time data.edge_weights policy
+    # (see scene_graph_dict_to_pyg). Class-level default (historical Gaussian
+    # affinity) so partially-constructed instances (tests) resolve it too.
+    edge_weights = "gaussian"
+
+    def __init__(self, model, tokenizer, include_edges: bool, permutation=None,
+                 edge_weights: str = "gaussian"):
         super().__init__(model, tokenizer, include_edges=include_edges)
         self.permutation = permutation
+        self.edge_weights = edge_weights
 
     def _parse_all_pyg_graphs(self, msg: List[Dict]) -> List:
         """Extract all scene graphs from SPINE message list and convert to PyG Data objects."""
@@ -118,7 +125,8 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
             for match in re.finditer(r"[Ss]cene graph: ?(.*})", m.get("content", ""), re.DOTALL):
                 try:
                     scene_graph_dict = literal_eval(match.group(1))
-                    graphs.append(utils.scene_graph_dict_to_pyg(scene_graph_dict))
+                    graphs.append(utils.scene_graph_dict_to_pyg(
+                        scene_graph_dict, edge_weights=self.edge_weights))
                 except Exception:
                     continue
         return graphs

@@ -110,6 +110,18 @@ def train_model(config: omegaconf.DictConfig):
     else:
         print(f"[data] injection_scope={config.data.injection_scope}")
 
+    # GNN edge weighting over the scene-graph adjacency: "gaussian" (historical
+    # Gaussian affinity from Euclidean distances) or "binary" (no edge_weight —
+    # plain SBM adjacency). Threaded to the train collator here and to every eval
+    # path below; recorded in train_config.json.
+    valid_edge_weights = ("gaussian", "binary")
+    if config.data.edge_weights not in valid_edge_weights:
+        raise ValueError(
+            f"data.edge_weights must be one of {valid_edge_weights}, "
+            f"got {config.data.edge_weights!r}")
+    collator.edge_weights = config.data.edge_weights
+    print(f"[data] edge_weights={config.data.edge_weights}")
+
     # --- Multistage init: weight-only carry-over from a prior stage (NOT HF resume). --
     # Load PE first (lives outside the LoRA adapter), then attach the carried adapter.
     is_graph_arch = config.gnn.arch in (
@@ -225,6 +237,7 @@ def train_model(config: omegaconf.DictConfig):
             "base_model": config.model.path,
             "text_edge_list": config.data.text_edge_list,
             "injection_scope": config.data.injection_scope,
+            "edge_weights": config.data.edge_weights,
             # Two-group LR: structural (GT / PE) params train at structural_lr_mult × base LR
             # (GraphSFTTrainer.create_optimizer). Default 1.0 = no boost.
             "structural_lr_mult": config.gnn.structural_lr_mult,
@@ -292,6 +305,7 @@ def train_model(config: omegaconf.DictConfig):
             use_icl=config.eval.use_icl,
             include_edge_list=(config.data.text_edge_list == "present"),
             eval_epoch_interval=config.eval.epoch_interval,
+            edge_weights=config.data.edge_weights,
         )
     )
 
@@ -315,6 +329,7 @@ def train_model(config: omegaconf.DictConfig):
             use_icl=config.eval.use_icl,
             architecture=config.gnn.arch,
             checkpoint_label=sft_args.output_dir,
+            edge_weights=config.data.edge_weights,
         )
     else:
         trainer.train()
@@ -343,6 +358,7 @@ def train_model(config: omegaconf.DictConfig):
             use_icl=config.eval.use_icl,
             architecture=config.gnn.arch,
             checkpoint_label=sft_args.output_dir,
+            edge_weights=config.data.edge_weights,
         )
 
     return trainer

@@ -434,10 +434,15 @@ class SpineDataCollator(TokenIndexCollator):
     # Index column holding the supervised positions; the trainer sets it from
     # trainer.loss_target when injection_scope='exclude_supervised'.
     supervised_positions_key = None
+    # GNN edge weighting ("gaussian" | "binary"), set by the trainer from
+    # data_cfg.edge_weights; see scene_graph_dict_to_pyg.
+    edge_weights = "gaussian"
 
     def _extract_graph(self, example):
         """Build PyG graph and injection map from a preprocessed example."""
-        pyg_graph = utils.scene_graph_dict_to_pyg(example["scene_graph_dict"])
+        pyg_graph = utils.scene_graph_dict_to_pyg(
+            example["scene_graph_dict"], edge_weights=self.edge_weights
+        )
         node_token_seqs = node_token_variants(pyg_graph.node_names, self.tokenizer)
         # Scope to the last (query) graph block so ICL-example node mentions don't cross-link.
         scope_start = find_last_graph_scope(example["input_ids"], self.tokenizer)

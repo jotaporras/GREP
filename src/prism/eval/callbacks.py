@@ -30,12 +30,15 @@ class EvalCallback(TrainerCallback):
         use_icl: bool,
         include_edge_list: bool,
         eval_epoch_interval: float = 1.0,
+        edge_weights: str = "gaussian",
     ):
         self.eval_samples_by_graph = eval_samples_by_graph
         self.tokenizer = tokenizer
         self.use_icl = use_icl
         self.include_edge_list = include_edge_list
         self.eval_epoch_interval = eval_epoch_interval
+        # "gaussian" | "binary"; must match the train-time data.edge_weights policy.
+        self.edge_weights = edge_weights
         self._steps_per_interval: int | None = None
         self._last_eval_step: int = -1
         self.metrics = {}
@@ -57,6 +60,7 @@ class EvalCallback(TrainerCallback):
             use_icl=self.use_icl,
             permutation=None,
             on_graph_done=None,
+            edge_weights=self.edge_weights,
         )
         model.train()
 

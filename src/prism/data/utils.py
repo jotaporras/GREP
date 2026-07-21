@@ -81,13 +81,25 @@ def safe_parse_graph(
     return G, as_str
 
 
-def scene_graph_dict_to_pyg(scene_graph_dict: dict) -> Data:
+def scene_graph_dict_to_pyg(scene_graph_dict: dict, edge_weights: str = "gaussian") -> Data:
     """Convert a scene graph dict to a PyG Data object.
 
-    Returns a Data with ``coords``, ``x``, ``edge_index``, ``edge_weight``
-    (Gaussian heat-kernel affinity), ``distance_m``, ``node_names``, ``node_types``,
-    ``robot_location``, ``raw_scene_graph``.
+    Args:
+        edge_weights: ``"gaussian"`` (historical default) attaches ``edge_weight`` =
+            exp(-d^2 / 2σ^2) with σ = per-graph median edge length (E1 Gaussian
+            affinity); ``"binary"`` attaches NO ``edge_weight`` so downstream GNNs
+            (GCNConv treats a missing weight as all-ones) see the plain adjacency.
+            On SBM-with-geometry scene graphs the Gaussian form nearly severs the
+            long inter-community edges — "binary" is the control for that.
+
+    Returns a Data with ``coords``, ``x``, ``edge_index``, ``distance_m``,
+    ``node_names``, ``node_types``, ``robot_location``, ``raw_scene_graph``, plus
+    ``edge_weight`` when ``edge_weights="gaussian"``.
     """
+    if edge_weights not in ("gaussian", "binary"):
+        raise ValueError(
+            f"edge_weights must be 'gaussian' or 'binary', got {edge_weights!r}"
+        )
     nx_graph, _ = safe_parse_graph(scene_graph_dict)
     node_names = list(nx_graph.nodes)
     coords = torch.tensor(
@@ -101,12 +113,14 @@ def scene_graph_dict_to_pyg(scene_graph_dict: dict) -> Data:
         if hasattr(pyg_graph, attr):
             delattr(pyg_graph, attr)
     # edge_weight = exp(-d^2 / 2σ^2), σ = per-graph median distance (E1 Gaussian affinity).
+    # "binary" keeps distance_m (diagnostics) but attaches no edge_weight.
     if raw_distance is not None and raw_distance.numel() > 0:
         d = raw_distance.float()
-        sigma = d.median()
-        pyg_graph.edge_weight = (
-            torch.exp(-(d ** 2) / (2.0 * sigma ** 2)) if sigma > 0 else torch.ones_like(d)
-        )
+        if edge_weights == "gaussian":
+            sigma = d.median()
+            pyg_graph.edge_weight = (
+                torch.exp(-(d ** 2) / (2.0 * sigma ** 2)) if sigma > 0 else torch.ones_like(d)
+            )
         pyg_graph.distance_m = d
     pyg_graph.coords = coords
     pyg_graph.x = torch.zeros((coords.size(0), 1), dtype=torch.float32)

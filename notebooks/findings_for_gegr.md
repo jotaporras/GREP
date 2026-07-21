@@ -1,11 +1,12 @@
 ---
-tags: [transfer, gegr, graph-injection, e11, e12]
+tags: [transfer, gegr, graph-injection, e11, e12, edge-weights]
 date: 2026-07-02
+updated: 2026-07-04 (edge-weights A/B, §5.5)
 source_project: GREP-PRISM (branch fable_experiments)
-status: final — additive-PE line closed, mask line active
+status: final — additive-PE line closed (edge-weighting ruled out as its bottleneck, §5.5), mask line active
 ---
 
-# GREP-PRISM → GEGR: findings transfer (injection-asymmetry investigation, e11–e12)
+# GREP-PRISM → GEGR: findings transfer (injection-asymmetry investigation, e11–e12, + edge-weights A/B)
 
 Written to be self-contained: everything needed to audit and fix a graph-augmented-LLM
 pipeline of the GREP/GEGR family without access to GREP-PRISM history. Context: SPINE
@@ -14,6 +15,34 @@ navigation planning, Gemma-4 (12B/31B) + LoRA, graph channel delivered either
 attention mask/bias** (adjacency-shaped logit bias). All findings below were
 established causally (single-variable A/Bs or same-weights ablations), not by
 correlation across runs.
+
+## Background: what GREP is, in one page
+
+GREP-PRISM studies **graph-augmented LLM planners** on SPINE-style navigation. A
+scene graph — regions connected to regions, objects attached to regions, all
+with metric coordinates — is described in the prompt, and a Gemma-4 model
+(12B/31B, LoRA-finetuned) answers held-out navigation queries with a route,
+graded by a deterministic path-validity walk over the graph. The eval graphs are
+SBM-like with geometry attached: dense within-community (region) structure,
+few long inter-community edges.
+
+The architecture idea: besides (or instead of) the textual edge list in the
+prompt, deliver the graph's structure through a **graph channel**:
+
+- **additive** (`rpearl_llm`, `gt_llm`, `rpearl_gt_llm`): a GNN / graph
+  transformer computes node encodings Ψ (R-PEARL: stochastic-probe positional
+  encodings), added into the token stream at node-name token positions via a
+  learned gate, `h_t += tanh(g)·ψ_{π(t)}`;
+- **mask/bias** (`graph_mask_llm`, `learnable_graph_mask`): an adjacency-shaped
+  structural bias on the attention logits, parameter-free or learnable
+  `α·A + (1−α)·sim(ΨΨᵀ)`.
+
+The central question is whether the graph channel lets the model plan **without
+the textual edge list**. Reference points on the headline metric (fraction of
+held-out tasks answered with a valid route): text-only *with* edges ≈ 0.9;
+text-only *without* edges ≈ 0.10–0.16 (the no-information floor). The findings
+below are about why the additive channel stayed at that floor, what got the
+mask channel off it, and which explanations we eliminated along the way.
 
 ## 0. TL;DR — what to do in GEGR
 
@@ -34,6 +63,12 @@ correlation across runs.
    additive interface is self-limiting (measured, §5.4): amplitude corrupts the very
    token identities the readout needs, with the useful ceiling at ~0.25× embedding
    scale delivering ~6× too little information per decision.
+5. **Don't blame the distance kernel (§5.5).** Gaussian heat-kernel edge weights
+   really do collapse algebraic connectivity on SBM+geometry graphs (mean Fiedler
+   λ₂ 0.104 → 3.5e-5 across our eval graphs), but A/B-ing plain binary adjacency
+   into the GNN changed nothing: no-edge-text accuracy 0.09 → 0.10. The additive
+   floor is the interface (§5.4), not the GNN's input graph. GEGR uses unweighted
+   graphs today, so this is a caution for any future distance kernel, not a to-do.
 
 ## 1. The bug class: train/inference injection asymmetry
 
@@ -213,6 +248,63 @@ optimizer had parked the gate at the measured optimum — the ceiling is the int
 not the optimization. Mask/logit-bias interfaces pay no such tax (orthogonal to the
 content pathway).
 
+### 5.5 Geometric edge weighting ruled out as the additive-PE bottleneck (edge-weights A/B, **12B**, 2026-07-04)
+
+Hypothesis tested: the GNN consumes Gaussian heat-kernel edge weights
+`w = exp(−d²/2σ²)`, σ = per-graph median edge length. On SBM+geometry graphs the
+few inter-community edges are the long ones, so the kernel could be severing
+exactly the connectivity Ψ is supposed to encode.
+
+**The mechanism is real.** Over the 10 eval graphs, Gaussian weighting collapses
+algebraic connectivity (Fiedler λ₂ of the normalized Laplacian) from mean 0.104
+unweighted to 3.5e-5 weighted (worst graph 2.9e-12). Region–region edges are
+~91% of edges with median distance ≈ σ (median weight 0.57), but the
+inter-community tail is effectively zeroed. Diagnostic:
+`scripts/diag_edge_weights.py`.
+
+**It is not the bottleneck.** Intervention: new collator-level knob
+`data.edge_weights ∈ {gaussian (historical) | binary}`; binary hands the GNN
+plain SBM adjacency (no `edge_weight` attr). Four arms, `rpearl_llm` on
+Gemma-4-12B, e10 dev recipe (LoRA r16, bf16, 3 epochs, lr 2.5e-4), full
+10-graph held-out generation eval (100 tasks/arm, keyword-match accuracy),
+historical `injection_scope=full_sequence`:
+
+| arm | gaussian | binary |
+|---|---|---|
+| with textual edge list | 0.90 | 0.88 |
+| no edge text | 0.09 | 0.10 |
+
+With edges, both arms sit at the text ceiling (text carries the connectivity);
+without edges, both sit at the no-information floor with the same failure mode
+(hallucinated `region_connections` the model never saw). A 3–4 order-of-magnitude
+connectivity collapse in the GNN's input graph does not move the additive channel
+at all — consistent with §5.2/§5.4: the interface, not the input, is limiting.
+
+Caveats: single seed, n=100/arm (≈8-point minimum detectable difference); run
+under the leaky `full_sequence` scope (historical protocol), so a genuine Ψ
+improvement could in principle be masked by the shortcut — though §5.2 shows
+leak-free additive floors too; and the §5.3 cold-start saddle applies to both
+no-edge arms equally (`structural_lr_mult=1.0`), so "both floored" cannot by
+itself distinguish "weighting irrelevant" from "gate never opened in either arm".
+Note this row of evidence is 12B; the rest of §5 is 31B.
+
+For GEGR: **as of writing, GEGR uses unweighted graphs, so no action is needed**
+— this section is (a) a caution for the future: if a distance/affinity kernel is
+ever added (it's a tempting way to use geometry), check its effect on algebraic
+connectivity first, and (b) one more eliminated explanation for the additive-PE
+floor, which GEGR inherits regardless of weighting. Should a kernel appear, the
+A/B is cheap (collator-level knob; tests in `tests/test_edge_weights.py`) and
+the Fiedler diagnostic tells you in seconds whether it is severing your
+communities — but do not expect binary adjacency alone to rescue an additive
+channel.
+
+Portable engineering gotcha found en route: additive-PE attention patches must
+move Ψ to the current layer's **device**, not just its dtype — under
+`device_map="auto"` sharding, Ψ lives on the embedding device while the patched
+layer may be elsewhere, and the patch crashes. Fix in
+`src/prism/models/gnn_llm.py`: `psi.to(device=query.device, dtype=query.dtype)`
+(historical single-GPU runs never hit this).
+
 ## 6. Architecture guidance for GEGR
 
 1. **Interface ranking (empirical):** structural attention bias/mask ≫ additive
@@ -268,6 +360,13 @@ content pathway).
   `ror8gtet`/`tyvhwlmx`; e12 chain `0dq55cex` → `wh0537au`/`gvzylvay` vs paired
   `3bitwckz` → `kfuu2djo`/`6lefhd76`; diagnostics JSONs in each run dir
   (`injection_diag*.json`).
+- Edge-weights A/B (§5.5): code on the working tree as of 2026-07-04
+  (`data.edge_weights` knob, `tests/test_edge_weights.py`,
+  `scripts/diag_edge_weights.py`, gnn_llm device fix — commit hash TBD).
+  Run dirs `outputs/dev_edge_weights_ab/rpearl12b_ew_{gaussian_36d24eec,
+  binary_99ab8cb7, binary_noedges_d97f1141, gaussian_noedges_b692c5d5}`
+  (per-graph eval JSONs under `eval_logs/cross_eval/`); local dev box
+  (2×A6000), not logged to W&B (`report_to=none`).
 - Caveats attached to all of the above: single seed per cell; generation metric
   0.1-grained per graph; 31B; 400-conversation corpus. The cross-family separations
   (0.09 vs 0.39–0.48) and the gate-sweep shape are far outside these grains; the
