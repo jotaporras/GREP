@@ -135,6 +135,11 @@ def train_model(config: omegaconf.DictConfig):
         raise ValueError(
             "init_pe_from / init_lora_from are only supported for graph architectures."
         )
+    # Load the pretrained PE encoder first; a later init_pe_from carry (stage 2/3)
+    # overwrites the whole pe_model, including this submodule.
+    if config.gnn.arch == "learnable_graph_mask" and config.gnn.pe_gt_from:
+        model_loaders.load_navigator_pe_into(
+            model, config.gnn.pe_gt_from, config.gnn.semantic_gt_from)
     if config.trainer.init_pe_from:
         model_loaders.load_pe_weights_into(
             model, config.trainer.init_pe_from, config.gnn.arch
@@ -239,6 +244,9 @@ def train_model(config: omegaconf.DictConfig):
             **{k: config.gnn[k] for k in _direct},
             **({k: config.gnn[k] for k in ("k_gt", "gt_num_layers", "gt_heads")}
                if config.gnn.arch in ("rpearl_gt_llm", "gt_llm", "learnable_graph_mask") else {}),
+            # learnable_graph_mask navigator: record both sources so eval rebuilds the NavigatorPE.
+            **({"pe_gt_from": config.gnn.pe_gt_from, "semantic_gt_from": config.gnn.semantic_gt_from}
+               if config.gnn.arch == "learnable_graph_mask" and config.gnn.pe_gt_from else {}),
             # graph_mask_llm / learnable_graph_mask adjacency (A) + fold + scope rebuild params.
             **({k: config.gnn[k] for k in ("mask_k_hops", "mask_symmetrize", "mask_use_edges",
                                            "mask_buggy_causal_fold", "mask_layer_scope")}
@@ -467,6 +475,14 @@ def _validate_config(config: omegaconf.DictConfig) -> None:
             raise ValueError(
                 "gnn.mask_psi_scale='cosine' with gnn.mask_use_edges=false is degenerate "
                 "(constant mask, zero GT gradient). Use mask_psi_scale='inv_sqrt_d' or keep edges.")
+    if config.gnn.pe_gt_from or config.gnn.semantic_gt_from:
+        if config.gnn.arch != "learnable_graph_mask":
+            raise ValueError(
+                "gnn.pe_gt_from / semantic_gt_from are only supported for arch='learnable_graph_mask'.")
+        if config.gnn.semantic_gt_from and not config.gnn.pe_gt_from:
+            raise ValueError(
+                "gnn.semantic_gt_from requires gnn.pe_gt_from (the navigator needs both). "
+                "Set pe_gt_from alone for a GT-only Ψ producer.")
     if config.trainer.loss_target not in ("all", "responses", "edge_list"):
         raise ValueError(
             f"loss_target must be 'all', 'responses', or 'edge_list', got {config.trainer.loss_target!r}"

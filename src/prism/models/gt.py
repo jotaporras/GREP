@@ -50,7 +50,7 @@ class SparseGraphAttention(nn.Module):
 
         values = torch.ones(edge_index.shape[1], device=x.device, dtype=x.dtype)
         A = torch.sparse_coo_tensor(
-            indices=edge_index, values=values, size=(N, N)
+            indices=edge_index, values=values, size=(N, N), device=x.device
         ).coalesce().to_sparse_csr()
 
         out = self._mha_sparse_attention(q, k, v, A)
@@ -464,3 +464,28 @@ class SemanticGraphTransformer(nn.Module):
             else:
                 x = block(x, khop_edge_index)
         return x * torch.tanh(self.output_gain).to(x.dtype)
+
+
+class NavigatorPE(nn.Module):
+    """Sequential PE from notebooks/e9_gnn_navigation.ipynb (GNNShortestPathNavigator):
+    the Semantic GT consumes the PE GT's output as its node features (navigator forward
+    with the navigation seed = 0, so head input = PE_GT(graph)).
+
+    A drop-in ``pe_model`` for ``GraphAugmentedLLM``; both submodules are loaded from the
+    notebook's trained state dicts (pe_gt = path_navigator_gt.pt, semantic_gt =
+    path_navigator_agt.pt). ``semantic_gt.node_feature_dim`` must equal ``pe_gt.d_model``.
+
+    Args:
+        pe_gt: a ``GraphTransformer`` (random-probe PE) -> [N, d_model].
+        semantic_gt: a ``SemanticGraphTransformer`` consuming [N, d_model].
+    """
+
+    def __init__(self, pe_gt: "GraphTransformer", semantic_gt: "SemanticGraphTransformer"):
+        super().__init__()
+        self.pe_gt = pe_gt
+        self.semantic_gt = semantic_gt
+
+    def forward(self, data, permutation=None) -> Tensor:
+        pe = self.pe_gt(data, permutation=permutation)             # [N, d_model]
+        feed = Data(x=pe, edge_index=data.edge_index)              # seed = 0 -> head input = PE
+        return self.semantic_gt(feed)                              # [N, d_model]
