@@ -36,3 +36,5 @@ shared/
 eval/*
 data_store/*
 slurm/
+notebooks/wandb
+path_navigator_*.pt
