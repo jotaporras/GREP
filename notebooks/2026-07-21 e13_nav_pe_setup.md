@@ -125,6 +125,16 @@ vs e11 — `e13c_rpe_decode` vs 0.48 (22lq43i6), `e13c_gmask_decode` vs 0.39
 (bznw3x9p). Open question: do prompt-side + answer-side channels stack above the
 ~0.83/decision convergence?
 
+Review (independent agent) caught a critical latent bug in the first injector:
+prefix-ambiguous node names (`region_1` vs `region_10` under digit-split BPE)
+never received their query tag (deferred-commit landed one step too late). Fixed
+in `b9a46ba` with the resolve-position rule (tag at `e` instead of `e-1` for
+extendable names) on BOTH the training map and the injector; parity re-proven
+incl. an ambiguous-name fixture. On the CURRENT n30 val set the fix is a
+verified no-op (nodes numbered 1-3 per type — corrected diagnostic reproduces
+every number bit-for-bit), but it is load-bearing for the 100/1000-node
+transferability graphs where double-digit names make prefix collisions routine.
+
 ## Smoke (job 7156517 → crashed on a pre-existing bug; fixed; job 7156540)
 
 First smoke run validated the navigator load + 4 training steps on a b200, then
