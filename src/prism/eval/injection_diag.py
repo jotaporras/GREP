@@ -59,6 +59,53 @@ def partition_answer_node_positions(
     }
 
 
+def decode_style_query_map(
+    injection_map: dict[int, list[tuple[int, int]]],
+    answer_start: int,
+) -> dict[int, list[tuple[int, int]]]:
+    """QUERY-role map under the decode-consistency rule (decode-time design note §3).
+
+    Prompt-side spans (start < ``answer_start``) are kept whole. Each answer-side
+    span is reduced to its FINAL token position only — the forward that consumes a
+    mention's completing token is the first that can know its node id at decode
+    time. Pair with the FULL map in the key role (answer mentions always act as
+    keys once complete; the bias is applied at score time, so key wiring needs no
+    KV-cache surgery).
+    """
+    out: dict[int, list[tuple[int, int]]] = {}
+    for node_idx, spans in injection_map.items():
+        kept = [(s, e) if s < answer_start else (e - 1, e) for s, e in spans]
+        out[node_idx] = sorted(kept)
+    return out
+
+
+def decode_trail_query_map(
+    injection_map: dict[int, list[tuple[int, int]]],
+    answer_start: int,
+    seq_len: int,
+) -> dict[int, list[tuple[int, int]]]:
+    """``decode_style_query_map`` + current-location context (decode-computable).
+
+    After an answer-side mention completes, its node id rides the QUERY row of every
+    subsequent position up to (not including) the start of the next answer-side
+    mention — i.e. the inter-mention tokens (", then ") carry "the plan is currently
+    at node i", giving the next-hop decision a direct bias toward i's neighbors.
+    Everything here is computable from the generated prefix at decode time.
+    """
+    out = decode_style_query_map(injection_map, answer_start)
+    answer_spans = sorted(
+        (s, e, node_idx)
+        for node_idx, spans in injection_map.items()
+        for s, e in spans if s >= answer_start
+    )
+    for i, (s, e, node_idx) in enumerate(answer_spans):
+        trail_end = answer_spans[i + 1][0] if i + 1 < len(answer_spans) else seq_len
+        trail_end = min(trail_end, seq_len)
+        if e - 1 < trail_end:
+            out[node_idx] = sorted(set(out[node_idx]) - {(e - 1, e)} | {(e - 1, trail_end)})
+    return out
+
+
 def grade_positions(
     logits: torch.Tensor,
     input_ids: torch.Tensor,

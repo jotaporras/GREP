@@ -12,6 +12,19 @@ node mentions, split into decision / completion / repeat positions
   no_injection — empty map (mask archs) / gate zeroed (additive archs): plain
                  causal LLM.
 
+Mask archs only — the two DECODE-REALIZABLE conditions (decode-time design note
+§3; keys wired from the full map, queries from a causal map):
+  decode_style — answer mentions act as keys everywhere but as queries only at
+                 their final token: exactly what decode-time injection could
+                 provide with span-end assignment.
+  decode_trail — decode_style + the last completed mention's node id riding the
+                 query rows of inter-mention tokens ("current location context"),
+                 giving the next-hop decision a direct bias toward its neighbors.
+How to read decode_style/decode_trail vs train_style: the gap between them is the
+part of the leak-trained channel that decode-time injection CANNOT legally restore
+(mid-span query enrichment); decode_* ≈ train_style ⇒ decode-time injection should
+recover the measured headroom.
+
 How to read the decision-token row:
   train_style >> prompt_only ≈ no_injection  → a label-side (leak) channel was
       learned; it cannot exist at decode, explaining generation collapse.
@@ -80,8 +93,8 @@ ADDITIVE_ARCHS = ("rpearl_llm", "rpearl_gt_llm", "gt_llm")
 MASK_ARCHS = ("graph_mask_llm", "learnable_graph_mask")
 
 
-def build_conditions(arch, pyg_graph, full_map, prompt_map):
-    """(name, graphs, injection_maps, gain_override) per condition, per architecture.
+def build_conditions(arch, pyg_graph, full_map, prompt_map, answer_start, seq_len):
+    """(name, graphs, injection_maps, key_injection_maps, gain_override) per condition.
 
     ``gain_override`` is a RAW pe_gain value to set temporarily for the forward
     (None = leave the trained parameter untouched). ``no_injection`` must be
@@ -91,19 +104,31 @@ def build_conditions(arch, pyg_graph, full_map, prompt_map):
       would break gt_llm's word_embeddings feature prep, which requires every
       node to have a mention span.
     - mask archs: empty map → all-zero structural bias (no gate parameter exists).
+
+    Mask archs additionally get the two DECODE-REALIZABLE conditions (decode-time
+    design note §3; ``key_injection_maps`` wires bias columns from the full map
+    while rows follow the causal query map):
+    - decode_style: answer mentions as keys everywhere; as queries only at their
+      final token (the neighborhood-absorption step gets one wired position).
+    - decode_trail: decode_style + the completed mention's id riding the query rows
+      of the inter-mention tokens (direct "current location" bias at the decision).
     """
     graphs = Batch.from_data_list([pyg_graph])
     if arch in ADDITIVE_ARCHS:
         return [
-            ("train_style", graphs, [full_map], None),
-            ("prompt_only", graphs, [prompt_map], None),
-            ("no_injection", graphs, [full_map], 0.0),
+            ("train_style", graphs, [full_map], None, None),
+            ("prompt_only", graphs, [prompt_map], None, None),
+            ("no_injection", graphs, [full_map], None, 0.0),
         ]
     if arch in MASK_ARCHS:
+        decode_q = injection_diag.decode_style_query_map(full_map, answer_start)
+        trail_q = injection_diag.decode_trail_query_map(full_map, answer_start, seq_len)
         return [
-            ("train_style", graphs, [full_map], None),
-            ("prompt_only", graphs, [prompt_map], None),
-            ("no_injection", graphs, [{}], None),
+            ("train_style", graphs, [full_map], None, None),
+            ("prompt_only", graphs, [prompt_map], None, None),
+            ("decode_style", graphs, [decode_q], [full_map], None),
+            ("decode_trail", graphs, [trail_q], [full_map], None),
+            ("no_injection", graphs, [{}], None, None),
         ]
     raise ValueError(f"diagnostic not wired for architecture {arch!r}")
 
@@ -159,9 +184,13 @@ def main():
 
     if gate_sweep is not None:
         condition_names = [name for name, _ in gate_sweep]
+    elif arch == "llm":
+        condition_names = ["no_injection"]
+    elif arch in MASK_ARCHS:
+        condition_names = ["train_style", "prompt_only", "decode_style", "decode_trail",
+                           "no_injection"]
     else:
-        condition_names = (["no_injection"] if arch == "llm"
-                           else ["train_style", "prompt_only", "no_injection"])
+        condition_names = ["train_style", "prompt_only", "no_injection"]
     totals = {
         cond: {s: {"n": 0, "correct": 0, "nll_sum": 0.0} for s in injection_diag.POSITION_SETS}
         for cond in condition_names
@@ -186,13 +215,14 @@ def main():
 
         if gate_sweep is not None:
             graphs_b = Batch.from_data_list([pyg_graph])
-            conditions = [(name, graphs_b, [prompt_map], raw) for name, raw in gate_sweep]
+            conditions = [(name, graphs_b, [prompt_map], None, raw) for name, raw in gate_sweep]
         elif arch == "llm":
-            conditions = [("no_injection", None, None, None)]
+            conditions = [("no_injection", None, None, None, None)]
         else:
-            conditions = build_conditions(arch, pyg_graph, full_map, prompt_map)
+            conditions = build_conditions(arch, pyg_graph, full_map, prompt_map,
+                                          answer_start, len(example["input_ids"]))
 
-        for cond, graphs, maps, gain_override in conditions:
+        for cond, graphs, maps, key_maps, gain_override in conditions:
             if gain_override is not None:
                 saved_gain = model.pe_gain.data.clone()
                 model.pe_gain.data.fill_(gain_override)
@@ -200,6 +230,10 @@ def main():
             with torch.no_grad():
                 if arch == "llm":
                     outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                elif key_maps is not None:
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask,
+                                    graphs=graphs, injection_maps=maps,
+                                    key_injection_maps=key_maps)
                 else:
                     outputs = model(input_ids=input_ids, attention_mask=attention_mask,
                                     graphs=graphs, injection_maps=maps)

@@ -106,6 +106,21 @@ def _graph_mask_attention_forward(module, query, key, value, attention_mask,
 AttentionInterface.register(_GRAPH_MASK_IMPL, _graph_mask_attention_forward)
 
 
+def tok2node_vector(injection_map, seq_len, device) -> torch.Tensor:
+    """``[seq_len]`` long tensor: token position → node id, −1 for non-node tokens.
+
+    Spans are disjoint (``build_injection_map`` dedups longest-first), so each token
+    maps to at most one node; spans extending past ``seq_len`` are truncated.
+    """
+    tok2node = torch.full((seq_len,), -1, dtype=torch.long, device=device)
+    for node_idx, spans in injection_map.items():
+        for start, end in spans:
+            end = min(end, seq_len)
+            if start < end:
+                tok2node[start:end] = node_idx
+    return tok2node
+
+
 def node_adjacency(g, device, k_hops: int = 1, symmetrize: bool = True,
                    use_edges: bool = True) -> torch.Tensor:
     """Boolean ``[N, N]`` node adjacency — True where two nodes may attend.
@@ -255,7 +270,8 @@ class GraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         return node_adjacency(g, device, k_hops=self._mask_k_hops,
                               symmetrize=self._mask_symmetrize, use_edges=self._mask_use_edges)
 
-    def build_structural_mask(self, seq_len, graphs, injection_maps, device, dtype=None):
+    def build_structural_mask(self, seq_len, graphs, injection_maps, device, dtype=None,
+                              key_injection_maps=None):
         """Additive attention bias ``[B, 1, seq, seq]`` — 0 allowed, ``finfo.min`` blocked.
 
         ``bias[b,0,i,j] = finfo.min`` iff tokens i and j BOTH belong to graph nodes
@@ -264,6 +280,12 @@ class GraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         is ADDED to the model's causal/sliding mask, blocking only ever removes
         already-causal pairs. Each node-token row keeps BOS (a non-node) and its own
         diagonal, so no row is fully masked (no softmax NaN).
+
+        ``key_injection_maps``: optional separate map for the KEY role. When given,
+        bias rows (queries) are wired from ``injection_maps`` and bias columns (keys)
+        from ``key_injection_maps`` — the decode-consistency rule of the decode-time
+        design note §3 (answer mentions act as keys everywhere, as queries only where
+        the assignment is decode-knowable). Default None = same map for both roles.
         """
         if dtype is None:
             dtype = self.llm.get_input_embeddings().weight.dtype
@@ -272,24 +294,21 @@ class GraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         bias = torch.zeros(B, 1, seq_len, seq_len, device=device, dtype=dtype)
         for b in range(B):
             g = graphs[b]
-            # token position -> node id (-1 for non-node tokens). Spans are disjoint
-            # (build_injection_map dedups longest-first), so each token maps to one node.
-            tok2node = torch.full((seq_len,), -1, dtype=torch.long, device=device)
-            for node_idx, spans in injection_maps[b].items():
-                for start, end in spans:
-                    end = min(end, seq_len)
-                    if start < end:
-                        tok2node[start:end] = node_idx
-            node_pos = (tok2node >= 0).nonzero(as_tuple=True)[0]
-            if node_pos.numel() == 0:
+            tok2node_q = tok2node_vector(injection_maps[b], seq_len, device)
+            tok2node_k = (tok2node_q if key_injection_maps is None
+                          else tok2node_vector(key_injection_maps[b], seq_len, device))
+            q_pos = (tok2node_q >= 0).nonzero(as_tuple=True)[0]
+            k_pos = (tok2node_k >= 0).nonzero(as_tuple=True)[0]
+            if q_pos.numel() == 0 or k_pos.numel() == 0:
                 continue
             adj = self._node_adjacency(g, device)        # [N, N] bool
-            nid = tok2node[node_pos]                      # node id for each node-token
-            allowed = adj[nid][:, nid]                    # [P, P] bool over node-token pairs
+            q_nid = tok2node_q[q_pos]                     # node id per query node-token
+            k_nid = tok2node_k[k_pos]                     # node id per key node-token
+            allowed = adj[q_nid][:, k_nid]                # [Pq, Pk] bool over pairs
             blocked = ~allowed
             if blocked.any():
                 bi, bj = blocked.nonzero(as_tuple=True)
-                bias[b, 0, node_pos[bi], node_pos[bj]] = neg
+                bias[b, 0, q_pos[bi], k_pos[bj]] = neg
         return bias
 
     def forward(
@@ -299,6 +318,7 @@ class GraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         labels: torch.Tensor | None = None,
         graphs: Batch | None = None,
         injection_maps: list[dict[int, list[tuple[int, int]]]] | None = None,
+        key_injection_maps: list[dict[int, list[tuple[int, int]]]] | None = None,
         **kwargs,
     ):
         kwargs.pop("inputs_embeds", None)
@@ -307,7 +327,8 @@ class GraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         # non-graph batch) ⇒ plain causal LLM.
         if graphs is not None and injection_maps is not None and input_ids is not None:
             self._struct_bias = self.build_structural_mask(
-                input_ids.shape[1], graphs, injection_maps, input_ids.device)
+                input_ids.shape[1], graphs, injection_maps, input_ids.device,
+                key_injection_maps=key_injection_maps)
         else:
             self._struct_bias = None
         try:
@@ -489,7 +510,8 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         return node_adjacency(g, device, k_hops=self._mask_k_hops,
                               symmetrize=self._mask_symmetrize, use_edges=self._mask_use_edges)
 
-    def build_structural_mask(self, seq_len, graphs, injection_maps, device, dtype=None):
+    def build_structural_mask(self, seq_len, graphs, injection_maps, device, dtype=None,
+                              key_injection_maps=None):
         """Additive attention bias ``[B, 1, seq, seq]`` with the learned relative-PE mask.
 
         For token pairs (i, j) where BOTH tokens map to graph nodes::
@@ -501,6 +523,10 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         entries carry gradient through ``sim → Ψ → pe_model``; blocked entries and
         non-node entries are constants. Each node row keeps its diagonal (self-loop)
         and BOS, so no row is fully masked (softmax safe).
+
+        ``key_injection_maps``: optional separate map for the KEY role (queries wired
+        from ``injection_maps``, keys from ``key_injection_maps`` — decode-consistency
+        rule, decode-time design note §3). Default None = same map for both roles.
         """
         if dtype is None:
             dtype = self.llm.get_input_embeddings().weight.dtype
@@ -510,15 +536,12 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         alpha = self._mask_alpha
         for b in range(B):
             g = graphs[b]
-            # token position -> node id (-1 for non-node tokens); spans are disjoint.
-            tok2node = torch.full((seq_len,), -1, dtype=torch.long, device=device)
-            for node_idx, spans in injection_maps[b].items():
-                for start, end in spans:
-                    end = min(end, seq_len)
-                    if start < end:
-                        tok2node[start:end] = node_idx
-            node_pos = (tok2node >= 0).nonzero(as_tuple=True)[0]
-            if node_pos.numel() == 0:
+            tok2node_q = tok2node_vector(injection_maps[b], seq_len, device)
+            tok2node_k = (tok2node_q if key_injection_maps is None
+                          else tok2node_vector(key_injection_maps[b], seq_len, device))
+            q_pos = (tok2node_q >= 0).nonzero(as_tuple=True)[0]
+            k_pos = (tok2node_k >= 0).nonzero(as_tuple=True)[0]
+            if q_pos.numel() == 0 or k_pos.numel() == 0:
                 continue
             adj = self._node_adjacency(g, device)              # [N, N] bool
             psi = self.pe_model(g).float()                     # [N, D] (GT runs fp32)
@@ -528,12 +551,13 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             else:  # inv_sqrt_d
                 sim = (psi @ psi.t()) / (psi.shape[-1] ** 0.5)
             node_M = alpha + (1.0 - alpha) * sim               # [N, N] edge value (fp32)
-            nid = tok2node[node_pos]                           # node id per node-token
-            allowed = adj[nid][:, nid]                         # [P, P] bool
-            block = node_M[nid][:, nid].to(dtype)              # [P, P] learned values
+            q_nid = tok2node_q[q_pos]                          # node id per query node-token
+            k_nid = tok2node_k[k_pos]                          # node id per key node-token
+            allowed = adj[q_nid][:, k_nid]                     # [Pq, Pk] bool
+            block = node_M[q_nid][:, k_nid].to(dtype)          # [Pq, Pk] learned values
             neg_t = torch.tensor(neg, dtype=dtype, device=device)
             block = torch.where(allowed, block, neg_t)         # hard-block non-edges
-            bias[b, 0, node_pos.unsqueeze(1), node_pos.unsqueeze(0)] = block
+            bias[b, 0, q_pos.unsqueeze(1), k_pos.unsqueeze(0)] = block
         return bias
 
     def forward(
@@ -543,6 +567,7 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         labels: torch.Tensor | None = None,
         graphs: Batch | None = None,
         injection_maps: list[dict[int, list[tuple[int, int]]]] | None = None,
+        key_injection_maps: list[dict[int, list[tuple[int, int]]]] | None = None,
         **kwargs,
     ):
         kwargs.pop("inputs_embeds", None)
@@ -551,7 +576,8 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         # (e.g. a non-graph batch) ⇒ plain causal LLM.
         if graphs is not None and injection_maps is not None and input_ids is not None:
             self._struct_bias = self.build_structural_mask(
-                input_ids.shape[1], graphs, injection_maps, input_ids.device)
+                input_ids.shape[1], graphs, injection_maps, input_ids.device,
+                key_injection_maps=key_injection_maps)
         else:
             self._struct_bias = None
         try:
