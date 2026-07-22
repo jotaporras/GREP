@@ -40,6 +40,7 @@ case "$TASK_ID" in
     0) CKPT=$ALELAB/GREP-PRISM/outputs/dev_e10/e10_integ_rpe/e10_integ_rpe__no_edge_list_tyvhwlmx ;;
     1) CKPT=$ALELAB/GREP-PRISM/outputs/e11_injection_scope/e11_integ_rpe_noedges_promptonly_22lq43i6 ;;
     2) CKPT=$ALELAB/GREP-PRISM/outputs/refactor_verify_fulltest/rv_gmask_noedges_ror8gtet ;;
+    3) CKPT=$ALELAB/GREP-PRISM/outputs/dev_e10/e10_integ_rpe/e10_integ_rpe__with_edge_list_wo83xg96 ;;
     *) echo "bad task id $TASK_ID" >&2; exit 1 ;;
 esac
 echo "[$(date --iso-8601=seconds)] decode-style diag on $CKPT"
