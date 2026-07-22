@@ -82,6 +82,30 @@ a permutation). None of the e13 runs pass `--permutation-seed`, so this cannot
 affect them — but a future permutation/transferability sweep on this arch must
 fix it first.
 
+## RESULTS (all 6 arms complete, 10-graph free-generation eval, n=100 tasks)
+
+| arm | schedule | acc | halluc | vs e11 edge-detector Ψ (0.48) |
+|---|---|---|---|---|
+| e13_gt_pe1only | PE-only 1ep (LoRA frozen) | 0.08 | 0.42 | floor, expected pre-joint |
+| e13_agt_pe1only | PE-only 1ep | 0.11 | 0.44 | floor, expected pre-joint |
+| e13_gt_joint3 | direct joint 3ep | 0.44 | 0.21 | ≈ (−0.04) |
+| **e13_agt_joint3** | **direct joint 3ep** | **0.58** | **0.13** | **+0.10 — best mask-family number to date** |
+| e13_gt_joint2 | freeze→joint (1+2ep) | 0.47 | 0.16 | ≈ (−0.01) |
+| e13_agt_joint2 | freeze→joint (1+2ep) | 0.48 | 0.17 | ≈ (0.00) |
+
+Observations (single seed, n=100 ⇒ ±0.05 s.e.; interpretation is Javier's):
+- Nav-pretrained **GT alone ≈ edge-detector GT** (0.44–0.47 vs 0.48) — consistent
+  with the e13b diagnostic's "wall is channel content; both pretrainings deliver
+  similar content" reading.
+- The **NavigatorPE (GT+AGT) direct-joint arm is the outlier**: 0.58, lowest
+  hallucination (0.128), ~2 s.e. above the 0.48 reference. The AGT's extra
+  pretrained depth carries real content after joint adaptation — contra the
+  session's stated prior that the null-episode AGT would add nothing.
+- Schedule × Ψ interaction: freeze-then-joint helped the GT slightly
+  (0.44→0.47) but the AGT lost its edge under it (0.58→0.48). Single-seed;
+  needs a replication before believing the interaction.
+- W&B tag `e13_nav_pe`; run dirs under `$ALELAB/GREP-PRISM/outputs/e13_nav_pe/`.
+
 ## e13c: decode-consistent injection (same session, user-approved)
 
 Gate evidence in `notebooks/2026-07-21 e13b_decode_style_diagnostic.ipynb`:
