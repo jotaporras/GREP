@@ -9,6 +9,7 @@ from spine import models as spine_models
 from prism.data import compact_prompt
 from prism.data import utils
 from prism.models.gnn_llm import (
+    MaskDecodeInjector,
     GraphAugmentedLLM,
     GraphMaskLLM,
     LearnableGraphMaskLLM,
@@ -109,12 +110,19 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
     # (see scene_graph_dict_to_pyg). Class-level default (historical Gaussian
     # affinity) so partially-constructed instances (tests) resolve it too.
     edge_weights = "gaussian"
+    # Train-time data.injection_scope; "decode_consistent" arms MaskDecodeInjector
+    # during generation (mask archs). Every other value generates as before
+    # (prompt-only prefill wiring, no decode injection). Class-level default so
+    # partially-constructed instances (tests) resolve it too.
+    injection_scope = "full_sequence"
 
     def __init__(self, model, tokenizer, include_edges: bool, permutation=None,
-                 edge_weights: str = "gaussian"):
+                 edge_weights: str = "gaussian",
+                 injection_scope: str = "full_sequence"):
         super().__init__(model, tokenizer, include_edges=include_edges)
         self.permutation = permutation
         self.edge_weights = edge_weights
+        self.injection_scope = injection_scope
 
     def _parse_all_pyg_graphs(self, msg: List[Dict]) -> List:
         """Extract all scene graphs from SPINE message list and convert to PyG Data objects."""
@@ -193,6 +201,16 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
             # both classes share build_structural_mask + _struct_bias; cleared in finally.
             graph_model._struct_bias = graph_model.build_structural_mask(
                 input_ids.shape[1], [pyg_graph], [injection_map], input_ids.device)
+            # decode_consistent checkpoints extend the channel to generated mentions:
+            # a forward pre-hook arms a per-step bias row (span-end assignment, design
+            # note §2.2). Other scopes keep the historical prompt-only behavior.
+            hook_handle = None
+            if self.injection_scope == "decode_consistent":
+                injector = MaskDecodeInjector(
+                    graph_model, pyg_graph, injection_map,
+                    input_ids.shape[1], node_token_seqs)
+                hook_handle = graph_model.llm.register_forward_pre_hook(
+                    injector.pre_hook, with_kwargs=True)
             try:
                 outputs = graph_model.llm.generate(
                     input_ids=input_ids, attention_mask=attention_mask,
@@ -202,6 +220,9 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
                 return outputs[:, input_ids.shape[-1]:]
             finally:
                 graph_model._struct_bias = None
+                if hook_handle is not None:
+                    hook_handle.remove()
+                    graph_model._decode_bias_row = None
 
         # Base R-PEARL: build_pe_signal places Ψ at scoped node spans (tanh gate);
         # attention layers add it post-RoPE. Injection skips cached decode steps; disarmed in finally.

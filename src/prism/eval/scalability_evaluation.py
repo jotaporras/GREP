@@ -65,6 +65,7 @@ from prism.models import utils as model_utils
 _is_gnn_checkpoint = checkpoint.is_gnn_checkpoint
 _resolve_text_edge_list = checkpoint.resolve_text_edge_list
 _resolve_edge_weights = checkpoint.resolve_edge_weights
+_resolve_injection_scope = checkpoint.resolve_injection_scope
 _load_checkpoint = checkpoint.load_checkpoint
 
 
@@ -224,12 +225,13 @@ def main(argv: list[str] | None = None) -> None:
     is_gnn = _is_gnn_checkpoint(checkpoint)
     text_edge_list = _resolve_text_edge_list(checkpoint, is_gnn, args.text_edge_list)
     edge_weights = _resolve_edge_weights(checkpoint)
+    injection_scope = _resolve_injection_scope(checkpoint)
 
     print(f"Loading checkpoint: {checkpoint}")
     model, tokenizer, _ = _load_checkpoint(checkpoint, four_bit=args.four_bit, device=args.device)
     architecture = "graph-augmented" if is_gnn else "llm"
     print(f"  architecture: {architecture}  |  text_edge_list={text_edge_list}  |  "
-          f"edge_weights={edge_weights}  |  4bit={args.four_bit}")
+          f"edge_weights={edge_weights}  |  injection_scope={injection_scope}  |  4bit={args.four_bit}")
     print(f"  {len(samples_by_graph)} graph file(s)\n")
 
     use_icl = args.use_icl == "true"
@@ -262,6 +264,7 @@ def main(argv: list[str] | None = None) -> None:
             permutation=permutation,
             on_graph_done=progress,
             edge_weights=edge_weights,
+            injection_scope=injection_scope,
         )
 
         if has_seeds:

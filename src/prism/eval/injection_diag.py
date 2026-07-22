@@ -10,6 +10,8 @@ channel is being used.
 """
 import torch
 
+from prism.models import gnn_llm
+
 
 # Token-position splits graded by the diagnostic (all within the assistant answer).
 POSITION_SETS = ("decision", "completion", "repeat", "all_answer_nodes")
@@ -59,24 +61,9 @@ def partition_answer_node_positions(
     }
 
 
-def decode_style_query_map(
-    injection_map: dict[int, list[tuple[int, int]]],
-    answer_start: int,
-) -> dict[int, list[tuple[int, int]]]:
-    """QUERY-role map under the decode-consistency rule (decode-time design note §3).
-
-    Prompt-side spans (start < ``answer_start``) are kept whole. Each answer-side
-    span is reduced to its FINAL token position only — the forward that consumes a
-    mention's completing token is the first that can know its node id at decode
-    time. Pair with the FULL map in the key role (answer mentions always act as
-    keys once complete; the bias is applied at score time, so key wiring needs no
-    KV-cache surgery).
-    """
-    out: dict[int, list[tuple[int, int]]] = {}
-    for node_idx, spans in injection_map.items():
-        kept = [(s, e) if s < answer_start else (e - 1, e) for s, e in spans]
-        out[node_idx] = sorted(kept)
-    return out
+# Canonical implementation lives with the other map utilities in gnn_llm;
+# aliased here so the diagnostic namespace stays complete.
+decode_style_query_map = gnn_llm.decode_style_query_map
 
 
 def decode_trail_query_map(

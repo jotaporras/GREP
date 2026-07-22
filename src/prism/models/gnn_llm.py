@@ -70,6 +70,29 @@ def _graph_mask_attention_forward(module, query, key, value, attention_mask,
     bias = None if (model is None or not active) else model._struct_bias
     q_len = query.shape[-2]
     k_len = key.shape[-2]
+    # Decode-time extension (design note §2.2): a per-step [1, 1, 1, K] bias row armed
+    # by MaskDecodeInjector replaces the historical silent fall-through on cached
+    # decode steps. Layers whose cached key length differs (e.g. cropped sliding
+    # windows) still fall through — run decode_consistent arms with
+    # mask_layer_scope=dense so train and decode wire the same layers.
+    row = None if (model is None or not active) else model._decode_bias_row
+    if (row is not None and q_len == 1 and k_len == row.shape[-1]
+            and not (bias is not None and q_len == bias.shape[-2]
+                     and k_len == bias.shape[-1])):
+        # The prefill _struct_bias stays armed throughout generate (its shape only
+        # matches the prefill forward), so the decode row applies whenever the
+        # prefill branch below does not.
+        row = row.to(device=query.device, dtype=query.dtype)
+        if attention_mask is None:
+            attention_mask = row
+        else:
+            am = attention_mask[..., :k_len]
+            if am.dtype == torch.bool:
+                am = torch.zeros_like(am, dtype=query.dtype).masked_fill(
+                    ~am, torch.finfo(query.dtype).min)
+            else:
+                am = am.to(device=query.device, dtype=query.dtype)
+            attention_mask = am + row
     if bias is not None and q_len == bias.shape[-2] and k_len == bias.shape[-1]:
         bias = bias.to(device=query.device, dtype=query.dtype)
         if attention_mask is None:
@@ -197,6 +220,7 @@ class GraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         # Per-forward additive attention bias [B, 1, seq, seq]; read by the patched
         # attention layers, set in forward / inference, disarmed afterwards.
         self._struct_bias: torch.Tensor | None = None
+        self._decode_bias_row: torch.Tensor | None = None
         self._install_graph_mask()
 
     def structural_parameters(self) -> list[nn.Parameter]:
@@ -435,6 +459,7 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
 
         # Per-forward additive attention bias [B, 1, seq, seq]; carries grad to the GT.
         self._struct_bias: torch.Tensor | None = None
+        self._decode_bias_row: torch.Tensor | None = None
         self._install_graph_mask()
 
     def structural_parameters(self) -> list[nn.Parameter]:
@@ -977,6 +1002,27 @@ def build_injection_map(
     return injection_map
 
 
+def decode_style_query_map(
+    injection_map: dict[int, list[tuple[int, int]]],
+    answer_start: int,
+) -> dict[int, list[tuple[int, int]]]:
+    """QUERY-role map under the decode-consistency rule (decode-time design note §3).
+
+    Prompt-side spans (start < ``answer_start``) are kept whole; each answer-side span
+    is reduced to its FINAL token position only — the forward that consumes a
+    mention's completing token is the first that can know its node id at decode time.
+    Pair with the FULL map in the key role (``key_injection_maps``): answer mentions
+    always act as keys once complete (score-level bias needs no KV-cache surgery).
+    Used by ``injection_scope='decode_consistent'`` training and the decode-style
+    diagnostic.
+    """
+    out: dict[int, list[tuple[int, int]]] = {}
+    for node_idx, spans in injection_map.items():
+        kept = [(s, e) if s < answer_start else (e - 1, e) for s, e in spans]
+        out[node_idx] = sorted(kept)
+    return out
+
+
 def clamp_injection_map(
     injection_map: dict[int, list[tuple[int, int]]],
     scope_end: int,
@@ -1049,3 +1095,105 @@ def bucketize_prompt(input_ids_b: list, node_token_seqs : list) -> defaultdict:
             if has_match(input_ids_b, to_match=node_token_seq,start_pos=p_idx):
                 buckets[node_idx].add(p_idx)
     return buckets
+
+
+class MaskDecodeInjector:
+    """Decode-time structural-mask extension for the mask archs (design note §2.2).
+
+    Batch-size-1 generation only (eval generates one sample at a time). Register
+    :meth:`pre_hook` as a forward pre-hook on ``model.llm`` for the duration of one
+    ``generate`` call; remove the handle and clear ``model._decode_bias_row`` after.
+
+    Per decode step (single-token forward), the hook:
+      1. appends the consumed token to the generated suffix and re-derives node-mention
+         spans over the suffix with ``build_injection_map`` (same longest-first,
+         disjoint semantics as training); a span ending exactly at the suffix end is
+         DEFERRED while any node-name token sequence strictly extends it (partial-
+         mention ambiguity rule);
+      2. tags the current query iff it is the FINAL token of a completed span
+         (``decode_style`` semantics — the §3 consistency rule);
+      3. arms ``model._decode_bias_row`` ([1, 1, 1, K]) with ``M[q, π_k(s)]`` over all
+         key positions (prompt wiring + every completed suffix mention), −inf on
+         non-adjacent node pairs, 0 elsewhere; untagged queries arm nothing.
+
+    ``M`` is the same per-node-pair value the prefill bias uses: 0/−inf for
+    ``GraphMaskLLM``, ``α + (1−α)·sim(ΨΨᵀ)`` (Ψ computed once at construction) for
+    ``LearnableGraphMaskLLM``.
+    """
+
+    def __init__(self, model, pyg_graph, prompt_injection_map, prompt_len,
+                 node_token_seqs):
+        self.model = model
+        self.node_token_seqs = node_token_seqs
+        self.prompt_len = prompt_len
+        self.generated: list[int] = []
+        self.device = next(model.parameters()).device
+        adj = model._node_adjacency(pyg_graph, self.device)
+        if hasattr(model, "pe_model"):
+            # LearnableGraphMaskLLM: learned relative-PE values on allowed pairs.
+            with torch.no_grad():
+                psi = model.pe_model(pyg_graph).float()
+                if model._mask_psi_scale == "cosine":
+                    psi = psi / psi.norm(dim=-1, keepdim=True).clamp_min(model._mask_eps)
+                    sim = psi @ psi.t()
+                else:
+                    sim = (psi @ psi.t()) / (psi.shape[-1] ** 0.5)
+            node_m = model._mask_alpha + (1.0 - model._mask_alpha) * sim
+        else:
+            node_m = torch.zeros_like(adj, dtype=torch.float32)
+        neg = torch.finfo(torch.float32).min
+        self.node_values = torch.where(adj, node_m, torch.full_like(node_m, neg))
+        self.prompt_tok2node = tok2node_vector(prompt_injection_map, prompt_len,
+                                               self.device)
+        # Flattened variant list for the partial-mention ambiguity check.
+        self._all_variants = [seq for seqs in node_token_seqs
+                              for seq in (seqs if seqs and isinstance(seqs[0], list)
+                                          else [seqs]) if seq]
+
+    def _suffix_spans(self):
+        """Completed, unambiguous suffix spans: {node: [(s, e)]}, suffix coordinates."""
+        smap = build_injection_map(self.generated, self.node_token_seqs, scope_start=0)
+        n = len(self.generated)
+        out = {}
+        for nid, spans in smap.items():
+            kept = []
+            for start, end in spans:
+                if end == n and self._extendable(self.generated[start:end]):
+                    continue                     # still ambiguous — defer assignment
+                kept.append((start, end))
+            if kept:
+                out[nid] = kept
+        return out
+
+    def _extendable(self, toks):
+        """True iff some node-name token sequence strictly extends ``toks``."""
+        k = len(toks)
+        return any(len(seq) > k and seq[:k] == toks for seq in self._all_variants)
+
+    def pre_hook(self, module, args, kwargs):
+        input_ids = kwargs.get("input_ids")
+        if input_ids is None and args:
+            input_ids = args[0]
+        if input_ids is None or input_ids.shape[0] != 1 or input_ids.shape[1] != 1:
+            return                                # prefill (or unexpected shape)
+        self.generated.append(int(input_ids[0, 0]))
+        spans = self._suffix_spans()
+        p_suffix = len(self.generated) - 1
+        q_node = -1
+        for nid, sps in spans.items():
+            for start, end in sps:
+                if end - 1 == p_suffix:
+                    q_node = nid
+        if q_node < 0:
+            self.model._decode_bias_row = None    # untagged query: bias row is all-zero
+            return
+        k_len = self.prompt_len + len(self.generated)
+        tok2node_k = torch.full((k_len,), -1, dtype=torch.long, device=self.device)
+        tok2node_k[:self.prompt_len] = self.prompt_tok2node
+        for nid, sps in spans.items():
+            for start, end in sps:
+                tok2node_k[self.prompt_len + start:self.prompt_len + end] = nid
+        row = torch.zeros(k_len, dtype=torch.float32, device=self.device)
+        k_pos = (tok2node_k >= 0).nonzero(as_tuple=True)[0]
+        row[k_pos] = self.node_values[q_node, tok2node_k[k_pos]]
+        self.model._decode_bias_row = row.view(1, 1, 1, k_len)

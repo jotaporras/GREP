@@ -108,3 +108,88 @@ def test_forward_accepts_key_injection_maps():
                      key_injection_maps=[FULL_MAP]).logits
     # Different wiring must change the logits (node rows lose in-span blocking).
     assert not torch.allclose(sym, asym)
+
+
+# ---------------------------------------------------------------------------
+# Decode-time parity (design note §4.2): the per-step rows armed by
+# MaskDecodeInjector must reproduce the teacher-forced asymmetric bias exactly,
+# and step-by-step cached decode must reproduce teacher-forced logits.
+# ---------------------------------------------------------------------------
+from prism.models.gnn_llm import MaskDecodeInjector, build_injection_map
+from prism.models.gnn_llm import decode_style_query_map as dsqm
+
+# node0 = [10, 11], node1 = [12], node2 = [13, 14]; path graph 0-1-2.
+SEQS = [[[10, 11]], [[12]], [[13, 14]]]
+PROMPT = [1, 10, 11, 12, 13, 14, 2]                 # node list in the prompt
+ANSWER = [3, 10, 11, 4, 13, 14, 5]                  # mentions node0 then node2
+FULL = PROMPT + ANSWER
+A_START = len(PROMPT)
+
+
+def _parity_fixture():
+    model = GraphMaskLLM(_tiny_llm(), k_hops=1, symmetrize=True).eval()
+    g = _graph(3, [[0, 1], [1, 2]])
+    full_map = build_injection_map(FULL, SEQS, scope_start=0)
+    q_map = dsqm(full_map, A_START)
+    prompt_map = build_injection_map(PROMPT, SEQS, scope_start=0)
+    return model, g, full_map, q_map, prompt_map
+
+
+def test_decode_rows_match_teacher_forced_bias():
+    model, g, full_map, q_map, prompt_map = _parity_fixture()
+    ref = model.build_structural_mask(len(FULL), [g], [q_map], "cpu",
+                                      dtype=torch.float32,
+                                      key_injection_maps=[full_map])[0, 0]
+    injector = MaskDecodeInjector(model, g, prompt_map, len(PROMPT), SEQS)
+    for i, tok in enumerate(ANSWER):
+        p = A_START + i
+        injector.pre_hook(None, (), {"input_ids": torch.tensor([[tok]])})
+        row = model._decode_bias_row
+        if row is None:
+            assert (ref[p, :p + 1] == 0).all(), f"pos {p}: ref row nonzero but no decode row"
+        else:
+            assert row.shape == (1, 1, 1, p + 1)
+            assert torch.equal(row[0, 0, 0], ref[p, :p + 1]), f"pos {p}: row mismatch"
+
+
+def test_decode_logits_match_teacher_forced():
+    model, g, full_map, q_map, prompt_map = _parity_fixture()
+    ids = torch.tensor([FULL])
+    with torch.no_grad():
+        ref = model(input_ids=ids, graphs=[g], injection_maps=[q_map],
+                    key_injection_maps=[full_map]).logits[0]
+
+    injector = MaskDecodeInjector(model, g, prompt_map, len(PROMPT), SEQS)
+    model._struct_bias = model.build_structural_mask(
+        len(PROMPT), [g], [prompt_map], "cpu")
+    with torch.no_grad():
+        out = model.llm(input_ids=torch.tensor([PROMPT]), use_cache=True)
+        past = out.past_key_values
+        assert torch.allclose(ref[:len(PROMPT)], out.logits[0], atol=1e-4)
+        for i, tok in enumerate(ANSWER):
+            injector.pre_hook(None, (), {"input_ids": torch.tensor([[tok]])})
+            step = model.llm(input_ids=torch.tensor([[tok]]),
+                             past_key_values=past, use_cache=True)
+            past = step.past_key_values
+            p = A_START + i
+            assert torch.allclose(ref[p], step.logits[0, 0], atol=1e-4), f"pos {p}"
+    model._struct_bias = None
+    model._decode_bias_row = None
+
+
+def test_partial_mention_ambiguity_defers_assignment():
+    # nodeA = [20], nodeB = [20, 21]: after generating [20] alone the span is
+    # extendable and must be deferred; a following non-extending token finalizes it.
+    model = GraphMaskLLM(_tiny_llm(), k_hops=1, symmetrize=True).eval()
+    g = _graph(2, [[0, 1]])
+    seqs = [[[20]], [[20, 21]]]
+    injector = MaskDecodeInjector(model, g, {}, 3, seqs)
+    injector.pre_hook(None, (), {"input_ids": torch.tensor([[20]])})
+    assert injector._suffix_spans() == {}          # deferred: [20] extendable to [20,21]
+    injector.pre_hook(None, (), {"input_ids": torch.tensor([[22]])})
+    assert injector._suffix_spans() == {0: [(0, 1)]}   # finalized as nodeA
+    injector.pre_hook(None, (), {"input_ids": torch.tensor([[20]])})
+    injector.pre_hook(None, (), {"input_ids": torch.tensor([[21]])})
+    spans = injector._suffix_spans()
+    assert spans[1] == [(2, 4)]                    # completed [20,21] = nodeB
+    model._decode_bias_row = None

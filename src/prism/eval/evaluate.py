@@ -202,6 +202,7 @@ def eval_model_single_graph(
     use_icl: bool,
     permutation,
     edge_weights: str = "gaussian",
+    injection_scope: str = "full_sequence",
 ) -> Tuple[float, List[Dict]]:
     """Run the planning-simulation loop over `eval_samples` (all same underlying graph).
 
@@ -228,6 +229,7 @@ def eval_model_single_graph(
             include_edges=include_edge_list,
             permutation=permutation,
             edge_weights=edge_weights,
+            injection_scope=injection_scope,
         )
     else:
         client = inference.InMemoryLLM(
@@ -389,6 +391,7 @@ def eval_model_multiple_graphs(
     permutation,
     on_graph_done: Optional[Callable[[str, GraphEvalResultSummary], None]],
     edge_weights: str = "gaussian",
+    injection_scope: str = "full_sequence",
 ) -> Dict[str, GraphEvalResultSummary]:
     """Evaluate one model over many graphs; returns per-graph GraphEvalResultSummary dicts.
 
@@ -410,6 +413,7 @@ def eval_model_multiple_graphs(
             use_icl=use_icl,
             permutation=permutation,
             edge_weights=edge_weights,
+            injection_scope=injection_scope,
         )
         elapsed = time.time() - t0
 
@@ -797,6 +801,7 @@ def evaluate_model(
     checkpoint_label: Optional[str] = None,
     permutation=None,
     edge_weights: str = "gaussian",
+    injection_scope: str = "full_sequence",
 ) -> Dict[str, "GraphEvalResultSummary"]:
     """Score a loaded model over a graph set and write per-graph cross-eval JSONs.
 
@@ -842,6 +847,7 @@ def evaluate_model(
         permutation=permutation,
         on_graph_done=None,
         edge_weights=edge_weights,
+        injection_scope=injection_scope,
     )
 
     for name, result in results.items():

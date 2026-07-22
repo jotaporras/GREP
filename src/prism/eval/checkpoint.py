@@ -99,6 +99,21 @@ def resolve_edge_weights(checkpoint: str) -> str:
     return "gaussian"
 
 
+def resolve_injection_scope(checkpoint: str) -> str:
+    """Recover the train-time ``data.injection_scope`` so generation wiring matches
+    training (``decode_consistent`` checkpoints need decode-time injection armed).
+
+    Read from ``train_config.json``. A missing key means the checkpoint predates the
+    knob; every such run was trained with full-sequence maps — the exact historical
+    value, not a guess (generation behavior is identical for every value except
+    ``decode_consistent``).
+    """
+    tc = _read_json(os.path.join(checkpoint, "train_config.json"))
+    if tc is not None and tc.get("injection_scope") is not None:
+        return tc["injection_scope"]
+    return "full_sequence"
+
+
 def load_checkpoint(checkpoint: str, four_bit: bool, device: int):
     """Load a trained checkpoint for eval. Returns ``(model, tokenizer, is_gnn)``.
 

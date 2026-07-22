@@ -15,6 +15,7 @@ from prism.eval import evaluate
 from prism.models.gnn_llm import (
     build_injection_map,
     clamp_injection_map,
+    decode_style_query_map,
     exclude_positions_from_injection_map,
     find_last_graph_scope,
     node_token_variants,
@@ -428,6 +429,12 @@ class SpineDataCollator(TokenIndexCollator):
       ``edge_list_idx`` for ``loss_target='edge_list'``) so no supervised token
       carries its own node's channel. Enforces injection ∩ loss-target = ∅ even
       when the supervised block lives in the prompt (edge-list reconstruction).
+    - ``"decode_consistent"`` (e13c, mask archs only): asymmetric wiring per the
+      decode-time design note §3 — answer mentions act as KEYS over their full span
+      (``key_injection_maps`` = full map) but as QUERIES only at their final token
+      (``injection_maps`` = ``decode_style_query_map``). Exactly reproducible at
+      generation by ``MaskDecodeInjector`` (span-end assignment from the generated
+      prefix), so training and decode expose the identical channel.
     """
 
     injection_scope = "full_sequence"
@@ -439,7 +446,7 @@ class SpineDataCollator(TokenIndexCollator):
     edge_weights = "gaussian"
 
     def _extract_graph(self, example):
-        """Build PyG graph and injection map from a preprocessed example."""
+        """Build PyG graph, injection map, and (decode_consistent only) key map."""
         pyg_graph = utils.scene_graph_dict_to_pyg(
             example["scene_graph_dict"], edge_weights=self.edge_weights
         )
@@ -449,6 +456,7 @@ class SpineDataCollator(TokenIndexCollator):
         injection_map = build_injection_map(
             example["input_ids"], node_token_seqs, scope_start=scope_start
         )
+        key_injection_map = None
         if self.injection_scope == "prompt_only":
             injection_map = clamp_injection_map(injection_map, example["answer_start"])
         elif self.injection_scope == "exclude_supervised":
@@ -460,18 +468,26 @@ class SpineDataCollator(TokenIndexCollator):
             injection_map = exclude_positions_from_injection_map(
                 injection_map, set(example[self.supervised_positions_key])
             )
-        return pyg_graph, injection_map
+        elif self.injection_scope == "decode_consistent":
+            key_injection_map = injection_map
+            injection_map = decode_style_query_map(
+                injection_map, example["answer_start"])
+        return pyg_graph, injection_map, key_injection_map
 
     def __call__(self, features, return_tensors: Optional[str] = None):
         """Extract PyG graphs and injection maps, then delegate to TokenIndexCollator for padding."""
         pyg_graphs = []
         injection_maps = []
+        key_injection_maps = []
         for example in features:
-            pyg_graph, injection_map = self._extract_graph(example)
+            pyg_graph, injection_map, key_injection_map = self._extract_graph(example)
             pyg_graphs.append(pyg_graph)
             injection_maps.append(injection_map)
+            key_injection_maps.append(key_injection_map)
 
         batch = super().__call__(features)
         batch["graphs"] = Batch.from_data_list(pyg_graphs)
         batch["injection_maps"] = injection_maps
+        if self.injection_scope == "decode_consistent":
+            batch["key_injection_maps"] = key_injection_maps
         return batch

@@ -90,7 +90,8 @@ def train_model(config: omegaconf.DictConfig):
     # positions (from trainer.loss_target's index column) so no supervised token
     # carries its own node's channel — needed when the supervised block is inside
     # the prompt (loss_target='edge_list'), where prompt_only doesn't reach.
-    valid_scopes = ("full_sequence", "prompt_only", "exclude_supervised")
+    valid_scopes = ("full_sequence", "prompt_only", "exclude_supervised",
+                    "decode_consistent")
     if config.data.injection_scope not in valid_scopes:
         raise ValueError(
             f"data.injection_scope must be one of {valid_scopes}, "
@@ -306,6 +307,7 @@ def train_model(config: omegaconf.DictConfig):
             include_edge_list=(config.data.text_edge_list == "present"),
             eval_epoch_interval=config.eval.epoch_interval,
             edge_weights=config.data.edge_weights,
+            injection_scope=config.data.injection_scope,
         )
     )
 
@@ -330,6 +332,7 @@ def train_model(config: omegaconf.DictConfig):
             architecture=config.gnn.arch,
             checkpoint_label=sft_args.output_dir,
             edge_weights=config.data.edge_weights,
+            injection_scope=config.data.injection_scope,
         )
     else:
         trainer.train()
@@ -359,6 +362,7 @@ def train_model(config: omegaconf.DictConfig):
             architecture=config.gnn.arch,
             checkpoint_label=sft_args.output_dir,
             edge_weights=config.data.edge_weights,
+            injection_scope=config.data.injection_scope,
         )
 
     return trainer
@@ -483,6 +487,19 @@ def _validate_config(config: omegaconf.DictConfig) -> None:
             raise ValueError(
                 "gnn.semantic_gt_from requires gnn.pe_gt_from (the navigator needs both). "
                 "Set pe_gt_from alone for a GT-only Ψ producer.")
+    if (config.data.injection_scope == "decode_consistent"
+            and config.gnn.arch not in ("graph_mask_llm", "learnable_graph_mask")):
+        raise ValueError(
+            "injection_scope='decode_consistent' is only wired for the mask archs "
+            "(graph_mask_llm / learnable_graph_mask) — the additive family needs the "
+            f"q/kv split (design note §2.3, not built). Got {config.gnn.arch!r}.")
+    if (config.data.injection_scope == "decode_consistent"
+            and config.gnn.mask_layer_scope != "dense"):
+        raise ValueError(
+            "injection_scope='decode_consistent' requires gnn.mask_layer_scope='dense': "
+            "at decode, sliding-window layers crop their KV cache so the per-step bias "
+            "row cannot be applied there — training them with the bias would recreate "
+            "the train/decode asymmetry this mode exists to remove.")
     if config.trainer.loss_target not in ("all", "responses", "edge_list"):
         raise ValueError(
             f"loss_target must be 'all', 'responses', or 'edge_list', got {config.trainer.loss_target!r}"
