@@ -162,3 +162,31 @@ deleted (6.3G freed). The e13 pipeline is fully validated; arms fire as soon as
 
 Navigator-mode wiring check on a b200: 4 steps + save + 1-graph eval +
 from-disk reload eval. RANDOMINIT GT stand-in — NOT science, report_to=none.
+
+## e13d + e13e (2026-07-22): combination and layer-scope ablation
+
+| arm | config | acc | halluc |
+|---|---|---|---|
+| **e13d_agt_decode** | nav GT+AGT × decode_consistent | **0.79** | 0.038 |
+| **e13d_gt_decode** | nav GT only × decode_consistent | **0.79** | 0.035 |
+| e13c_rpe_decode | edge-detector Ψ × decode (ref) | 0.73 | 0.060 |
+| e13e_rpe_tophalf | 0.73-config, deeper 5 globals only | (pending) | — |
+| e13e_rpe_firstglobal | 0.73-config, first global only | 0.15 | 0.53 |
+
+- **0.79 = new best** (with-edges band: 0.87–0.95). Nav-pretraining is worth
+  +0.06 on top of decode wiring; single-flag pairs vs e13 arms: gt 0.44→0.79,
+  agt 0.58→0.79.
+- GT-only ≡ GT+AGT under decode wiring — the AGT's prompt-only advantage (+0.14)
+  vanishes; its content is redundant once the wiring delivers the GT's signal at
+  decision time.
+- One mask layer (dense_first) collapses to 0.15/0.53 halluc — the channel
+  requires multi-layer attention structure; a single insertion point is not a
+  bottleneck-friendly interface.
+- Diagnostic on the 0.73 checkpoint: decode_style (native) 0.861/0.49 ==
+  train_style exactly; prompt_only 0.64. The teacher-forced ~0.83 wall was an
+  artifact of circuits trained under other wirings; decode-consistent training
+  broke it. Per-decision gap to with-edges: 6 pts / 0.2 nats.
+- Failure modes of 0.73 (per-sample analysis, eval_logs step_000600): 23/27
+  failures = 1-2 hallucinated hops in otherwise-valid routes, 15/23 of them
+  distance-2 near-misses; waypoint/avoid tasks 0.60 vs plain 0.82; length decay
+  0.86/0.72/0.58 (≤3/4-5/6+ nodes). Zero formatting/node-existence failures.
