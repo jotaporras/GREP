@@ -196,3 +196,30 @@ Layer-scope ladder (single-flag vs 0.73): all 10 globals 0.73 > deeper 5 = 0.63
 ~0.10 even keeping the deeper half; the mask is not compressible to few layers.
 (Whether MORE than 10 would help is untestable under decode wiring — sliding
 layers can't carry the row.)
+
+## e13f (2026-07-22): mask-composition sweep on the 0.79 recipe (job 7161720)
+
+Single-flag A/Bs vs e13d_gt_decode (α=0.7, k_hops=1, 0.79). Edge values are
+`α + (1−α)·cosine(ΨΨᵀ)` on legal pairs, −inf elsewhere (`gnn_llm.py:567`).
+
+| arm | change | edge-value band | acc | halluc |
+|---|---|---|---|---|
+| **e13f_alpha00** | α=0.0 | [−1, 1] pure learned sim | **0.86** | 0.013 |
+| e13f_alpha09 | α=0.9 | [0.8, 1.0] near-uniform | 0.84 | 0.012 |
+| e13d_gt_decode (ref) | α=0.7 | [0.4, 1.0] | 0.79 | 0.035 |
+| e13f_alpha03 | α=0.3 | [−0.4, 1.0] | 0.79 | 0.037 |
+| e13f_khops2 | k_hops=2, α=0.7 | 2-hop legal set | 0.16 | 0.51 |
+
+- **0.86 = new campaign best** (with-edges band 0.87–0.95; per-run ref
+  wo83xg96 = 0.95). Campaign ladder now 0.48 → 0.58 → 0.73 → 0.79 → 0.86.
+- α curve is non-monotone (0.86 / 0.79 / 0.79 / 0.84 at 0/0.3/0.7/0.9) and the
+  spread is ~1.5 s.e. at n=100 — flat within noise except that both extremes
+  beat the middle. Hallucination DOES separate: ~0.012 at the extremes vs
+  ~0.036 mid-α. No interpretation committed here; replication seeds needed
+  before reading the α shape as real.
+- **k_hops=2 collapses (0.16, halluc 0.51)**: hard-allowing distance-2 pairs
+  legalizes exactly the distance-2 near-miss failure mode and the model takes
+  the skips. Settles the full-N×N-soft-bias question empirically — the 1-hop
+  hard block IS the load-bearing signal; softening/widening it destroys the
+  channel. (Dead end recorded: do not revisit N×N soft bias without a new
+  mechanism for preserving the hard 1-hop constraint.)
