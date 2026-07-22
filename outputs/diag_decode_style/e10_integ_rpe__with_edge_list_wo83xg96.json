@@ -1,0 +1,120 @@
+{
+  "checkpoint": "/vast/projects/aribeiro/alelab/jporras/GREP-PRISM/outputs/dev_e10/e10_integ_rpe/e10_integ_rpe__with_edge_list_wo83xg96",
+  "architecture": "learnable_graph_mask",
+  "text_edge_list": "present",
+  "val_file": "data/revised/gen/nav100_n30_gemma_data/split/formatted_all_new__val.json",
+  "seed": 1234,
+  "n_examples_graded": 100,
+  "conditions": {
+    "train_style": {
+      "decision": {
+        "n": 519,
+        "acc": 0.9152215799614644,
+        "mean_nll": 0.29807343999241287
+      },
+      "completion": {
+        "n": 1716,
+        "acc": 0.9994172494172494,
+        "mean_nll": 0.002476341492375527
+      },
+      "repeat": {
+        "n": 9965,
+        "acc": 0.994982438534872,
+        "mean_nll": 0.013246796050368494
+      },
+      "all_answer_nodes": {
+        "n": 12200,
+        "acc": 0.9922131147540983,
+        "mean_nll": 0.0238486748589365
+      }
+    },
+    "prompt_only": {
+      "decision": {
+        "n": 519,
+        "acc": 0.9210019267822736,
+        "mean_nll": 0.29054364377923175
+      },
+      "completion": {
+        "n": 1716,
+        "acc": 0.9982517482517482,
+        "mean_nll": 0.006375811928697048
+      },
+      "repeat": {
+        "n": 9965,
+        "acc": 0.9946813848469643,
+        "mean_nll": 0.014371744391416226
+      },
+      "all_answer_nodes": {
+        "n": 12200,
+        "acc": 0.9920491803278688,
+        "mean_nll": 0.024995694080316155
+      }
+    },
+    "decode_style": {
+      "decision": {
+        "n": 519,
+        "acc": 0.9210019267822736,
+        "mean_nll": 0.28424782362961926
+      },
+      "completion": {
+        "n": 1716,
+        "acc": 0.9982517482517482,
+        "mean_nll": 0.006824320216002181
+      },
+      "repeat": {
+        "n": 9965,
+        "acc": 0.9945810336176618,
+        "mean_nll": 0.015221410795025623
+      },
+      "all_answer_nodes": {
+        "n": 12200,
+        "acc": 0.9919672131147541,
+        "mean_nll": 0.025484959300007236
+      }
+    },
+    "decode_trail": {
+      "decision": {
+        "n": 519,
+        "acc": 0.905587668593449,
+        "mean_nll": 0.3592265103579515
+      },
+      "completion": {
+        "n": 1716,
+        "acc": 0.9982517482517482,
+        "mean_nll": 0.0065643717169005505
+      },
+      "repeat": {
+        "n": 9965,
+        "acc": 0.9905669844455595,
+        "mean_nll": 0.03507709176264359
+      },
+      "all_answer_nodes": {
+        "n": 12200,
+        "acc": 0.9880327868852459,
+        "mean_nll": 0.04485624929518366
+      }
+    },
+    "no_injection": {
+      "decision": {
+        "n": 519,
+        "acc": 0.9190751445086706,
+        "mean_nll": 0.29658463481970804
+      },
+      "completion": {
+        "n": 1716,
+        "acc": 0.9982517482517482,
+        "mean_nll": 0.005994853976878733
+      },
+      "repeat": {
+        "n": 9965,
+        "acc": 0.994982438534872,
+        "mean_nll": 0.014099428151272337
+      },
+      "all_answer_nodes": {
+        "n": 12200,
+        "acc": 0.9922131147540983,
+        "mean_nll": 0.024976671306835296
+      }
+    }
+  }
+}
