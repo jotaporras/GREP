@@ -170,7 +170,7 @@ from-disk reload eval. RANDOMINIT GT stand-in — NOT science, report_to=none.
 | **e13d_agt_decode** | nav GT+AGT × decode_consistent | **0.79** | 0.038 |
 | **e13d_gt_decode** | nav GT only × decode_consistent | **0.79** | 0.035 |
 | e13c_rpe_decode | edge-detector Ψ × decode (ref) | 0.73 | 0.060 |
-| e13e_rpe_tophalf | 0.73-config, deeper 5 globals only | (pending) | — |
+| e13e_rpe_tophalf | 0.73-config, deeper 5 globals only | 0.63 | 0.065 |
 | e13e_rpe_firstglobal | 0.73-config, first global only | 0.15 | 0.53 |
 
 - **0.79 = new best** (with-edges band: 0.87–0.95). Nav-pretraining is worth
@@ -190,3 +190,9 @@ from-disk reload eval. RANDOMINIT GT stand-in — NOT science, report_to=none.
   failures = 1-2 hallucinated hops in otherwise-valid routes, 15/23 of them
   distance-2 near-misses; waypoint/avoid tasks 0.60 vs plain 0.82; length decay
   0.86/0.72/0.58 (≤3/4-5/6+ nodes). Zero formatting/node-existence failures.
+
+Layer-scope ladder (single-flag vs 0.73): all 10 globals 0.73 > deeper 5 = 0.63
+> first 1 = 0.15. Every insertion point carries weight — halving the scope costs
+~0.10 even keeping the deeper half; the mask is not compressible to few layers.
+(Whether MORE than 10 would help is untestable under decode wiring — sliding
+layers can't carry the row.)
