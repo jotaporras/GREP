@@ -84,7 +84,7 @@ gnn:
   # STANDALONE GraphTransformer (reuses the gt_*/pe_* params above) + mask_k_hops/
   # symmetrize/use_edges for A. Requires pe_node_features=random (probe-based GT).
   mask_alpha: 0.7            # edge value = alpha + (1-alpha)*sim; non-edge = blocked (alpha in [0,1))
-  mask_layer_scope: dense    # "all" = every self-attn layer | "dense" = Gemma full_attention (global) layers only
+  mask_layer_scope: dense    # "all" = every layer | "dense" = all global layers | "dense_top_half" = deeper half of globals | "dense_first" = first global only
   mask_psi_scale: cosine     # "cosine" (row-normalized, sim in [-1,1]) | "inv_sqrt_d" (Gemma-style raw/sqrt(D))
 
   # Two-group LR: structural (GT/PE) params train at structural_lr_mult x base LR

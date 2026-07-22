@@ -129,6 +129,36 @@ def _graph_mask_attention_forward(module, query, key, value, attention_mask,
 AttentionInterface.register(_GRAPH_MASK_IMPL, _graph_mask_attention_forward)
 
 
+MASK_LAYER_SCOPES = ("all", "dense", "dense_top_half", "dense_first")
+
+
+def resolve_mask_active_flags(layers, layer_scope) -> list[bool]:
+    """Per-layer activation of the structural mask under ``layer_scope``.
+
+    - ``"all"``: every self-attn layer (historical).
+    - ``"dense"``: every non-sliding (Gemma full_attention / global) layer.
+    - ``"dense_top_half"``: the LATER half of the global layers (10 globals → the
+      last 5, i.e. the deeper ones).
+    - ``"dense_first"``: only the first (shallowest) global layer.
+
+    All dense_* scopes are subsets of "dense", so they stay compatible with
+    decode-time injection (sliding layers never carry the channel).
+    """
+    if layer_scope not in MASK_LAYER_SCOPES:
+        raise ValueError(f"layer_scope must be one of {MASK_LAYER_SCOPES}, got {layer_scope!r}")
+    sliding = [bool(getattr(layer.self_attn, "is_sliding", False)) for layer in layers]
+    if layer_scope == "all":
+        return [True] * len(layers)
+    globals_idx = [i for i, sl in enumerate(sliding) if not sl]
+    if layer_scope == "dense":
+        keep = set(globals_idx)
+    elif layer_scope == "dense_top_half":
+        keep = set(globals_idx[len(globals_idx) // 2:])
+    else:  # dense_first
+        keep = {globals_idx[0]}
+    return [i in keep for i in range(len(layers))]
+
+
 def tok2node_vector(injection_map, seq_len, device) -> torch.Tensor:
     """``[seq_len]`` long tensor: token position → node id, −1 for non-node tokens.
 
@@ -211,8 +241,8 @@ class GraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         self._mask_use_edges = bool(use_edges)
         # "all" = every self-attn layer (default, historical behavior); "dense" = only Gemma
         # full_attention (global) layers — the non-learnable control matching the learnable mask.
-        if layer_scope not in ("all", "dense"):
-            raise ValueError(f"layer_scope must be 'all' or 'dense', got {layer_scope!r}")
+        if layer_scope not in MASK_LAYER_SCOPES:
+            raise ValueError(f"layer_scope must be one of {MASK_LAYER_SCOPES}, got {layer_scope!r}")
         self._mask_layer_scope = layer_scope
         # A/B ablation knob: reproduce the pre-fix causal/sliding-mask leak (see
         # _graph_mask_attention_forward). Default False = correct masking.
@@ -266,15 +296,14 @@ class GraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             masking_utils.AttentionMaskInterface.register(
                 _GRAPH_MASK_IMPL, mask_fns._global_mapping[self._graph_mask_orig_attn_impl])
 
-        for layer in layers:
+        active_flags = resolve_mask_active_flags(layers, self._mask_layer_scope)
+        for layer, active in zip(layers, active_flags):
             attn = layer.self_attn
             # Bypass nn.Module.__setattr__ to avoid registering a submodule cycle (attn→wrapper→llm→attn).
             object.__setattr__(attn, "_graph_mask_model", self)
             attn._graph_mask_orig_attn_fn = orig_attn_fn
             attn._graph_mask_buggy_fold = self._mask_buggy_fold
-            # Layer scope: 'dense' ⇒ only Gemma full_attention (global) layers carry the mask.
-            attn._graph_mask_active = bool(
-                self._mask_layer_scope == "all" or not getattr(attn, "is_sliding", False))
+            attn._graph_mask_active = active
             attn.config._attn_implementation = _GRAPH_MASK_IMPL
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
@@ -433,8 +462,8 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             raise ValueError(
                 f"alpha must be in [0, 1); alpha=1 zeroes the learnable term so the GT "
                 f"gets no gradient. Got {alpha}.")
-        if layer_scope not in ("all", "dense"):
-            raise ValueError(f"layer_scope must be 'all' or 'dense', got {layer_scope!r}")
+        if layer_scope not in MASK_LAYER_SCOPES:
+            raise ValueError(f"layer_scope must be one of {MASK_LAYER_SCOPES}, got {layer_scope!r}")
         self._mask_layer_scope = layer_scope
         if psi_scale not in ("cosine", "inv_sqrt_d"):
             raise ValueError(f"psi_scale must be 'cosine' or 'inv_sqrt_d', got {psi_scale!r}")
@@ -507,14 +536,14 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             masking_utils.AttentionMaskInterface.register(
                 _GRAPH_MASK_IMPL, mask_fns._global_mapping[self._graph_mask_orig_attn_impl])
 
-        for layer in layers:
+        active_flags = resolve_mask_active_flags(layers, self._mask_layer_scope)
+        for layer, _active in zip(layers, active_flags):
             attn = layer.self_attn
             # Bypass nn.Module.__setattr__ to avoid registering a submodule cycle.
             object.__setattr__(attn, "_graph_mask_model", self)
             attn._graph_mask_orig_attn_fn = orig_attn_fn
             # Dense-only scope deactivates sliding-window layers (they delegate untouched).
-            attn._graph_mask_active = bool(
-                self._mask_layer_scope == "all" or not getattr(attn, "is_sliding", False))
+            attn._graph_mask_active = _active
             attn._graph_mask_buggy_fold = self._mask_buggy_fold
             attn.config._attn_implementation = _GRAPH_MASK_IMPL
 

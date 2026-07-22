@@ -222,3 +222,22 @@ def test_partial_mention_ambiguity_defers_assignment():
     spans = injector._suffix_spans()
     assert spans[1] == [(2, 4)]                    # completed [20,21] = nodeB
     model._decode_bias_row = None
+
+
+def test_mask_layer_scope_variants():
+    from prism.models.gnn_llm import resolve_mask_active_flags
+
+    class _A:  # attn stub
+        def __init__(self, sliding): self.is_sliding = sliding
+    class _L:
+        def __init__(self, sliding): self.self_attn = _A(sliding)
+    # 12-layer 5:1 gemma-like pattern -> globals at 5, 11
+    layers = [_L(i % 6 != 5) for i in range(12)]
+    assert [i for i, f in enumerate(resolve_mask_active_flags(layers, "dense")) if f] == [5, 11]
+    assert [i for i, f in enumerate(resolve_mask_active_flags(layers, "dense_top_half")) if f] == [11]
+    assert [i for i, f in enumerate(resolve_mask_active_flags(layers, "dense_first")) if f] == [5]
+    assert all(resolve_mask_active_flags(layers, "all"))
+    # 10-global pattern: top half = last 5
+    layers = [_L(False) for _ in range(10)]
+    assert sum(resolve_mask_active_flags(layers, "dense_top_half")) == 5
+    assert [i for i, f in enumerate(resolve_mask_active_flags(layers, "dense_top_half")) if f] == [5, 6, 7, 8, 9]

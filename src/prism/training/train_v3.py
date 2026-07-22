@@ -469,9 +469,10 @@ def _validate_config(config: omegaconf.DictConfig) -> None:
             raise ValueError(
                 f"gnn.mask_alpha must be in [0, 1) (alpha=1 kills the GT gradient), "
                 f"got {config.gnn.mask_alpha}")
-        if config.gnn.mask_layer_scope not in ("all", "dense"):
+        if config.gnn.mask_layer_scope not in ("all", "dense", "dense_top_half", "dense_first"):
             raise ValueError(
-                f"gnn.mask_layer_scope must be 'all' or 'dense', got {config.gnn.mask_layer_scope!r}")
+                f"gnn.mask_layer_scope must be one of ('all', 'dense', 'dense_top_half', "
+                f"'dense_first'), got {config.gnn.mask_layer_scope!r}")
         if config.gnn.mask_psi_scale not in ("cosine", "inv_sqrt_d"):
             raise ValueError(
                 f"gnn.mask_psi_scale must be 'cosine' or 'inv_sqrt_d', got {config.gnn.mask_psi_scale!r}")
@@ -494,9 +495,9 @@ def _validate_config(config: omegaconf.DictConfig) -> None:
             "(graph_mask_llm / learnable_graph_mask) — the additive family needs the "
             f"q/kv split (design note §2.3, not built). Got {config.gnn.arch!r}.")
     if (config.data.injection_scope == "decode_consistent"
-            and config.gnn.mask_layer_scope != "dense"):
+            and config.gnn.mask_layer_scope == "all"):
         raise ValueError(
-            "injection_scope='decode_consistent' requires gnn.mask_layer_scope='dense': "
+            "injection_scope='decode_consistent' requires a dense-family mask_layer_scope: "
             "at decode, sliding-window layers crop their KV cache so the per-step bias "
             "row cannot be applied there — training them with the bias would recreate "
             "the train/decode asymmetry this mode exists to remove.")
