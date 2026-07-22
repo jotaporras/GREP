@@ -1002,24 +1002,57 @@ def build_injection_map(
     return injection_map
 
 
+def _extendable_span(tokens: list[int], node_token_seqs: list) -> bool:
+    """True iff some node-name token sequence strictly extends ``tokens`` — the
+    mention is still ambiguous at its own final token (e.g. ``region_1`` vs
+    ``region_10`` under digit-split tokenization)."""
+    k = len(tokens)
+    for seqs in node_token_seqs:
+        variants = seqs if (seqs and isinstance(seqs[0], list)) else [seqs]
+        for seq in variants:
+            if len(seq) > k and seq[:k] == tokens:
+                return True
+    return False
+
+
 def decode_style_query_map(
     injection_map: dict[int, list[tuple[int, int]]],
     answer_start: int,
+    input_ids: list[int],
+    node_token_seqs: list,
 ) -> dict[int, list[tuple[int, int]]]:
     """QUERY-role map under the decode-consistency rule (decode-time design note §3).
 
-    Prompt-side spans (start < ``answer_start``) are kept whole; each answer-side span
-    is reduced to its FINAL token position only — the forward that consumes a
-    mention's completing token is the first that can know its node id at decode time.
-    Pair with the FULL map in the key role (``key_injection_maps``): answer mentions
-    always act as keys once complete (score-level bias needs no KV-cache surgery).
-    Used by ``injection_scope='decode_consistent'`` training and the decode-style
-    diagnostic.
+    Prompt-side spans (start < ``answer_start``) are kept whole; each answer-side
+    span is reduced to the single position where its node id first becomes
+    KNOWABLE at decode time:
+
+    - unambiguous name: the span's final token (``e-1``) — the forward consuming
+      the completing token can already commit the assignment;
+    - name that is a token-prefix of another node's name (``_extendable_span``):
+      the position AFTER the span (``e``) — only the next token resolves whether
+      the mention stopped short or continues into the longer name. A span ending
+      at the sequence end with no resolving position is dropped (matches decode,
+      where generation ended before the ambiguity resolved).
+
+    Pair with the FULL map in the key role (``key_injection_maps``): answer
+    mentions always act as keys once complete (score-level bias needs no KV-cache
+    surgery). Used by ``injection_scope='decode_consistent'`` training and the
+    decode-style diagnostic; ``MaskDecodeInjector`` reproduces these positions
+    step-by-step at generation (parity-tested).
     """
     out: dict[int, list[tuple[int, int]]] = {}
     for node_idx, spans in injection_map.items():
-        kept = [(s, e) if s < answer_start else (e - 1, e) for s, e in spans]
-        out[node_idx] = sorted(kept)
+        kept = []
+        for s, e in spans:
+            if s < answer_start:
+                kept.append((s, e))
+            elif not _extendable_span(list(input_ids[s:e]), node_token_seqs):
+                kept.append((e - 1, e))
+            elif e < len(input_ids):
+                kept.append((e, e + 1))
+        if kept:
+            out[node_idx] = sorted(kept)
     return out
 
 
@@ -1127,6 +1160,7 @@ class MaskDecodeInjector:
         self.node_token_seqs = node_token_seqs
         self.prompt_len = prompt_len
         self.generated: list[int] = []
+        self._committed: set = set()
         self.device = next(model.parameters()).device
         adj = model._node_adjacency(pyg_graph, self.device)
         if hasattr(model, "pe_model"):
@@ -1174,15 +1208,28 @@ class MaskDecodeInjector:
         input_ids = kwargs.get("input_ids")
         if input_ids is None and args:
             input_ids = args[0]
-        if input_ids is None or input_ids.shape[0] != 1 or input_ids.shape[1] != 1:
-            return                                # prefill (or unexpected shape)
+        if input_ids is None or input_ids.shape[1] != 1:
+            return                                # prefill (multi-token forward)
+        if input_ids.shape[0] != 1:
+            raise RuntimeError(
+                "MaskDecodeInjector supports batch-size-1 generation only "
+                f"(got batch {input_ids.shape[0]}; beam search is not wired).")
         self.generated.append(int(input_ids[0, 0]))
+        prev_committed = self._committed
         spans = self._suffix_spans()
+        self._committed = {(nid, sp) for nid, sps in spans.items() for sp in sps}
         p_suffix = len(self.generated) - 1
+        # Query tag = the position where a span's node id first becomes knowable
+        # (mirrors decode_style_query_map): a span completing unambiguously at the
+        # current position tags NOW (end-1 == p); a span that was DEFERRED for
+        # prefix-ambiguity and committed only on this step tags at this resolving
+        # position (end-1 == p-1, newly committed).
         q_node = -1
         for nid, sps in spans.items():
             for start, end in sps:
                 if end - 1 == p_suffix:
+                    q_node = nid
+                elif end - 1 == p_suffix - 1 and (nid, (start, end)) not in prev_committed:
                     q_node = nid
         if q_node < 0:
             self.model._decode_bias_row = None    # untagged query: bias row is all-zero

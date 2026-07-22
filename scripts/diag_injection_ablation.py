@@ -93,7 +93,8 @@ ADDITIVE_ARCHS = ("rpearl_llm", "rpearl_gt_llm", "gt_llm")
 MASK_ARCHS = ("graph_mask_llm", "learnable_graph_mask")
 
 
-def build_conditions(arch, pyg_graph, full_map, prompt_map, answer_start, seq_len):
+def build_conditions(arch, pyg_graph, full_map, prompt_map, answer_start,
+                     input_ids_list, node_token_seqs):
     """(name, graphs, injection_maps, key_injection_maps, gain_override) per condition.
 
     ``gain_override`` is a RAW pe_gain value to set temporarily for the forward
@@ -121,8 +122,10 @@ def build_conditions(arch, pyg_graph, full_map, prompt_map, answer_start, seq_le
             ("no_injection", graphs, [full_map], None, 0.0),
         ]
     if arch in MASK_ARCHS:
-        decode_q = injection_diag.decode_style_query_map(full_map, answer_start)
-        trail_q = injection_diag.decode_trail_query_map(full_map, answer_start, seq_len)
+        decode_q = injection_diag.decode_style_query_map(
+            full_map, answer_start, input_ids_list, node_token_seqs)
+        trail_q = injection_diag.decode_trail_query_map(
+            full_map, answer_start, input_ids_list, node_token_seqs)
         return [
             ("train_style", graphs, [full_map], None, None),
             ("prompt_only", graphs, [prompt_map], None, None),
@@ -220,7 +223,8 @@ def main():
             conditions = [("no_injection", None, None, None, None)]
         else:
             conditions = build_conditions(arch, pyg_graph, full_map, prompt_map,
-                                          answer_start, len(example["input_ids"]))
+                                          answer_start, example["input_ids"],
+                                          node_token_seqs)
 
         for cond, graphs, maps, key_maps, gain_override in conditions:
             if gain_override is not None:

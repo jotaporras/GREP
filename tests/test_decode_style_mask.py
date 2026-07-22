@@ -48,17 +48,20 @@ GRAPH = _graph(3, [[0, 1], [1, 2]])
 FULL_MAP = {0: [(1, 3), (7, 9)], 1: [(3, 5)], 2: [(5, 7), (10, 12)]}
 ANSWER_START = 7
 SEQ = 12
+# Backing tokens + name inventory (no name is a token-prefix of another).
+MAP_SEQS = [[[10, 11]], [[12, 13]], [[14, 15]]]
+MAP_IDS = [0, 10, 11, 12, 13, 14, 15, 10, 11, 9, 14, 15]
 
 
 def test_decode_style_query_map_reduces_answer_spans_to_final_token():
-    q = injection_diag.decode_style_query_map(FULL_MAP, ANSWER_START)
+    q = injection_diag.decode_style_query_map(FULL_MAP, ANSWER_START, MAP_IDS, MAP_SEQS)
     assert q[0] == [(1, 3), (8, 9)]          # prompt span whole, answer span -> final tok
     assert q[1] == [(3, 5)]                  # prompt-only node untouched
     assert q[2] == [(5, 7), (11, 12)]
 
 
 def test_decode_trail_query_map_trails_until_next_mention():
-    t = injection_diag.decode_trail_query_map(FULL_MAP, ANSWER_START, SEQ)
+    t = injection_diag.decode_trail_query_map(FULL_MAP, ANSWER_START, MAP_IDS, MAP_SEQS)
     # node0's answer mention ends at 9; next answer mention starts at 10 -> trail [8,10).
     assert t[0] == [(1, 3), (8, 10)]
     # node2's is the last mention -> trails to seq_len.
@@ -78,7 +81,7 @@ def test_key_maps_none_reproduces_symmetric_mask():
 
 def test_asymmetric_mask_rows_and_columns():
     model = GraphMaskLLM(_tiny_llm(), k_hops=1, symmetrize=True).eval()
-    q_map = injection_diag.decode_style_query_map(FULL_MAP, ANSWER_START)
+    q_map = injection_diag.decode_style_query_map(FULL_MAP, ANSWER_START, MAP_IDS, MAP_SEQS)
     bias = model.build_structural_mask(SEQ, [GRAPH], [q_map], "cpu",
                                        dtype=torch.float32,
                                        key_injection_maps=[FULL_MAP])[0, 0]
@@ -101,7 +104,7 @@ def test_asymmetric_mask_rows_and_columns():
 def test_forward_accepts_key_injection_maps():
     model = GraphMaskLLM(_tiny_llm(), k_hops=1, symmetrize=True).eval()
     ids = torch.randint(0, 64, (1, SEQ))
-    q_map = injection_diag.decode_style_query_map(FULL_MAP, ANSWER_START)
+    q_map = injection_diag.decode_style_query_map(FULL_MAP, ANSWER_START, MAP_IDS, MAP_SEQS)
     with torch.no_grad():
         sym = model(input_ids=ids, graphs=[GRAPH], injection_maps=[FULL_MAP]).logits
         asym = model(input_ids=ids, graphs=[GRAPH], injection_maps=[q_map],
@@ -126,34 +129,60 @@ FULL = PROMPT + ANSWER
 A_START = len(PROMPT)
 
 
-def _parity_fixture():
+# Second fixture with PREFIX-AMBIGUOUS names: nodeA=[20] is a strict token-prefix
+# of nodeB=[20,21] (the region_1 / region_10 pattern under digit-split BPE). The
+# answer mentions nodeA resolved NEGATIVELY (followed by a non-extending token) —
+# the case where the query tag must fire at the RESOLVING position (e, not e-1).
+SEQS_AMB = [[[20]], [[20, 21]], [[22]]]
+PROMPT_AMB = [1, 20, 5, 20, 21, 6, 22, 7]      # nodeA@(1,2) nodeB@(3,5) nodeC@(6,7)
+ANSWER_AMB = [20, 9, 22, 4]                     # nodeA (resolves at 9), nodeC
+
+
+def _parity_fixture(seqs=None, prompt=None, answer=None):
+    seqs, prompt, answer = seqs or SEQS, prompt or PROMPT, answer or ANSWER
+    n_nodes = len(seqs)
     model = GraphMaskLLM(_tiny_llm(), k_hops=1, symmetrize=True).eval()
-    g = _graph(3, [[0, 1], [1, 2]])
-    full_map = build_injection_map(FULL, SEQS, scope_start=0)
-    q_map = dsqm(full_map, A_START)
-    prompt_map = build_injection_map(PROMPT, SEQS, scope_start=0)
-    return model, g, full_map, q_map, prompt_map
+    g = _graph(n_nodes, [[i, i + 1] for i in range(n_nodes - 1)])
+    full = prompt + answer
+    full_map = build_injection_map(full, seqs, scope_start=0)
+    q_map = dsqm(full_map, len(prompt), full, seqs)
+    prompt_map = build_injection_map(prompt, seqs, scope_start=0)
+    return model, g, full_map, q_map, prompt_map, seqs, prompt, answer
 
 
-def test_decode_rows_match_teacher_forced_bias():
-    model, g, full_map, q_map, prompt_map = _parity_fixture()
-    ref = model.build_structural_mask(len(FULL), [g], [q_map], "cpu",
+def _assert_rows_parity(seqs=None, prompt=None, answer=None):
+    model, g, full_map, q_map, prompt_map, seqs, prompt, answer = _parity_fixture(
+        seqs, prompt, answer)
+    full = prompt + answer
+    ref = model.build_structural_mask(len(full), [g], [q_map], "cpu",
                                       dtype=torch.float32,
                                       key_injection_maps=[full_map])[0, 0]
-    injector = MaskDecodeInjector(model, g, prompt_map, len(PROMPT), SEQS)
-    for i, tok in enumerate(ANSWER):
-        p = A_START + i
+    injector = MaskDecodeInjector(model, g, prompt_map, len(prompt), seqs)
+    tagged = 0
+    for i, tok in enumerate(answer):
+        p = len(prompt) + i
         injector.pre_hook(None, (), {"input_ids": torch.tensor([[tok]])})
         row = model._decode_bias_row
         if row is None:
             assert (ref[p, :p + 1] == 0).all(), f"pos {p}: ref row nonzero but no decode row"
         else:
+            tagged += 1
             assert row.shape == (1, 1, 1, p + 1)
             assert torch.equal(row[0, 0, 0], ref[p, :p + 1]), f"pos {p}: row mismatch"
+    # Guard against vacuous parity: at least one decode step must actually arm a row.
+    assert tagged >= 2, f"only {tagged} tagged steps — fixture exercises nothing"
+
+
+def test_decode_rows_match_teacher_forced_bias():
+    _assert_rows_parity()
+
+
+def test_decode_rows_match_teacher_forced_bias_ambiguous_names():
+    _assert_rows_parity(SEQS_AMB, PROMPT_AMB, ANSWER_AMB)
 
 
 def test_decode_logits_match_teacher_forced():
-    model, g, full_map, q_map, prompt_map = _parity_fixture()
+    model, g, full_map, q_map, prompt_map, *_ = _parity_fixture()
     ids = torch.tensor([FULL])
     with torch.no_grad():
         ref = model(input_ids=ids, graphs=[g], injection_maps=[q_map],

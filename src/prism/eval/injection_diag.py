@@ -69,7 +69,8 @@ decode_style_query_map = gnn_llm.decode_style_query_map
 def decode_trail_query_map(
     injection_map: dict[int, list[tuple[int, int]]],
     answer_start: int,
-    seq_len: int,
+    input_ids: list[int],
+    node_token_seqs: list,
 ) -> dict[int, list[tuple[int, int]]]:
     """``decode_style_query_map`` + current-location context (decode-computable).
 
@@ -79,7 +80,9 @@ def decode_trail_query_map(
     at node i", giving the next-hop decision a direct bias toward i's neighbors.
     Everything here is computable from the generated prefix at decode time.
     """
-    out = decode_style_query_map(injection_map, answer_start)
+    seq_len = len(input_ids)
+    out = decode_style_query_map(injection_map, answer_start, input_ids,
+                                 node_token_seqs)
     answer_spans = sorted(
         (s, e, node_idx)
         for node_idx, spans in injection_map.items()
@@ -88,8 +91,12 @@ def decode_trail_query_map(
     for i, (s, e, node_idx) in enumerate(answer_spans):
         trail_end = answer_spans[i + 1][0] if i + 1 < len(answer_spans) else seq_len
         trail_end = min(trail_end, seq_len)
-        if e - 1 < trail_end:
-            out[node_idx] = sorted(set(out[node_idx]) - {(e - 1, e)} | {(e - 1, trail_end)})
+        # The style map holds this mention's single knowable query position:
+        # (e-1, e) unambiguous, (e, e+1) prefix-ambiguous (or absent at seq end).
+        for q in ((e - 1, e), (e, e + 1)):
+            if q in out.get(node_idx, []) and q[0] < trail_end:
+                out[node_idx] = sorted(set(out[node_idx]) - {q} | {(q[0], trail_end)})
+                break
     return out
 
 

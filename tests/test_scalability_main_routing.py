@@ -315,3 +315,18 @@ if __name__ == "__main__":
     for name, err in failed:
         print(f"  FAIL {name}: {err}")
     sys.exit(1 if failed else 0)
+
+
+def test_main_resolves_decode_consistent_from_train_config():
+    """A checkpoint whose train_config.json records injection_scope=decode_consistent
+    must thread that exact value into eval_model_multiple_graphs (the eval client
+    arms MaskDecodeInjector off it)."""
+    ckpt = _ckpt_dir("decode_scope")
+    with open(os.path.join(ckpt, "train_config.json"), "w") as f:
+        json.dump({"injection_scope": "decode_consistent",
+                   "edge_weights": "binary"}, f)
+    rec = _Recorder(["g1"])
+    _run_main(["--checkpoint", ckpt, "--graphs", "/data/g.json",
+               "--text-edge-list", "none", "--use-icl", "true"], rec)
+    assert rec.calls[0]["injection_scope"] == "decode_consistent"
+    assert rec.calls[0]["edge_weights"] == "binary"

@@ -471,7 +471,8 @@ class SpineDataCollator(TokenIndexCollator):
         elif self.injection_scope == "decode_consistent":
             key_injection_map = injection_map
             injection_map = decode_style_query_map(
-                injection_map, example["answer_start"])
+                injection_map, example["answer_start"],
+                example["input_ids"], node_token_seqs)
         return pyg_graph, injection_map, key_injection_map
 
     def __call__(self, features, return_tensors: Optional[str] = None):

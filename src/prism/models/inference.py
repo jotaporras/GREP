@@ -199,19 +199,23 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
         if isinstance(graph_model, (GraphMaskLLM, LearnableGraphMaskLLM)):
             # Build and arm [1, 1, seq, seq] additive (adjacency or learned-relative-PE) bias;
             # both classes share build_structural_mask + _struct_bias; cleared in finally.
-            graph_model._struct_bias = graph_model.build_structural_mask(
-                input_ids.shape[1], [pyg_graph], [injection_map], input_ids.device)
-            # decode_consistent checkpoints extend the channel to generated mentions:
-            # a forward pre-hook arms a per-step bias row (span-end assignment, design
-            # note §2.2). Other scopes keep the historical prompt-only behavior.
+            # Arming happens inside the try so a construction-time failure (e.g. OOM
+            # building Ψ on a large graph) can never leave _struct_bias or the hook
+            # attached across samples.
             hook_handle = None
-            if self.injection_scope == "decode_consistent":
-                injector = MaskDecodeInjector(
-                    graph_model, pyg_graph, injection_map,
-                    input_ids.shape[1], node_token_seqs)
-                hook_handle = graph_model.llm.register_forward_pre_hook(
-                    injector.pre_hook, with_kwargs=True)
             try:
+                graph_model._struct_bias = graph_model.build_structural_mask(
+                    input_ids.shape[1], [pyg_graph], [injection_map], input_ids.device)
+                # decode_consistent checkpoints extend the channel to generated
+                # mentions: a forward pre-hook arms a per-step bias row (span-end
+                # assignment, design note §2.2). Other scopes keep the historical
+                # prompt-only behavior.
+                if self.injection_scope == "decode_consistent":
+                    injector = MaskDecodeInjector(
+                        graph_model, pyg_graph, injection_map,
+                        input_ids.shape[1], node_token_seqs)
+                    hook_handle = graph_model.llm.register_forward_pre_hook(
+                        injector.pre_hook, with_kwargs=True)
                 outputs = graph_model.llm.generate(
                     input_ids=input_ids, attention_mask=attention_mask,
                     max_new_tokens=max_new_tokens, **DECODE_KWARGS,
