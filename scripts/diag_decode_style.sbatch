@@ -6,7 +6,7 @@
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=14
 #SBATCH --mem=256G
-#SBATCH --array=0-2
+#SBATCH --array=0-3
 #
 # Decode-realizability gate for decode-time mask injection (decode-time design
 # note §3): rerun the injection-ablation diagnostic with the two new
