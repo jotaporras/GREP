@@ -53,11 +53,15 @@ def main():
     model, tokenizer, _ = ckpt_mod.load_checkpoint(args.checkpoint, four_bit=False, device=args.device)
     device = next(model.parameters()).device
     llm = model.llm if hasattr(model, "llm") else model
+    # Decoder layer list — Gemma text-only: model.layers; multimodal: get_decoder().layers
+    # (mirrors GraphMaskLLM._decoder_layers).
+    base = getattr(llm, "model", llm)
+    decoder_layers = base.layers if hasattr(base, "layers") else llm.get_decoder().layers
     if arch == "llm":
         # Mask archs already run eager (set at wrap time); force it for the plain LLM
         # so the hooks below receive real attention probabilities.
         llm.config._attn_implementation = "eager"
-        for layer in llm.model.layers:
+        for layer in decoder_layers:
             layer.self_attn.config._attn_implementation = "eager"
 
     ds = datasets.load_dataset("json", data_files=[args.val_file], split="train")
@@ -88,7 +92,7 @@ def main():
                 raise RuntimeError(f"layer {lid}: attention weights are None (not eager?)")
             captured[lid] = weights.detach().float().cpu()  # [1, H, S, S]
         return fn
-    handles = [llm.model.layers[lid].self_attn.register_forward_hook(hook(lid), with_kwargs=True)
+    handles = [decoder_layers[lid].self_attn.register_forward_hook(hook(lid), with_kwargs=True)
                for lid in layer_ids]
 
     with torch.no_grad():
@@ -113,7 +117,7 @@ def main():
         layers_out[lid] = {
             "head_mean": w.mean(0).to(torch.float16),                       # [S, S]
             "node_sub_per_head": w[:, node_pos][:, :, node_pos].to(torch.float16),
-            "is_global": not bool(getattr(llm.model.layers[lid].self_attn, "is_sliding", False)),
+            "is_global": not bool(getattr(decoder_layers[lid].self_attn, "is_sliding", False)),
         }
 
     torch.save({
