@@ -1,0 +1,120 @@
+{
+  "checkpoint": "/vast/projects/aribeiro/alelab/jporras/GREP-PRISM/outputs/e13c_decode_consistent/e13c_rpe_decode_pag5ua40",
+  "architecture": "learnable_graph_mask",
+  "text_edge_list": "none",
+  "val_file": "data/revised/gen/nav100_n30_gemma_data/split/formatted_all_new__val.json",
+  "seed": 1234,
+  "n_examples_graded": 100,
+  "conditions": {
+    "train_style": {
+      "decision": {
+        "n": 519,
+        "acc": 0.861271676300578,
+        "mean_nll": 0.48989255385093616
+      },
+      "completion": {
+        "n": 1716,
+        "acc": 0.9947552447552448,
+        "mean_nll": 0.014206599848049783
+      },
+      "repeat": {
+        "n": 9965,
+        "acc": 0.9950827897641746,
+        "mean_nll": 0.015105469031217508
+      },
+      "all_answer_nodes": {
+        "n": 12200,
+        "acc": 0.989344262295082,
+        "mean_nll": 0.035176946971771594
+      }
+    },
+    "prompt_only": {
+      "decision": {
+        "n": 519,
+        "acc": 0.6416184971098265,
+        "mean_nll": 1.9945844651589415
+      },
+      "completion": {
+        "n": 1716,
+        "acc": 0.9935897435897436,
+        "mean_nll": 0.018219805972288027
+      },
+      "repeat": {
+        "n": 9965,
+        "acc": 0.9946813848469643,
+        "mean_nll": 0.014647726742337818
+      },
+      "all_answer_nodes": {
+        "n": 12200,
+        "acc": 0.9795081967213115,
+        "mean_nll": 0.09937861437493263
+      }
+    },
+    "decode_style": {
+      "decision": {
+        "n": 519,
+        "acc": 0.861271676300578,
+        "mean_nll": 0.49007277233023216
+      },
+      "completion": {
+        "n": 1716,
+        "acc": 0.9941724941724942,
+        "mean_nll": 0.016968456029619276
+      },
+      "repeat": {
+        "n": 9965,
+        "acc": 0.9944806823883593,
+        "mean_nll": 0.015259056939536008
+      },
+      "all_answer_nodes": {
+        "n": 12200,
+        "acc": 0.9887704918032787,
+        "mean_nll": 0.035698535851141834
+      }
+    },
+    "decode_trail": {
+      "decision": {
+        "n": 519,
+        "acc": 0.8554913294797688,
+        "mean_nll": 0.6095966149334558
+      },
+      "completion": {
+        "n": 1716,
+        "acc": 0.9941724941724942,
+        "mean_nll": 0.016897162849853105
+      },
+      "repeat": {
+        "n": 9965,
+        "acc": 0.9886603110888108,
+        "mean_nll": 0.04171413529713169
+      },
+      "all_answer_nodes": {
+        "n": 12200,
+        "acc": 0.9837704918032787,
+        "mean_nll": 0.06238176504220645
+      }
+    },
+    "no_injection": {
+      "decision": {
+        "n": 519,
+        "acc": 0.5722543352601156,
+        "mean_nll": 2.8126893057452436
+      },
+      "completion": {
+        "n": 1716,
+        "acc": 0.9924242424242424,
+        "mean_nll": 0.018798809713128837
+      },
+      "repeat": {
+        "n": 9965,
+        "acc": 0.9943803311590567,
+        "mean_nll": 0.0159420275892824
+      },
+      "all_answer_nodes": {
+        "n": 12200,
+        "acc": 0.9761475409836066,
+        "mean_nll": 0.1353202258216763
+      }
+    }
+  }
+}
