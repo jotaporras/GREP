@@ -125,6 +125,16 @@ vs e11 — `e13c_rpe_decode` vs 0.48 (22lq43i6), `e13c_gmask_decode` vs 0.39
 (bznw3x9p). Open question: do prompt-side + answer-side channels stack above the
 ~0.83/decision convergence?
 
+**e13c RESULTS**: `e13c_rpe_decode` **0.73** (paired e11 prompt_only: 0.48;
+single flag changed; hallucination 0.06 vs ~0.17-0.22 band) — the largest
+single-intervention jump in the project and the best no-edge-text number to
+date, 0.19-0.22 below the with-edges band (0.92-0.95 per-decision / 0.87-0.95
+task). `e13c_gmask_decode` pending final (interim eval 0.61 vs paired 0.39).
+The e13b teacher-forced convergence at ~0.83/decision did NOT bound joint
+training: trained WITH the decode wiring, prompt-side and answer-side channels
+stack. (Caveats: single seed, n=100; free-gen per-decision profile not yet
+diagnosed — worth running the decision diagnostic on this checkpoint.)
+
 Review (independent agent) caught a critical latent bug in the first injector:
 prefix-ambiguous node names (`region_1` vs `region_10` under digit-split BPE)
 never received their query tag (deferred-commit landed one step too late). Fixed
