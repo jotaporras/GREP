@@ -82,6 +82,25 @@ a permutation). None of the e13 runs pass `--permutation-seed`, so this cannot
 affect them — but a future permutation/transferability sweep on this arch must
 fix it first.
 
+## e13c: decode-consistent injection (same session, user-approved)
+
+Gate evidence in `notebooks/2026-07-21 e13b_decode_style_diagnostic.ipynb`:
+decode-realizable wiring retains ~97% of the leak circuit's decision channel.
+Build (`c07d086`): `injection_scope=decode_consistent` — collator emits asymmetric
+q/k maps (answer mentions: keys full-span, queries span-final only;
+`decode_style_query_map`); `MaskDecodeInjector` extends the mask to generated
+mentions at decode (suffix re-matching with partial-mention deferral, per-step
+bias row through the attention patch's former fall-through); scope recorded in
+`train_config.json` and threaded through every eval path (mask archs only;
+requires `mask_layer_scope=dense` — sliding layers crop their cache and cannot
+carry the row, validated fail-loud). Parity tests (design note §4.2): per-step
+decode rows == teacher-forced asymmetric bias exactly; step-wise cached decode
+logits == teacher-forced logits (atol 1e-4); partial-mention deferral covered.
+78 tests green. Arms (`scripts/e13c_decode_consistent.sbatch`): single-flag A/Bs
+vs e11 — `e13c_rpe_decode` vs 0.48 (22lq43i6), `e13c_gmask_decode` vs 0.39
+(bznw3x9p). Open question: do prompt-side + answer-side channels stack above the
+~0.83/decision convergence?
+
 ## Smoke (job 7156517 → crashed on a pre-existing bug; fixed; job 7156540)
 
 First smoke run validated the navigator load + 4 training steps on a b200, then
