@@ -88,12 +88,14 @@ class _Recorder:
         return object(), object(), False  # (model, tokenizer, is_gnn) — opaque stubs
 
     def eval_model_multiple_graphs(self, model, tokenizer, samples_by_graph, *,
-                                   include_edge_list, use_icl, permutation, on_graph_done):
+                                   include_edge_list, use_icl, permutation, on_graph_done,
+                                   edge_weights):
         self.calls.append({
             "include_edge_list": include_edge_list,
             "use_icl": use_icl,
             "permutation_seed": None if permutation is None else permutation.seed,
             "permutation_is_none": permutation is None,
+            "edge_weights": edge_weights,
         })
         return {n: _summary(n) for n in self.graph_names}
 
@@ -150,6 +152,9 @@ def test_main_no_seed_plumbs_policy_into_scorer():
     assert rec.calls[0]["include_edge_list"] is False   # text_edge_list == "none"
     assert rec.calls[0]["use_icl"] is True
     assert rec.calls[0]["permutation_is_none"] is True
+    # No edge_weights key in the stub checkpoint's train_config.json => the
+    # resolver returns the exact historical policy ("gaussian").
+    assert rec.calls[0]["edge_weights"] == "gaussian"
 
 
 # ==========================================================================

@@ -110,6 +110,18 @@ def train_model(config: omegaconf.DictConfig):
     else:
         print(f"[data] injection_scope={config.data.injection_scope}")
 
+    # GNN edge weighting over the scene-graph adjacency: "gaussian" (historical
+    # Gaussian affinity from Euclidean distances) or "binary" (no edge_weight —
+    # plain SBM adjacency). Threaded to the train collator here and to every eval
+    # path below; recorded in train_config.json.
+    valid_edge_weights = ("gaussian", "binary")
+    if config.data.edge_weights not in valid_edge_weights:
+        raise ValueError(
+            f"data.edge_weights must be one of {valid_edge_weights}, "
+            f"got {config.data.edge_weights!r}")
+    collator.edge_weights = config.data.edge_weights
+    print(f"[data] edge_weights={config.data.edge_weights}")
+
     # --- Multistage init: weight-only carry-over from a prior stage (NOT HF resume). --
     # Load PE first (lives outside the LoRA adapter), then attach the carried adapter.
     is_graph_arch = config.gnn.arch in (
@@ -123,6 +135,11 @@ def train_model(config: omegaconf.DictConfig):
         raise ValueError(
             "init_pe_from / init_lora_from are only supported for graph architectures."
         )
+    # Load the pretrained PE encoder first; a later init_pe_from carry (stage 2/3)
+    # overwrites the whole pe_model, including this submodule.
+    if config.gnn.arch == "learnable_graph_mask" and config.gnn.pe_gt_from:
+        model_loaders.load_navigator_pe_into(
+            model, config.gnn.pe_gt_from, config.gnn.semantic_gt_from)
     if config.trainer.init_pe_from:
         model_loaders.load_pe_weights_into(
             model, config.trainer.init_pe_from, config.gnn.arch
@@ -220,12 +237,16 @@ def train_model(config: omegaconf.DictConfig):
             "base_model": config.model.path,
             "text_edge_list": config.data.text_edge_list,
             "injection_scope": config.data.injection_scope,
+            "edge_weights": config.data.edge_weights,
             # Two-group LR: structural (GT / PE) params train at structural_lr_mult × base LR
             # (GraphSFTTrainer.create_optimizer). Default 1.0 = no boost.
             "structural_lr_mult": config.gnn.structural_lr_mult,
             **{k: config.gnn[k] for k in _direct},
             **({k: config.gnn[k] for k in ("k_gt", "gt_num_layers", "gt_heads")}
                if config.gnn.arch in ("rpearl_gt_llm", "gt_llm", "learnable_graph_mask") else {}),
+            # learnable_graph_mask navigator: record both sources so eval rebuilds the NavigatorPE.
+            **({"pe_gt_from": config.gnn.pe_gt_from, "semantic_gt_from": config.gnn.semantic_gt_from}
+               if config.gnn.arch == "learnable_graph_mask" and config.gnn.pe_gt_from else {}),
             # graph_mask_llm / learnable_graph_mask adjacency (A) + fold + scope rebuild params.
             **({k: config.gnn[k] for k in ("mask_k_hops", "mask_symmetrize", "mask_use_edges",
                                            "mask_buggy_causal_fold", "mask_layer_scope")}
@@ -284,6 +305,7 @@ def train_model(config: omegaconf.DictConfig):
             use_icl=config.eval.use_icl,
             include_edge_list=(config.data.text_edge_list == "present"),
             eval_epoch_interval=config.eval.epoch_interval,
+            edge_weights=config.data.edge_weights,
         )
     )
 
@@ -307,6 +329,7 @@ def train_model(config: omegaconf.DictConfig):
             use_icl=config.eval.use_icl,
             architecture=config.gnn.arch,
             checkpoint_label=sft_args.output_dir,
+            edge_weights=config.data.edge_weights,
         )
     else:
         trainer.train()
@@ -335,6 +358,7 @@ def train_model(config: omegaconf.DictConfig):
             use_icl=config.eval.use_icl,
             architecture=config.gnn.arch,
             checkpoint_label=sft_args.output_dir,
+            edge_weights=config.data.edge_weights,
         )
 
     return trainer
@@ -451,6 +475,14 @@ def _validate_config(config: omegaconf.DictConfig) -> None:
             raise ValueError(
                 "gnn.mask_psi_scale='cosine' with gnn.mask_use_edges=false is degenerate "
                 "(constant mask, zero GT gradient). Use mask_psi_scale='inv_sqrt_d' or keep edges.")
+    if config.gnn.pe_gt_from or config.gnn.semantic_gt_from:
+        if config.gnn.arch != "learnable_graph_mask":
+            raise ValueError(
+                "gnn.pe_gt_from / semantic_gt_from are only supported for arch='learnable_graph_mask'.")
+        if config.gnn.semantic_gt_from and not config.gnn.pe_gt_from:
+            raise ValueError(
+                "gnn.semantic_gt_from requires gnn.pe_gt_from (the navigator needs both). "
+                "Set pe_gt_from alone for a GT-only Ψ producer.")
     if config.trainer.loss_target not in ("all", "responses", "edge_list"):
         raise ValueError(
             f"loss_target must be 'all', 'responses', or 'edge_list', got {config.trainer.loss_target!r}"

@@ -14,11 +14,10 @@
 name: e9
 
 model:
-  # Base LLM. DEFAULT = Gemma-4 31B (multimodal; LoRA vision/audio-tower exclusion is
-  # auto-applied). 31B is the default ON PURPOSE so a confirmatory run is never silently
-  # downsized to 12B — override explicitly for the smaller/cheaper bases:
-  #   google/gemma-4-12B-it              # text-only 12B (fast dev only; NOT the confirmatory base)
-  path: google/gemma-4-31B-it
+  # Base LLM. DEFAULT = Gemma-4 12B (text-only). Override for the multimodal 31B confirmatory
+  # base (LoRA vision/audio-tower exclusion is auto-applied):
+  #   google/gemma-4-31B-it              # multimodal 31B (confirmatory base)
+  path: google/gemma-4-12B-it
   # disable_graph_token_rope: position_id 0 on node-name tokens so RoPE is identity
   # there (set true for the norope_graph run).
   disable_graph_token_rope: false
@@ -62,6 +61,14 @@ gnn:
   gt_heads: 8
   k_gt: 2
 
+  # learnable_graph_mask navigator mode: use the notebook (e9_gnn_navigation.ipynb) pretrained
+  # PE GT + Semantic GT (AGT), composed as NavigatorPE (Ψ = SemanticGT(PE_GT(graph)), seed 0),
+  # as the mask's Ψ producer. Both are plain state_dict .pt files (path_navigator_gt.pt /
+  # path_navigator_agt.pt). Set together for navigator mode; set pe_gt_from ALONE (semantic_gt_from
+  # null) for a GT-only Ψ producer (standalone GraphTransformer, Ψ = GT(graph), no AGT).
+  pe_gt_from: null
+  semantic_gt_from: null
+
   # --- graph_mask_llm structural attention mask (parameter-free) ---
   # Also read by learnable_graph_mask for the adjacency A.
   mask_k_hops: 1
@@ -96,6 +103,13 @@ data:
   # "present" writes the edge list into the prompt; "none" removes it (connectivity must
   # come from the graph PE — the Stage-3 / no-edges axis).
   text_edge_list: present
+  # GNN edge weighting over the scene-graph adjacency ("gaussian" | "binary").
+  # "gaussian" (historical): edge_weight = exp(-d^2/2sigma^2), sigma = per-graph median
+  # edge length (E1 Gaussian affinity), consumed by the R-PEARL/GT GCN. On SBM-with-
+  # geometry graphs this nearly severs the long inter-community edges. "binary": no
+  # edge_weight attached — GNNs see the plain SBM adjacency. Applies to train collator
+  # AND all eval graph parsing; recorded in train_config.json.
+  edge_weights: gaussian
   # Which token positions carry the graph channel (PE / structural mask) during TRAINING:
   # "full_sequence" (historical) also injects node mentions inside the assistant answer —
   # the predicted positions carry the ground-truth node's channel, which generation never

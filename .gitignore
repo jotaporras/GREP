@@ -12,6 +12,8 @@ wandb/*
 data/*
 *txt
 .env
+docs/
+notebooks/wandb
 src/outputs/
 src/wandb/
 checkpoints

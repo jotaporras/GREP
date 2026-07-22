@@ -274,23 +274,31 @@ class LocalHFQueryClient:
     This is a pure backend swap: it accepts and honours the SAME call
     parameters the OpenAI client does, so every other knob in the data
     generator is unchanged. ``temperature`` and ``max_tokens`` map directly to
-    ``model.generate`` (the populate path uses the ``GPTQueryClient`` defaults
-    of ``temperature=0.31`` / ``max_tokens=10240``). ``reasoning_effort`` has no
-    HF equivalent; thinking is enabled, and its ``<think>`` block is stripped by
-    ``parse_response`` so the returned output is still a single well-formed JSON
-    object (matching gpt-5.1 ``output_text``, whose reasoning never appears
-    inline).
+    ``model.generate`` (the populate path uses the ``GPTQueryClient`` default
+    ``temperature=0.31``). ``reasoning_effort`` has no HF equivalent; thinking is
+    enabled, and its ``<think>`` block is stripped by ``parse_response`` so the
+    returned output is still a single well-formed JSON object (matching gpt-5.1
+    ``output_text``, whose reasoning never appears inline).
+
+    Generation budget: ``max_new_tokens`` is the ONE budget for BOTH the
+    ``<think>`` block and the JSON graph. Larger graphs (more regions/objects)
+    need a bigger cap or the JSON is truncated mid-object and fails to parse.
+    The default reads ``$PRISM_HF_POPULATE_MAX_NEW_TOKENS`` (fallback 10240 —
+    ample for ~10-node graphs); raise it for ~100-node graphs. Callers may still
+    pass an explicit ``max_tokens`` to override per-call.
     """
 
-    def __init__(self, model_id: Optional[str] = None, max_new_tokens: int = 10240):
+    def __init__(self, model_id: Optional[str] = None, max_new_tokens: Optional[int] = None):
         self.model, self.processor = load_gemma(model_id)
-        self.max_new_tokens = max_new_tokens
+        self.max_new_tokens = max_new_tokens or int(
+            os.environ.get("PRISM_HF_POPULATE_MAX_NEW_TOKENS", "10240")
+        )
 
     def query_gpt(
         self,
         query: str,
         temperature: Optional[float] = 0.31,
-        max_tokens: Optional[int] = 10240,
+        max_tokens: Optional[int] = None,
         reasoning_effort: str = "low",
     ) -> str:
         return self.query_gpt_5(query, temperature, max_tokens, reasoning_effort)
@@ -299,7 +307,7 @@ class LocalHFQueryClient:
         self,
         query: str,
         temperature: Optional[float] = 0.31,
-        max_tokens: Optional[int] = 10240,
+        max_tokens: Optional[int] = None,
         reasoning_effort: str = "low",
     ) -> str:
         messages = [{"role": "user", "content": query}]
