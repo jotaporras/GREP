@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=e11_transferability_spine
+#SBATCH --job-name=e13f_transferability_spine
 #SBATCH --output=/vast/projects/aribeiro/alelab/jporras/GREP-PRISM/slurm-%x-%j.out
 #SBATCH --time=24:00:00
 #SBATCH --partition=dgx-b200
@@ -7,8 +7,8 @@
 #SBATCH --cpus-per-task=14
 #SBATCH --mem=256G
 #
-# e11 no-permutation eval WITH SPINE tool-calling ENABLED — the tools-on counterpart
-# to scripts/e11_transferability.sbatch (which sets PRISM_DISABLE_SPINE_TOOLS). This
+# e13f no-permutation eval WITH SPINE tool-calling ENABLED — the tools-on counterpart
+# to scripts/e13f_transferability.sbatch (which sets PRISM_DISABLE_SPINE_TOOLS). This
 # script leaves that env var unset, so the eval harness
 # (evaluate._spine_tools_disabled) keeps tool-calling on. Same cross_eval output
 # layout: one per-graph JSON directly into <OUTPUT>:
@@ -19,9 +19,9 @@
 # A relative override is still anchored under the cluster project dir $PROJ
 # (=/vast/.../GREP-PRISM); an absolute override passes through untouched.
 #
-# Submit:  sbatch scripts/e11_transferability_spine.sbatch [CHECKPOINT] [GRAPHS] [OUTPUT]
-#   env  :  CHECKPOINT=... GRAPHS=... OUTPUT=... sbatch scripts/e11_transferability_spine.sbatch
-# Local :  bash   scripts/e11_transferability_spine.sbatch [CHECKPOINT] [GRAPHS] [OUTPUT]
+# Submit:  sbatch scripts/e13f_transferability_spine.sbatch [CHECKPOINT] [GRAPHS] [OUTPUT]
+#   env  :  CHECKPOINT=... GRAPHS=... OUTPUT=... sbatch scripts/e13f_transferability_spine.sbatch
+# Local :  bash   scripts/e13f_transferability_spine.sbatch [CHECKPOINT] [GRAPHS] [OUTPUT]
 
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/..}"
@@ -35,7 +35,7 @@ _anchor() { case "$1" in /*) printf '%s' "$1" ;; *) printf '%s' "$PROJ/$1" ;; es
 
 CHECKPOINT=$(_anchor "${1:-${CHECKPOINT:-outputs/e13f_alpha_khops/e13f_alpha00_ai8c2bm0}}")
 GRAPHS=$(_anchor "${2:-${GRAPHS:-data/n_100/gen/nav_n100_gemma_data/test_graphs}}")
-OUTPUT=$(_anchor "${3:-${OUTPUT:-results/e11_transferability_spine}}")
+OUTPUT=$(_anchor "${3:-${OUTPUT:-results/e13f_transferability_spine}}")
 
 # Home dir sits near its quota; keep the HF hub cache (base gemma-4-31B-it
 # weights, loaded 4-bit) on shared vast — downloaded once, reused across jobs.
@@ -50,7 +50,7 @@ module load anaconda3
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "$ENV_NAME"
 
-echo "[$(date --iso-8601=seconds)] e11 no-perm eval (SPINE tools ENABLED)"
+echo "[$(date --iso-8601=seconds)] e13f no-perm eval (SPINE tools ENABLED)"
 echo "  checkpoint: $CHECKPOINT"
 echo "  graphs:     $GRAPHS"
 echo "  output:     $OUTPUT/"
@@ -63,4 +63,4 @@ srun python -m prism.eval.scalability_evaluation \
     --text-edge-list none \
     --use-icl false
 
-echo "[$(date --iso-8601=seconds)] e11 no-perm eval (SPINE tools ENABLED) DONE"
+echo "[$(date --iso-8601=seconds)] e13f no-perm eval (SPINE tools ENABLED) DONE"
