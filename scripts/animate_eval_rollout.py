@@ -449,8 +449,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   </div>
 
   <div id="transport">
+    <button id="prev" title="Previous task">⏮</button>
     <button id="restart" title="Restart">⟲</button>
     <button id="play" title="Play / pause">▶</button>
+    <button id="next" title="Next task">⏭</button>
     <input id="scrub" type="range" min="0" max="0" step="0.001" value="0">
     <span id="time">0 / 0 hops</span>
     <select id="speed" title="Speed">
@@ -670,6 +672,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     $("speed").addEventListener("change", e => { speedMul = parseFloat(e.target.value); });
     $("sel-ep").addEventListener("change", e => selectEpisode(parseInt(e.target.value)));
     $("sel-sample").addEventListener("change", e => selectSample(parseInt(e.target.value)));
+
+    // Step ±1 task, wrapping across graph (episode) boundaries.
+    function stepTask(delta) {
+      let e2 = epIdx, i2 = sampleIdx + delta;
+      while (i2 < 0) { e2 = (e2 - 1 + EPISODES.length) % EPISODES.length; i2 += EPISODES[e2].samples.length; }
+      while (i2 >= EPISODES[e2].samples.length) { i2 -= EPISODES[e2].samples.length; e2 = (e2 + 1) % EPISODES.length; }
+      if (e2 !== epIdx) { $("sel-ep").value = e2; selectEpisode(e2); }
+      $("sel-sample").value = i2;
+      selectSample(i2);
+    }
+    $("prev").addEventListener("click", () => stepTask(-1));
+    $("next").addEventListener("click", () => stepTask(1));
 
     // ---- main loop (always running: drives breathing + playback) -----------
     function loop(ts) {
