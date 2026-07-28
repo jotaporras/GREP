@@ -78,8 +78,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--checkpoint", required=True,
+    # Exactly one eval subject: an LLM checkpoint OR a NavigatorGT config.
+    subject = p.add_mutually_exclusive_group(required=True)
+    subject.add_argument("--checkpoint",
                    help="Checkpoint dir (run dir or subdir with adapter_config.json / train_config.json).")
+    subject.add_argument("--navigator-config",
+                   help="YAML config for a NavigatorGT eval (e.g. experiments/e9_navigator_gt.yaml). "
+                        "When set, evaluates the GNN navigator instead of an LLM checkpoint: the route "
+                        "is generated directly from explicit start/goal nodes.")
     p.add_argument("--graphs", required=True,
                    help="A test-graph JSON file, a directory of them, or a glob pattern.")
     p.add_argument("--permutation-seed", type=int, nargs="+", default=None,
@@ -215,21 +221,53 @@ def _make_progress_printer(samples_by_graph: dict[str, list[evaluate.EvalSample]
 # Main
 # ----------------------------------------------------------------------------
 
+def _load_navigator(config_path: str):
+    """Build a NavigatorGT + its eval policy from a YAML config (see experiments/e9_navigator_gt.yaml).
+
+    Returns ``(model, edge_weights)``. The model is placed on CUDA when available (the sparse
+    CSR attention kernels are CPU/CUDA-only — MPS is unsupported), else CPU.
+    """
+    import torch
+    import yaml
+    from prism.models.gt import NavigatorGT
+
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)["navigator"]
+    model = NavigatorGT.from_pretrained(
+        cfg["weights"], gt_kwargs=cfg["gt"], semantic_kwargs=cfg["semantic"],
+        max_length=cfg.get("max_length", 128))
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device).eval()
+    return model, cfg.get("edge_weights", "binary")
+
+
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
-    checkpoint = os.path.abspath(args.checkpoint.rstrip("/"))
-    ckpt_name = os.path.basename(checkpoint)
+    # The mutually-exclusive required group guarantees exactly one of these is set.
+    is_navigator = args.navigator_config is not None
 
     samples_by_graph, graph_file_by_name = data.load_samples_by_graph(args.graphs)
 
-    is_gnn = _is_gnn_checkpoint(checkpoint)
-    text_edge_list = _resolve_text_edge_list(checkpoint, is_gnn, args.text_edge_list)
-    edge_weights = _resolve_edge_weights(checkpoint)
-    injection_scope = _resolve_injection_scope(checkpoint)
-
-    print(f"Loading checkpoint: {checkpoint}")
-    model, tokenizer, _ = _load_checkpoint(checkpoint, four_bit=args.four_bit, device=args.device)
-    architecture = "graph-augmented" if is_gnn else "llm"
+    if is_navigator:
+        # NavigatorGT: no LLM checkpoint. The route is generated from explicit start/goal
+        # nodes; text_edge_list / injection_scope are LLM-only and unused here.
+        checkpoint = os.path.abspath(args.navigator_config)
+        ckpt_name = os.path.splitext(os.path.basename(checkpoint))[0]
+        text_edge_list, injection_scope = "none", "full_sequence"
+        print(f"Loading navigator: {checkpoint}")
+        model, edge_weights = _load_navigator(args.navigator_config)
+        tokenizer = None
+        architecture = "navigator-gt"
+    else:
+        checkpoint = os.path.abspath(args.checkpoint.rstrip("/"))
+        ckpt_name = os.path.basename(checkpoint)
+        is_gnn = _is_gnn_checkpoint(checkpoint)
+        text_edge_list = _resolve_text_edge_list(checkpoint, is_gnn, args.text_edge_list)
+        edge_weights = _resolve_edge_weights(checkpoint)
+        injection_scope = _resolve_injection_scope(checkpoint)
+        print(f"Loading checkpoint: {checkpoint}")
+        model, tokenizer, _ = _load_checkpoint(checkpoint, four_bit=args.four_bit, device=args.device)
+        architecture = "graph-augmented" if is_gnn else "llm"
     print(f"  architecture: {architecture}  |  text_edge_list={text_edge_list}  |  "
           f"edge_weights={edge_weights}  |  injection_scope={injection_scope}  |  4bit={args.four_bit}")
     print(f"  {len(samples_by_graph)} graph file(s)\n")
@@ -241,10 +279,15 @@ def main(argv: list[str] | None = None) -> None:
     )
     has_seeds = args.permutation_seed is not None
 
-    # Default output dir depends on mode.
-    base_output = args.output or (
-        os.path.join(checkpoint, "eval_logs", "cross_eval") if not has_seeds else "results"
-    )
+    # Default output dir depends on mode. The navigator has no checkpoint dir to nest under,
+    # so its default cross-eval output goes to results/<config-stem>/.
+    if not has_seeds and not is_navigator:
+        default_output = os.path.join(checkpoint, "eval_logs", "cross_eval")
+    elif not has_seeds:
+        default_output = os.path.join("results", ckpt_name)
+    else:
+        default_output = "results"
+    base_output = args.output or default_output
 
     for permutation in permutations:
         if permutation is not None:

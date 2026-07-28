@@ -3,9 +3,10 @@ import warnings
 
 import torch
 from torch import nn, Tensor
+from torch.distributions import Normal
 from torch.utils.checkpoint import checkpoint
 from torch_geometric.data import Data
-from torch_geometric.utils import add_self_loops, coalesce, softmax
+from torch_geometric.utils import add_self_loops, coalesce, softmax, to_dense_adj
 
 from prism.models.r_pearl import RandomGNNPositionalEncodings
 from prism.models.utils import SparseCSRDropout
@@ -489,3 +490,129 @@ class NavigatorPE(nn.Module):
         pe = self.pe_gt(data, permutation=permutation)             # [N, d_model]
         feed = Data(x=pe, edge_index=data.edge_index)              # seed = 0 -> head input = PE
         return self.semantic_gt(feed)                              # [N, d_model]
+
+
+class NavigatorGT(NavigatorPE):
+    """Autoregressive shortest-path navigator — the notebook's ``GNNShortestPathNavigator``
+    (notebooks/e9_gnn_navigation.ipynb §3) rebuilt on this repo's GT blocks.
+
+    Extends :class:`NavigatorPE` (``pe_gt`` = probe PE ``GraphTransformer``; ``semantic_gt``
+    = ``SemanticGraphTransformer`` head) with a per-node scoring ``classifier`` and an
+    autoregressive :meth:`generate`. Unlike ``NavigatorPE`` (seed 0, a pure Ψ producer),
+    the head reads ``graph.x + PE`` where ``graph.x`` is the navigation SEED: start and
+    goal are provided EXPLICITLY, not parsed from text — the goal node is biased low
+    (``loc=-5``) and the current node carries the running step count, exactly as the
+    notebook seeds them. R-PEARL probes are x-independent, so the PE is cached per graph.
+
+    Load the notebook checkpoint (``path_navigator.pt`` = ``navigator.state_dict()``, keys
+    ``gnn.*`` / ``head.*`` / ``classifier.*``) with :meth:`from_pretrained`, which remaps
+    ``gnn.``→``pe_gt.`` and ``head.``→``semantic_gt.``.
+
+    Args:
+        pe_gt: a ``GraphTransformer`` (random-probe PE) -> [N, d_model].
+        semantic_gt: a ``SemanticGraphTransformer`` consuming [N, d_model].
+        max_length: hard cap on rollout length (the notebook's ``MAX_LENGTH``).
+    """
+
+    def __init__(self, pe_gt: "GraphTransformer", semantic_gt: "SemanticGraphTransformer",
+                 max_length: int = 128):
+        super().__init__(pe_gt, semantic_gt)
+        self.MAX_LENGTH = max_length
+        self.shape = pe_gt.d_model                       # PE / seed feature width
+        self.classifier = nn.Linear(self.shape, 1)
+        # PE cache keyed on graph identity (R-PEARL probes ignore data.x).
+        self.graph = None
+        self.cached_pe = None
+
+    def _device(self) -> torch.device:
+        try:
+            return next(self.parameters()).device
+        except StopIteration:
+            return torch.device("cpu")
+
+    def invalidate_cache(self) -> None:
+        self.graph = None
+        self.cached_pe = None
+
+    def forward(self, graph: Data, permutation=None) -> Tensor:
+        # Cache PE per graph: R-PEARL probes are x-independent, so re-seeding graph.x
+        # across rollout steps does not change the PE.
+        if self.cached_pe is None or not self.cached_pe.any() or self.graph is not graph:
+            self.graph = graph
+            self.cached_pe = self.pe_gt(graph, permutation=permutation)   # [N, d_model]
+        feed = graph.clone()
+        feed.x = graph.x + self.cached_pe
+        return self.classifier(self.semantic_gt(feed))                    # [N, 1]
+
+    @torch.no_grad()
+    def generate(self, graph: Data, node1: int, node2: int) -> Tensor:
+        """Autoregressively walk ``node1 -> node2`` under adjacency + visited masking.
+
+        Mirrors the notebook: seed every node ~N(0, 0.1), the goal ~N(-5, 0.1), and the
+        current node ~N(count, 0.1) as the step counter advances; at each step score all
+        nodes, mask to unvisited neighbours of the current node, and take the argmax.
+        Returns the ordered node-index path as a ``[len, 1]`` LongTensor.
+        """
+        device = self._device()
+        N, D = graph.num_nodes, self.shape
+        adj = getattr(graph, "adj", None)
+        if adj is None:
+            adj = to_dense_adj(graph.edge_index, max_num_nodes=N).squeeze(0).bool()
+        adj = adj.to(device)
+
+        graph.x = Normal(loc=0.0, scale=0.1).sample((N, D)).to(device)
+        graph.x[node2] = Normal(loc=-5.0, scale=0.1).sample((1, D)).to(device)
+
+        count = 1.0
+        preds = [node1]
+        visited = {node1}
+        while not (preds[-1] == node2 or len(preds) > self.MAX_LENGTH):
+            c = preds[-1]
+            graph.x[c] = Normal(loc=count, scale=0.1).sample((1, D)).to(device)
+            allowed = adj[c].clone()
+            if visited:
+                allowed[torch.as_tensor(sorted(visited), device=allowed.device)] = False
+            if not bool(allowed.any()):
+                break
+            logits = self(graph).T.masked_fill(~allowed.unsqueeze(0), float("-inf"))
+            nxt = int(logits.argmax(dim=1))
+            preds.append(nxt)
+            visited.add(nxt)
+            count += 1.0
+        return torch.tensor([preds], device=device).T
+
+    @classmethod
+    def from_pretrained(cls, state_dict_path: str, *, gt_kwargs: dict,
+                        semantic_kwargs: dict, max_length: int = 128,
+                        map_location="cpu") -> "NavigatorGT":
+        """Build a ``NavigatorGT`` and load the notebook's full-navigator state dict.
+
+        ``state_dict_path`` is ``navigator.state_dict()`` (``path_navigator.pt``): keys
+        ``gnn.*`` (the GraphTransformer), ``head.*`` (the SemanticGraphTransformer) and
+        ``classifier.*``. They are remapped onto this class's ``pe_gt.*`` / ``semantic_gt.*``
+        / ``classifier.*`` and loaded strictly (a mismatch means ``gt_kwargs`` /
+        ``semantic_kwargs`` do not reproduce the trained submodules).
+        """
+        model = cls(GraphTransformer(**gt_kwargs),
+                    SemanticGraphTransformer(**semantic_kwargs),
+                    max_length=max_length)
+        raw = torch.load(state_dict_path, map_location=map_location)
+        remap = {}
+        for k, v in raw.items():
+            if k.startswith("gnn."):
+                remap["pe_gt." + k[len("gnn."):]] = v
+            elif k.startswith("head."):
+                remap["semantic_gt." + k[len("head."):]] = v
+            else:
+                remap[k] = v                                 # classifier.*
+        missing, unexpected = model.load_state_dict(remap, strict=False)
+        # Buffers registered on submodules (e.g. attention scale) are non-persistent and
+        # legitimately "missing"; unexpected keys mean a genuine architecture mismatch.
+        real_missing = [k for k in missing if not k.endswith(".scale")]
+        if real_missing or unexpected:
+            raise RuntimeError(
+                f"NavigatorGT load from {state_dict_path} mismatched the config "
+                f"(missing={real_missing}, unexpected={list(unexpected)}); gt_kwargs / "
+                f"semantic_kwargs must reproduce the trained submodules exactly.")
+        model.eval()
+        return model

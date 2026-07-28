@@ -69,10 +69,12 @@ def _fixed_get_base_prompt(request, scene_graph, use_icl=True):
 spine_prompts.get_base_prompt_update_graph = _fixed_get_base_prompt
 
 from prism.models import gnn_llm
+from prism.models import gt as gt_module
 from prism.models import inference
 from prism.models import utils as model_utils
 from prism.data import graph_sim
 from prism.data import planning_sim
+from prism.data import utils as data_utils
 from prism.eval import path_validator
 
 
@@ -217,6 +219,13 @@ def eval_model_single_graph(
     - `sample_results` is one dict per sample; `subjective_correct` / `false_positive` /
       `false_negative` carry the Gemma judge's separate verdict where it ran.
     """
+    if _is_navigator(model):
+        # NavigatorGT: no LLM/SPINE loop — the GNN walks init_node -> goal directly.
+        # Scoring is identical to the LLM path (same path_validator machinery); only the
+        # route source differs, and the endpoints are supplied explicitly.
+        return _eval_navigator_single_graph(
+            model, eval_samples, permutation=permutation, edge_weights=edge_weights)
+
     graph_handler = graph_util.GraphHandler("")
     graph_sim_cls = _NoToolsGraphSim if _spine_tools_disabled() else graph_sim.GraphSim
     graph_simulation = graph_sim_cls(graph_handler)
@@ -737,6 +746,117 @@ def _is_graph_augmented(model) -> bool:
         return True
     inner = getattr(getattr(model, "base_model", None), "model", None)
     return isinstance(inner, graph_types)
+
+
+def _is_navigator(model) -> bool:
+    """True if `model` is a NavigatorGT (autoregressive GNN shortest-path navigator)."""
+    return isinstance(model, gt_module.NavigatorGT)
+
+
+def _navigator_route(model, pyg, start_name: str, goal_name: Optional[str]) -> List[str]:
+    """Run one navigator rollout, mapping node names <-> indices. [] if endpoints unresolved."""
+    names = pyg.node_names
+    if goal_name is None or start_name not in names or goal_name not in names:
+        return []
+    out = model.generate(pyg, names.index(start_name), names.index(goal_name))
+    return [names[k] for k in out.view(-1).tolist()]
+
+
+def _eval_navigator_single_graph(
+    model,
+    eval_samples: List[EvalSample],
+    *,
+    permutation,
+    edge_weights: str,
+) -> Tuple[float, List[Dict]]:
+    """NavigatorGT scoring loop (all samples share one underlying scene graph).
+
+    Builds the PyG graph once, then for each sample resolves ``(start, goal)`` via
+    ``path_validator.resolve_start_goal`` (start = ``init_node``, goal = the scorer's own
+    target), walks the route with ``model.generate``, and wraps it as a planner response
+    (``plan`` = ``a -> b -> c``) so the downstream verdict/path-metric code is byte-identical
+    to the LLM path. Endpoints are the ONLY thing handed to the model directly.
+    """
+    if permutation is not None:
+        raise NotImplementedError(
+            "NavigatorGT eval does not support node-index permutation (the seed features "
+            "and dense adjacency mask would also need permuting); pass permutation=None.")
+    from torch_geometric.utils import to_dense_adj
+
+    device = model._device()
+    pyg = None
+    total_correct = 0
+    sample_results: List[Dict] = []
+
+    for i, es in enumerate(eval_samples):
+        try:
+            if pyg is None:
+                pyg = data_utils.scene_graph_dict_to_pyg(es.graph, edge_weights)
+                pyg.edge_index = pyg.edge_index.to(device)
+                pyg.adj = to_dense_adj(
+                    pyg.edge_index, max_num_nodes=pyg.num_nodes).squeeze(0).bool().to(device)
+                model.invalidate_cache()
+
+            start, goal = path_validator.resolve_start_goal(
+                es.graph, init_node=es.init_node, answer=es.answer,
+                criterion=es.acceptance_criterion, task=es.task)
+            route = _navigator_route(model, pyg, start, goal)
+            plan_str = " -> ".join(route)
+            planner_response = {
+                "primary_goal": es.task,
+                "relevant_graph": "",
+                "reasoning": f"Navigator rollout {start} -> {goal}: {plan_str}",
+                "plan": plan_str,
+            }
+
+            result, formatted_answer = _construct_eval_result(planner_response, es.answer)
+            print(formatted_answer if result.formatted else f"incorrect formatting\n{formatted_answer}")
+            print(f"correct answer: {result.plan_keyword}")
+
+            pm = _sample_path_metrics(planner_response, es)
+            v, structured, judge_pass = _objective_verdict(pm, result, es)
+            sample_dict = {
+                "graph_name": es.graph_name,
+                "idx": i,
+                "task": es.task,
+                "answer_key": es.answer,
+                "response": planner_response,
+                "interaction_trace": [],
+                "terminated_by": "navigator",
+                "formatted": result.formatted,
+                "plan_keyword": result.plan_keyword,
+                "correct": v["objective_correct"],
+                "structured": structured,
+                "subjective_correct": v["subjective_correct"],
+                "false_positive": v["false_positive"],
+                "false_negative": v["false_negative"],
+                "llm_judge_pass": judge_pass,
+                "error": None,
+                "traceback": None,
+                "path_metrics": pm,
+            }
+            if _gemma_regrade_enabled():
+                sample_dict["gemma_regrade"] = _gemma_regrade_block(planner_response, es, result)
+            sample_results.append(sample_dict)
+            total_correct += int(v["objective_keyword"])
+        except Exception as e:
+            tb_str = traceback_mod.format_exc()
+            print("!" * 80)
+            print(f"[NAV CRASH] Sample {i}/{len(eval_samples)}: {type(e).__name__}: {e}")
+            print(tb_str)
+            print("!" * 80)
+            sample_results.append({
+                "graph_name": es.graph_name, "idx": i, "task": es.task,
+                "answer_key": es.answer, "response": None, "interaction_trace": [],
+                "terminated_by": "exception", "formatted": False, "plan_keyword": False,
+                "correct": False, "structured": False, "subjective_correct": None,
+                "false_positive": False, "false_negative": False, "llm_judge_pass": None,
+                "error": f"{type(e).__name__}: {e}", "traceback": tb_str, "path_metrics": None,
+            })
+        print("\n=====\n")
+
+    accuracy = total_correct / len(eval_samples) if eval_samples else 0.0
+    return accuracy, sample_results
 
 
 def _graph_node_count(graph: dict) -> int:

@@ -1,0 +1,32 @@
+# NavigatorGT eval config — the notebook (e9_gnn_navigation.ipynb, create_gnn('gt'))
+# hyperparameters for the trained autoregressive shortest-path navigator. Consumed by
+# `python -m prism.eval.scalability_evaluation --navigator-config <this>`; the GT /
+# semantic sub-blocks MUST match the checkpoint under `weights` (loaded strictly).
+navigator:
+  weights: outputs/e9_multistage_training/suite4/path_navigator.pt
+  max_length: 128
+  # Graph parsing policy for the eval scene graphs (matches the notebook: 'binary').
+  edge_weights: binary
+
+  # Probe-PE GraphTransformer (navigator.gnn). node_feature_dim omitted => random probes.
+  gt:
+    num_layers: 3
+    pe_hidden_channels: 256
+    pe_num_layers: 5
+    d_model: 1024
+    heads: 8
+    num_samples: 320
+    dropout: 0.1
+    k_pe: 3
+    k_gt: 2
+    eps: 1.0e-6
+    use_layer_norm: true
+
+  # SemanticGraphTransformer head (navigator.head). node_feature_dim == gt.d_model.
+  semantic:
+    node_feature_dim: 1024
+    num_layers: 3
+    d_model: 1024
+    heads: 8
+    dropout: 0.1
+    k_gt: 2

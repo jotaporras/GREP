@@ -503,6 +503,26 @@ def derive_targets(graph_dict: dict, *, init_node, answer, criterion, task):
     return goal, waypoints, sorted(avoid), required_edges, kind
 
 
+def resolve_start_goal(
+    graph_dict: dict,
+    *,
+    init_node: Optional[str],
+    answer: Optional[str] = None,
+    criterion: Optional[str] = None,
+    task: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve ``(start, goal)`` node names for an explicit-endpoint navigator.
+
+    ``start`` is the task's ``init_node``; ``goal`` is the same graph target the
+    deterministic scorer resolves (:func:`derive_targets`), so a route generated to
+    this goal and the route scored by :func:`evaluate_sample` share one destination.
+    ``goal`` is ``None`` for tasks with no graph goal (e.g. counting).
+    """
+    goal, *_ = derive_targets(
+        graph_dict, init_node=init_node, answer=answer, criterion=criterion, task=task)
+    return init_node, goal
+
+
 def validate_structured(
     generated_text: str,
     graph_dict: dict,
