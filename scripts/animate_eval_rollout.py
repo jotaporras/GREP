@@ -139,6 +139,11 @@ def build_neon_base(graph_dict: dict, min_sep: float = 52.0) -> tuple:
     return nodes, edges
 
 
+# Per-task metrics not worth showing: hallucination_rate ≡ 1−edge_validity_rate;
+# parsed_nodes is the animated path; goal is shown in the panel header.
+_METRIC_BLOCKLIST = {"hallucination_rate", "parsed_nodes", "goal"}
+
+
 def build_adjacency(graph_dict: dict) -> set:
     """Undirected edge set for classifying a hop as real vs. hallucinated."""
     adj = set()
@@ -245,6 +250,22 @@ def build_episode(eval_data: dict, graph_dict: dict, name: str,
         cost_opt = (min(1.0, opt_cost / model_cost)
                     if opt_cost != float("inf") and model_cost > 1e-9 else None)
 
+        # Full per-task diagnostics, minus keys that are redundant or shown
+        # elsewhere (hallucination_rate ≡ 1−edge_validity; parsed_nodes ≡ path;
+        # goal shown in the header). Fill the (usually null) cost_optimality with
+        # our geometric value.
+        metrics = {k: v for k, v in pm.items()
+                   if k not in _METRIC_BLOCKLIST}
+        if metrics.get("cost_optimality") is None and cost_opt is not None:
+            metrics["cost_optimality"] = cost_opt
+
+        # Reasoning chain + final answer for the right-hand drop-down.
+        resp = s.get("response") or {}
+        answer = ""
+        for act in resp.get("plan") or []:
+            if isinstance(act, (list, tuple)) and len(act) >= 2 and act[0] == "answer":
+                answer = act[1]
+
         samples.append({
             "idx": s.get("idx"),
             "task": s.get("task", ""),
@@ -254,9 +275,10 @@ def build_episode(eval_data: dict, graph_dict: dict, name: str,
             "segments": segments,
             "dijkstra": dpath,
             "correct": bool(s.get("correct")),
-            "edge_validity": pm.get("edge_validity_rate"),
-            "cost_optimality": cost_opt,
-            "num_parsed": pm.get("num_parsed"),
+            "metrics": metrics,
+            "reasoning": resp.get("reasoning", ""),
+            "answer": answer,
+            "answer_key": s.get("answer_key", ""),
             # any parsed node absent from the graph is a ghost the overlay places
             "missing": sorted(n for n in path if n not in node_names),
         })
@@ -378,14 +400,44 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     #stage { position: relative; width: 100%; height: calc(100vh - 52px); }
     #graph { width: 100%; height: 100%; }
     #panel {
-      position: absolute; top: 14px; left: 14px; width: 320px; max-width: 42vw;
+      position: absolute; top: 14px; left: 14px; width: 300px; max-width: 30vw;
+      max-height: calc(100vh - 90px); overflow-y: auto;
       background: rgba(10,10,26,.82); border: 1px solid #26264d; border-radius: 10px;
-      padding: 14px 16px; backdrop-filter: blur(6px); pointer-events: none;
+      padding: 14px 16px; backdrop-filter: blur(6px);
       box-shadow: 0 8px 30px rgba(0,0,0,.5);
     }
-    #panel .task { font-size: .86rem; line-height: 1.4; color: #e6e9ff; margin-bottom: 10px; }
+    #panel .task { font-size: 1rem; line-height: 1.45; color: #e6e9ff; margin-bottom: 10px; }
     #panel .row { display: flex; gap: 10px; font-size: .74rem; margin: 4px 0; color: #9aa2cf; }
     #panel .row b { color: #cdd3f0; font-weight: 600; }
+    .section-title { font-size: .78rem; text-transform: uppercase; letter-spacing: .6px;
+      color: #7cf3ff; margin: 12px 0 6px; opacity: .8; }
+    #p-metrics .mrow { display: flex; justify-content: space-between; gap: 12px;
+      font-size: .88rem; padding: 5px 0; border-bottom: 1px solid rgba(255,255,255,.05); }
+    #p-metrics .mrow span { color: #8a92c0; }
+    #p-metrics .mrow b { color: #cdd3f0; font-weight: 600; font-variant-numeric: tabular-nums;
+      text-align: right; word-break: break-word; }
+    /* right-hand reasoning-chain drop-down */
+    #reasoning {
+      position: absolute; top: 14px; right: 14px; width: 350px; max-width: 32vw;
+      max-height: calc(100vh - 90px); overflow-y: auto;
+      background: rgba(10,10,26,.86); border: 1px solid #26264d; border-radius: 10px;
+      backdrop-filter: blur(6px); box-shadow: 0 8px 30px rgba(0,0,0,.5);
+    }
+    #reasoning details > summary {
+      cursor: pointer; list-style: none; user-select: none;
+      padding: 12px 16px; font-weight: 700; font-size: .96rem; letter-spacing: .3px; color: #9cf6ff;
+    }
+    #reasoning details > summary::-webkit-details-marker { display: none; }
+    #reasoning details > summary::before { content: "▸ "; color: #39ffbe; }
+    #reasoning details[open] > summary::before { content: "▾ "; }
+    #r-reasoning { padding: 0 16px 14px; font-size: .92rem; line-height: 1.55;
+      color: #d4d9f7; white-space: pre-wrap; }
+    #answerbox { margin: 0 12px 14px; border: 1px solid #2c2c58; border-radius: 8px;
+      background: rgba(20,20,45,.55); }
+    #answerbox > summary { color: #ffe14a; padding: 9px 12px; font-size: .9rem; }
+    #answerbox > summary::before { color: #ffe14a; }
+    #r-answer { padding: 0 12px 12px; font-size: .9rem; line-height: 1.5; color: #eef0ff; white-space: pre-wrap; }
+    .answer-key { display: block; margin-top: 8px; font-size: .78rem; color: #8a92c0; word-break: break-all; }
     .legend { margin-top: 12px; display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; font-size: .72rem; }
     .legend .li { display: flex; align-items: center; gap: 7px; color: #aab1de; }
     .swatch { width: 14px; height: 14px; border-radius: 50%; flex: none; box-shadow: 0 0 8px currentColor; }
@@ -431,10 +483,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div id="graph"></div>
     <div id="panel">
       <div class="task" id="p-task">—</div>
-      <div class="row"><span>Start</span><b id="p-start">—</b></div>
-      <div class="row"><span>Goal</span><b id="p-goal">—</b></div>
-      <div class="row"><span>Last reached</span><b id="p-last">—</b></div>
-      <div class="row"><span>Edge validity</span><b id="p-valid">—</b><span>Cost optimality</span><b id="p-opt">—</b></div>
+      <div class="section-title">How the model did</div>
+      <div id="p-metrics"></div>
       <div class="legend">
         <div class="li" style="color:#39ff14"><span class="swatch line" style="background:#39ff14"></span>Valid hop</div>
         <div class="li" style="color:#ff2d55"><span class="swatch dash line"></span>Hallucinated</div>
@@ -445,6 +495,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="li" style="color:#3aa0ff"><span class="swatch" style="background:#3aa0ff"></span>Last node</div>
       </div>
       <div class="hint">Drag nodes to rearrange · scroll to zoom · scrub or press play to draw the route.</div>
+    </div>
+    <div id="reasoning">
+      <details id="chain" open>
+        <summary>Reasoning chain</summary>
+        <div id="r-reasoning">—</div>
+        <details id="answerbox">
+          <summary>Answer</summary>
+          <div id="r-answer">—</div>
+        </details>
+      </details>
     </div>
   </div>
 
@@ -622,16 +682,79 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       $("scrub").max = Math.max(numSegs(), 0.001);
       $("scrub").value = 0;
       $("p-task").textContent = s.task || "(no task text)";
-      $("p-start").textContent = s.start || "—";
-      $("p-goal").textContent = s.goal || "—";
-      $("p-last").textContent = s.path.length ? s.path[s.path.length - 1] : "—";
-      $("p-valid").textContent = s.edge_validity == null ? "—" : (100 * s.edge_validity).toFixed(0) + "%";
-      $("p-opt").textContent   = s.cost_optimality == null ? "—" : (100 * s.cost_optimality).toFixed(0) + "%";
+      renderMetrics(s.metrics || {});
+      // reasoning chain + answer (answer stays collapsed by default each task)
+      $("r-reasoning").textContent = s.reasoning || "(no reasoning recorded)";
+      $("r-answer").innerHTML = "";
+      $("r-answer").append(document.createTextNode(s.answer || "(no answer)"));
+      if (s.answer_key) {
+        const k = document.createElement("span");
+        k.className = "answer-key"; k.textContent = "answer_key: " + s.answer_key;
+        $("r-answer").append(k);
+      }
+      $("answerbox").open = false;
       const v = $("verdict");
       v.textContent = s.correct ? "correct" : "incorrect";
       v.className = "badge " + (s.correct ? "ok" : "bad");
       updateTime();
       network.redraw();
+    }
+
+    // Plain-language names for each diagnostic, in the order they should read.
+    const METRIC_LABELS = {
+      num_parsed: "Route steps",
+      nodes_exist_rate: "Locations exist",
+      edge_validity_rate: "Valid connections",
+      full_path_valid: "Route valid",
+      start_goal_ok: "Start & goal",
+      cost_optimality: "Cost optimality",
+      hop_optimality: "Length optimality",
+      path_from_reasoning: "From reasoning",
+      path_rescued: "Rescued",
+      kind: "Task type",
+      waypoints_ok: "Stops visited",
+      avoid_ok: "Avoided no-go areas",
+      required_edges: "Required links",
+      required_edges_present: "Required links used",
+      structured_correct: "Correct (cleaned)",
+      structured: "Well-formed",
+      judge_used: "AI-judged",
+      llm_judge_pass: "Judge verdict",
+      path_expected: "Route expected",
+      valid_path_ab: "Reaches goal",
+    };
+    const METRIC_ORDER = Object.keys(METRIC_LABELS);
+    const prettyKey = k => METRIC_LABELS[k] ||
+      (k.charAt(0).toUpperCase() + k.slice(1).replace(/_/g, " "));
+
+    // Presentation-friendly value: percentages, Yes/No, node pairs as "a ↔ b".
+    function fmtMetric(k, v) {
+      if (v === null || v === undefined) return ["—", "#7c84ad"];
+      if (typeof v === "boolean") return [v ? "Yes" : "No", v ? "#7dff6b" : "#ff6b86"];
+      if (typeof v === "number") {
+        if (/optimality$/.test(k)) return [Number(v).toPrecision(3), "#cdd3f0"];
+        if (/_rate$/.test(k)) return [(100 * v).toFixed(0) + "%", "#cdd3f0"];
+        return [Number.isInteger(v) ? String(v) : v.toFixed(2), "#cdd3f0"];
+      }
+      if (Array.isArray(v)) {
+        if (!v.length) return ["none", "#7c84ad"];
+        return [v.map(e => Array.isArray(e) ? e.join(" ↔ ") : String(e)).join(", "), "#aab1de"];
+      }
+      const s = String(v);
+      return [s.charAt(0).toUpperCase() + s.slice(1), "#cdd3f0"];
+    }
+
+    function renderMetrics(m) {
+      const el = $("p-metrics"); el.innerHTML = "";
+      const keys = [...METRIC_ORDER.filter(k => k in m),
+                    ...Object.keys(m).filter(k => !(k in METRIC_LABELS))];
+      keys.forEach(k => {
+        const [txt, col] = fmtMetric(k, m[k]);
+        const row = document.createElement("div"); row.className = "mrow";
+        const a = document.createElement("span"); a.textContent = prettyKey(k);
+        const b = document.createElement("b"); b.textContent = txt; b.style.color = col;
+        row.append(a, b); el.append(row);
+      });
     }
 
     function selectEpisode(i) {
