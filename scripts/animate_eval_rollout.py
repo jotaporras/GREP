@@ -342,21 +342,29 @@ def collect_episodes(rollouts: str, graphs_dir: str, min_sep: float = 52.0) -> l
     for f in files:
         eval_data = json.loads(f.read_text())
 
+        # Skip non-rollout files (e.g. run summaries with no per-task samples).
+        if not eval_data.get("samples"):
+            continue
+
         # Multi-graph eval log: one file → one episode per graph_name.
         if _is_multigraph_log(eval_data):
             episodes.extend(
                 _episodes_from_multigraph(eval_data, gdir, f.name, min_sep))
             continue
 
-        # Per-graph rollout file: one file → one episode, matched by stem.
-        stem = f.stem
-        graph_path = gdir / f"{stem}.json"
+        # Per-graph rollout file: one file → one episode. Prefer the samples'
+        # own graph_name (filenames may carry run-id prefixes like
+        # "e13f_alpha00_binary_..._data_gen_001"); fall back to the file stem.
+        samples = eval_data.get("samples", [])
+        gnames = {s.get("graph_name") for s in samples if s.get("graph_name")}
+        gname = gnames.pop() if len(gnames) == 1 else f.stem
+        graph_path = gdir / f"{gname}.json"
         if not graph_path.exists():
-            print(f"  ! no graph for {f.name} at {graph_path} — skipping")
+            print(f"  ! no graph for {f.name} ({gname}) at {graph_path} — skipping")
             continue
         graph_dict = load_graph(str(graph_path))
-        episodes.append(build_episode(eval_data, graph_dict, stem, min_sep=min_sep))
-        print(f"  · {stem}: {len(eval_data.get('samples', []))} tasks")
+        episodes.append(build_episode(eval_data, graph_dict, gname, min_sep=min_sep))
+        print(f"  · {gname}: {len(samples)} tasks")
     return episodes
 
 
@@ -848,6 +856,7 @@ def render_html(episodes: list, out_path: str, title: str) -> None:
             .replace("__TITLE__", title)
             .replace("__SUBTITLE__", subtitle)
             .replace("/*__EPISODES__*/[]", json.dumps(episodes)))
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     Path(out_path).write_text(html, encoding="utf-8")
     print(f"Saved → {out_path}  ({len(episodes)} graphs, {n_tasks} tasks)")
 
