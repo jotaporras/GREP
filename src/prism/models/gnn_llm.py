@@ -406,8 +406,8 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
     attention logits at node-token positions. Unlike ``GraphMaskLLM`` (parameter-free,
     0 = allowed / finfo.min = blocked), the per-node-pair bias is **learned**::
 
-        M[i,j] = α·1 + (1−α)·sim(Ψ_i, Ψ_j)     i,j adjacent (or self-loop)
-        M[i,j] = finfo.min                       i,j non-adjacent (hard block)
+        M[i,j] = log(α·1 + (1−α)·sim(Ψ_i, Ψ_j))   i,j adjacent (or self-loop)
+        M[i,j] = finfo.min                        i,j non-adjacent (hard block)
 
     where ``Ψ = pe_model(graph)`` ∈ ``[N, D]`` is produced by a standalone Graph
     Transformer (a relative PE), and the ``N×N`` form is induced by the outer product
@@ -570,7 +570,7 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
 
         For token pairs (i, j) where BOTH tokens map to graph nodes::
 
-            adjacent / self-loop:  bias = α + (1−α)·sim(Ψ_i, Ψ_j)
+            adjacent / self-loop:  bias = log(α + (1−α)·sim(Ψ_i, Ψ_j))  (multiplicative gate)
             non-adjacent:          bias = finfo.min   (hard block)
 
         Every other pair (node↔non-node, non-node↔non-node) stays 0. The allowed
@@ -604,11 +604,12 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
                 sim = psi @ psi.t()                            # cosine ∈ [−1, 1]
             else:  # inv_sqrt_d
                 sim = (psi @ psi.t()) / (psi.shape[-1] ** 0.5)
-            node_M = alpha + (1.0 - alpha) * sim               # [N, N] edge value (fp32)
+            gate = (alpha + (1.0 - alpha) * sim).clamp_min(self._mask_eps)
+            node_M = gate.log()                                # [N, N] log-gate (fp32)
             q_nid = tok2node_q[q_pos]                          # node id per query node-token
             k_nid = tok2node_k[k_pos]                          # node id per key node-token
             allowed = adj[q_nid][:, k_nid]                     # [Pq, Pk] bool
-            block = node_M[q_nid][:, k_nid].to(dtype)          # [Pq, Pk] learned values
+            block = node_M[q_nid][:, k_nid].to(dtype)          # [Pq, Pk] log-gate values
             neg_t = torch.tensor(neg, dtype=dtype, device=device)
             block = torch.where(allowed, block, neg_t)         # hard-block non-edges
             bias[b, 0, q_pos.unsqueeze(1), k_pos.unsqueeze(0)] = block
@@ -1183,7 +1184,7 @@ class MaskDecodeInjector:
          non-adjacent node pairs, 0 elsewhere; untagged queries arm nothing.
 
     ``M`` is the same per-node-pair value the prefill bias uses: 0/−inf for
-    ``GraphMaskLLM``, ``α + (1−α)·sim(ΨΨᵀ)`` (Ψ computed once at construction) for
+    ``GraphMaskLLM``, ``log(α + (1−α)·sim(ΨΨᵀ))`` (Ψ computed once at construction) for
     ``LearnableGraphMaskLLM``.
     """
 
@@ -1205,7 +1206,8 @@ class MaskDecodeInjector:
                     sim = psi @ psi.t()
                 else:
                     sim = (psi @ psi.t()) / (psi.shape[-1] ** 0.5)
-            node_m = model._mask_alpha + (1.0 - model._mask_alpha) * sim
+            gate = (model._mask_alpha + (1.0 - model._mask_alpha) * sim).clamp_min(model._mask_eps)
+            node_m = gate.log()  # log-gate: matches build_structural_mask's multiplicative fold
         else:
             node_m = torch.zeros_like(adj, dtype=torch.float32)
         neg = torch.finfo(torch.float32).min
