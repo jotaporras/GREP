@@ -856,7 +856,11 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
                 g.x = feats.detach()
             pe = self.pe_proj(self.pe_model(g, permutation=permutation))  # [n, hidden_size]
             if self.pe_norm is not None:
-                pe = self.pe_norm(pe)
+                # Norm weight is fp32; under bf16 autocast pe is bf16. Compute the norm in
+                # fp32 (matches the codebase's fp32-norm convention; tiny [n, hidden] tensor)
+                # and cast back, so the fused rms_norm kernel dispatches instead of falling
+                # back on an input/weight dtype mismatch.
+                pe = self.pe_norm(pe.float()).to(pe.dtype)
             # Gate: g = tanh(pe_gain) ∈ (-1, 1); norm sets scale, gate sets ramp.
             pe = pe * torch.tanh(self.pe_gain)
             for node_idx, spans in injection_maps[b].items():
