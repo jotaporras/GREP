@@ -44,7 +44,7 @@ from prism.data.compact_prompt import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = REPO_ROOT / "data_store" / "revised" / "gen" / "nav100_n30_gemma_data"
+DATA_DIR = REPO_ROOT / "data" / "n_30" / "gen" / "nav100_n30_gemma_data"
 DEFAULT_PLAN = DATA_DIR / "generated_plans" / "sample_000_000.json"
 DEFAULT_GRAPH = DATA_DIR / "populated_graphs" / "data_gen_000.json"
 SECOND_GRAPH = DATA_DIR / "populated_graphs" / "data_gen_001.json"
