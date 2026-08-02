@@ -256,7 +256,9 @@ def test_parse_args_defaults():
     assert ns.four_bit is False
     assert ns.permutation_seed is None
     assert ns.output is None
-    assert ns.use_icl == "true"          # default true (historical behavior)
+    # Default false: the deployed prompt is zero-shot, matching the checkpoints
+    # (data.icl_examples=0). ICL stays available via --use-icl true.
+    assert ns.use_icl == "false"
     assert ns.text_edge_list is None     # no default; resolved later
 
 

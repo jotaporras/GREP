@@ -123,7 +123,7 @@ def test_full_argv_parses_and_routes():
     assert ns.device == 0
     # No seeds -> non-seeded cross_eval layout must be selected.
     assert ns.permutation_seed is None
-    assert ns.use_icl == "true"  # documented default
+    assert ns.use_icl == "false"  # documented default: zero-shot, as trained
 
 
 def test_text_edge_list_none_also_parses():

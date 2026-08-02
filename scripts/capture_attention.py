@@ -47,6 +47,8 @@ def main():
     is_gnn = ckpt_mod.is_gnn_checkpoint(args.checkpoint)
     arch = ckpt_mod.load_gnn_config(args.checkpoint)["architecture"] if is_gnn else "llm"
     text_edge_list = ckpt_mod.resolve_text_edge_list(args.checkpoint, is_gnn, None)
+    # Prompt policy (SPINE tools / few-shot count) recovered from the checkpoint.
+    spine_tools, icl_examples = ckpt_mod.resolve_prompt_policy(args.checkpoint)
     scope = ckpt_mod.resolve_injection_scope(args.checkpoint)
     print(f"[capture] arch={arch} text_edge_list={text_edge_list} scope={scope} layers={layer_ids}")
 
@@ -65,7 +67,8 @@ def main():
             layer.self_attn.config._attn_implementation = "eager"
 
     ds = datasets.load_dataset("json", data_files=[args.val_file], split="train")
-    ds = data_mod.preprocess_dataset(ds, tokenizer, text_edge_list=text_edge_list)
+    ds = data_mod.preprocess_dataset(ds, tokenizer, text_edge_list=text_edge_list,
+                                    spine_tools=spine_tools, icl_examples=icl_examples)
     example = ds[args.example_idx]
     input_ids = torch.tensor([example["input_ids"]], dtype=torch.long, device=device)
     answer_start = example["answer_start"]

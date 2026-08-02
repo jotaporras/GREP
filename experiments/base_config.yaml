@@ -104,6 +104,29 @@ data:
   # "present" writes the edge list into the prompt; "none" removes it (connectivity must
   # come from the graph PE — the Stage-3 / no-edges axis).
   text_edge_list: present
+  # SPINE tool calling in the TRAINING text. "present": the system prompt documents the
+  # SPINE API (goto/map_region/explore_region/extend_map/inspect/answer), requires every
+  # hop to be ratified with map_region before answer() — no hallucinated edges — and the
+  # SFT targets keep their action-list plans. "none": no tool calls; the model reasons
+  # over adjacencies by thought and the targets are bare `a -> b` routes.
+  #
+  # DEPLOYMENT IS DELIBERATELY ASYMMETRIC: we TRAIN tool-free ("none") and DEPLOY with the
+  # SPINE API live (eval reads PRISM_DISABLE_SPINE_TOOLS, unset = tools on, which also
+  # selects GraphSim over _NoToolsGraphSim). The seam absorbs the difference: a model
+  # trained on bare routes emits a bare route, and compact_output_to_spine_json wraps it
+  # as [answer(route)] for the planner. The residual cost is that the deployed contract
+  # asks for an action list the model was never trained to emit — flip this to "present"
+  # (and regenerate rollouts that actually call tools) if that gap ever shows up in evals.
+  spine_tools: none
+  # Few-shot examples prepended to each training prompt, taken from
+  # evaluate.SPINE_ICL_EXAMPLES (EXAMPLE_1, EXAMPLE_2) — the same ones eval sends. 0 =
+  # zero-shot (what we train and deploy today), 2 = few-shot; keep it equal to
+  # eval.use_icl's effect, since ICL also MOVES the scene graph out of the system message
+  # and into the query turn. Each example costs prompt length (~1.7k Llama-3 tokens for
+  # the two, measured), and its own scene-graph block precedes the query's (which stays
+  # last, so PE injection still scopes to the query graph). NOTE: those canned examples
+  # call goto/map_region, so only pair icl_examples>0 with spine_tools=present.
+  icl_examples: 0
   # GNN edge weighting over the scene-graph adjacency ("gaussian" | "binary").
   # "gaussian" (historical): edge_weight = exp(-d^2/2sigma^2), sigma = per-graph median
   # edge length (E1 Gaussian affinity), consumed by the R-PEARL/GT GCN. On SBM-with-
@@ -184,7 +207,11 @@ eval:
   data: data/revised/gen/nav100_n30_gemma_data/split/test_graphs
   num_graphs: 5       # cap on evaluated graphs; -1 = the whole directory
   epoch_interval: 1.0 # run the generation eval every this many epochs
-  use_icl: true       # keep the one-shot ICL example in eval prompts
+  # false = zero-shot eval prompts (the deployed setting; matches data.icl_examples=0).
+  # true keeps SPINE's two ICL examples, compacted, ahead of the query — and moves the
+  # scene graph out of the system message into the query turn, so train with
+  # data.icl_examples=2 if you turn this on.
+  use_icl: false
   # Held-out graph set evaluated once post-training (reloaded from the saved checkpoint).
   post_train_graphs: null
 

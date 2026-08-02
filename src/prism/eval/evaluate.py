@@ -44,8 +44,11 @@ _orig_get_base_prompt = spine_prompts.get_base_prompt_update_graph
 
 # Pin eval to the same two ICL examples the model trained on: SPINE's default uses five
 # (EXAMPLE_1..EXAMPLE_5), tripling prompt length vs training and causing repeated-token
-# degeneration (especially with RoPE disabled).
-_ICL_EXAMPLES_2 = examples.EXAMPLE_1 + examples.EXAMPLE_2
+# degeneration (especially with RoPE disabled). Also the source of the compact-format
+# few-shot examples on the TRAINING side (``data.preprocess_dataset`` imports it), so
+# both paths show the model the same demonstrations.
+SPINE_ICL_EXAMPLES = examples.EXAMPLE_1 + examples.EXAMPLE_2
+_ICL_EXAMPLES_2 = SPINE_ICL_EXAMPLES
 
 
 def _fixed_get_base_prompt(request, scene_graph, use_icl=True):
@@ -88,13 +91,31 @@ _SPINE_TOOL_ACTIONS = frozenset(
 
 
 def _spine_tools_disabled() -> bool:
-    """True when PRISM_DISABLE_SPINE_TOOLS opts the eval out of tool calling."""
+    """True when PRISM_DISABLE_SPINE_TOOLS opts the eval out of tool calling.
+
+    The SINGLE switch for tool calling at eval: it selects the simulator
+    (``_NoToolsGraphSim`` vs ``GraphSim``), the SPINE-side directive appended to
+    ``SYS_PROMPT``, and — via ``include_tools`` on the inference clients — the compact
+    system prompt the model actually reads (SPINE API + path ratification, or reason
+    by thought with no tool calls). All three must agree, so they read this one flag.
+    """
     return os.environ.get("PRISM_DISABLE_SPINE_TOOLS", "0").strip().lower() in (
         "1",
         "true",
         "yes",
         "on",
     )
+
+
+def _compact_icl_examples(use_icl: bool) -> int:
+    """How many SPINE few-shot examples the compact prompt keeps.
+
+    ``use_icl`` builds the header with ``SPINE_ICL_EXAMPLES`` (2 examples); the compact
+    translator keeps all of them (-1). Without it the LLM-facing prompt is zero-shot
+    (0) — the header's single EXAMPLE_1 is dropped, as it always has been — which is
+    the ICL A/B arm.
+    """
+    return -1 if use_icl else 0
 
 
 def _gemma_regrade_enabled() -> bool:
@@ -230,12 +251,19 @@ def eval_model_single_graph(
     graph_sim_cls = _NoToolsGraphSim if _spine_tools_disabled() else graph_sim.GraphSim
     graph_simulation = graph_sim_cls(graph_handler)
 
+    # One tool switch for the simulator above and the prompt below; one ICL switch for
+    # the SPINE header built by _fixed_get_base_prompt and the compact text it becomes.
+    include_tools = not _spine_tools_disabled()
+    icl_examples = _compact_icl_examples(use_icl)
+
     is_gnn = _is_graph_augmented(model)
     if is_gnn:
         client = inference.GraphAugmentedInMemoryLLM(
             model=model,
             tokenizer=tokenizer,
             include_edges=include_edge_list,
+            include_tools=include_tools,
+            icl_examples=icl_examples,
             permutation=permutation,
             edge_weights=edge_weights,
             injection_scope=injection_scope,
@@ -245,6 +273,8 @@ def eval_model_single_graph(
             model=model,
             tokenizer=tokenizer,
             include_edges=include_edge_list,
+            include_tools=include_tools,
+            icl_examples=icl_examples,
         )
 
 

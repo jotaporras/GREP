@@ -30,7 +30,8 @@ import json
 
 import torch
 
-from prism.models.inference import InMemoryLLM, DECODE_KWARGS
+from prism.models.inference import (
+    DECODE_KWARGS, MAX_NEW_TOKENS, SPINE_TOKEN_MULTIPLIER, InMemoryLLM)
 from prism.data import compact_prompt
 
 
@@ -102,7 +103,8 @@ class _StubModel:
 
 
 def _client(decoded: str = "", model_out: torch.Tensor | None = None,
-            include_edges: bool = False) -> InMemoryLLM:
+            include_edges: bool = False, include_tools: bool = False,
+            icl_examples: int = 0) -> InMemoryLLM:
     """InMemoryLLM with __init__ bypassed (like tests/test_inference_graph_parser.py),
     wired to the stub tokenizer/model so only the plumbing is exercised."""
     llm = InMemoryLLM.__new__(InMemoryLLM)
@@ -110,6 +112,12 @@ def _client(decoded: str = "", model_out: torch.Tensor | None = None,
     llm.model = _StubModel(model_out if model_out is not None else torch.zeros(1, 1, dtype=torch.long))
     llm.device = "cpu"
     llm.include_edges = include_edges
+    # Prompt-policy flags the client threads into spine_to_compact_messages; the defaults
+    # here are the zero-shot / tool-free form these plumbing tests were written against.
+    llm.include_tools = include_tools
+    llm.icl_examples = icl_examples
+    # __init__ is bypassed here, so resolve the budget the same way it would.
+    llm.max_new_tokens = MAX_NEW_TOKENS * (SPINE_TOKEN_MULTIPLIER if include_tools else 1)
     return llm
 
 
@@ -122,13 +130,15 @@ def test_init_reads_device_from_model_params():
     model/tokenizer/include_edges are stored on the instance."""
     model = torch.nn.Linear(2, 2)  # CPU param holder, not under test — just a device source
     tok = _StubTokenizer()
-    llm = InMemoryLLM(model, tok, include_edges=True)
+    llm = InMemoryLLM(model, tok, include_edges=True, include_tools=True, icl_examples=2)
 
     assert llm.device == next(model.parameters()).device
     assert llm.device.type == "cpu"
     assert llm.model is model
     assert llm.tokenizer is tok
     assert llm.include_edges is True
+    assert llm.include_tools is True
+    assert llm.icl_examples == 2
 
 
 # ---------------------------------------------------------------------------

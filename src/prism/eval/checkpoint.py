@@ -85,6 +85,20 @@ def resolve_text_edge_list(checkpoint: str, is_gnn: bool, cli_override: str | No
     )
 
 
+def resolve_prompt_policy(checkpoint: str) -> tuple:
+    """Recover the train-time ``(data.spine_tools, data.icl_examples)`` prompt policy.
+
+    Read from ``train_config.json``. Missing keys mean the checkpoint predates the
+    knobs, and every such run was trained tool-free and zero-shot — so ``("none", 0)``
+    is the exact historical value, not a guess (same rule as
+    :func:`resolve_edge_weights`).
+    """
+    tc = _read_json(os.path.join(checkpoint, "train_config.json")) or {}
+    spine_tools = tc.get("spine_tools") or "none"
+    icl_examples = tc.get("icl_examples")
+    return spine_tools, 0 if icl_examples is None else int(icl_examples)
+
+
 def resolve_edge_weights(checkpoint: str) -> str:
     """Recover the train-time ``data.edge_weights`` policy ("gaussian" | "binary")
     so eval-time graph parsing matches training.

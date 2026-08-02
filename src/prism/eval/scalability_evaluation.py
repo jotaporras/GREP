@@ -102,9 +102,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Override the textual-edge-list mode. Default: read from "
                         "train_config.json (legacy graph checkpoints: gnn_config.json) "
                         "for plain LLMs. Required if a plain-LLM checkpoint has neither.")
-    p.add_argument("--use-icl", choices=["true", "false"], default="true",
+    p.add_argument("--use-icl", choices=["true", "false"], default="false",
                    help="Include SPINE in-context-learning examples in the planner prompt. "
-                        "Default: true (matches historical behavior).")
+                        "Default: false — the deployed setting, matching the zero-shot "
+                        "prompts the checkpoints were trained on (data.icl_examples=0). "
+                        "true also moves the scene graph out of the system message.")
     return p.parse_args(argv)
 
 

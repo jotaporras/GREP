@@ -25,6 +25,15 @@ from prism.models.gnn_llm import (
 # (results unchanged). Sampling params live here, in one place, if ever re-enabled.
 DECODE_KWARGS = {"do_sample": False, "use_cache": True}
 
+# Generation budget. SPINE mode costs far more output: the model has to work through
+# the tool tutorial, ratify each hop, and then still write the action list — and a
+# generation cut off before the plan line yields an EMPTY plan
+# (``compact_output_to_spine_json``), i.e. a lost sample rather than a wrong one.
+# Measured on a 24-node graph, tool-free answers land in a few hundred tokens while
+# ratifying answers ran past 1k, so SPINE gets 4x the tool-free budget.
+MAX_NEW_TOKENS = 2048
+SPINE_TOKEN_MULTIPLIER = 4
+
 
 def _core_graph_model(model):
     """Peel PEFT wrappers to reach the GraphAugmentedLLM / GraphMaskLLM core.
@@ -50,16 +59,26 @@ class InMemoryLLM(spine_models.InMemoryLLM):
 
     Subclasses ``spine.models.InMemoryLLM`` to inherit the shared SPINE client
     contract (``format_prompt``); overrides ``query_llm`` to route through the
-    compact prompt translation (SPINE system prompt + ICL dropped; scene graph
-    compacted; edge bullets present iff ``include_edges``) and inverse-translate
-    the compact output back to SPINE JSON.
+    compact prompt translation (verbose SPINE system prompt replaced by the compact
+    one; scene graph compacted; edge bullets present iff ``include_edges``; the
+    first ``icl_examples`` SPINE few-shot examples kept and compacted; SPINE API
+    documented and action-list plans preserved iff ``include_tools``) and
+    inverse-translate the compact output back to SPINE JSON.
     """
 
-    def __init__(self, model, tokenizer, include_edges: bool):
+    def __init__(self, model, tokenizer, include_edges: bool, include_tools: bool,
+                 icl_examples: int):
         # Reuse SPINE's __init__ for model/tokenizer/device; device is taken from
         # the model's own parameters rather than the SPINE "cuda" default.
         super().__init__(model, tokenizer, device=next(model.parameters()).device)
         self.include_edges = include_edges
+        # Tool policy must match the simulator the planning loop runs
+        # (evaluate._spine_tools_disabled -> _NoToolsGraphSim), and the ICL count must
+        # match what the SPINE header actually carries; evaluate.py sets both.
+        self.include_tools = include_tools
+        self.icl_examples = icl_examples
+        # SPINE mode gets SPINE_TOKEN_MULTIPLIER x the tool-free budget (see the constants).
+        self.max_new_tokens = MAX_NEW_TOKENS * (SPINE_TOKEN_MULTIPLIER if include_tools else 1)
 
     def _decode(self, outputs) -> str:
         # clean_up_tokenization_spaces=False: WordPiece post-process corrupts BPE plan text.
@@ -77,8 +96,12 @@ class InMemoryLLM(spine_models.InMemoryLLM):
         # Strip the input prefix — keep only newly generated tokens.
         return outputs[:, input_ids.shape[-1]:]
 
-    def query_llm(self, msg: List[Dict], max_new_tokens: int = 2048):
-        llm_msg = compact_prompt.spine_to_compact_messages(msg, include_edges=self.include_edges)
+    def query_llm(self, msg: List[Dict], max_new_tokens: int = None):
+        # None -> the policy budget resolved at construction (4x under SPINE).
+        max_new_tokens = self.max_new_tokens if max_new_tokens is None else max_new_tokens
+        llm_msg = compact_prompt.spine_to_compact_messages(
+            msg, include_edges=self.include_edges, include_tools=self.include_tools,
+            icl_examples=self.icl_examples)
         input = self.tokenizer.apply_chat_template(
             llm_msg, tokenize=True, add_generation_prompt=True, return_tensors="pt"
         )
@@ -116,10 +139,12 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
     # partially-constructed instances (tests) resolve it too.
     injection_scope = "full_sequence"
 
-    def __init__(self, model, tokenizer, include_edges: bool, permutation=None,
+    def __init__(self, model, tokenizer, include_edges: bool, include_tools: bool,
+                 icl_examples: int, permutation=None,
                  edge_weights: str = "gaussian",
                  injection_scope: str = "full_sequence"):
-        super().__init__(model, tokenizer, include_edges=include_edges)
+        super().__init__(model, tokenizer, include_edges=include_edges,
+                         include_tools=include_tools, icl_examples=icl_examples)
         self.permutation = permutation
         self.edge_weights = edge_weights
         self.injection_scope = injection_scope
@@ -139,10 +164,14 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
                     continue
         return graphs
 
-    def query_llm(self, msg: List[Dict], max_new_tokens: int = 2048):
+    def query_llm(self, msg: List[Dict], max_new_tokens: int = None):
+        # None -> the policy budget resolved at construction (4x under SPINE).
+        max_new_tokens = self.max_new_tokens if max_new_tokens is None else max_new_tokens
         # Parse PyG graphs from ORIGINAL message (full connectivity, unaffected by include_edges).
         pyg_graphs = self._parse_all_pyg_graphs(msg)
-        llm_msg = compact_prompt.spine_to_compact_messages(msg, include_edges=self.include_edges)
+        llm_msg = compact_prompt.spine_to_compact_messages(
+            msg, include_edges=self.include_edges, include_tools=self.include_tools,
+            icl_examples=self.icl_examples)
 
         input = self.tokenizer.apply_chat_template(
             llm_msg, tokenize=True, add_generation_prompt=True, return_tensors="pt"

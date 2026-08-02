@@ -112,9 +112,13 @@ def edge_list_token_positions(full_text, input_ids, tokenizer):
     Supervised target for ``loss_target='edge_list'`` (Stage-2 edge-list reconstruction).
     Primary: char-span via offset mapping (trusted when re-encode reproduces input_ids).
     Fallback: subsequence match. Returns ``[]`` if the block can't be located.
+
+    The LAST block is taken: with few-shot examples in the prompt (``icl_examples`` > 0)
+    each demo graph carries its own edge bullets, and the supervised span must be the
+    QUERY graph's — the same block ``find_last_graph_scope`` scopes injection to.
     """
     try:
-        start_char = full_text.index("• Region Edges:")
+        start_char = full_text.rindex("• Region Edges:")
     except ValueError:
         return []
     obj = full_text.find("• Object Edges:", start_char)
@@ -212,6 +216,8 @@ def preprocess_dataset(
     ds: datasets.Dataset,
     tokenizer,
     text_edge_list: str,
+    spine_tools: str,
+    icl_examples: int,
 ) -> datasets.Dataset:
     """Prepare a raw JSON dataset for training.
 
@@ -219,6 +225,15 @@ def preprocess_dataset(
     2. Translate to compact format via ``spine_to_compact_messages``.
        ``text_edge_list`` is resolved once to ``include_edges``; for graph archs the GNN
        always reads structural edges from the ORIGINAL messages (flag only gates the LLM-facing text).
+       ``spine_tools`` resolves to ``include_tools`` (SPINE API documented + action-list
+       targets vs reason-by-thought + bare-route targets). It need NOT match the eval
+       switch ``PRISM_DISABLE_SPINE_TOOLS``: the deployed configuration trains tool-free
+       and evaluates with the API live, and ``compact_output_to_spine_json`` wraps the
+       bare route the model emits into ``[answer(route)]`` for the planner.
+       ``icl_examples`` > 0 prepends that many of ``evaluate.SPINE_ICL_EXAMPLES`` — the
+       same few-shot examples eval sends — to each rollout before translation; the
+       corpus itself is ICL-stripped (``utils.write_conversations``), so this is where
+       train-side ICL comes from. Match it to ``eval.use_icl`` (which keeps 2).
     3. Tokenize, filter out examples with no assistant turn, and precompute graph-token index columns.
     """
     @no_type_check
@@ -232,7 +247,9 @@ def preprocess_dataset(
 
     def _parse_scene_graph(example):
         full_text = tokenizer.apply_chat_template(example["messages"], tokenize=False)
-        m = re.search(r"[Ss]cene graph:", full_text)
+        # LAST marker = the query graph. The corpus is ICL-stripped so it is usually the
+        # only one, but few-shot examples (icl_examples > 0) put their own graphs first.
+        m = list(re.finditer(r"[Ss]cene graph:", full_text))[-1]
         start = full_text.index("{", m.end())
         tail = full_text[start:]
         try:
@@ -268,6 +285,13 @@ def preprocess_dataset(
     # text_edge_list=="present" gates edge bullets in the LLM-facing text only;
     # the GNN always reads structural edges from the ORIGINAL messages.
     include_edges = (text_edge_list == "present")
+    # spine_tools=="present" documents the SPINE API in the system prompt and keeps the
+    # action-list plan in each target; "none" trains the reason-by-thought/bare-route form.
+    include_tools = (spine_tools == "present")
+    # The corpus is ICL-stripped, so few-shot examples are prepended here from the SAME
+    # constant eval sends (evaluate.SPINE_ICL_EXAMPLES); the translator compacts the
+    # first `icl_examples` of them and drops the rest.
+    icl_prefix = list(evaluate.SPINE_ICL_EXAMPLES) if icl_examples else []
 
     # Same pipeline for every architecture: the scene graph is parsed even for the
     # plain LLM (the graph_acc/* metrics need it), and include_edges gates only the
@@ -276,7 +300,10 @@ def preprocess_dataset(
     ds = ds.map(_parse_scene_graph)
     def _translate_to_compact(example):
         example["messages"] = compact_prompt.spine_to_compact_messages(
-            example["conversations"], include_edges=include_edges
+            icl_prefix + list(example["conversations"]),
+            include_edges=include_edges,
+            include_tools=include_tools,
+            icl_examples=icl_examples,
         )
         return example
     ds = ds.map(_translate_to_compact)
@@ -296,16 +323,21 @@ def preprocess_dataset(
                 example["messages"][:-1], tokenize=True,
                 add_generation_prompt=True, return_dict=False)),
             len(input_ids))
+        scope_start = find_last_graph_scope(input_ids, tokenizer)
         scene_idx, answer_idx = node_index_columns(
-            input_ids, variants,
-            scope_start=find_last_graph_scope(input_ids, tokenizer),
-            answer_start=answer_start)
+            input_ids, variants, scope_start=scope_start, answer_start=answer_start)
         example["scene_node_idx"] = scene_idx
         example["answer_node_idx"] = answer_idx
         example["answer_start"] = answer_start
         # assistant_idx -> loss_target='responses'; edge_list_idx -> loss_target='edge_list'.
-        example["assistant_idx"] = assistant_token_positions(
-            example["messages"], input_ids, tokenizer)
+        # Clamped to the query graph's scope: a few-shot prompt (icl_examples > 0) carries
+        # DEMO assistant turns, and supervising those would train the model to reproduce
+        # SPINE's canned example answers (and their graphs) instead of only its own task.
+        # A no-op at icl_examples=0, where every assistant turn already follows the block.
+        example["assistant_idx"] = [
+            p for p in assistant_token_positions(example["messages"], input_ids, tokenizer)
+            if p >= scope_start
+        ]
         # edge_list_idx is empty when include_edges is False (no edge bullets in text).
         if include_edges:
             full_text = tokenizer.apply_chat_template(example["messages"], tokenize=False)
@@ -327,8 +359,8 @@ def load_and_split_dataset(data_cfg, tokenizer):
 
     Args:
         data_cfg: the ``data`` config section (OmegaConf) supplying ``train_files``,
-            ``val_files``, ``val_frac``, ``debug``, ``dataset_proportion``, and
-            ``text_edge_list``.
+            ``val_files``, ``val_frac``, ``debug``, ``dataset_proportion``,
+            ``text_edge_list``, ``spine_tools``, and ``icl_examples``.
         tokenizer: tokenizer passed through to ``preprocess_dataset``.
 
     Returns:
@@ -340,7 +372,8 @@ def load_and_split_dataset(data_cfg, tokenizer):
         full_dataset = full_dataset.select(range(round(len(full_dataset) * data_cfg.dataset_proportion)))
 
     full_dataset = preprocess_dataset(
-        full_dataset, tokenizer, text_edge_list=data_cfg.text_edge_list)
+        full_dataset, tokenizer, text_edge_list=data_cfg.text_edge_list,
+        spine_tools=data_cfg.spine_tools, icl_examples=data_cfg.icl_examples)
 
     if data_cfg.val_files:
         train_dataset = full_dataset
@@ -348,7 +381,8 @@ def load_and_split_dataset(data_cfg, tokenizer):
         if data_cfg.debug:
             eval_dataset = eval_dataset.select(range(round(len(eval_dataset) * data_cfg.dataset_proportion)))
         eval_dataset = preprocess_dataset(
-            eval_dataset, tokenizer, text_edge_list=data_cfg.text_edge_list)
+            eval_dataset, tokenizer, text_edge_list=data_cfg.text_edge_list,
+            spine_tools=data_cfg.spine_tools, icl_examples=data_cfg.icl_examples)
         print(f"Using pre-split val file: {len(train_dataset)} train / {len(eval_dataset)} eval")
     elif data_cfg.val_frac and data_cfg.val_frac > 0.0:
         dataset_size = len(full_dataset)

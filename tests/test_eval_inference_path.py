@@ -110,7 +110,8 @@ def _graph_mask_model(llm):
 
 def _make_client(cls, model, tok, **kw):
     """Build a client via real __init__ (reads device from model params)."""
-    return cls(model, tok, include_edges=False, **kw)
+    return cls(model, tok, include_edges=False, include_tools=False,
+               icl_examples=0, **kw)
 
 
 def _prompt_ids(tok):

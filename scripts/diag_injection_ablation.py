@@ -164,6 +164,9 @@ def main():
     is_gnn = ckpt_mod.is_gnn_checkpoint(args.checkpoint)
     arch = ckpt_mod.load_gnn_config(args.checkpoint)["architecture"] if is_gnn else "llm"
     text_edge_list = ckpt_mod.resolve_text_edge_list(args.checkpoint, is_gnn, args.text_edge_list)
+    # Prompt policy (SPINE tools / few-shot count) recovered from the checkpoint so the
+    # diagnostic tokenizes the SAME text the model was trained on.
+    spine_tools, icl_examples = ckpt_mod.resolve_prompt_policy(args.checkpoint)
     print(f"[diag] checkpoint={args.checkpoint}")
     print(f"[diag] arch={arch} text_edge_list={text_edge_list} val_file={args.val_file}")
 
@@ -171,7 +174,8 @@ def main():
     device = next(model.parameters()).device
 
     ds = datasets.load_dataset("json", data_files=[args.val_file], split="train")
-    ds = data_mod.preprocess_dataset(ds, tokenizer, text_edge_list=text_edge_list)
+    ds = data_mod.preprocess_dataset(ds, tokenizer, text_edge_list=text_edge_list,
+                                    spine_tools=spine_tools, icl_examples=icl_examples)
     if args.max_examples > 0:
         ds = ds.select(range(min(args.max_examples, len(ds))))
 

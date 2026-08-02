@@ -237,6 +237,10 @@ def train_model(config: omegaconf.DictConfig):
             "architecture": config.gnn.arch,
             "base_model": config.model.path,
             "text_edge_list": config.data.text_edge_list,
+            # Prompt-format provenance: whether the targets teach SPINE tool calling and
+            # how many few-shot examples the prompts carried (eval must match).
+            "spine_tools": config.data.spine_tools,
+            "icl_examples": config.data.icl_examples,
             "injection_scope": config.data.injection_scope,
             "edge_weights": config.data.edge_weights,
             # Two-group LR: structural (GT / PE) params train at structural_lr_mult × base LR
@@ -285,6 +289,8 @@ def train_model(config: omegaconf.DictConfig):
                 "architecture": config.gnn.arch,
                 "base_model": config.model.path,
                 "text_edge_list": config.data.text_edge_list,
+                "spine_tools": config.data.spine_tools,
+                "icl_examples": config.data.icl_examples,
             },
             loss_target=config.trainer.loss_target,
         )
@@ -509,6 +515,28 @@ def _validate_config(config: omegaconf.DictConfig) -> None:
         raise ValueError(
             "loss_target='edge_list' requires text_edge_list='present'."
         )
+    if config.data.spine_tools not in ("present", "none"):
+        raise ValueError(
+            f"data.spine_tools must be 'present' or 'none', got {config.data.spine_tools!r}")
+    # Train/eval prompt policy: always reported (measured, not assumed) because the two
+    # sides are deliberately allowed to differ. The standard configuration TRAINS tool-free
+    # and DEPLOYS with the SPINE API live; the seam handles it (bare route -> [answer(...)]).
+    eval_tools = not evaluate._spine_tools_disabled()
+    print(f"[prompt-policy] train: spine_tools={config.data.spine_tools} "
+          f"icl_examples={config.data.icl_examples}  |  eval: tools="
+          f"{'on' if eval_tools else 'off'} use_icl={config.eval.use_icl}")
+    # Only the genuinely lossy directions warn. Trained WITH tool targets but evaluated
+    # with tools off: the model emits action lists into a prompt that forbids them and a
+    # simulator that no-ops them. ICL either way: the few-shot layout also relocates the
+    # scene graph (system message vs query turn), so the eval prompt has a shape the model
+    # never saw during training.
+    if config.data.spine_tools == "present" and not eval_tools:
+        print("WARNING: trained with SPINE tool targets but PRISM_DISABLE_SPINE_TOOLS is "
+              "set — eval forbids and no-ops the actions the targets teach.")
+    if (config.data.icl_examples > 0) != bool(config.eval.use_icl):
+        print(f"WARNING: ICL mismatch — training icl_examples={config.data.icl_examples} "
+              f"but eval.use_icl={config.eval.use_icl}; the few-shot layout moves the scene "
+              f"graph between the system message and the query turn.")
 
 
 # ----------------------------

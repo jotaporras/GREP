@@ -157,7 +157,8 @@ def test_pure_text_matrix_edges_present_iff_include_edges():
     convs = _load_conversations()
     for conv in convs[:10]:
         for include_edges in (True, False):
-            out = compact_prompt.spine_to_compact_messages(conv, include_edges=include_edges)
+            out = compact_prompt.spine_to_compact_messages(
+                conv, include_edges=include_edges, include_tools=False, icl_examples=0)
             assert out and out[0]["role"] == "system", "graph must hoist to a leading system message"
             sys_content = out[0]["content"]
 
@@ -183,8 +184,10 @@ def test_pure_text_matrix_only_difference_is_edges_block():
     matching prompt; the node-name lines are identical, proving the toggle adds
     edges rather than rebuilding an unrelated block."""
     conv = _load_conversations()[0]
-    on = compact_prompt.spine_to_compact_messages(conv, include_edges=True)[0]["content"]
-    off = compact_prompt.spine_to_compact_messages(conv, include_edges=False)[0]["content"]
+    on = compact_prompt.spine_to_compact_messages(
+        conv, include_edges=True, include_tools=False, icl_examples=0)[0]["content"]
+    off = compact_prompt.spine_to_compact_messages(
+        conv, include_edges=False, include_tools=False, icl_examples=0)[0]["content"]
     # Node-name bullets identical across variants.
     for line in off.splitlines():
         if line.startswith("• Region nodes:") or line.startswith("• Object nodes:") \
@@ -359,8 +362,11 @@ def test_preprocess_dataset_toggles_edges_end_to_end():
 
     for arch in ("llm", "rpearl_llm"):
         for text_edge_list, want_edges in (("present", True), ("none", False)):
+            # Zero-shot, tool-free: this test is about the edge axis only, and with
+            # icl_examples > 0 the graph moves out of the system message.
             ds = data_mod.preprocess_dataset(
-                base, tokenizer, text_edge_list=text_edge_list)
+                base, tokenizer, text_edge_list=text_edge_list,
+                spine_tools="none", icl_examples=0)
             sys_msgs = [m["content"] for ex in ds for m in ex["messages"] if m["role"] == "system"]
             assert sys_msgs, f"{arch}/{text_edge_list}: no system message produced"
             for content in sys_msgs:
