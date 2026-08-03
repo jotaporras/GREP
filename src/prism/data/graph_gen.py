@@ -363,14 +363,23 @@ Return ONLY valid JSON in the following format — no extra text, no reasoning, 
 """
 
 class TaskGraphGen:
-    def __init__(self, client=None):
+    def __init__(
+        self,
+        client=None,
+        max_tokens: Optional[int] = None,
+    ):
         # Backend selected by PRISM_LLM_BACKEND (default "openai"). Set it to
         # "hf" to populate graphs/tasks with a local Gemma 4 model instead of
         # the OpenAI API. An explicit `client` always wins.
+        # `max_tokens` is the per-call generation budget (reasoning + output);
+        # it is passed on every query so both backends honour the same value.
+        # None is coerced to the configured default rather than left uncapped —
+        # an unbounded generate() is never what a caller wants here.
+        self.max_tokens = max_tokens or local_llm.populate_max_tokens()
         if client is not None:
             self.client = client
         elif local_llm.hf_backend_enabled():
-            self.client = local_llm.LocalHFQueryClient()
+            self.client = local_llm.LocalHFQueryClient(max_new_tokens=self.max_tokens)
         else:
             self.client = utils.GPTQueryClient()  # OpenAI()
 
@@ -462,6 +471,7 @@ class TaskGraphGen:
                 task_types=task_types,
                 task_complexities=task_complexities,
             ),
+            max_tokens=self.max_tokens,
             reasoning_effort=reasoning_effort,
         )
 

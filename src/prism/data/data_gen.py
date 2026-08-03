@@ -80,6 +80,10 @@ def sample_task_complexities(
 
 class DataGenerator:
     n_graph_gen_attempts = 10
+    # Phase-1 generation budget (reasoning + emitted JSON share it). See
+    # local_llm.DEFAULT_POPULATE_MAX_TOKENS for how it was measured; override
+    # per run with `--max-gen-tokens` or $PRISM_HF_POPULATE_MAX_NEW_TOKENS.
+    max_gen_tokens = local_llm.populate_max_tokens()
 
     def __init__(
         self,
@@ -87,12 +91,15 @@ class DataGenerator:
         task_proportions: Optional[List[float]] = None,
         complexity_proportions: Optional[List[float]] = None,
         seed: Optional[int] = None,
+        max_gen_tokens: Optional[int] = None,
     ):
         self.unknown_pcts = graph_unknown
         self.task_proportions = task_proportions
         self.complexity_proportions = complexity_proportions
         self.rng = np.random.default_rng(seed)
-        self.context_gen = graph_gen.TaskGraphGen()
+        if max_gen_tokens is not None:
+            self.max_gen_tokens = max_gen_tokens
+        self.context_gen = graph_gen.TaskGraphGen(max_tokens=self.max_gen_tokens)
         self.planning_sim = planning_sim.PlanningSim()
 
     def populate_graphs_and_tasks(
@@ -250,6 +257,7 @@ class DataGenerator:
             model=model,
             reasoning_effort=reasoning_effort,
             poll_interval=poll_interval,
+            max_tokens=self.max_gen_tokens,
         )
 
         for idx, response in enumerate(responses):

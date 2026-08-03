@@ -68,10 +68,11 @@ export PRISM_HF_MODEL="${2:-${PRISM_HF_MODEL:-google/gemma-4-26B-A4B-it}}"
 # 4bit (NF4) fits a single 24GB GPU (~13GB for 26B-A4B); none=bf16 (~52GB).
 export PRISM_HF_QUANT="${PRISM_HF_QUANT:-4bit}"
 # Populate generation budget (ONE cap shared by the <think> block AND the JSON
-# graph). The ~10-node default (10240) truncates a ~100-node graph mid-object
-# ("Expecting ',' delimiter"). Doubled for the larger graph + reasoning headroom.
-# Consumed by prism.data.local_llm.LocalHFQueryClient; override by pre-setting it.
-export PRISM_HF_POPULATE_MAX_NEW_TOKENS="${PRISM_HF_POPULATE_MAX_NEW_TOKENS:-24576}"
+# graph). 10240 truncates a ~100-node graph mid-object ("Expecting ',' delimiter").
+# Sized at 2x the MEASURED output: 184 tok/node at p95 over the 24 populated
+# n~100 graphs (gemma-4-31B-it tokenizer) => ~20.2k for 110 nodes, doubled.
+# Consumed by prism.data.local_llm.populate_max_tokens(); override by pre-setting it.
+export PRISM_HF_POPULATE_MAX_NEW_TOKENS="${PRISM_HF_POPULATE_MAX_NEW_TOKENS:-40960}"
 
 # --- Quiet transformers / HuggingFace warnings, progress bars & banners ---
 export TRANSFORMERS_VERBOSITY=error
