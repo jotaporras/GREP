@@ -1,0 +1,57 @@
+# Config for scripts/demo_compact_prompt.py — the compact-prompt format demo.
+#
+# Exists so the demo hard-codes nothing (repo rule: paths/thresholds/indices come from
+# config). Every key below is overridable on the CLI; see the script's --help.
+# Loaded with OmegaConf to match the rest of experiments/, but it is a standalone
+# sidecar: no `defaults:` merge with base_config, because the demo trains nothing and
+# needs none of the model/gnn/trainer surface.
+
+corpus:
+  # Paths are relative to the repo root, resolved by the script.
+  root: data/n_30/gen/nav100_n30_gemma_data
+  graphs_subdir: populated_graphs
+  plans_subdir: generated_plans
+  # populated_graphs/ holds two families of 50: data_gen_* are populated, graph_gen_*
+  # are empty skeletons (0 regions / 0 objects / 0 tasks). Only the populated family is
+  # usable, and the script's census re-verifies that live rather than trusting this note.
+  graph_glob: "data_gen_*.json"
+  # Rollouts are named sample_<graph-index>_<task-index>.json and pair with the
+  # like-indexed graph file.
+  plan_glob: "sample_{idx}_*.json"
+
+selection:
+  # How many graphs to draw for the corpus spread. Indices are evenly spaced across the
+  # populated range by integer arithmetic — deterministic, no RNG, no date dependence.
+  spread: 5
+  # Which graph carries the one full byte-exact prompt.
+  #   widest = most region+object nodes (tie-break: lowest index) | first | an integer index
+  canonical: widest
+  # Which graph the SPINE section draws its corpus evidence from.
+  #   most_tool_calls = most logged targets calling a non-answer action | first | an integer
+  tool_demo: most_tool_calls
+  # How many logged rollouts become data-drawn ICL demos, and the offset (in the spread)
+  # of the graph they are drawn from — must differ from the query graph.
+  icl_demos: 2
+  icl_offset: 1
+
+display:
+  width: 78
+  # Elision budget for non-canonical excerpts: head/tail lines kept verbatim around a
+  # counted "… N lines elided …" marker. --full disables elision everywhere.
+  excerpt_head: 8
+  excerpt_tail: 4
+  # auto = colour only when stdout is a TTY. --no-color forces off.
+  color: auto
+
+policy:
+  # Shipped configuration: trained tool-free and zero-shot, deployed with the SPINE API
+  # live and still zero-shot. Mirrors data.spine_tools / data.icl_examples (training) and
+  # PRISM_DISABLE_SPINE_TOOLS / eval.use_icl (deployment).
+  train_tools: false
+  train_icl_examples: 0
+  deploy_tools: true
+  deploy_icl_examples: 0
+
+# Read by AST (never imported) so the demo stays torch-free: importing this module would
+# pull in torch + spine.
+budget_source: src/prism/models/inference.py

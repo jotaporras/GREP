@@ -1,81 +1,101 @@
 """Demo: the compact plain-text prompt format fed to the GREP-PRISM models.
 
-Shows exactly what training and eval prompts become once the verbose SPINE JSON
-(long system prompt + few-shot ICL examples + full scene-graph JSON) is translated
-to the compact format the LLM consumes:
+Shows what training and eval prompts become once the verbose SPINE JSON (long system
+prompt + few-shot ICL examples + full scene-graph JSON) is translated to the compact
+format the LLM consumes, and what the model's answer becomes on the way back out.
 
-  * the verbose SPINE system prompt is always DROPPED and replaced by the short
-    compact-format system prompt: intro + tool policy + the ``<think>…</think>``
-    contract (``compact_prompt.compact_system_prompt``);
-  * the scene graph becomes a compact ``Scene graph:`` block (bulleted node-name
-    lists + robot location). Graph-augmented archs OMIT edges (the GNN supplies
-    connectivity) and use the latent-connectivity intro; the plain-LLM baseline
-    (``include_edges=True``) instead lists ``• Region Edges:`` / ``• Object Edges:``
-    and uses an edge-aware intro that points at them — see the PLAIN-LLM section;
-  * SPINE TOOL CALLING (``include_tools=True``) documents the SPINE API in the system
-    prompt, demands every hop be ratified with ``map_region`` before ``answer()``, and
-    keeps each target's action-list plan (``[goto(x), answer(a -> b)]``). With
-    ``include_tools=False`` the prompt instead forbids tool calls, tells the model to
-    walk adjacencies by thought in latent space, and the plan is a bare arrow route;
-  * ICL (``icl_examples > 0``) keeps that many of the leading SPINE few-shot examples
-    and compacts them — plans, ``updates:`` turns and replans intact, which is what
-    demonstrates tool calling. With ICL the query graph is NOT hoisted into the system
-    message: it opens the query ``user`` turn so it stays the LAST graph block and PE
-    injection (``find_last_graph_scope``) still scopes to the query graph;
-  * tasks then stack as ``user``/``assistant`` pairs in the same conversation per
-    graph; the assistant target wraps reasoning in
-    ``<think>Relevant graph: …\\n\\nReasoning: …</think>`` followed by the bare plan.
+THE THREE POLICY SWITCHES, which every section below is one setting of:
 
-Every SPINE / SPINE+ICL example below is drawn from the DATA — the raw logged rollouts
-under ``generated_plans/`` still carry SPINE's system prompt and its five ICL examples,
-so they are fed to ``compact_prompt`` verbatim rather than to a hand-written showcase.
+  * ``include_edges`` — the scene graph is always a compact ``Scene graph:`` block
+    (bulleted node-name lists + robot location). Graph-augmented archs OMIT the edges
+    (the GNN supplies connectivity) and get the latent-connectivity intro, written at
+    length on purpose: the graph channel is the premise of the architecture, so the
+    prompt tells the model in several ways that the edges really are present. The
+    plain-LLM baseline (``include_edges=True``) instead lists ``• Region Edges:`` /
+    ``• Object Edges:`` and gets an edge-aware intro pointing at them.
+  * ``include_tools`` — SPINE tool calling. ``False`` adds NOTHING: that arm is the
+    pre-SPINE prompt exactly (intro + answer contract, no tool text), so the tool-free
+    baseline never drifts; its plan is a bare ``a -> b`` route. ``True`` inserts the
+    SPINE tutorial (8-action planning API, 7-function inbound update API, argument
+    rules, plus a plannability gate / ``replan()`` trigger / substitution ban added
+    after zero-shot probing showed ``clarify`` and ``replan`` never fired) and switches
+    the contract's part 2 to an action list.
+  * ``icl_examples`` — how many leading SPINE few-shot examples survive, compacted.
+    With ICL the query graph is NOT hoisted into the system message: it opens the query
+    ``user`` turn so it stays the LAST graph block and PE injection
+    (``find_last_graph_scope``) still scopes to the query graph rather than a demo's.
 
-TRAINING and DEPLOYMENT run different policies, and the demo shows both. The shipped
-configuration TRAINS tool-free and zero-shot (``data.spine_tools=none``,
-``data.icl_examples=0``) and DEPLOYS with the SPINE API live, still zero-shot
-(``PRISM_DISABLE_SPINE_TOOLS`` unset, ``eval.use_icl=false``). The seam absorbs the tool
-gap: the model emits the bare route it was trained on and
-``compact_output_to_spine_json`` wraps it as ``[answer(route)]`` for the planner. ICL is
-fully supported on both sides and simply switched off by default — the SPINE + ICL
-sections below always render it so the layout stays visible.
+Tasks stack as ``user``/``assistant`` pairs in one conversation per graph; the assistant
+target wraps reasoning in ``<think>Relevant graph: …\\n\\nReasoning: …</think>`` followed
+by the plan alone.
 
-The ``User:``/``Assistant:`` turn delimiters are produced by the tokenizer's chat
-template (native role special tokens), NOT literal text — so with ``--tokenizer``
-the demo renders the byte-for-byte prompt via ``apply_chat_template``; without it,
-it prints an illustrative ``Role:``-labelled view instead of the byte-exact
-template output.
+Coming back out, ``compact_output_to_spine_json`` maps model text to the SPINE JSON the
+grader expects: a bare route is wrapped as ``[answer(route)]``, an action list passes
+through untouched (wrapping it would bury the actions inside one ``answer()`` and no tool
+would ever execute), and an unterminated ``<think>`` yields an EMPTY plan — never the
+reasoning wrapped in ``answer(...)``, which is how a truncated generation used to score
+"correct" off node names its prose happened to contain.
 
-Pure pre-processing; does NOT modify anything under data/.
+TRAINING and DEPLOYMENT run different policies and both are shown. The shipped config
+TRAINS tool-free and zero-shot and DEPLOYS with the SPINE API live, still zero-shot; the
+seam absorbs the gap, since the model emits the bare route it was trained on and the
+inverse translator wraps it. SPINE mode also gets ``SPINE_TOKEN_MULTIPLIER``x the
+tool-free generation budget.
 
-Run:  PYTHONPATH=src python scripts/demo_compact_prompt.py            # shipped policy
-      PYTHONPATH=src python scripts/demo_compact_prompt.py --tokenizer meta-llama/Llama-3.2-3B-Instruct
-      PYTHONPATH=src python scripts/demo_compact_prompt.py --icl-examples 2   # few-shot deploy
-      PYTHONPATH=src python scripts/demo_compact_prompt.py --train-spine-tools --train-icl-examples 2
+PRESENTATION. One canonical prompt is printed in full, byte-for-byte, as the centrepiece;
+every other section shows only its delta or a framed excerpt with a counted
+``… N lines elided …`` marker. ``--full`` disables all elision, so the byte-exact artifact
+is always reachable. Nothing printed is reflowed or hand-edited — text either comes from
+the live translator verbatim or is a counted elision of it. Correctness checks all remain
+in the code but report as one ``invariants: N/N passed`` line, with detail only on failure.
+
+DATA. Everything is drawn live from the corpus named in the config
+(``experiments/demo_compact_prompt.yaml``), selected deterministically by a live census —
+no RNG, no dates, reproducible run to run. The one exception is labeled:
+``RECORDED_SPINE_ROLLOUT``, a real two-turn tool-calling exchange captured from an eval
+run, kept because the logged corpus contains no ``updates:`` round-trip at all (the demo
+measures this rather than assuming it).
+
+The ``User:``/``Assistant:`` delimiters come from the tokenizer's chat template, NOT
+literal text — with ``--tokenizer`` the demo renders the byte-exact
+``apply_chat_template`` output; without it, an illustrative ``Role:``-labelled view.
+
+Pure pre-processing; does NOT modify anything under data/, and imports nothing heavier
+than ``compact_prompt`` (torch-free) unless ``--tokenizer`` is given.
+
+Run:  uv run python scripts/demo_compact_prompt.py
+      uv run python scripts/demo_compact_prompt.py --full
+      uv run python scripts/demo_compact_prompt.py --tokenizer meta-llama/Llama-3.2-3B-Instruct
+      uv run python scripts/demo_compact_prompt.py --spread 8 --canonical 12
+      uv run python scripts/demo_compact_prompt.py --train-spine-tools --icl-examples 2
 """
 
 import argparse
+import ast
 import json
+import sys
+import textwrap
 from pathlib import Path
 
+from omegaconf import OmegaConf
+
 from prism.data.compact_prompt import (
+    _SPINE_ACTIONS,
+    _SPINE_TOOLS_SECTION,
+    append_followup_task,
     assemble_training_conversation,
     compact_output_to_spine_json,
+    compact_system_prompt,
     format_eval_messages,
     format_training_messages,
     icl_demos_from_rollouts,
     render,
     spine_to_compact_messages,
-    strip_icl,
     try_load_json,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = REPO_ROOT / "data" / "n_30" / "gen" / "nav100_n30_gemma_data"
-PLAN_DIR = DATA_DIR / "generated_plans"
-DEFAULT_PLAN = PLAN_DIR / "sample_000_000.json"
-DEFAULT_GRAPH = DATA_DIR / "populated_graphs" / "data_gen_000.json"
-# A DIFFERENT graph's rollouts, used as data-drawn few-shot demos for the query graph.
-ICL_GRAPH_INDEX = "001"
+DEFAULT_CONFIG = REPO_ROOT / "experiments" / "demo_compact_prompt.yaml"
 
 # A REAL two-turn SPINE rollout, captured verbatim from a live eval run so the tool
 # section can show tool calls actually working. The logged training corpus answers
@@ -146,295 +166,622 @@ RECORDED_SPINE_ROLLOUT = {
 }
 
 
-def _rule(title: str) -> None:
-    print(f"\n{'=' * 78}\n{title}\n{'=' * 78}")
+# --------------------------------------------------------------------------- presentation
+class Style:
+    """Subtle ANSI (dim/bold only), auto-off when stdout is not a TTY."""
+
+    def __init__(self, enabled: bool):
+        self.on = enabled
+
+    def dim(self, s: str) -> str:
+        return f"\033[2m{s}\033[0m" if self.on else s
+
+    def bold(self, s: str) -> str:
+        return f"\033[1m{s}\033[0m" if self.on else s
 
 
+class Invariants:
+    """Correctness checks stay in the code; they report as one line, detail on failure.
+
+    Every check that used to narrate itself to stdout runs here instead. Failure is still
+    loud — `report` raises — so silencing the prose costs no guarantee.
+    """
+
+    def __init__(self):
+        self.passed = 0
+        self.failures = []
+
+    def __call__(self, ok, msg: str) -> bool:
+        if ok:
+            self.passed += 1
+        else:
+            self.failures.append(msg)
+        return bool(ok)
+
+    def report(self, style: Style) -> None:
+        total = self.passed + len(self.failures)
+        if self.failures:
+            print(style.bold(f"\ninvariants: {self.passed}/{total} passed — FAILED:"))
+            for f in self.failures:
+                print(f"  x {f}")
+            raise AssertionError(f"{len(self.failures)} invariant(s) failed")
+        print(style.dim(f"\ninvariants: {self.passed}/{total} passed"))
+
+
+class Out:
+    """Rules, tables and counted elision at one consistent width."""
+
+    def __init__(self, style: Style, width: int, head: int, tail: int, full: bool):
+        self.s, self.w, self.head, self.tail, self.full = style, width, head, tail, full
+
+    def rule(self, title: str) -> None:
+        print(f"\n{self.s.dim('-' * self.w)}\n{self.s.bold(title)}")
+
+    def note(self, text: str = "", indent: str = "  ") -> None:
+        """Commentary, wrapped to the rule width.
+
+        Notes are this script's own prose, never prompt or model bytes, so wrapping them
+        is free — the no-reflow rule applies to `block`, which prints the real artifacts.
+        """
+        if not text:
+            print()
+            return
+        for ln in textwrap.wrap(text, width=self.w - len(indent)) or [""]:
+            print(self.s.dim(f"{indent}{ln}"))
+
+    def table(self, headers, rows, align: str = "", indent: str = "  ", maxw=None) -> None:
+        rows = [[str(c) for c in r] for r in rows]
+        if not rows:
+            return
+        align = (align or "l" * len(headers)).ljust(len(headers), "l")
+        if maxw:
+            rows = [[c if len(c) <= maxw[i] else c[:maxw[i] - 1] + "…"
+                     for i, c in enumerate(r)] for r in rows]
+        w = [max(len(str(headers[i])), max(len(r[i]) for r in rows))
+             for i in range(len(headers))]
+
+        def line(cells):
+            return indent + "  ".join(
+                c.rjust(w[i]) if align[i] == "r" else c.ljust(w[i])
+                for i, c in enumerate(cells)).rstrip()
+
+        print(self.s.dim(line(headers)))
+        print(self.s.dim(indent + "  ".join("-" * x for x in w)))
+        for r in rows:
+            print(line(r))
+
+    def block(self, text: str, indent: str = "    ", elide: bool = True,
+              clip: bool = True) -> None:
+        """Print text verbatim, with counted markers wherever it is shortened.
+
+        Two independent budgets, because prompt text is long in both directions: `elide`
+        drops whole LINES from the middle, `clip` trims each line to the rule width. Both
+        only ever remove, and both say exactly how much they removed, so what remains is
+        byte-accurate. --full disables the pair.
+        """
+        lines = text.split("\n")
+        if clip and not self.full:
+            limit = max(24, self.w - len(indent))
+            lines = [ln if len(ln) <= limit
+                     else ln[:limit] + self.s.dim(f"… +{len(ln) - limit:,} chars")
+                     for ln in lines]
+        if elide and not self.full and len(lines) > self.head + self.tail + 1:
+            n = len(lines) - self.head - self.tail
+            lines = (lines[:self.head]
+                     + [self.s.dim(f"… {n} lines elided (--full prints all) …")]
+                     + lines[-self.tail:])
+        for ln in lines:
+            print(f"{indent}{ln}")
+
+
+# --------------------------------------------------------------------------- corpus census
+def _minmedmax(values):
+    v = sorted(values)
+    return (v[0], v[len(v) // 2], v[-1]) if v else (0, 0, 0)
+
+
+def _graph_stats(payload) -> dict:
+    g = payload.get("graph", {}) or {}
+    return {"regions": len(g.get("regions") or {}), "objects": len(g.get("objects") or {}),
+            "edges": len(g.get("region_connections") or []),
+            "tasks": len(payload.get("tasks") or [])}
+
+
+def _census(cfg, inv: Invariants):
+    """Measure the corpus live: which graphs are populated, and which targets call tools.
+
+    Everything the selection later claims comes from these numbers, never from a constant —
+    populated_graphs/ also holds 50 empty skeletons that must not be selected, and the
+    tool-call rate is the kind of thing that silently changes when the corpus is regenerated.
+    """
+    root = REPO_ROOT / cfg.corpus.root
+    gdir, pdir = root / cfg.corpus.graphs_subdir, root / cfg.corpus.plans_subdir
+    inv(gdir.is_dir() and pdir.is_dir(), f"corpus dirs missing under {root}")
+
+    # Glob EVERY graph file, not just the configured populated pattern, so that excluding
+    # the empty skeletons is a measured decision (0 regions / 0 tasks / no rollouts) rather
+    # than a naming assumption this demo would silently inherit.
+    graphs = []
+    for p in sorted(gdir.glob("*.json")):
+        st = _graph_stats(try_load_json(p))
+        idx = p.stem.rsplit("_", 1)[-1]
+        # Rollouts are keyed by index alone, and BOTH families run 000-049 — so a rollout
+        # may only be attributed to a graph that actually has the tasks it answers,
+        # otherwise every sample file would be counted once per family.
+        st.update(name=p.stem, idx=idx, path=p, family=p.stem.rsplit("_", 1)[0],
+                  plans=sorted(pdir.glob(cfg.corpus.plan_glob.format(idx=idx)))
+                  if st["tasks"] else [])
+        graphs.append(st)
+    populated = [g for g in graphs if g["regions"] and g["tasks"] and g["plans"]]
+    inv(bool(populated), "no populated graph with rollouts found")
+    inv(all(g["path"].match(cfg.corpus.graph_glob) for g in populated),
+        f"populated graphs no longer match corpus.graph_glob ({cfg.corpus.graph_glob})")
+
+    totals = {"tool_targets": 0, "total": 0, "updates": 0, "multi_turn": 0}
+    for g in populated:
+        hits = 0
+        for pp in g["plans"]:
+            c = try_load_json(pp)
+            if not isinstance(c, list):
+                continue
+            msgs = spine_to_compact_messages(c, include_edges=False, include_tools=True,
+                                             icl_examples=0)
+            targets = [m["content"].split("</think>", 1)[-1].strip()
+                       for m in msgs if m["role"] == "assistant"]
+            if not targets:
+                continue
+            totals["total"] += 1
+            totals["multi_turn"] += len(targets) > 1
+            totals["updates"] += any(m["role"] == "user"
+                                     and m["content"].lstrip().startswith("updates")
+                                     for m in msgs)
+            if not targets[-1].startswith("[answer("):
+                hits += 1
+                totals["tool_targets"] += 1
+        g["tool_targets"] = hits
+    totals.update(all=graphs, populated=populated)
+    return populated, totals
+
+
+def _spread(populated, n: int):
+    """Evenly spaced indices across the populated range — deterministic, no RNG, no dates."""
+    n = max(1, min(int(n), len(populated)))
+    if n == 1:
+        return [populated[0]]
+    last = len(populated) - 1
+    return [populated[round(i * last / (n - 1))] for i in range(n)]
+
+
+def _pick(populated, want: str, key, describe, default_reason: str):
+    """Resolve a selection knob: a named measured policy, 'first', or an explicit index."""
+    if want == "first":
+        return populated[0], default_reason
+    if key is not None and want != "first" and not want.isdigit():
+        best = max(populated, key=key)
+        return best, describe(best)
+    hit = next((g for g in populated if g["idx"] == want.zfill(3)), populated[0])
+    return hit, f"requested index {want}"
+
+
+def _select(cfg, populated, inv: Invariants) -> dict:
+    spread = _spread(populated, cfg.selection.spread)
+    canonical, why = _pick(
+        populated, str(cfg.selection.canonical),
+        key=lambda g: (g["regions"] + g["objects"], -int(g["idx"])),
+        describe=lambda g: (f"widest: {g['regions']} regions + {g['objects']} objects = "
+                            f"{g['regions'] + g['objects']} nodes, {g['edges']} edges"),
+        default_reason="first populated graph")
+    tool, why_tool = _pick(
+        populated, str(cfg.selection.tool_demo),
+        key=lambda g: (g["tool_targets"], -int(g["idx"])),
+        describe=lambda g: f"most tool-calling targets: {g['tool_targets']}/{len(g['plans'])}",
+        default_reason="first populated graph")
+    off = int(cfg.selection.icl_offset) % len(spread)
+    icl = spread[off] if spread[off]["idx"] != canonical["idx"] else spread[(off + 1) % len(spread)]
+    inv(icl["idx"] != canonical["idx"], "ICL demos must come from a different graph")
+    return {"spread": spread, "canonical": canonical, "why": why,
+            "tool": tool, "why_tool": why_tool, "icl": icl}
+
+
+def _generation_budget(cfg):
+    """``(base, multiplier)`` read out of models/inference.py by AST.
+
+    Read from source rather than imported: importing that module would drag in torch +
+    spine and cost this demo its torch-free property. Reading the real constants still
+    beats restating them here, which would rot the moment they change.
+    """
+    tree = ast.parse((REPO_ROOT / cfg.budget_source).read_text())
+    consts = {t.id: n.value.value
+              for n in tree.body if isinstance(n, ast.Assign) and isinstance(n.value, ast.Constant)
+              for t in n.targets if isinstance(t, ast.Name)}
+    return consts.get("MAX_NEW_TOKENS"), consts.get("SPINE_TOKEN_MULTIPLIER")
+
+
+# --------------------------------------------------------------------------- helpers
 def _roles(messages) -> str:
-    return " ".join(m["role"][0].upper() for m in messages)  # e.g. "S U A U A"
+    return "".join(m["role"][0].upper() for m in messages)
 
 
-def _show(messages, tokenizer, add_generation_prompt: bool) -> None:
-    label = "apply_chat_template" if tokenizer is not None else "illustrative Role: view"
-    if add_generation_prompt:
-        label += " (+generation prompt)"
-    print(f"\n-- prompt the model receives [{label}] --")
-    print(render(messages, tokenizer=tokenizer, add_generation_prompt=add_generation_prompt))
-
-
-def _make_counter(tokenizer):
+def _counter(tokenizer):
     if tokenizer is not None:
         return "tokens", lambda s: len(tokenizer.encode(s, add_special_tokens=False))
     return "chars", len
 
 
-def _reduction_summary(before_msgs, after_msgs, tokenizer) -> None:
-    label, count = _make_counter(tokenizer)
-    b = count(render(before_msgs, tokenizer=tokenizer))
-    a = count(render(after_msgs, tokenizer=tokenizer))
-    saved = 100.0 * (b - a) / b if b else 0.0
-    print(f"\n  context ({label}):  before={b:,}  after={a:,}  saved={saved:.1f}%")
-
-
-def _verbose_baseline(graph_dict, task):
-    """Illustrative 'before' baseline: the full graph dict restated per task."""
-    return [{"role": "user", "content": f"task: {task}\nScene graph:{graph_dict}"}]
-
-
 def _plan_lines(messages):
-    """The text each assistant turn emits after </think> — i.e. the plan format."""
     return [m["content"].split("</think>", 1)[-1].strip()
             for m in messages if m["role"] == "assistant"]
 
 
-def _rollouts_for_graph(graph_idx: str):
-    """Every logged rollout for one graph, in task order (real data, ICL prefix intact)."""
-    return [try_load_json(p) for p in sorted(PLAN_DIR.glob(f"sample_{graph_idx}_*.json"))]
+def _graph_blocks(messages):
+    return [i for i, m in enumerate(messages) if "Scene graph:" in m["content"]]
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--plan-sample", type=Path, default=DEFAULT_PLAN)
-    parser.add_argument("--graph-sample", type=Path, default=DEFAULT_GRAPH)
-    parser.add_argument("--task-index", type=int, default=0)
-    parser.add_argument("--tokenizer", type=str, default="")
-    # Two policies, because the live pipeline runs two: TRAINING (data.spine_tools /
-    # data.icl_examples) and DEPLOYMENT (PRISM_DISABLE_SPINE_TOOLS / eval.use_icl). The
-    # defaults are the shipped configuration — trained tool-free and zero-shot, deployed
-    # with the SPINE API live and still zero-shot.
-    parser.add_argument("--train-spine-tools", dest="train_tools", action="store_true",
-                        default=False,
-                        help="train WITH the SPINE API + action-list targets (default: off)")
-    parser.add_argument("--train-icl-examples", type=int, default=0,
-                        help="few-shot examples in TRAINING prompts (default 0)")
-    parser.add_argument("--spine-tools", dest="deploy_tools", action="store_true", default=True,
-                        help="deploy with the SPINE API + action-list plans (default)")
-    parser.add_argument("--no-spine-tools", dest="deploy_tools", action="store_false",
-                        help="deploy with no tool calls: adjacency reasoning, bare routes")
-    parser.add_argument("--icl-examples", type=int, default=0,
-                        help="few-shot examples in DEPLOYED prompts (0=none, -1=all; default 0)")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="Compact-prompt format demo.")
+    ap.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    ap.add_argument("--tokenizer", type=str, default="",
+                    help="render the byte-exact apply_chat_template output")
+    ap.add_argument("--full", action="store_true", help="disable all elision; print verbatim")
+    ap.add_argument("--no-color", action="store_true")
+    ap.add_argument("--spread", type=int, default=None, help="how many graphs to sample")
+    ap.add_argument("--canonical", type=str, default=None, help="widest | first | <index>")
+    ap.add_argument("--tool-demo", type=str, default=None,
+                    help="most_tool_calls | first | <index>")
+    ap.add_argument("--task-index", type=int, default=0)
+    ap.add_argument("--train-spine-tools", dest="train_tools", action="store_true", default=None)
+    ap.add_argument("--train-icl-examples", type=int, default=None)
+    ap.add_argument("--no-spine-tools", dest="deploy_tools", action="store_false", default=None)
+    ap.add_argument("--icl-examples", type=int, default=None, help="deployed few-shot count")
+    args = ap.parse_args()
+
+    # The config is required, not optional: it carries the corpus paths and the selection
+    # policy, and silently falling back to built-in defaults would reintroduce exactly the
+    # hard-coded indices this script was refactored to remove.
+    if not args.config.is_file():
+        sys.exit(f"config not found: {args.config}\n"
+                 f"expected the sidecar at {DEFAULT_CONFIG.relative_to(REPO_ROOT)}, "
+                 f"or pass --config <path>.")
+    cfg = OmegaConf.load(args.config)
+    for key, val in (("selection.spread", args.spread), ("selection.canonical", args.canonical),
+                     ("selection.tool_demo", args.tool_demo),
+                     ("policy.train_tools", args.train_tools),
+                     ("policy.train_icl_examples", args.train_icl_examples),
+                     ("policy.deploy_tools", args.deploy_tools),
+                     ("policy.deploy_icl_examples", args.icl_examples)):
+        if val is not None:
+            OmegaConf.update(cfg, key, val)
+
+    style = Style((not args.no_color) and cfg.display.color != "off" and sys.stdout.isatty())
+    out = Out(style, int(cfg.display.width), int(cfg.display.excerpt_head),
+              int(cfg.display.excerpt_tail), args.full)
+    inv = Invariants()
 
     tokenizer = None
     if args.tokenizer:
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+    label, count = _counter(tokenizer)
 
-    train_tools, train_icl = args.train_tools, args.train_icl_examples
-    tools, icl = args.deploy_tools, args.icl_examples
-    print(f"policy  TRAIN: include_tools={train_tools} icl_examples={train_icl}   "
-          f"DEPLOY: include_tools={tools} icl_examples={icl}   "
-          f"(include_edges toggled per section)")
-    if train_tools != tools:
-        print("  train/deploy tool policies differ by design: the model learns bare routes and\n"
-              "  compact_output_to_spine_json wraps them as [answer(route)] for the planner.")
+    train_tools, train_icl = bool(cfg.policy.train_tools), int(cfg.policy.train_icl_examples)
+    tools, icl = bool(cfg.policy.deploy_tools), int(cfg.policy.deploy_icl_examples)
 
-    payload = try_load_json(args.graph_sample)
+    # ---------------------------------------------------------------- 1. corpus & selection
+    populated, corpus = _census(cfg, inv)
+    sel = _select(cfg, populated, inv)
+    canonical, tool_g, icl_g = sel["canonical"], sel["tool"], sel["icl"]
+
+    out.rule("1  CORPUS & SELECTION")
+    out.note(f"{cfg.corpus.root} — census run live; every choice below is measured, not fixed")
+    fams = {}
+    for g in corpus["all"]:
+        f = fams.setdefault(g["family"], {"files": 0, "pop": 0, "rolls": 0})
+        f["files"] += 1
+        f["pop"] += bool(g["regions"] and g["tasks"] and g["plans"])
+        f["rolls"] += len(g["plans"])
+    out.table(["family", "files", "populated", "rollouts", "nodes (min/med/max)"],
+              [[f"{name}_*", v["files"], v["pop"], v["rolls"],
+                "/".join(str(s) for s in _minmedmax(
+                    [g["regions"] + g["objects"] for g in corpus["all"] if g["family"] == name]))]
+               for name, v in sorted(fams.items())], align="lrrrl")
+    out.note("Both families are globbed; the empty ones are dropped for measuring 0 "
+             "regions / 0 tasks / 0 rollouts, not for being named differently.")
+    out.table(["role", "graph", "why (measured)"],
+              [["canonical", canonical["name"], sel["why"]],
+               ["tool demo", tool_g["name"], sel["why_tool"]],
+               ["ICL source", icl_g["name"], "spread offset "
+                f"{cfg.selection.icl_offset}, distinct from the query graph"],
+               ["spread", " ".join(g["idx"] for g in sel["spread"]),
+                f"{len(sel['spread'])} evenly spaced over {len(populated)} graphs"]])
+    out.note(f"policy — train: tools={train_tools} icl={train_icl} | "
+             f"deploy: tools={tools} icl={icl}")
+
+    # ---------------------------------------------------------------- 2. prompt policy
+    sizes = {(e, t): count(compact_system_prompt(include_edges=e, include_tools=t))
+             for e in (False, True) for t in (False, True)}
+    off_p = compact_system_prompt(include_edges=False, include_tools=False)
+    on_p = compact_system_prompt(include_edges=False, include_tools=True)
+
+    out.rule(f"2  PROMPT POLICY   system-prompt size, include_edges x include_tools ({label})")
+    out.table(["arch", "tools OFF", "tools ON", "delta"],
+              [["graph-aug (no edge list)", f"{sizes[(False, False)]:,}",
+                f"{sizes[(False, True)]:,}", f"+{sizes[(False, True)] - sizes[(False, False)]:,}"],
+               ["plain-LLM (edge list)", f"{sizes[(True, False)]:,}",
+                f"{sizes[(True, True)]:,}", f"+{sizes[(True, True)] - sizes[(True, False)]:,}"]],
+              align="lrrr")
+    tutorial = _SPINE_TOOLS_SECTION.split("\n\n")
+    contract_delta = sizes[(False, True)] - sizes[(False, False)] - count(_SPINE_TOOLS_SECTION)
+    out.table([label, "what tools ON adds"],
+              [[f"{count(b):,}", b.splitlines()[0][:56]] for b in tutorial]
+              + [[f"{count(_SPINE_TOOLS_SECTION):,}", "= the whole tutorial"],
+                 [f"+{contract_delta:,}", "answer contract part 2 (route -> action list) + sep"]],
+              align="rl")
+    base, mult = _generation_budget(cfg)
+    out.note(f"documented: {len(_SPINE_ACTIONS)} planning actions + 7 inbound update fns "
+             f"(received, never called)")
+    out.note(f"  {', '.join(_SPINE_ACTIONS)}")
+    out.note(f"generation budget: tool-free {base:,} tokens, SPINE {base * mult:,} "
+             f"({mult}x) — ratifying answers run long, and a generation cut before the "
+             f"plan line is a lost sample, not a wrong one.")
+
+    # Tools OFF must stay byte-free of tool text: this is what keeps the tool-free arm equal
+    # to the pre-SPINE prompt rather than quietly drifting toward the SPINE one.
+    for leak in ("PLANNING API", "GRAPH UPDATE API", "map_region", "clarify(", "replan()"):
+        inv(leak not in off_p, f"tool-free prompt leaked {leak!r}")
+    inv("give the final plan only: the route the robot follows" in off_p,
+        "tool-free arm must keep the pre-SPINE bare-route contract")
+    inv("SPINE action list" in on_p, "tools-on must request an action list")
+    for a in _SPINE_ACTIONS:
+        inv(f"{a}(" in on_p, f"planning API missing {a}")
+    for fn in ("add_nodes", "remove_nodes", "add_connections", "remove_connections",
+               "update_robot_location", "update_node_attributes", "no_updates"):
+        inv(fn in on_p, f"graph-update API missing {fn}")
+    for rule_text in ("decide whether the instruction is plannable",
+                      "close that plan with replan()",
+                      "NEVER substitute a node that happens to be in the graph",
+                      # routes are checked with goto, not map_region (map_region needs the
+                      # reachability it would be testing, so it cannot ratify a hop)
+                      "Put goto(goal_region) in front of the answer()",
+                      "Use it to discover, and goto to confirm",
+                      # navigation_update is advisory text, not a graph mutation
+                      "Treat it as a correction to your behaviour"):
+        inv(rule_text in on_p, f"missing behavioral rule: {rule_text!r}")
+    # No "new capability" framing anywhere: goto is in the training targets and the rest of
+    # the actions are in the ICL examples, so the model is not being handed something new.
+    for framing in ("NEW CAPABILITY", "new to you", "You can now act", "This is new"):
+        inv(framing not in on_p, f"tool prompt regained new-capability framing: {framing!r}")
+    # Undeclared-but-emitted update calls must be named, or the model meets them blind.
+    for undeclared in ("navigation_update", "add_node(", "add_connection("):
+        inv(undeclared in on_p, f"update API omits emitted call {undeclared!r}")
+
+    # ---------------------------------------------------------------- 3. canonical prompt
+    payload = try_load_json(canonical["path"])
     graph_dict, tasks = payload["graph"], payload["tasks"]
-    task = tasks[args.task_index]["task"]
+    task = tasks[args.task_index % len(tasks)]["task"]
+    eval_msgs = format_eval_messages(graph_dict, task, include_edges=False, include_tools=tools)
 
-    # --- 1. Training prompt: a real rollout -> compact (TRAIN policy) ---------------
-    # Zero-shot training goes through the builder; with few-shot training the live path
-    # (data.preprocess_dataset) prepends evaluate.SPINE_ICL_EXAMPLES and translates, which
-    # is what spine_to_compact_messages does to a rollout that still carries its ICL.
-    conversation = try_load_json(args.plan_sample)
-    training_messages = (
-        format_training_messages(conversation, include_edges=False, include_tools=train_tools)
-        if train_icl == 0 else
-        spine_to_compact_messages(conversation, include_edges=False,
-                                  include_tools=train_tools, icl_examples=train_icl)
-    )
-    _rule(f"TRAINING PROMPT  (from {args.plan_sample.name}; "
-          f"spine_tools={'present' if train_tools else 'none'}, icl_examples={train_icl})")
-    _show(training_messages, tokenizer, add_generation_prompt=False)
-    _reduction_summary(strip_icl(conversation), training_messages, tokenizer)
+    view = "apply_chat_template, byte-exact" if tokenizer else "illustrative Role: view"
+    out.rule(f"3  THE PROMPT — printed in full, byte-for-byte   "
+             f"{canonical['name']} task {args.task_index}")
+    out.note(f"graph-aug arch (no edge list) | tools {'ON' if tools else 'OFF'} | icl {icl} | "
+             f"{view} | +gen prompt")
+    out.block(render(eval_msgs, tokenizer=tokenizer, add_generation_prompt=True),
+              indent="  ", elide=False, clip=False)
+    inv(_graph_blocks(eval_msgs) == [0], "zero-shot eval must carry exactly one graph, in system")
 
-    # --- 2. Eval prompt: graph + task -> compact (open assistant turn) ------------
-    eval_messages = format_eval_messages(
-        graph_dict, task, include_edges=False, include_tools=tools)
-    _rule(f"EVAL PROMPT  (DEPLOY policy; from {args.graph_sample.name}, task {args.task_index})")
-    _show(eval_messages, tokenizer, add_generation_prompt=True)  # mirrors query_llm
+    # ---------------------------------------------------------------- 4. deltas
+    # Every other prompt in the pipeline is section 3 with one switch moved, so these are
+    # shown as deltas rather than as four more ~95-line dumps of near-identical text.
+    out.rule("4  DELTAS FROM THAT PROMPT   one switch moved at a time")
+    llm_p = compact_system_prompt(include_edges=True, include_tools=tools)
+    gnn_p = compact_system_prompt(include_edges=False, include_tools=tools)
+    out.note("include_edges=True — the plain-LLM baseline. Its intro cites written "
+             "edges instead of latent structure:")
+    out.block(llm_p.split("\n\n")[0])
+    llm_eval = format_eval_messages(graph_dict, task, include_edges=True, include_tools=tools)
+    # Only the scene-graph bullets: the tutorial's API list is bulleted too, so filter from
+    # the block itself rather than by "• " over the whole message.
+    llm_block = llm_eval[0]["content"].rsplit("Scene graph:", 1)[-1]
+    edge_lines = [ln for ln in llm_block.split("\n") if ln.startswith("• ")]
+    out.note(f"and the scene-graph block gains edge bullets ({len(edge_lines)} bullet lines):")
+    out.block("\n".join(edge_lines))
+    # The bullets only exist once a graph is rendered — compact_system_prompt() alone just
+    # describes them in the intro, so these must be checked on the rendered message.
+    inv("• Region Edges:" in llm_block and "• Object Edges:" in llm_block, "edge bullets missing")
+    inv("latent" not in llm_p, "plain-LLM prompt must not claim latent connectivity")
+    inv("latent space" in gnn_p, "graph-aug prompt lost its latent-connectivity intro")
+    # The latent note's job is verification-and-recovery, not an assertion that the model
+    # already knows everything — check the instruction it actually has to carry.
+    inv("Verify the route before you give it" in gnn_p, "latent note lost its verify step")
+    inv("Correct that step, or look for an alternative route" in gnn_p,
+        "latent note lost its recovery step")
+    for banned in ("The edges are NOT missing", "because you have", "never refuse for"):
+        inv(banned not in gnn_p, f"latent note regained over-strict claim {banned!r}")
+    inv("• Region Edges:" not in eval_msgs[0]["content"], "graph-aug prompt leaked an edge list")
 
-    # --- 3. SPINE TOOL CALLING: a real two-turn rollout, in compact form ----------
-    # The logged corpus answers directly ([answer(...)]), so replaying it here would show
-    # a "SPINE" section with no SPINE calls in it. Instead this replays RECORDED_SPINE_
-    # ROLLOUT: a real receding-horizon exchange captured from a live eval run — the model
-    # ratifies with map_region, GraphSim executes it and returns an `updates:` turn, and
-    # only then does the model commit to a route. The transcript is fed through the LIVE
-    # translator in SPINE's own logged shape, so what prints is what the pipeline
-    # produces, not a hand-written sample.
-    raw = conversation
+    out.note()
+    out.note(f"include_tools=False — the tutorial disappears entirely "
+             f"({sizes[(False, True)] - sizes[(False, False)]:,} {label}); the only other "
+             f"prose that differs is the contract's part 2:")
+    diff = [b for b in on_p.split("\n\n") if b not in off_p.split("\n\n") and b not in tutorial]
+    out.block("\n".join(diff) if diff else "(contract identical)")
+
+    rollouts = [try_load_json(p) for p in canonical["plans"]]
+    pick = args.task_index % len(rollouts)
+    train_msgs = (format_training_messages(rollouts[pick], include_edges=False,
+                                           include_tools=train_tools)
+                  if train_icl == 0 else
+                  spine_to_compact_messages(rollouts[pick], include_edges=False,
+                                            include_tools=train_tools, icl_examples=train_icl))
+    out.note()
+    out.note(f"TRAINING vs EVAL — same prompt, plus the assistant target and no "
+             f"generation prompt (tools {'ON' if train_tools else 'OFF'}, "
+             f"icl {train_icl}). Its target line:")
+    out.block(_plan_lines(train_msgs)[-1])
+    if train_tools != tools:
+        out.note("train/deploy tool policies differ by design: the model learns bare "
+                 "routes, and compact_output_to_spine_json wraps them as [answer(route)] "
+                 "for the planner.")
+
+    # ---------------------------------------------------------------- 5. SPINE tool calling
     rec = RECORDED_SPINE_ROLLOUT
     spine_convo = [
         {"role": "system", "content": "<SPINE system prompt — dropped by the translator>"},
-        {"role": "user",
-         "content": f"{rec['task']}\nAdvice: \n- Recall the scene may be incomplete.\n\n"
-                    f"Scene graph:{graph_dict}"},
+        {"role": "user", "content": f"{rec['task']}\nAdvice: \n- Recall the scene may be "
+                                    f"incomplete.\n\nScene graph:{graph_dict}"},
     ]
-    for t, turn in enumerate(rec["turns"]):
+    for turn in rec["turns"]:
         spine_convo.append({"role": "assistant", "content": json.dumps({
             "primary_goal": rec["task"], "relevant_graph": turn["relevant_graph"],
             "reasoning": turn["reasoning"], "plan": turn["plan"]})})
-        if turn.get("updates"):                    # what GraphSim returned after executing
-            spine_convo.append({"role": "user", "content": turn["updates"]})
-    compact_rollout = spine_to_compact_messages(
-        spine_convo, include_edges=False, include_tools=True, icl_examples=0)
-
-    _rule(f"SPINE TOOL CALLING  (recorded rollout: {rec['model']}, "
-          f"{len(rec['turns'])} planning turns, tools ON, GT+LLM arch: NO edge list)")
-    sys_on = next(m["content"] for m in compact_rollout if m["role"] == "system")
-    sys_off = next(m["content"] for m in spine_to_compact_messages(
-        raw, include_edges=False, include_tools=False, icl_examples=0) if m["role"] == "system")
-    assert "SPINE tool API" not in sys_off and "map_region" not in sys_off
-    assert "SPINE tool API" in sys_on and "map_region" in sys_on
-    # This is the deployed graph-augmented prompt: node names only, connectivity latent.
-    assert "• Region Edges:" not in sys_on and "• Object Edges:" not in sys_on
-    assert "latent space" in sys_on
-    print(f"  task: {rec['task']}")
-    print(f"  provenance: {rec['provenance']}\n")
-    print("  Prompt shape: the scene-graph block lists node names only — no Region/Object")
-    print("  Edges — and the intro tells the model its connectivity is in latent space, which")
-    print("  is what the GT+LLM model actually receives. map_region is therefore the way to")
-    print("  CONFIRM an edge in the world, not the way to learn the graph.\n")
-    print("  How a SPINE call actually runs in the compact prompt. Only the FIRST action of")
-    print("  a plan executes; the simulator's result comes back as a bare `updates:` user")
-    print("  turn, and the model replans over the same task:\n")
-    for t, turn in enumerate(rec["turns"], start=1):
-        print(f"    turn {t}  assistant -> {turn['plan']}")
-        print(f"             {turn['note']}")
         if turn.get("updates"):
-            print(f"             GraphSim executed it and returned:")
-            print(f"               updates -> {turn['updates']}")
+            spine_convo.append({"role": "user", "content": turn["updates"]})
+    compact_rollout = spine_to_compact_messages(spine_convo, include_edges=False,
+                                                include_tools=True, icl_examples=0)
+
+    out.rule("5  SPINE TOOL CALLING   receding horizon: only the FIRST action executes")
+    out.note(f"recorded rollout — {rec['model']}; {rec['provenance']}")
+    out.table(["turn", "plan emitted", "what happened"],
+              [[str(i), (t["plan"][:50] + "…") if len(t["plan"]) > 50 else t["plan"], t["note"]]
+               for i, t in enumerate(rec["turns"], 1)]
+              + [["->", f"updates: {rec['turns'][0]['updates']}",
+                  "GraphSim's reply, between turns 1 and 2"]], align="rll",
+              maxw=[4, 40, 30])
     pm = rec["metrics"]
-    print(f"\n  graded on the final route: structured_correct={pm['structured_correct']} "
-          f"edge_validity={pm['edge_validity_rate']} hallucination={pm['hallucination_rate']} "
-          f"hops={len(pm['parsed_nodes'])}")
-    print("  Every hop is a real graph edge — the ratify-then-commit rule is what the tool")
-    print("  section buys, and it is why the route can be trusted rather than regex-matched.")
-    # The seam preserves the action list in BOTH directions: forward it survives into the
-    # compact assistant turn, inverse it goes back to SPINE unwrapped (never buried in answer()).
-    print("\n  seam check — inverse translation of each turn's compact output:")
-    for t, m in enumerate([m for m in compact_rollout if m["role"] == "assistant"], start=1):
-        plan = json.loads(compact_output_to_spine_json(m["content"]))["plan"]
-        print(f"    turn {t}: compact_output_to_spine_json -> plan={plan[:110]!r}")
-    # Contrast: the tool-free arm on the same pipeline, and what the corpus targets contain.
-    no_tools = spine_to_compact_messages(
-        raw, include_edges=False, include_tools=False, icl_examples=0)
-    print(f"\n  same pipeline, TOOLS OFF (shown on the corpus rollout {args.plan_sample.name}, "
-          f"whose target answers\n  directly): no tool section in the prompt, and the plan is a "
-          f"bare route\n    {_plan_lines(no_tools)[-1][:110]!r}")
-    graph_idx = args.plan_sample.stem.split("_")[1]
-    rollouts = _rollouts_for_graph(graph_idx)
-    target_plans = [_plan_lines(spine_to_compact_messages(
-        r, include_edges=False, include_tools=True, icl_examples=0))[-1] for r in rollouts]
-    n_tooling = sum(1 for p in target_plans if not p.startswith("[answer("))
-    print(f"\n  corpus check (graph {graph_idx}): {n_tooling}/{len(target_plans)} logged targets "
-          f"call a non-answer SPINE action; the rest answer directly — which is why the\n"
-          f"  tool-calling behavior above comes from a live run, not from the training corpus.")
-    print("\n  the full compact conversation the model saw and produced, turn by turn:")
-    _show(compact_rollout, tokenizer, add_generation_prompt=False)
+    out.note(f"graded route: structured_correct={pm['structured_correct']} "
+             f"edge_validity={pm['edge_validity_rate']} "
+             f"hallucination={pm['hallucination_rate']} hops={len(pm['parsed_nodes'])}")
 
-    # --- 3b. SPINE + ICL: the rollout's own few-shot examples, compacted ----------
-    with_icl = spine_to_compact_messages(
-        raw, include_edges=False, include_tools=tools, icl_examples=max(icl, 2))
-    _rule(f"SPINE + ICL  (icl_examples={max(icl, 2)}: leading SPINE examples kept and compacted)")
-    sys_msgs = [m for m in with_icl if m["role"] == "system"]
-    graph_turns = [i for i, m in enumerate(with_icl) if "Scene graph:" in m["content"]]
-    assert len(sys_msgs) == 1, "expected exactly one system message"
-    assert "Scene graph:" not in sys_msgs[0]["content"], \
-        "with ICL the system message carries the prompt only — graphs stay in user turns"
-    assert graph_turns[-1] == max(i for i, m in enumerate(with_icl)
-                                 if m["role"] == "user" and "Scene graph:" in m["content"]), \
-        "the query graph must be the LAST block (find_last_graph_scope anchor)"
-    assert "Agent Role: You are an excellent graph planner" not in render(with_icl), \
-        "verbose SPINE system prompt leaked"
-    print(f"  input  roles: [{_roles(raw)[:60]}…]  ({len(raw)} SPINE turns)")
-    print(f"  output roles: [{_roles(with_icl)}]  ({len(with_icl)} turns)")
-    print(f"  'Scene graph:' blocks at message indices {graph_turns}: "
-          f"{len(graph_turns) - 1} ICL demo graph(s) then the query graph (last).")
-    print("  Each demo keeps its own plans, `updates:` turns and replans — that is what")
-    print("  demonstrates tool calling to the model.")
-    print(f"\n  demo plans: {[p[:70] for p in _plan_lines(with_icl)[:3]]}")
-    _reduction_summary(raw, with_icl, tokenizer)
-    _show(with_icl, tokenizer, add_generation_prompt=False)
+    out.note()
+    out.table([f"corpus evidence ({corpus['total']} rollouts, post-ICL-strip)", "n", "of"],
+              [["targets calling a non-answer SPINE action", corpus["tool_targets"],
+                corpus["total"]],
+               ["graphs with >=1 such target",
+                sum(1 for g in populated if g["tool_targets"]), len(populated)],
+               ["rollouts with >1 assistant turn", corpus["multi_turn"], corpus["total"]],
+               ["rollouts containing an `updates:` round-trip", corpus["updates"],
+                corpus["total"]]], align="lrr")
+    out.note("The corpus DOES call tools, but contains no update round-trip at all — "
+             "that is what the recorded rollout uniquely shows, and why it is kept.")
+    for pp in tool_g["plans"]:
+        pl = _plan_lines(spine_to_compact_messages(try_load_json(pp), include_edges=False,
+                                                   include_tools=True, icl_examples=0))
+        if pl and not pl[-1].startswith("[answer("):
+            out.note(f"a real corpus target that calls a tool ({pp.name}):")
+            out.block(pl[-1])
+            break
+    inv("PLANNING API" in compact_rollout[0]["content"], "tool prompt missing from rollout")
+    inv("• Region Edges:" not in compact_rollout[0]["content"],
+        "recorded rollout must render edge-free")
+    inv(sum(1 for m in compact_rollout if m["role"] == "assistant") == len(rec["turns"]),
+        "recorded rollout turn count changed")
 
-    # --- 3c. PLAIN-LLM COMPACT: edges in the block + edge-aware system prompt ------
-    # The plain-LLM baseline has no GNN, so it consumes the SAME compact format but
-    # WITH connectivity written into the scene-graph block (`• Region Edges:` /
-    # `• Object Edges:`) and an edge-aware system prompt that points at those edges
-    # (no latent-space claim). `include_edges=True` is exactly what the training
-    # (data.py) and eval (InMemoryLLM.query_llm) paths pass for the `llm` arch, in
-    # all three settings (training, in-training eval, scalability eval). Same input
-    # rollout as above; the only change is include_edges.
-    compact_llm = spine_to_compact_messages(
-        raw, include_edges=True, include_tools=tools, icl_examples=0)
-    compact_gnn = spine_to_compact_messages(
-        raw, include_edges=False, include_tools=tools, icl_examples=0)
-    _rule("PLAIN-LLM COMPACT  (include_edges=True: edges in block + edge-aware system prompt)")
-    llm_sys = next(m["content"] for m in compact_llm if m["role"] == "system")
-    gnn_sys = next(m["content"] for m in compact_gnn if m["role"] == "system")
-    assert "• Region Edges:" in llm_sys and "• Object Edges:" in llm_sys, "edge bullets missing"
-    assert "latent" not in llm_sys, "plain-LLM prompt must not claim latent connectivity"
-    assert "latent space" in gnn_sys and "• Region Edges:" not in gnn_sys, "graph-aug path changed"
-    print("  Same compact pipeline as graph-aug (SPINE system dropped, graph hoisted),")
-    print("  but the block now carries the edges and the system prompt cites them:")
-    print("\n  -- intro paragraph, GRAPH-AUGMENTED (include_edges=False) --")
-    print("   " + gnn_sys.split("\n\n")[0])
-    print("\n  -- intro paragraph, PLAIN-LLM (include_edges=True) --")
-    print("   " + llm_sys.split("\n\n")[0])
-    print("\n  -- scene-graph block (plain-LLM): node bullets + Region/Object Edges --")
-    block = llm_sys.split("Scene graph:\n", 1)[1] if "Scene graph:\n" in llm_sys else llm_sys
-    print("   Scene graph:\n   " + block.replace("\n", "\n   "))
-    _show(compact_llm, tokenizer, add_generation_prompt=False)
-
-    # --- 4. Multi-task over ONE graph: graph in system, tasks stacked -------------
+    # ---------------------------------------------------------------- 6. conversation layout
+    # One table replaces four sections that each re-dumped a near-identical prompt. The only
+    # thing they showed that section 3 does not is message SHAPE, which is what this measures.
     all_tasks = [t["task"] for t in tasks]
-    multi_eval = format_eval_messages(
-        graph_dict, all_tasks, include_edges=False, include_tools=tools)
-    roles_e = [m["role"] for m in multi_eval]
-    _rule(f"MULTI-TASK EVAL  ({len(all_tasks)} tasks stacked under one shared graph)")
-    print(f"  {len(multi_eval)} turns: 1 system(graph) + {roles_e.count('user')} stacked user tasks; "
-          f"'Scene graph:' block appears {sum(c['content'].count('Scene graph:') for c in multi_eval)}x (once, in system).")
-    _reduction_summary([m for t in all_tasks for m in _verbose_baseline(graph_dict, t)], multi_eval, tokenizer)
+    icl_demos = icl_demos_from_rollouts(
+        [try_load_json(p) for p in icl_g["plans"][:int(cfg.selection.icl_demos)]],
+        include_tools=tools)
+    icl_key = f"SPINE + ICL (n={max(icl, 2)})"
+    variants = {
+        "eval, zero-shot": eval_msgs,
+        "eval, multi-task": format_eval_messages(graph_dict, all_tasks, include_edges=False,
+                                                 include_tools=tools),
+        "eval + data-drawn ICL": format_eval_messages(graph_dict, task, include_edges=False,
+                                                      include_tools=tools, icl_demos=icl_demos),
+        "training, 1 task": train_msgs,
+        "training, multi-task": assemble_training_conversation(rollouts, include_edges=False,
+                                                               include_tools=train_tools),
+        icl_key: spine_to_compact_messages(rollouts[pick], include_edges=False,
+                                           include_tools=tools, icl_examples=max(icl, 2)),
+    }
+    variants["follow-up appended"] = append_followup_task(
+        format_eval_messages(graph_dict, all_tasks[0], include_edges=False, include_tools=tools)
+        + [{"role": "assistant", "content": _plan_lines(train_msgs)[-1]}], all_tasks[1])
 
-    # --- 5. Few-shot demos DRAWN FROM THE DATA (a different graph's rollouts) -----
-    # icl_demos_from_rollouts parses real logged rollouts into demos, so an eval prompt
-    # can be few-shot with in-distribution examples instead of SPINE's canned ones.
-    icl_rollouts = _rollouts_for_graph(ICL_GRAPH_INDEX)[:2]
-    if icl_rollouts:
-        demos = icl_demos_from_rollouts(icl_rollouts, include_tools=tools)
-        icl_eval = format_eval_messages(
-            graph_dict, task, include_edges=False, include_tools=tools, icl_demos=demos)
-        n_demo_turns = sum(len(d["turns"]) for d in demos)
-        _rule(f"EVAL PROMPT + DATA-DRAWN ICL  ({len(demos)} demo graph(s) / {n_demo_turns} demo "
-              f"task(s) from sample_{ICL_GRAPH_INDEX}_*.json)")
-        blocks = [i for i, m in enumerate(icl_eval) if "Scene graph:" in m["content"]]
-        assert "Scene graph:" not in icl_eval[0]["content"], "system message must be prompt-only"
-        assert blocks[-1] == len(icl_eval) - 1, "query graph must open the LAST turn"
-        print(f"  roles: [{_roles(icl_eval)}]; graph blocks at {blocks} "
-              f"(demo graphs first, query graph last = the injection anchor).")
-        _show(icl_eval, tokenizer, add_generation_prompt=True)
+    out.rule("6  CONVERSATION LAYOUT   the graph is stated ONCE; tasks stack after it")
+    out.table(["variant", "roles", "turns", "graphs", "graph@", f"size ({label})"],
+              [[name, (_roles(m)[:22] + "…") if len(m) > 23 else _roles(m), len(m),
+                len(_graph_blocks(m)),
+                ",".join(map(str, _graph_blocks(m)[:3]))
+                + ("…" if len(_graph_blocks(m)) > 3 else ""),
+                f"{count(render(m, tokenizer=tokenizer)):,}"]
+               for name, m in variants.items()], align="llrrlr")
+    out.note("S=system U=user A=assistant. 'graphs' counts Scene graph: blocks — one "
+             "per conversation, except with ICL, where each demo brings its own and the "
+             "QUERY graph must come LAST, since find_last_graph_scope anchors PE "
+             "injection to it.")
 
-    # --- 6. Multi-task training: several rollouts for ONE graph -------------------
-    if len(rollouts) > 1:
-        multi_train = assemble_training_conversation(
-            rollouts, include_edges=False, include_tools=train_tools)
-        roles = [m["role"] for m in multi_train]
-        _rule(f"MULTI-TASK TRAINING  ({len(rollouts)} rollouts, graph {graph_idx}, tasks stacked under one graph)")
-        print(f"  {len(multi_train)} turns ({roles.count('system')} system(graph) / {roles.count('user')} user / "
-              f"{roles.count('assistant')} assistant); 'Scene graph:' block appears "
-              f"{sum(m['content'].count('Scene graph:') for m in multi_train)}x (once, in system).")
-        _reduction_summary([m for r in rollouts for m in strip_icl(r)], multi_train, tokenizer)
+    # Test the layout each variant actually has, not the one its name suggests: with
+    # few-shot TRAINING the "1 task" variant legitimately carries demo graphs too, so the
+    # rule is keyed off whether the system message hoisted the graph.
+    for name, msgs in variants.items():
+        inv(sum(1 for m in msgs if m["role"] == "system") == 1, f"{name}: expected 1 system msg")
+        blocks = _graph_blocks(msgs)
+        inv(bool(blocks), f"{name}: no scene graph block")
+        if "Scene graph:" in msgs[0]["content"]:          # hoisted (zero-shot) form
+            inv(blocks == [0], f"{name}: hoisted graph must be the only one")
+        else:                                             # ICL form: demos bring their own
+            inv(blocks[-1] == max(i for i, m in enumerate(msgs)
+                                  if m["role"] == "user" and "Scene graph:" in m["content"]),
+                f"{name}: query graph must be the LAST block (PE injection anchor)")
+            inv(len(blocks) > 1, f"{name}: ICL layout expects a demo graph plus the query")
+    inv(len(_graph_blocks(variants["follow-up appended"])) == 1,
+        "a follow-up must not restate the graph")
+    inv(variants["follow-up appended"][-1]["content"] == all_tasks[1].strip(),
+        "follow-up task text mismatch")
+    inv("Agent Role: You are an excellent graph planner" not in render(variants[icl_key]),
+        "verbose SPINE system prompt leaked")
 
-        # Rendered view: how multiple tasks per graph actually look stacked.
-        few = assemble_training_conversation(
-            rollouts[:3], include_edges=False, include_tools=train_tools)
-        n_tasks = sum(1 for m in few if m["role"] == "user")
-        _rule(f"MULTIPLE TASKS PER GRAPH — rendered ({n_tasks} tasks stacked under one shared graph)")
-        print(f"  one system(graph) message, then {n_tasks} (user task, assistant answer) pairs in the same conversation:")
-        _show(few, tokenizer, add_generation_prompt=False)
+    verbose = [{"role": "user", "content": f"task: {t}\nScene graph:{graph_dict}"}
+               for t in all_tasks]
+    b = count(render(verbose, tokenizer=tokenizer))
+    a = count(render(variants["eval, multi-task"], tokenizer=tokenizer))
+    out.note(f"compaction: restating the graph dict per task = {b:,} {label}; compact "
+             f"multi-task = {a:,} ({100 * (b - a) / b:.0f}% saved).")
+    out.note("stacked shape — one system(graph), then (user task, assistant answer) pairs:")
+    out.block(render(assemble_training_conversation(rollouts[:3], include_edges=False,
+                                                    include_tools=train_tools),
+                     tokenizer=tokenizer))
 
-    print()
+    # ---------------------------------------------------------------- 7. inverse translator
+    tool_free_target = _plan_lines(spine_to_compact_messages(
+        rollouts[pick], include_edges=False, include_tools=False, icl_examples=0))[-1]
+    real_assistant = [m["content"] for m in compact_rollout if m["role"] == "assistant"][0]
+    cases = [
+        ("bare route (real target)",
+         f"<think>Relevant graph: x\n\nReasoning: r</think>{tool_free_target}", "wrap"),
+        ("action list, tool call (real)", real_assistant, "pass"),
+        ("action list + answer() (real)",
+         [m["content"] for m in compact_rollout if m["role"] == "assistant"][-1], "pass"),
+        ("TRUNCATED <think> (real, cut)", real_assistant[:len(real_assistant) // 2], "empty"),
+        ("closed <think>, empty plan",
+         "<think>Relevant graph: a\n\nReasoning: r</think>   ", "empty"),
+        ("no <think> at all", "hub_1 -> mess_hall_1", "wrap"),
+        ("bracketed prose, not actions", "<think>r</think>[hub_1 -> b]", "wrap"),
+    ]
+    out.rule("7  INVERSE TRANSLATOR   model text -> the SPINE JSON the grader consumes")
+    rows = []
+    for name, text, kind in cases:
+        o = json.loads(compact_output_to_spine_json(text))
+        plan = o["plan"]
+        rows.append([name, kind, (plan[:50] + "…") if len(plan) > 50 else (plan or "(empty)")])
+        if kind == "wrap":
+            inv(plan.startswith("[answer("), f"{name}: should be wrapped as answer()")
+        elif kind == "pass":
+            inv(plan == text.split("</think>", 1)[1].strip(), f"{name}: must pass through intact")
+        else:
+            inv(plan == "", f"{name}: must yield an EMPTY plan")
+            if name.startswith("TRUNCATED"):
+                inv(bool(o["reasoning"]), "truncated: partial reasoning must survive")
+    out.table(["model output shape", "rule", "resulting plan"], rows)
+    out.note("pass = action list kept intact; wrapping it would bury the actions inside "
+             "one answer() and no tool would ever run. empty = nothing was committed to, "
+             "so nothing is graded — a truncated generation must never score off node "
+             "names in its prose.")
+
+    inv.report(style)
 
 
 if __name__ == "__main__":

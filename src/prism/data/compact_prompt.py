@@ -53,8 +53,8 @@ Two further policy args, both required (no library-level defaults), mirror
 ``include_edges``:
 
 ``include_tools`` — SPINE tool calling. True inserts the SPINE API tutorial
-(``_SPINE_TOOLS_SECTION``) into the system prompt, requires every hop to be ratified
-with ``map_region`` before ``answer()``, and keeps the assistant plan as a SPINE
+(``_SPINE_TOOLS_SECTION``) into the system prompt, has the route checked by ``goto``
+before ``answer()`` reports it, and keeps the assistant plan as a SPINE
 action list (``[goto(x), answer(a -> b)]``). False adds NOTHING: that arm is the
 pre-SPINE prompt exactly — intro + answer contract, plan unwrapped to the bare route
 — so the tool-free baseline never drifts. WITHIN eval it must agree with the simulator:
@@ -151,35 +151,34 @@ def _edges(pairs: List) -> str:
 #
 # The latent note is the ONE deliberate change to the tool-free prompt: everything
 # else in that arm is byte-identical to the pre-SPINE original, so the tool-free
-# baseline stays comparable. It is written long on purpose — the graph channel is
-# the entire premise of the architecture, and the model has to be told, in as many
-# ways as it takes, that the connectivity really is present and must be used rather
-# than apologized for.
+# baseline stays comparable. It states that the connectivity is reachable through the
+# node names and then spends most of its length on VERIFICATION and recovery — check the
+# route, drop a step that does not hold, take a longer supported path over a short
+# unsupported one — rather than on insisting the model already knows the whole graph.
 _INTRO_LATENT = (
     "You are a navigation planner for a mobile robot. Below is a scene graph listing the "
     "environment's regions, its objects, and the robot's starting location. The connections "
     "between these nodes — which regions border one another, and which region each object is "
     "in — are available to you in latent space; reason over reachability and paths from that "
     "latent access even though the connecting edges are not written out here.\n\n"
-    "About that latent access, because it decides whether you can do this task at all:\n"
-    "• The edges are NOT missing. A graph encoder has already read the complete scene graph — "
-    "every region-to-region border and every object-to-region membership — and written that "
-    "structure directly into the representations of the node names you are reading. The names "
-    "in the lists below are not bare strings to you: each one carries its own position in the "
-    "graph, its neighborhood, and its distance relationships to every other node.\n"
-    "• So when you consider a node, you already know what it touches. Treat a step from one "
-    "node to an adjacent one as something you can verify internally, exactly as you would if "
-    "the edge were printed on the page. The absence of a written edge list is a property of "
-    "this prompt's formatting, not a gap in your knowledge.\n"
-    "• Use it actively. Recover the neighbors of the robot's location, walk outward node by "
-    "node toward the goal, and read off the connected route. Reachability, adjacency, "
-    "shortest paths, and which region contains a given object are all decidable from the "
-    "latent structure you hold.\n"
-    "• Never say the connections are unavailable, never ask for an edge list, never refuse for "
-    "want of the topology, and never fall back to guessing from names or coordinates alone. "
-    "Naming similarity is not adjacency; the latent structure is the authority.\n"
-    "• Commit to the route your latent reading of the graph supports. State it plainly, with "
-    "every intermediate node in order, as if you had traced it on a map — because you have."
+    "About that latent access, and how to check your work with it:\n"
+    "• Read the connections off the node names themselves rather than off a written list. "
+    "Recover the neighbors of the robot's location, walk outward node by node toward the "
+    "goal, and read off a connected route.\n"
+    "• Verify the route before you give it. Every node you name must be one that appears in "
+    "the lists below, and every step between consecutive nodes must be one your latent "
+    "reading of the graph supports.\n"
+    "• If a step does not hold up, do not keep it. Correct that step, or look for an "
+    "alternative route to the same goal — a longer path you can support is better than a "
+    "short one you cannot.\n"
+    "• Naming similarity is not adjacency, and neither is nearness in coordinates. Two nodes "
+    "sounding related is not a connection between them, and a route assembled from names "
+    "that merely look like they belong together is the most common way to get this wrong.\n"
+    "• Work the same way for objects: find the region the object sits in, then route to that "
+    "region. The object itself is not a step in the path.\n"
+    "• If no route you can support gets all the way to the goal, give the part you can "
+    "support and say where it stops, rather than filling the gap with a step you cannot.\n"
+    "• State the route you settle on plainly, with every intermediate node in order."
 )
 
 _INTRO_WITH_EDGES = (
@@ -192,56 +191,131 @@ _INTRO_WITH_EDGES = (
 
 
 # ``include_tools=True``: the SPINE API is live. This section is a TUTORIAL, not a
-# reminder — the deployed model is trained tool-free (``data.spine_tools=none``) and
-# has never seen an action list, so it has to learn the capability zero-shot from
-# this text alone. Hence: an explicit "this is new" framing, one worked turn showing
-# the exact syntax end to end, then the rules. Signatures and semantics are condensed
-# from spine/prompts/api.py (what the eval-time SPINE system prompt ships verbatim);
-# the receding-horizon model is what `planning_sim.PlanningSim` actually runs; and the
-# load-bearing rule is that a route is RATIFIED before it may be wrapped in answer().
+# reminder — the deployed model is trained tool-free (``data.spine_tools=none``), so it
+# learns the action-list FORMAT from this text. It is deliberately not framed as a new
+# capability: ``goto`` is all over the training targets and the rest of the actions appear
+# in the ICL examples, so the model already knows these calls. What it needs is the
+# syntax, the argument rules, and when each action is the right one.
+#
+# SOURCE OF TRUTH: ``spine/prompts/api.py`` (spliced verbatim into SPINE's own system
+# prompt at ``spine/prompts/base.py:62``). Both of its groups are reproduced here:
+#   - the PLANNING API, the 8 actions enforced by ``VALID_ACTIONS``
+#     (``spine/spine.py:16-27``) — anything else is rejected with feedback + a replan;
+#   - the GRAPH UPDATE API, which the model only ever RECEIVES, emitted by
+#     ``GraphUpdate.form_updates()`` (``spine/spine_util.py:84-156``).
+# Argument validation mirrors ``spine/spine.py:28-33, 202-315`` (region vs object node,
+# existence + reachability, numeric coords) so a plan is not spent on a rejection.
+# ``navigation_update(...)`` / ``add_node(...)`` / ``add_connection(...)`` are named
+# because SPINE really emits them (``spine_util.py:144``, ``:193-198`` via
+# ``get_add_connection_update_str`` at ``:161-165``) even though ``api.py`` never declares
+# them; the model would otherwise meet undocumented calls in its update stream. Corpus
+# audit: ``navigation_update`` occurs in real n_10 rollouts, and it is ADVISORY text
+# (``form_updates`` wraps ``freeform_updates``), not a graph mutation — the prompt says so,
+# because reading it as a graph fact would corrupt the model's map.
+# The receding-horizon model is what ``planning_sim.PlanningSim`` actually runs. Routes are
+# checked with ``goto``, not ``map_region``: both sit in ``NAVIGATION_ACTIONS`` and so both
+# require reachability (``spine.py:243-265``), which makes ``map_region`` circular as a
+# ratifier — it presupposes the path it would be testing. ``goto`` runs the graph search and
+# fails loudly with the closest bridging pair. The corpus agrees: across n_30 targets
+# ``goto`` appears 103 times and ``map_region`` 0; across n_10, 224 vs 11.
 #
 # ``include_tools=False`` has NO counterpart section: that arm is the original
 # pre-SPINE prompt (intro + answer contract), unchanged.
 _SPINE_TOOLS_SECTION = (
-    "NEW CAPABILITY — READ THIS CAREFULLY. You can now act in the environment, not just "
-    "describe it. This is new to you, so here is the whole mechanism.\n\n"
-    "The SPINE tool API. These are the only actions you may plan with:\n"
-    "• goto(region_node): navigate to a region already in the graph. A graph search finds the "
-    "route, so call it on the goal region, never on each intermediate hop.\n"
-    "• map_region(region_node): travel to region_node and reveal its true neighbors (regions "
-    "and objects) and its description. This is the ONLY way to confirm which edges a region "
-    "actually has.\n"
-    "• explore_region(region_node, exploration_radius_meters): sweep around a region you are "
-    "already near, to surface nodes the graph is missing.\n"
-    "• extend_map(x_coordinate, y_coordinate): add a new region at those coordinates. Use it "
-    "only when NO existing connection can reach your goal.\n"
-    "• inspect(object_node, vlm_query): ask a vision-language model about an object. It is the "
-    "only way to obtain object attributes, and needs no travel first.\n"
-    "• answer(text): terminal — it ends the task, so emit it only once the route is ratified.\n\n"
+    "PLANNING API — the only eight actions you may put in a plan. Anything else is rejected "
+    "and you have to replan:\n"
+    "• goto(region_node: str) -> None: navigate to region_node. A graph search finds the most "
+    "efficient path there, so call it on the goal region, not on each intermediate hop. If no "
+    "path exists the plan is rejected, and the feedback names the closest pair of nodes "
+    "bridging the two disconnected parts of the graph.\n"
+    "• map_region(region_node: str) -> List[str]: navigate to region_node and reveal its "
+    "neighboring nodes (objects and regions) and the region's own description. It does NOT reveal "
+    "object attributes, and it cannot add connections. Returns graph updates.\n"
+    "• extend_map(x_coordinate: int, y_coordinate: int) -> List[str]: try to add a region node at "
+    "those coordinates. Use it when the goal is far away (over about 10 meters). If that spot is "
+    "not physically feasible — an obstacle, say — the closest feasible region is added instead. "
+    "Returns graph updates.\n"
+    "• explore_region(region_node: str, exploration_radius_meters: float = 3) -> List[str]: "
+    "explore within that radius around region_node. Only call it once you are close to your goal, "
+    "inside the radius. Returns graph updates.\n"
+    "• inspect(object_node: str, vlm_query: str) -> List[str]: ask a vision-language model about "
+    "an object. Callable on ANY object node without navigating there first — proximity is handled "
+    "for you — and it is the only way to get object-level attributes. Keep the query concise. "
+    "Returns graph updates.\n"
+    "• replan() -> None: a placeholder meaning \"I will update the plan once I have the new "
+    "information\". It is never executed directly; use it to close a plan whose later steps depend "
+    "on nodes you have not discovered yet, instead of guessing a stand-in node.\n"
+    "• answer(answer: str) -> None: answer the instruction. Terminal — it ends the task. Never "
+    "write \"I will replan\" inside an answer, and always name the relevant objects or locations "
+    "you identified.\n"
+    "• clarify(question: str) -> None: ask for clarification. Use it when the instruction never "
+    "identifies what to act on, and it is then your ONLY action for that turn.\n\n"
+    "ARGUMENT RULES — break one and the plan is rejected with feedback instead of executed:\n"
+    "• goto, map_region and explore_region take a REGION node; inspect takes an OBJECT node. "
+    "Passing a region to inspect is rejected, with map_region or explore_region suggested "
+    "instead.\n"
+    "• For all four, the node must already exist in the graph AND be reachable from the robot's "
+    "current location — inspect included, even though it needs no navigation of its own. If it "
+    "is not reachable, extend_map toward the bridging pair named in the feedback first.\n"
+    "• extend_map takes numeric coordinates (x, y); explore_region takes (region_node, radius).\n"
+    "• clarify is the whole plan for its turn when you use it.\n\n"
+    "GRAPH UPDATE API — you RECEIVE these, you never call them. After an action runs you get a "
+    "user turn reporting what changed, written with these functions: add_nodes(...), "
+    "remove_nodes(...), add_connections(...), remove_connections(...), "
+    "update_robot_location(region_node), update_node_attributes(...), and no_updates() when "
+    "nothing changed. Read them as facts about the graph and fold them into your next plan. "
+    "Singular add_node(...) and add_connection(...) mean the same as their plural forms.\n"
+    "One entry in that stream is NOT a graph fact: navigation_update(...) carries free-form "
+    "advice about your own planning — for example that you are calling replan too many times "
+    "in a row, or should try explore_region rather than extend_map. Treat it as a correction "
+    "to your behaviour, not as a change to the graph.\n\n"
     "How your plan runs, step by step: you write a plan as a bracketed, comma-separated list of "
     "these calls. Execution is receding-horizon — only the FIRST action in the list is actually "
-    "taken. You then receive a user turn beginning `updates:` that reports what it revealed, and "
-    "you write a fresh plan for the same task over the updated graph. The task ends the moment "
-    "your plan reaches answer(), so a plan may be a single action or a full sequence ending in "
-    "answer().\n\n"
-    "A worked example. Suppose the robot is in start_region and the goal is goal_region, and you "
-    "have not confirmed what start_region borders. A correct first turn is:\n"
-    "<think>Relevant graph: start_region, goal_region\n\n"
-    "Reasoning: I have not confirmed start_region's neighbors, so I map it before committing to "
-    "any hop.</think>[map_region(start_region)]\n"
-    "You then receive something like `updates:[add_connections([start_region, middle_region])]`, "
-    "and the ratified hop lets you finish:\n"
+    "taken. You then receive the update turn described above and write a fresh plan for the same "
+    "task over the updated graph. The task ends the moment your plan reaches answer(), so a plan "
+    "may be a single action or a full sequence ending in answer().\n\n"
+    "A worked example. Suppose the robot is in start_region and the goal is goal_region, by way "
+    "of middle_region. Read the route off the graph, then let goto check it for you:\n"
     "<think>Relevant graph: start_region, middle_region, goal_region\n\n"
-    "Reasoning: start_region <=> middle_region is now confirmed, and middle_region <=> "
-    "goal_region was already in the graph, so the route holds.</think>"
-    "[goto(goal_region), answer(start_region -> middle_region -> goal_region)]\n\n"
+    "Reasoning: start_region borders middle_region, which borders goal_region, so the route "
+    "holds. goto will take the graph-search path there and reject the plan if it does "
+    "not.</think>[goto(goal_region), answer(start_region -> middle_region -> goal_region)]\n"
+    "If instead the plan comes back rejected for want of a path, the feedback names the closest "
+    "bridging pair; use extend_map on that gap, or route around it, and answer only once a "
+    "connected route stands.\n\n"
+    "FIRST, decide whether the instruction is plannable at all. It IS plannable if you can point "
+    "at what to act on: a named node, an object, coordinates, or a description that picks out one "
+    "— \"the area containing the medkit\" and \"a tool near gallery_1\" both name a target. It is "
+    "NOT plannable if the instruction never says what or where — \"go get the thing from over "
+    "there\" identifies nothing. In that case do not guess a goal and do not explore on spec: emit "
+    "clarify(...) as the whole plan for that turn, for example [clarify(Which object should I "
+    "fetch, and from which region?)], and stop there.\n"
+    "A target you have to DISCOVER first is still plannable, and is not a reason to clarify: "
+    "\"the keycard that is not in the graph yet\" or \"whichever room it turns out to be in\" "
+    "tells you exactly what to look for. Search for it with map_region or explore_region and "
+    "close that plan with replan(). Reach for clarify only when nothing at all is identified.\n\n"
     "When you MUST call a tool:\n"
-    "• Ratify the path before committing to it. For every hop whose edge you have not read "
-    "directly off the scene graph, call map_region on that region and read its neighbors back "
-    "before you use the hop. Only then may you answer(). NEVER assert an edge you have neither "
-    "read nor confirmed with map_region — a hallucinated edge is a failed task.\n"
+    "• Put goto(goal_region) in front of the answer() that reports the route. goto runs a graph "
+    "search over the real graph, so it succeeds only if a path exists and is rejected with "
+    "corrective feedback if none does — that is what checks the route you worked out, and it "
+    "costs one action rather than one per hop. NEVER assert an edge you have neither read off "
+    "the scene graph nor had accepted by goto; a hallucinated edge is a failed task.\n"
+    "• map_region is for LEARNING a region you cannot see into — it reveals a region's "
+    "neighbors and description. It is not the way to test a route: it needs the region to be "
+    "reachable already, so a map_region that succeeds only tells you what you were trying to "
+    "find out. Use it to discover, and goto to confirm.\n"
     "• If a node you need is absent, or a region has no confirmed connection toward the goal, "
-    "call explore_region or extend_map first; do not invent the missing link.\n"
+    "call explore_region or extend_map first; do not invent the missing link. If a node you need "
+    "does not exist yet, you may name it in the Relevant graph line as "
+    "unobserved_node(description) — that is prose for your own reasoning, never a call.\n"
+    "• NEVER substitute a node that happens to be in the graph for one the task says is missing. "
+    "If the task is about something unrecorded, acting on a similarly named node that already "
+    "exists is a wrong answer, and passing it to inspect or goto is a rejected plan.\n"
+    "• When a later step depends on a node you have not discovered yet, plan only as far as your "
+    "knowledge actually reaches and close that plan with replan() — for example "
+    "[explore_region(gallery_1, 3), replan()]. You will be given the discovery in the next "
+    "updates: turn and can plan the rest then. Do not stretch a plan past the last thing you "
+    "know.\n"
     "• answer() repeats only ratified hops, in order.\n"
     "• Keep the reasoning short enough that the plan line always gets written. An unfinished "
     "answer counts as no answer at all."
@@ -261,8 +335,8 @@ def _answer_contract(include_tools: bool) -> str:
             "2. Immediately after </think>, give the plan ONLY as a SPINE action list in square "
             "brackets: the actions in execution order, comma-separated, ending in the terminal "
             "answer() once the route has been ratified — for example, "
-            "[map_region(start_region), goto(goal_region), answer(start_region -> "
-            "middle_region -> goal_region)]. The answer() argument carries the route itself: its "
+            "[goto(goal_region), answer(start_region -> middle_region -> goal_region)]. "
+            "The answer() argument carries the route itself: its "
             "nodes in order joined by arrows. Put nothing else there — no further reasoning, no "
             "labels, and no second <think> block."
         )
@@ -938,9 +1012,10 @@ def compact_output_to_spine_json(text: str) -> str:
     })
 
 
-# SPINE API actions a plan may open with (spine/prompts/api.py); `answer`/`clarify`
-# included so a tool-mode plan that goes straight to the terminal action is also
-# recognized as an action list.
+# SPINE actions a plan may open with — the full planning API, mirroring
+# ``spine.spine.VALID_ACTIONS`` (spine/spine.py:16-27). Kept as a literal because this
+# module is deliberately free of the heavy spine/torch imports; parity with the real
+# set is asserted in tests/test_spine_tools_icl.py so the two cannot drift.
 _SPINE_ACTIONS = (
     "goto", "map_region", "explore_region", "extend_map", "inspect", "replan",
     "answer", "clarify",

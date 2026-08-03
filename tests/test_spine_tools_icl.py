@@ -89,17 +89,143 @@ def _plans(messages):
 # include_tools — system prompt
 # ---------------------------------------------------------------------------
 
-def test_tools_on_documents_api_and_demands_ratification():
-    """With tools on the prompt names every SPINE action, says when they must be used,
-    and requires ratifying hops with map_region before answer() (no hallucinated edges)."""
+def test_tools_on_documents_api_and_validates_routes_with_goto():
+    """With tools on the prompt names every SPINE action and says how a route is checked.
+
+    The instrument is ``goto``, not ``map_region``: both sit in SPINE's NAVIGATION_ACTIONS
+    and so both require reachability (spine.py:243-265), which makes ``map_region``
+    circular as a ratifier — it presupposes the path it would be testing — while ``goto``
+    runs the graph search and is rejected with the closest bridging pair when none exists.
+    The training corpus agrees: n_30 targets use ``goto`` 103 times and ``map_region`` 0.
+    """
     sys_on = _system(_compact(include_tools=True, icl_examples=0))
     for action in ("goto(", "map_region(", "explore_region(", "extend_map(", "inspect(", "answer("):
         assert action in sys_on, f"SPINE API section missing {action}"
-    assert "Ratify the path before committing to it" in sys_on
+    # goto is the validation instrument, placed before the reporting answer().
+    assert "Put goto(goal_region) in front of the answer()" in sys_on
+    assert "Use it to discover, and goto to confirm" in sys_on
+    # ...and map_region is explicitly disclaimed as a route test.
+    assert "It is not the way to test a route" in sys_on
+    assert "Ratify the path before committing to it" not in sys_on, \
+        "map_region-based ratification was deliberately removed; it presupposes reachability"
     assert "hallucinated edge" in sys_on
     assert "TOOL CALLING IS DISABLED" not in sys_on
     # The plan format asked for is the action list, not a bare route.
     assert "SPINE action list" in sys_on
+
+
+def test_tools_on_has_no_new_capability_framing():
+    """The prompt must not tell the model it has gained something new: ``goto`` is all
+    over the training targets and the other actions appear in the ICL examples, so the
+    framing was both untrue and wasted tokens."""
+    sys_on = _system(_compact(include_tools=True, icl_examples=0))
+    for framing in ("NEW CAPABILITY", "new to you", "You can now act", "This is new",
+                    "not just describe it"):
+        assert framing not in sys_on, f"new-capability framing returned: {framing!r}"
+
+
+def test_update_api_declares_what_spine_actually_emits():
+    """SPINE emits calls ``api.py`` never declares; the prompt must still name them or the
+    model meets undocumented entries in its update stream. ``navigation_update`` is the
+    important one — it wraps ``freeform_updates`` (spine_util.py:144), so it is ADVICE
+    about planning, not a graph mutation, and must not be folded into the map."""
+    sys_on = _system(_compact(include_tools=True, icl_examples=0))
+    for emitted in ("navigation_update", "add_node(", "add_connection("):
+        assert emitted in sys_on, f"update API omits emitted call {emitted!r}"
+    assert "Treat it as a correction to your behaviour" in sys_on
+    assert "NOT a graph fact" in sys_on
+
+
+# The planning API as declared in spine/prompts/api.py — the text spliced into SPINE's
+# own system prompt. The compact prompt must document all of it, with the real
+# signatures, or the model is being taught an API that does not exist.
+_PLANNING_API = {
+    "goto": "goto(region_node: str) -> None",
+    "map_region": "map_region(region_node: str) -> List[str]",
+    "extend_map": "extend_map(x_coordinate: int, y_coordinate: int) -> List[str]",
+    "explore_region": "explore_region(region_node: str, exploration_radius_meters: float = 3) -> List[str]",
+    "inspect": "inspect(object_node: str, vlm_query: str) -> List[str]",
+    "replan": "replan() -> None",
+    "answer": "answer(answer: str) -> None",
+    "clarify": "clarify(question: str) -> None",
+}
+# The graph-update API (api.py:7-33) — the model RECEIVES these and must never call them.
+_UPDATE_API = ("add_nodes", "remove_nodes", "add_connections", "remove_connections",
+               "update_robot_location", "update_node_attributes", "no_updates")
+
+
+def test_every_planning_action_is_documented_with_its_real_signature():
+    """All 8 actions, verbatim signatures from api.py. A missing one is an action the
+    model will never use; a wrong signature is a plan SPINE will reject."""
+    sys_on = _system(_compact(include_tools=True, icl_examples=0))
+    for name, signature in _PLANNING_API.items():
+        assert signature in sys_on, f"{name}: signature not documented as {signature!r}"
+
+
+def test_documented_actions_match_spine_valid_actions():
+    """``_SPINE_ACTIONS`` (used by the inverse translator to recognize an action list)
+    must equal SPINE's own ``VALID_ACTIONS``. compact_prompt cannot import spine, so the
+    literal is pinned here instead — this is the guard against drift."""
+    assert set(compact_prompt._SPINE_ACTIONS) == set(_PLANNING_API), \
+        "_SPINE_ACTIONS disagrees with the documented planning API"
+    try:
+        from spine.spine import VALID_ACTIONS
+    except Exception:  # noqa: BLE001  — spine unavailable in this environment
+        return
+    assert set(compact_prompt._SPINE_ACTIONS) == set(VALID_ACTIONS), (
+        f"_SPINE_ACTIONS drifted from spine.spine.VALID_ACTIONS: "
+        f"{set(compact_prompt._SPINE_ACTIONS) ^ set(VALID_ACTIONS)}")
+
+
+def test_graph_update_api_is_documented_as_receive_only():
+    """The update vocabulary SPINE sends back must be documented, and flagged as inbound
+    so the model does not try to call it. The two undeclared-but-emitted strings
+    (navigation_update / add_connection) are named too — the model meets them for real."""
+    sys_on = _system(_compact(include_tools=True, icl_examples=0))
+    for fn in _UPDATE_API:
+        assert fn in sys_on, f"graph-update function {fn} not documented"
+    assert "you RECEIVE these, you never call them" in sys_on
+    assert "navigation_update(" in sys_on and "add_connection(" in sys_on
+
+
+def test_argument_rules_are_stated():
+    """Region-vs-object typing, existence + reachability, and the coordinate/radius forms
+    (spine.py:28-33, 202-315). Breaking one costs a planning turn to a rejection."""
+    sys_on = _system(_compact(include_tools=True, icl_examples=0))
+    assert "take a REGION node" in sys_on and "inspect takes an OBJECT node" in sys_on
+    assert "reachable from the robot's" in sys_on
+    assert "numeric coordinates" in sys_on
+    assert "unobserved_node(description)" in sys_on   # prose pseudo-token, not a call
+
+
+def test_clarify_and_replan_have_explicit_triggers():
+    """`clarify` and `replan` are the two actions a model will not reach on its own: probed
+    zero-shot against the earlier prompt, neither ever fired — the model explored on spec
+    instead of clarifying, and substituted an existing node instead of deferring with
+    replan(). Each therefore needs a stated trigger, plus the carve-out that keeps the two
+    apart (a target you must DISCOVER is plannable, so it belongs to replan, not clarify)."""
+    sys_on = _system(_compact(include_tools=True, icl_examples=0))
+    # clarify: a plannability gate, with the positive definition that keeps described
+    # targets (e.g. "the area containing the medkit") out of its scope.
+    assert "decide whether the instruction is plannable" in sys_on
+    assert "clarify(...) as the whole plan for that turn" in sys_on
+    # replan: a trigger with a worked action list, so the alternative is concrete.
+    assert "close that plan with replan()" in sys_on
+    assert "replan()]" in sys_on, "replan needs a worked example, not just a description"
+    # The carve-out — without it the gate swallows every discovery task.
+    assert "DISCOVER first is still plannable" in sys_on
+    assert "only when nothing at all is identified" in sys_on
+    # The substitution ban that removed the wrong-node failure.
+    assert "NEVER substitute a node that happens to be in the graph" in sys_on
+
+
+def test_tool_free_prompt_documents_none_of_the_api():
+    """None of the API — planning or update — may leak into the tool-free arm."""
+    sys_off = _system(_compact(include_tools=False, icl_examples=0))
+    for name in list(_PLANNING_API) + list(_UPDATE_API):
+        if name == "answer":
+            continue  # the historical contract legitimately says "answer" in prose
+        assert f"{name}(" not in sys_off, f"tool-free prompt leaks {name}("
 
 
 def test_tools_off_is_the_pre_spine_prompt_plus_the_latent_note():
@@ -113,10 +239,15 @@ def test_tools_off_is_the_pre_spine_prompt_plus_the_latent_note():
     # Pre-SPINE contract, verbatim (bare arrow route, not an action list).
     assert "give the final plan only: the route the robot follows" in sys_off
     assert "SPINE action list" not in sys_off
-    # Bolstered latent note.
+    # The latent note. Its job is verification-and-recovery, NOT an insistence that the
+    # model already knows the whole graph, so the over-strict claims must stay gone.
     assert "available to you in latent space" in sys_off
-    assert "The edges are NOT missing" in sys_off
-    assert "never ask for an edge list" in sys_off
+    assert "Verify the route before you give it" in sys_off
+    assert "Correct that step, or look for an alternative route" in sys_off
+    for overclaim in ("The edges are NOT missing", "never ask for an edge list",
+                      "never refuse for", "as if you had traced it on a map",
+                      "not a gap in your knowledge"):
+        assert overclaim not in sys_off, f"latent note regained over-strict claim {overclaim!r}"
 
 
 def test_tools_off_plain_llm_points_at_listed_edges_and_never_claims_latent():

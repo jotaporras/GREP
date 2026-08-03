@@ -35,6 +35,20 @@ CHECKPOINT=$(_anchor "${1:-${CHECKPOINT:-outputs/e13f_alpha_khops/e13f_alpha00_a
 GRAPHS=$(_anchor "${2:-${GRAPHS:-data/n_100/gen/nav_n100_gemma_data/test_graphs}}")
 OUTPUT=$(_anchor "${3:-${OUTPUT:-results/e13f_transferability}}")
 
+# ICL policy, stated explicitly so it cannot drift with the config defaults:
+#   USE_ICL       -> eval.use_icl. ON: eval prompts carry few-shot SPINE demos.
+#   DATA_ICL_EXAMPLES -> data.icl_examples. 0: training stays zero-shot.
+# Only USE_ICL is consumed here — scalability_evaluation is an eval-only entrypoint and
+# has no training stage, so data.icl_examples is recorded for the record and asserted
+# to be 0 rather than passed. ICL lengthens every eval prompt, so expect a larger KV
+# cache and slower generation than the zero-shot arm this replaces.
+USE_ICL=${USE_ICL:-true}
+DATA_ICL_EXAMPLES=${DATA_ICL_EXAMPLES:-0}
+if [ "$DATA_ICL_EXAMPLES" != "0" ]; then
+  echo "ERROR: DATA_ICL_EXAMPLES must be 0 (training is zero-shot); got $DATA_ICL_EXAMPLES" >&2
+  exit 1
+fi
+
 # Home dir sits near its quota; keep the HF hub cache (base gemma-4-31B-it
 # weights, loaded 4-bit) on shared vast — downloaded once, reused across jobs.
 export HF_HOME=${HF_HOME:-$ALELAB/hf_cache}
@@ -62,6 +76,6 @@ srun python -m prism.eval.scalability_evaluation \
     --output "$OUTPUT" \
     --four-bit \
     --text-edge-list none \
-    --use-icl false
+    --use-icl "$USE_ICL"
 
 echo "[$(date --iso-8601=seconds)] e13f no-perm eval DONE"
