@@ -131,6 +131,7 @@ def train_model(config: omegaconf.DictConfig):
         "gt_llm",
         "graph_mask_llm",
         "learnable_graph_mask",
+        "wire_llm",
     )
     if (config.trainer.init_pe_from or config.trainer.init_lora_from) and not is_graph_arch:
         raise ValueError(
@@ -248,7 +249,15 @@ def train_model(config: omegaconf.DictConfig):
             "structural_lr_mult": config.gnn.structural_lr_mult,
             **{k: config.gnn[k] for k in _direct},
             **({k: config.gnn[k] for k in ("k_gt", "gt_num_layers", "gt_heads")}
-               if config.gnn.arch in ("rpearl_gt_llm", "gt_llm", "learnable_graph_mask") else {}),
+               if config.gnn.arch in ("rpearl_gt_llm", "gt_llm", "learnable_graph_mask",
+                                      "wire_llm") else {}),
+            # wire_llm: every switch the rotation depends on, so eval rebuilds it exactly.
+            # wire_omega_seed is provenance only — omega itself is checkpointed.
+            **({k: config.gnn[k] for k in (
+                "wire_layer_scope", "wire_sigma_init", "wire_freeze_sigma",
+                "wire_omega_seed", "wire_rotate_nope_planes", "wire_max_angle",
+                "wire_decode")}
+               if config.gnn.arch == "wire_llm" else {}),
             # learnable_graph_mask navigator: record both sources so eval rebuilds the NavigatorPE.
             **({"pe_gt_from": config.gnn.pe_gt_from, "semantic_gt_from": config.gnn.semantic_gt_from}
                if config.gnn.arch == "learnable_graph_mask" and config.gnn.pe_gt_from else {}),
@@ -486,6 +495,24 @@ def _validate_config(config: omegaconf.DictConfig) -> None:
             raise ValueError(
                 "gnn.mask_psi_scale='cosine' with gnn.mask_use_edges=false is degenerate "
                 "(constant mask, zero GT gradient). Use mask_psi_scale='inv_sqrt_d' or keep edges.")
+    if config.gnn.arch == "wire_llm":
+        if config.gnn.wire_layer_scope not in ("all", "dense", "dense_top_half", "dense_first"):
+            raise ValueError(
+                f"gnn.wire_layer_scope must be one of ('all', 'dense', 'dense_top_half', "
+                f"'dense_first'), got {config.gnn.wire_layer_scope!r}")
+        if config.gnn.wire_decode not in ("error", "skip"):
+            raise ValueError(
+                f"gnn.wire_decode must be 'error' or 'skip', got {config.gnn.wire_decode!r}")
+        if float(config.gnn.wire_sigma_init) <= 0:
+            raise ValueError(
+                f"gnn.wire_sigma_init must be > 0, got {config.gnn.wire_sigma_init}")
+        if float(config.gnn.wire_max_angle) <= 0:
+            raise ValueError(
+                f"gnn.wire_max_angle must be > 0, got {config.gnn.wire_max_angle}")
+        if config.gnn.pe_node_features != "random":
+            raise ValueError(
+                "arch='wire_llm' requires gnn.pe_node_features='random' "
+                f"(word-embedding feature prep is not wired). Got {config.gnn.pe_node_features!r}.")
     if config.gnn.pe_gt_from or config.gnn.semantic_gt_from:
         if config.gnn.arch != "learnable_graph_mask":
             raise ValueError(

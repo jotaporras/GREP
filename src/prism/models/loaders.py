@@ -190,6 +190,48 @@ def graph_augmented_llm_from_pretrained(
             model.pe_gain.data.copy_(gnn_weights["pe_gain"])
         if model.pe_norm is not None and "pe_norm" in gnn_weights:
             model.pe_norm.load_state_dict(gnn_weights["pe_norm"])
+    elif architecture == "wire_llm":
+        # WIRE rotary injection: rebuild the Psi producer + the per-layer omega tables.
+        # omega is loaded STRICTLY (not regenerated from the seed) so a checkpoint can
+        # never silently diverge from the frequencies the run was trained with.
+        pe_model = gt_module.GraphTransformer(
+            num_layers=gnn_cfg["gt_num_layers"],
+            pe_hidden_channels=gnn_cfg["pe_hidden_channels"],
+            pe_num_layers=gnn_cfg["pe_num_layers"],
+            d_model=gnn_cfg["d_model"],
+            heads=gnn_cfg["gt_heads"],
+            num_samples=gnn_cfg["num_samples"],
+            dropout=gnn_cfg["dropout"],
+            k_pe=gnn_cfg["k_pe"],
+            k_gt=gnn_cfg["k_gt"],
+            eps=gnn_cfg["eps"],
+            use_layer_norm=gnn_cfg["use_layer_norm"],
+            node_feature_dim=None,
+        )
+        model = gnn_llm.WireGraphLLM(
+            llm, pe_model, d_model=gnn_cfg["d_model"],
+            layer_scope=gnn_cfg.get("wire_layer_scope", "dense"),
+            sigma_init=gnn_cfg.get("wire_sigma_init", 0.01),
+            freeze_sigma=gnn_cfg.get("wire_freeze_sigma", False),
+            omega_seed=gnn_cfg.get("wire_omega_seed", 0),
+            rotate_nope_planes=gnn_cfg.get("wire_rotate_nope_planes", False),
+            max_angle=gnn_cfg.get("wire_max_angle", 1.0),
+            pe_gain_init=gnn_cfg.get("pe_gain_init", 1.0),
+            decode=gnn_cfg.get("wire_decode", "error"),
+        )
+        gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
+        model.pe_model.load_state_dict(gnn_weights["pe_model"], strict=False)
+        if "pe_gain" in gnn_weights:
+            model.pe_gain.data.copy_(gnn_weights["pe_gain"])
+        if "wire_eps" not in gnn_weights or "wire_sigma" not in gnn_weights:
+            raise KeyError(
+                f"{os.path.join(path, 'gnn_weights.pt')} is missing 'wire_eps'/"
+                "'wire_sigma'; the WIRE frequency directions and scales were not "
+                "checkpointed and cannot be recovered (regenerating eps from "
+                "wire_omega_seed would not be guaranteed identical across "
+                "torch versions/devices).")
+        model._wire_eps.load_state_dict(gnn_weights["wire_eps"])
+        model._wire_sigma.load_state_dict(gnn_weights["wire_sigma"])
     elif architecture == "graph_mask_llm":
         # Parameter-free structural attention mask: rebuild from gnn_config, no weights
         # to load (the LoRA adapter was already merged into `llm` above).

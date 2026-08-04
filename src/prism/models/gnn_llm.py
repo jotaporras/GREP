@@ -1,6 +1,7 @@
 import copy
 import importlib
 import re
+import warnings
 from collections import defaultdict
 
 import torch
@@ -129,6 +130,204 @@ def _graph_mask_attention_forward(module, query, key, value, attention_mask,
 AttentionInterface.register(_GRAPH_MASK_IMPL, _graph_mask_attention_forward)
 
 
+# Attention implementation name: WireGraphLLM routes the in-scope decoder layers
+# through _wire_attention_forward, which composes a SECOND rotation onto the
+# already-RoPE'd q/k. The rotation is the ONLY path — there is no score-level
+# variant — which is what keeps the arch linear-attention compatible. See
+# WireGraphLLM.
+_WIRE_IMPL = "prism_wire"
+
+WIRE_DECODE_MODES = ("error", "skip")
+
+
+def wire_rope_planes(attn, rotate_nope: bool) -> int:
+    """Number of 2-D planes WIRE rotates on ``attn`` (out of ``head_dim // 2``).
+
+    Gemma's global layers use ``rope_type="proportional"`` with a
+    ``partial_rotary_factor``: only ``int(factor * head_dim // 2)`` leading planes
+    carry text RoPE and the remainder are NoPE (zero inv_freq ⇒ cos=1, sin=0), i.e.
+    channels the model treats as position-free content. This mirrors the upstream
+    formula in ``modeling_rope_utils._compute_proportional_rope_parameters`` (the
+    ``rope_angles`` line) rather than hard-coding a count, so it tracks the config.
+
+    ``rotate_nope=True`` returns every plane (graph phase also enters the NoPE
+    channels — a deliberate, auditable choice, not the default).
+
+    The return value IS WIRE's Monte-Carlo sample count for the layer (see
+    :class:`WireGraphLLM`), and it is not uniform across layer types. gemma-4-31B::
+
+        layer type   head_dim   rotate_nope=False   rotate_nope=True
+        global        512        64  (factor 0.25)   256
+        sliding       256       128  (no factor)     128
+    """
+    head_dim = int(attn.head_dim)
+    total = head_dim // 2
+    if rotate_nope:
+        return total
+    params = getattr(attn.config, "rope_parameters", None) or {}
+    layer_type = getattr(attn, "layer_type", None)
+    if isinstance(params, dict) and layer_type in params:
+        params = params[layer_type] or {}
+    factor = (params or {}).get("partial_rotary_factor", 1.0)
+    return int(factor * head_dim // 2)
+
+
+def wire_cos_sin(r, omega, head_dim: int):
+    """cos/sin of the WIRE angles ``θ_n = ω_n · r``, laid out for Gemma's rotary.
+
+    Args:
+        r: ``[B, S, m]`` graph feature per position (0 at non-graph positions).
+        omega: ``[P, m]`` frequency table, ``P <= head_dim // 2`` planes. ONE table per
+            layer, shared by every head — so this is computed once per layer, not once
+            per head.
+        head_dim: attention head width.
+
+    Returns ``(cos, sin)`` shaped ``[B, S, head_dim]``, broadcast over heads by the
+    caller. Planes beyond ``P`` are padded with **zero** angle, so ``cos=1, sin=0``
+    there and those channels are left exactly untouched. Both halves carry the same
+    angle because ``rotate_half`` pairs channel ``n`` with ``n + head_dim/2``
+    (matching upstream's ``cat((freqs, freqs))``).
+
+    Computed in fp32: ``θ`` is a length-``m`` dot product (m is 1024 by default) and
+    cos/sin are periodic, so a bf16 reduction produces an angle error that does NOT
+    shrink with magnitude. Mirrors upstream's own forced-fp32 rotary
+    (``Gemma4TextRotaryEmbedding.forward``).
+    """
+    theta = r.float() @ omega.float().t()                    # [B, S, P]
+    pad = head_dim // 2 - theta.shape[-1]
+    if pad < 0:
+        raise ValueError(
+            f"omega has {theta.shape[-1]} planes but head_dim//2 = {head_dim // 2}")
+    if pad > 0:
+        theta = torch.cat(
+            (theta, theta.new_zeros(*theta.shape[:-1], pad)), dim=-1)
+    emb = torch.cat((theta, theta), dim=-1)                  # [..., head_dim]
+    return emb.cos(), emb.sin()
+
+
+def _wire_rotate(x, cos, sin):
+    """WIRE's Eq. 11 efficient instantiation: ``cos ⊙ z + sin ⊙ Pz``.
+
+    ``x`` is ``[B, H, S, hd]``, cos/sin are ``[B, S, hd]``. ``O(d)`` per token, and it
+    allocates nothing whose shape depends on the graph size — the paper's
+    "parameters/compute independent of N" property (§3.1) holds literally here.
+
+    ``P`` is the pairing permutation. The paper writes it as the **alternate-entry**
+    swap (channels 2n, 2n+1), but Gemma pairs channel ``n`` with ``n + hd/2`` — its
+    ``rotate_half``. Using the paper's literal ``P`` here would rotate different
+    channel pairs than the text RoPE does, so the two rotations would no longer act in
+    the same 2-D planes and would NOT commute; the composition with RoPE that makes
+    this hook point valid would be lost. We therefore use Gemma's own pairing, which is
+    the same operator up to a fixed channel relabeling.
+
+    Out-of-place throughout (autograd-safe). ``cos``/``sin`` are ``[B, S, hd]`` and
+    BROADCAST over the head axis — the angles are shared by every head in the layer, so
+    they are computed once per layer and no per-head copy is ever materialized. This
+    also makes the q-side and k-side rotations use identical frequencies under GQA,
+    which is what keeps Eq. 3 exact when a key head is shared by several query heads.
+    """
+    cos = cos.unsqueeze(1).to(x.dtype)
+    sin = sin.unsqueeze(1).to(x.dtype)
+    half = x.shape[-1] // 2
+    x1, x2 = x[..., :half], x[..., half:]
+    return x * cos + torch.cat((-x2, x1), dim=-1) * sin
+
+
+def _wire_attention_forward(module, query, key, value, attention_mask,
+                            scaling=None, dropout=0.0, **kwargs):
+    """Attention fn applying WIRE to the already-RoPE'd q/k.
+
+    Registered as ``"prism_wire"``. Receives q/k as ``[B, H, S, head_dim]`` AFTER
+    ``apply_rotary_pos_emb`` (``modeling_gemma4.py:1251`` for q, ``:1267`` for k) and
+    AFTER the KV-cache write (``:1274``); Gemma dispatches here at ``:1282``. (Line
+    numbers verified against transformers 5.14.1.) Two consequences: the text RoPE is
+    already applied, so this COMPOSES rather than replaces — and cached keys are
+    already stored WITHOUT the graph phase, which is why decode cannot work (below).
+
+    Rotates q and k by ``R(θ)``, ``θ_n = ω_n·r``. Same-plane rotations commute, so the
+    score picks up ``r_j − r_i`` on top of the text phase ``p_j − p_i``. ``v`` and the
+    attention mask are untouched and NO ``S×S`` (or ``N×N``) object is ever built —
+    that is what keeps this linear-attention compatible rather than a bias-style RPE.
+
+    With the signal absent, or on an inactive layer, this delegates untouched (``r=0``
+    would also give the identity, but the early return avoids the work entirely).
+    """
+    model = getattr(module, "_wire_model", None)
+    active = getattr(module, "_wire_active", False)
+    r = None if (model is None or not active) else model._wire_signal
+    if r is None:
+        return module._wire_orig_attn_fn(
+            module, query, key, value, attention_mask,
+            scaling=scaling, dropout=dropout, **kwargs)
+
+    q_len, k_len = query.shape[-2], key.shape[-2]
+    if r.shape[0] != query.shape[0] or r.shape[1] != q_len or k_len != q_len:
+        # Cached decode step (or a batch/length mismatch). WIRE assumes BOTH q and k
+        # carry the graph phase, and the KV cache is written BEFORE this hook runs, so
+        # cached keys carry none: silently falling through would violate the premise.
+        if model._wire_decode == "skip":
+            return module._wire_orig_attn_fn(
+                module, query, key, value, attention_mask,
+                scaling=scaling, dropout=dropout, **kwargs)
+        raise NotImplementedError(
+            "WireGraphLLM: cached decode step reached the WIRE attention layer "
+            f"(q_len={q_len}, k_len={k_len}, signal_len={r.shape[1]}). Keys are "
+            "written to the KV cache before this hook, so cached keys carry no graph "
+            "rotation; rotating only the query would break the relative-only property "
+            "Theorem 3 assumes. Decode-time key re-rotation is not implemented. Use "
+            "wire_decode='skip' ONLY as a diagnostic (it disables WIRE at decode)."
+        )
+
+    # ONE table for the whole layer (ω = σ_ℓ·ε), so the angles are computed once here
+    # and broadcast over every head — H× less modulation work than a per-head table,
+    # and the same frequencies necessarily rotate q and k, keeping Eq. 3 exact under GQA.
+    omega = model.layer_omega(module.layer_idx, query.device)      # [P, m]
+    r = r.to(device=query.device)
+    cos, sin = wire_cos_sin(r, omega, module.head_dim)
+    query = _wire_rotate(query, cos, sin)
+    key = _wire_rotate(key, cos, sin)
+    return module._wire_orig_attn_fn(
+        module, query, key, value, attention_mask,
+        scaling=scaling, dropout=dropout, **kwargs)
+
+
+AttentionInterface.register(_WIRE_IMPL, _wire_attention_forward)
+
+
+def _wire_resolve_orig_attn_fn(wrapper, first_attn):
+    """Resolve the layers' pre-patch attention fn and mirror its mask registration.
+
+    The impl name is captured ONCE (configs are shared across layers, so a
+    post-mutation read would already see ``prism_wire``) and persisted for idempotent
+    re-install. ``prism_wire`` is registered in the mask registry mirroring the original
+    impl so HF builds the right causal/sliding mask for the delegated fn
+    (``create_causal_mask`` returns ``None`` for an unregistered impl, which would
+    silently disable causal masking).
+
+    Mirrors the identical dance inside the other wrappers' ``_install_*`` methods and
+    is deliberately NOT shared with them — the WIRE arch is kept self-contained so it
+    cannot perturb the existing architectures. Used only by :class:`WireGraphLLM`.
+    """
+    mod = importlib.import_module(type(first_attn).__module__)
+    if not hasattr(wrapper, "_wire_orig_attn_impl"):
+        impl = first_attn.config._attn_implementation
+        wrapper._wire_orig_attn_impl = "eager" if impl == _WIRE_IMPL else impl
+    orig_impl = wrapper._wire_orig_attn_impl
+    # Resolve original attention fn: ≥5.12 uses get_interface(); older subscripts the registry.
+    attn_fns = mod.ALL_ATTENTION_FUNCTIONS
+    if hasattr(attn_fns, "get_interface"):
+        orig_attn_fn = attn_fns.get_interface(orig_impl, mod.eager_attention_forward)
+    else:
+        orig_attn_fn = (
+            mod.eager_attention_forward if orig_impl == "eager" else attn_fns[orig_impl]
+        )
+    mask_fns = getattr(masking_utils, "ALL_MASK_ATTENTION_FUNCTIONS", None)
+    if mask_fns is not None and orig_impl in mask_fns._global_mapping:
+        masking_utils.AttentionMaskInterface.register(
+            _WIRE_IMPL, mask_fns._global_mapping[orig_impl])
+    return mod, orig_attn_fn
+
+
 MASK_LAYER_SCOPES = ("all", "dense", "dense_top_half", "dense_first")
 
 
@@ -172,6 +371,24 @@ def tok2node_vector(injection_map, seq_len, device) -> torch.Tensor:
             if start < end:
                 tok2node[start:end] = node_idx
     return tok2node
+
+
+def wire_place_at_node_spans(dest, b: int, rows, injection_map, seq_len: int) -> None:
+    """Accumulate per-node rows into ``dest[b]`` at each node's token spans, in place.
+
+    ``dest`` is ``[B, seq, D]`` (pre-zeroed), ``rows`` is ``[N, D]``. Spans are disjoint
+    (``build_injection_map`` dedups longest-first) so the accumulate is really an
+    assignment; written as ``x = x + row`` to stay out-of-place w.r.t. autograd.
+
+    Mirrors the placement loop inside ``GraphAugmentedLLM.build_pe_signal`` and is
+    deliberately NOT shared with it: the WIRE arch is kept self-contained so it cannot
+    perturb the additive family. Used only by :class:`WireGraphLLM`.
+    """
+    for node_idx, spans in injection_map.items():
+        for start, end in spans:
+            end = min(end, seq_len)
+            if start < end:
+                dest[b, start:end] = dest[b, start:end] + rows[node_idx].to(dest.dtype)
 
 
 def node_adjacency(g, device, k_hops: int = 1, symmetrize: bool = True,
@@ -944,6 +1161,634 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             # (backward recomputes attention forwards and must see the same signal).
             if not getattr(self.llm, "is_gradient_checkpointing", False):
                 self._pe_signal = None
+
+
+class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
+    """WIRE: graph PE injected as a **rotation** of q/k, not as an added signal.
+
+    Implements Wave-Induced Rotary Encodings (Reid et al., *Rotary Position Encodings
+    for Graphs*, ICML 2026) on Gemma-4. Gemma applies its own RoPE to q/k *before*
+    dispatching to the attention interface, so this composes a SECOND rotation there::
+
+        q_i → R(θ_i)·RoPE(p_i)·q_i        θ_i[n] = ω_n · r_i
+        k_j → R(θ_j)·RoPE(p_j)·k_j        r_i    = Ψ_i  (the GT's node feature)
+
+    The hook (:func:`_wire_attention_forward`) runs after ``apply_rotary_pos_emb``
+    (``modeling_gemma4.py:1251`` for q, ``:1267`` for k) and after the KV-cache write
+    (``:1274``), reached by the attention dispatch at ``:1282``.
+
+    Same-plane 2-D rotations commute, so the score becomes
+    ``qᵀ R(p_j − p_i + r_j − r_i) k``: the text phase and the graph phase simply add.
+    ``v`` is untouched (WIRE is a q/k mechanism). Because ``Ψ = 0`` at non-graph
+    tokens, ``θ = 0`` there ⇒ ``cos = 1, sin = 0`` ⇒ the rotation is **exactly** the
+    identity, not an approximation — a stronger invariant than the additive family's,
+    which needs bias-free projections to get it.
+
+    **What the theory does and does not give you.** Theorem 3 states, for
+    ``ω_i ~ N(0, ω²I)``::
+
+        E[(RoPE(r_i)q_i)ᵀ RoPE(r_j)k_j] = q_iᵀk_j (1 − ω²R(i,j)/2) + O(ω⁴)
+
+    Two independent steps hide in that, and only the first one transfers.
+
+    Step 1 — the Johnson–Lindenstrauss averaging that kills the odd ``sin`` term and
+    leaves ``qᵀk(1 − ω²‖r_i−r_j‖²/2) + O(ω⁴)`` — holds for ANY feature ``r``. That
+    step is what this class delivers.
+
+    Step 2 — the algebraic identity ``‖r_i−r_j‖² = R(i,j)`` (effective resistance) —
+    holds ONLY for ``r_i = [u_k[i]/√λ_k]_k`` over all nontrivial Laplacian modes. The
+    ``r`` fed in here is not that feature: ``pe_model`` is a ``GraphTransformer``
+    whose PE branch is a mean-pooled R-PEARL readout (a degree-``k_pe``=2 TAGConv
+    polynomial with LeakyReLU, LayerNorm and biases), followed by sparse-attention
+    blocks. Even on the most generous linear-filter reading of that stack you get
+    ``‖Ψ_i−Ψ_j‖² = Σ_k g(λ_k)²(u_k[i] − u_k[j])²`` for a LEARNED spectral response
+    ``g`` — and ``g = 1/√λ`` is neither a polynomial nor bounded as ``λ → 0``, so a
+    degree-2 filter cannot reach it even in principle; the nonlinearities and
+    attention blocks put the actual Ψ further away still.
+
+    **So: this class downweights attention by a learned Ψ-distance, NOT by effective
+    resistance.** Do not report effective-resistance or shortest-path-lower-bound
+    claims for runs of this class. Recovering the resistance reading means replacing
+    ``r`` with the spectral feature above — a different architecture, not a config.
+
+    Note also that a single layer's score is ONE draw of ω, not the expectation: the
+    identity above is an expectation over ω, and a single draw carries the full
+    oscillatory ``cos``/``sin`` terms of the paper's Eq. 8.
+
+    **Linear-attention compatibility is RETAINED here.** WIRE's headline architectural
+    claim (§3.3) is that the structural downweighting arises without instantiating the
+    attention matrix. Because the shared modulation is applied as a ROTATION of q and k
+    — not as a score-level ``[B, S, S]`` (or ``[N, N]``) multiplicative gate — no
+    quadratic object is built at any point, and the property survives. Sharing ω across
+    heads changes only how many times the angles are computed, never where they are
+    applied. If this class is ever changed to apply the modulation to logits instead,
+    that property is forfeited and this paragraph must be rewritten.
+
+    **Frequencies: ω = σ_ℓ · ε_ℓ, shared across heads.** Each in-scope layer holds ONE
+    table ``ε_ℓ ∈ R^{P×m}``, drawn once from ``N(0, I)`` (seeded by ``omega_seed``) and
+    kept FROZEN as a persistent buffer, plus one learnable scalar ``σ_ℓ``. The
+    frequencies used are ``ω_ℓ = σ_ℓ · s_ℓ · ε_ℓ`` (``s_ℓ`` is the angle clamp below,
+    exactly 1.0 in the normal regime), so ω remains a genuine Gaussian sample —
+    Theorem 3's hypothesis — while the trained quantity is exactly the ``ω`` that
+    appears in ``qᵀk(1 − ω²R(i,j)/2)``. ``freeze_sigma=True`` pins σ for the literal-
+    Theorem-3 A/B arm.
+
+    One table per LAYER, not per head: the modulation is therefore identical for every
+    head, computed once per layer and broadcast — H× less angle work — while each head
+    keeps its own ``qᵀk`` entirely (no content is averaged across heads; doing so would
+    collapse multi-head attention to a single shared pattern). Sharing across heads also
+    guarantees q and k are rotated by the same frequencies under GQA, which is what
+    makes Eq. 3 exact when one key head serves several query heads.
+
+    **Monte-Carlo sample count differs by layer type — and the DEFAULT inverts the
+    asymmetry.** With ω shared across heads, the Step-1 averaging comes from the ``P``
+    rotary planes in the shared table (Eq. 8's sum over ``k``), plus independence
+    across depth; the variance falls as ``1/P``. ``P`` is :func:`wire_rope_planes`,
+    and it is NOT uniform across layers. gemma-4-31B::
+
+        layer type   head_dim   rotate_nope_planes=False   =True
+        global        512        64  (factor 0.25)          256
+        sliding       256       128 (no factor)             128
+
+    At the DEFAULT (``rotate_nope_planes=False``) the global layers are the WORSE
+    estimator — 64 samples against the sliding layers' 128 — and flipping the flag to
+    True reverses that to 256 vs 128. Which layers this actually bites depends on
+    ``layer_scope``: at the default ``"dense"`` only global layers carry WIRE, so
+    every active layer runs at 64 planes; ``"all"`` is where the 2× cross-layer-type
+    asymmetry is live. For any model other than 31B read the number off
+    :func:`wire_rope_planes`, not off this table.
+
+    Be precise about what more planes buy: they tighten the estimate a layer's scores
+    are built from, but **no single score equals the expectation** — one score is one
+    draw and carries the full oscillatory cos/sin terms of Eq. 8.
+
+    **Scaling in the number of nodes.** Nothing here allocates or parameterizes in
+    ``N``: ω is ``[P, m]`` with ``P ≤ head_dim/2`` (a function of head width and GT
+    width only), Ψ is ``[N, m]`` (linear), and the rotation is ``O(d)`` per token via
+    Eq. 11. No ``N×N`` or ``S×S`` object is built at any point, which is both WIRE's
+    §3.1 parameters-independent-of-graph-size property and what keeps it
+    linear-attention compatible (§3.3), unlike bias-style RPEs. The one quantity that
+    CAN drift with graph size is the angle magnitude ``θ = ω·Ψ_i``: cos/sin are
+    periodic, so if ``‖Ψ‖`` grew with ``N`` the angles would wrap and the
+    leading-order Theorem 3 reading would silently fail — presenting exactly as
+    "worked at N=30, noise at N=100". :meth:`build_wire_signal` therefore MEASURES
+    ``σ·max‖Ψ_i‖`` and ``σ·max‖Ψ_i−Ψ_j‖`` on every forward and clamps the latter to
+    ``max_angle`` (below) rather than assuming the regime holds.
+
+    **The clamp, and the one hazard it creates.** ``max_angle`` is the ONLY angle
+    threshold; a former ``hard_max_angle`` that RAISED has been deleted, because no
+    training run may be killed by the angle guard. :meth:`layer_scale_factor` returns
+    ``min(1.0, max_angle / (|σ_ℓ|·span))`` and :meth:`layer_omega` applies it
+    unconditionally. Inside the bound the factor is EXACTLY 1.0, so the identity case
+    goes down the same code path, and the effective angle satisfies the bound by
+    construction on every forward.
+
+    The cost is a **biased gradient once the clamp saturates.** The factor is
+    detached, so ``ω = σ·s·ε`` has ``dω/dσ = s·ε ≠ 0`` and autograd dutifully reports
+    a non-zero ``dL/dσ``. But in the saturated regime ``σ·s`` is pinned at
+    ``max_angle/span`` *regardless of σ*: the loss is bit-identical across a 1000×
+    range of raw σ, so the TRUE ``dL/dσ`` is zero and the reported value is an
+    artifact of treating ``s`` as constant. Consequence: **σ can drift upward
+    indefinitely with no corrective signal and no effect on the model, while training
+    looks perfectly healthy.** Nothing detects this automatically. ``wire/sigma_raw_max``
+    diverging from ``wire/sigma_eff_max`` in :meth:`wire_telemetry` (equivalently
+    ``wire/clamp_engaged == 1``) is the ONLY signal, and a one-shot ``RuntimeWarning``
+    fires the first time it happens. A saturated run is NOT an A/B over σ — it is a
+    fixed-angle run at ``max_angle``, and must be reported as one.
+
+    **Decode is unsupported and fails loud.** ``decode="error"`` (the default) raises
+    ``NotImplementedError`` at the first cached decode step. The KV cache is written
+    at ``modeling_gemma4.py:1274``, BEFORE this hook, so cached keys carry no graph
+    phase; rotating only the query would leave an absolute ``+r_i`` in the score and
+    destroy the relative-only property Theorem 3 assumes. Re-rotating cached keys at
+    decode time is not implemented. ``decode="skip"`` falls through to stock attention
+    on cached steps — a labeled diagnostic in which WIRE is OFF for every generated
+    token, never a result. The prompt forward (training, teacher-forced eval) is
+    unaffected either way.
+
+    **Config switches.** All of them, and nothing else, fork behavior. Hydra keys are
+    ``gnn.wire_*`` (``experiments/base_config.yaml``), wired in
+    ``architectures.build_model``::
+
+        arg (config key)                   default    effect / what the other side does
+        layer_scope (wire_layer_scope)     "dense"    WIRE on Gemma full_attention
+                                                      (global) layers only. "all" = every
+                                                      layer incl. sliding; "dense_top_half"
+                                                      = deeper half of globals;
+                                                      "dense_first" = shallowest global.
+        sigma_init (wire_sigma_init)       0.01       initial σ_ℓ, every in-scope layer.
+                                                      Larger ⇒ larger angle; scale as
+                                                      1/√d_model (see Args).
+        freeze_sigma (wire_freeze_sigma)   False      σ trains, inside the structural LR
+                                                      group. True pins σ at sigma_init and
+                                                      drops it from
+                                                      structural_parameters() (still
+                                                      checkpointed) = literal-Theorem-3 arm.
+        omega_seed (wire_omega_seed)       0          seed of the frozen ε draw. Any other
+                                                      int ⇒ a different Monte-Carlo draw.
+        rotate_nope_planes                 False      rotate only the text-RoPE planes.
+          (wire_rotate_nope_planes)                   True also rotates the NoPE planes
+                                                      (4× more planes on 31B globals; see
+                                                      the sample-count table above).
+        max_angle (wire_max_angle)         1.0        clamp bound on σ_eff·max‖Ψ_i−Ψ_j‖.
+                                                      Larger ⇒ weaker clamp and a walk out
+                                                      of the small-angle regime; smaller ⇒
+                                                      saturates sooner (see the hazard).
+        pe_gain_init                       1.0        gate tanh(pe_gain), init ≈ 0.76.
+                                                      0.0 ⇒ θ=0 ⇒ exact identity cold start.
+        decode (wire_decode)               "error"    raise at the first cached decode
+                                                      step. "skip" = diagnostic only.
+        pe_node_features                   "random"   GT samples its own probes. Anything
+                                                      else is rejected in __init__.
+
+    **Known coverage gaps** (stated so they are not mistaken for verified behavior):
+
+    - ``dense`` / ``dense_top_half`` / ``dense_first`` are exercised but NOT
+      DIFFERENTIATED by the current test fixture: the 4-layer ``gemma4`` used in
+      ``tests/test_wire_*.py`` has exactly one ``full_attention`` layer (transformers
+      forces the last layer global), so all three scopes resolve to the same single
+      layer. Their divergence on a real 31B stack is untested.
+    - ``loaders.load_pe_weights_into`` has no ``wire_llm`` branch, so multistage init
+      of a WIRE run from a prior GT checkpoint raises.
+    - ``pe_node_features="word_embeddings"`` is unsupported (rejected in ``__init__``
+      and again in ``architectures.build_model``).
+    - Decode-time key re-rotation is not implemented (see above).
+
+    **Deliberately omitted — do not add**: any pooled/accumulated cross-layer estimate
+    or ``[N,N]``/``[S,S]`` score-level gate (that is a relative position encoding, the
+    class of method WIRE exists to replace, and it forfeits linear-attention
+    compatibility); ``pe_proj`` / ``pe_norm`` (rotation angles
+    are not in the LLM's hidden space, and renormalizing ``r`` would silently rescale
+    the ``‖r_i−r_j‖`` the theorem is stated in — ``max_angle`` is the principled scale
+    control instead); ``v`` injection (WIRE is q/k only); ``pe_node_features=
+    "word_embeddings"`` (not wired, fails loud).
+
+    Args:
+        llm: base causal LLM (Gemma-4).
+        pe_model: Ψ producer; ``forward(data) → [N, d_model]``.
+        d_model: Ψ width ``m`` — also the ω table's input width.
+        layer_scope: which layers carry WIRE (see :func:`resolve_mask_active_flags`).
+        sigma_init: initial value of every learnable ``σ_ℓ``. Only ``σ·‖r_i−r_j‖``
+            matters, and the guarantee is leading-order in it (``O(ω⁴)`` error), so this
+            must START inside the small-angle regime. **Scale it with 1/√d_model**:
+            ``‖Ψ_i‖`` is MEASURED at ≈ 1.1·√d_model (8.9 at d_model=64, 35.4 at
+            d_model=1024) and flat in N, so ``max‖Ψ_i−Ψ_j‖`` is ~√d_model and σ=0.05
+            would already put the angle at ~2.0 rad at d_model=1024 — past
+            ``max_angle``. The default is calibrated for d_model=1024 (σ=0.01 ⇒ ~0.4
+            rad). Note this scaling is EMPIRICAL, not structural: the GT's final
+            SparseTransformerBlock is built with ``normalize=False``, so no LayerNorm
+            pins the output magnitude and training may move it. ``max_angle`` is the
+            actual guarantee.
+        freeze_sigma: pin σ (literal-Theorem-3 A/B arm). Default False = σ trains.
+        omega_seed: seed for the frozen ε draw (recorded in the run config).
+        rotate_nope_planes: also rotate the NoPE planes of ``proportional``-rope
+            layers. Default False — see :func:`wire_rope_planes`.
+        max_angle: bound on the effective ``σ·max‖Ψ_i−Ψ_j‖``. Enforced by an exact,
+            UNCONDITIONAL clamp (:meth:`layer_scale_factor`), so it holds by
+            construction on every forward and can never fail a run — at the cost of
+            the biased-gradient hazard documented above.
+        pe_gain_init: gate ``tanh(pe_gain)``; 0.0 ⇒ θ=0 ⇒ exact identity cold start.
+        decode: ``"error"`` (default) or ``"skip"`` — see :func:`_wire_attention_forward`.
+        pe_node_features: must be ``"random"``; anything else is rejected here.
+    """
+
+    def __init__(self, llm: nn.Module, pe_model: nn.Module, d_model: int,
+                 layer_scope: str = "dense", sigma_init: float = 0.01,
+                 freeze_sigma: bool = False, omega_seed: int = 0,
+                 rotate_nope_planes: bool = False, max_angle: float = 1.0,
+                 pe_gain_init: float = 1.0,
+                 decode: str = "error", pe_node_features: str = "random"):
+        # Wrapper is not a registered HF architecture or MoE class; force "eager" so
+        # PreTrainedModel doesn't reject SDPA/flash or expert-impl validation.
+        config = copy.copy(llm.config)
+        config._attn_implementation = "eager"  # ty: ignore[invalid-assignment]
+        config._experts_implementation = "eager"  # ty: ignore[invalid-assignment]
+        super().__init__(config)
+        self.llm = llm
+
+        try:
+            device = next(self.parameters()).device
+        except StopIteration:
+            device = llm.device
+        self.pe_model = pe_model.to(device)
+
+        if layer_scope not in MASK_LAYER_SCOPES:
+            raise ValueError(f"layer_scope must be one of {MASK_LAYER_SCOPES}, got {layer_scope!r}")
+        if decode not in WIRE_DECODE_MODES:
+            raise ValueError(f"decode must be one of {WIRE_DECODE_MODES}, got {decode!r}")
+        if pe_node_features != "random":
+            raise ValueError(
+                "WireGraphLLM currently supports only pe_node_features='random' "
+                f"(word-embedding feature prep is not wired). Got {pe_node_features!r}.")
+        if not sigma_init > 0:
+            raise ValueError(f"sigma_init must be > 0, got {sigma_init}")
+        if not max_angle > 0:
+            raise ValueError(f"max_angle must be > 0, got {max_angle}")
+
+        self._wire_d_model = int(d_model)
+        self._wire_layer_scope = layer_scope
+        self._wire_sigma_init = float(sigma_init)
+        self._wire_freeze_sigma = bool(freeze_sigma)
+        self._wire_omega_seed = int(omega_seed)
+        self._wire_rotate_nope = bool(rotate_nope_planes)
+        self._wire_max_angle = float(max_angle)
+        self._wire_decode = decode
+        self._pe_node_features = pe_node_features
+        # max‖Ψ_i−Ψ_j‖ from the current forward; combined with σ to measure the angle.
+        self._wire_psi_span: float | None = None
+        self._wire_warned_angle: bool = False
+
+        # Gate g = tanh(pe_gain) ∈ (-1,1) on the ANGLE; 0.0 ⇒ exact identity cold start.
+        self.pe_gain = nn.Parameter(torch.tensor(float(pe_gain_init), device=device))
+
+        # Per-forward state; read by the patched attention fns, disarmed after forward.
+        self._wire_signal: torch.Tensor | None = None       # [B, seq, m]
+        # Measured small-angle diagnostics (see build_wire_signal): the pair term is
+        # the Theorem 3 expansion parameter; the row term catches Ψ-norm drift with N.
+        self._wire_measured_angle: float | None = None      # σ·max‖Ψ_i−Ψ_j‖
+        self._wire_measured_row_angle: float | None = None  # σ·max‖Ψ_i‖
+        self._wire_modeling_module = None
+
+        # ε: frozen unit-Gaussian directions, one [P, m] buffer per in-scope layer.
+        # σ: learnable per-layer scale. ω = σ_ℓ · ε_ℓ (see _install_wire).
+        self._wire_eps = nn.Module()
+        self._wire_sigma = nn.ParameterDict()
+        self._install_wire()
+
+    def layer_scale_factor(self, layer_idx: int) -> float:
+        """Detached scale ``s_ℓ ∈ (0, 1]`` pinning ``|σ_ℓ|·s_ℓ·span ≤ max_angle``.
+
+        Applied UNCONDITIONALLY by :meth:`layer_omega` — ``min(1.0, max_angle/measured)``
+        is exactly 1.0 inside the bound, so the identity case is the SAME code path — and
+        the Taylor-expansion premise therefore holds by construction on every forward
+        rather than being checked and reported. No run can be killed by it.
+
+        ``span`` is the pairwise Ψ spread measured by :meth:`build_wire_signal`. When it
+        is unset or zero (no graph armed, or a single-node / all-equal Ψ) the angle is
+        identically zero and the factor is 1.0.
+
+        HAZARD — the factor is detached, so ``ω = σ·s·ε`` gives ``dω/dσ = s·ε ≠ 0`` and
+        autograd reports a non-zero ``dL/dσ`` even when saturated. It is BIASED: once
+        ``s = max_angle/(|σ|·span)``, the product ``σ·s`` no longer depends on σ at all,
+        the loss is bit-identical across a 1000× range of raw σ, and the true ``dL/dσ``
+        is zero. σ can then drift upward forever with no corrective signal and no effect
+        on the model. The only detection is ``wire/sigma_raw_max`` diverging from
+        ``wire/sigma_eff_max`` in :meth:`wire_telemetry`.
+        """
+        span = self._wire_psi_span
+        if span is None or span <= 0:
+            return 1.0
+        sigma_abs = float(self._wire_sigma[str(layer_idx)].detach().abs())
+        measured = sigma_abs * span
+        if measured <= 0.0:
+            return 1.0
+        return min(1.0, self._wire_max_angle / measured)
+
+    def layer_omega(self, layer_idx: int, device=None):
+        """``ω_ℓ = σ_ℓ · s_ℓ · ε_ℓ`` — the clamped frequencies actually used.
+
+        Shape ``[P, m]`` — ONE table for the whole layer, shared by every head, so the
+        angles are computed once per layer and broadcast (see :func:`_wire_rotate`).
+
+        ``s_ℓ`` is the detached, unconditional factor from :meth:`layer_scale_factor`.
+        The multiply is out-of-place and ``ε`` is a frozen buffer, so this is
+        autograd-safe; gradient still reaches ``σ`` (scaled by ``s_ℓ``) — but read the
+        bias warning on :meth:`layer_scale_factor` before trusting it under saturation.
+        """
+        eps = getattr(self._wire_eps, str(layer_idx))
+        sigma = self._wire_sigma[str(layer_idx)]
+        if device is not None:
+            eps = eps.to(device)
+            sigma = sigma.to(device)
+        return (sigma * self.layer_scale_factor(layer_idx)) * eps
+
+    def wire_telemetry(self) -> dict:
+        """Per-forward scalars for the training logs (``GradientDebugCallback``, which
+        merges this dict when the wrapped model exposes it).
+
+        This is the ONLY instrument for the clamp-saturation hazard
+        (:meth:`layer_scale_factor`): a clamped σ grows without bound while the
+        effective σ stays pinned, so the parameter silently stops meaning anything
+        while loss and gradient norms look healthy.
+
+        Read it as::
+
+            wire/sigma_raw_max  >  wire/sigma_eff_max   ⇒ SATURATED (σ is dead weight)
+            wire/clamp_engaged  == 1                    ⇒ same, as a boolean
+            wire/scale_min      <  1.0                  ⇒ same, as the worst factor
+            wire/angle_raw_max                          angle that WOULD have applied
+            wire/angle_eff_max  ≤ wire/max_angle        angle actually applied
+
+        Per-layer ``wire/sigma_raw/L{i}`` and ``wire/sigma_eff/L{i}`` make the
+        saturation attributable to specific layers. With no graph armed (``span is
+        None``) only ``wire/psi_span`` (NaN) and ``wire/max_angle`` are returned.
+        """
+        span = self._wire_psi_span
+        out = {
+            "wire/psi_span": float(span) if span is not None else float("nan"),
+            "wire/max_angle": self._wire_max_angle,
+        }
+        if span is None:
+            return out
+        raw, eff, scales, clamped = [], [], [], 0
+        for li in self.active_layer_indices():
+            s = self.layer_scale_factor(li)
+            sig = float(self._wire_sigma[str(li)].detach().abs())
+            raw.append(sig)
+            eff.append(sig * s)
+            scales.append(s)
+            clamped += int(s < 1.0)
+            out[f"wire/sigma_raw/L{li}"] = sig
+            out[f"wire/sigma_eff/L{li}"] = sig * s
+        if raw:
+            out.update({
+                "wire/sigma_raw_max": max(raw),
+                "wire/sigma_raw_mean": sum(raw) / len(raw),
+                "wire/sigma_eff_max": max(eff),
+                "wire/sigma_eff_mean": sum(eff) / len(eff),
+                "wire/scale_min": min(scales),
+                "wire/angle_raw_max": max(raw) * span,      # what it WOULD have been
+                "wire/angle_eff_max": max(eff) * span,      # what was actually applied
+                "wire/clamp_engaged": int(clamped > 0),
+                "wire/clamped_layers": clamped,
+            })
+        return out
+
+    # ------------------------------------------------------------------ wiring
+
+    def structural_parameters(self) -> list[nn.Parameter]:
+        """Graph-side params for the boosted-LR group: the Ψ producer, the gate, and
+        the per-layer ``σ_ℓ`` **only when learnable** (under ``freeze_sigma`` they carry
+        ``requires_grad=False`` and must not enter an optimizer group). ``ε`` is never
+        here — it is a frozen persistent buffer, not a parameter."""
+        params = list(self.pe_model.parameters()) + [self.pe_gain]
+        if not self._wire_freeze_sigma:
+            params += list(self._wire_sigma.values())
+        return params
+
+    def _decoder_layers(self):
+        """Return the decoder layer list (Gemma text-only: ``model.layers``; multimodal: ``get_decoder().layers``)."""
+        base = getattr(self.llm, "model", None)
+        if base is not None and hasattr(base, "layers"):
+            return base.layers
+        return self.llm.get_decoder().layers
+
+    def _install_wire(self) -> None:
+        """Route every layer through ``prism_wire``, flagging only the in-scope ones.
+
+        The decoder layers share one ``config`` object so the impl name cannot be
+        flipped per layer; out-of-scope layers carry ``_wire_active=False`` and
+        delegate untouched (same pattern as ``LearnableGraphMaskLLM``).
+
+        Note the additive family's bias-free-projection guard is deliberately NOT
+        replicated: a rotation never projects Ψ through ``q_proj``/``k_proj``, so a
+        projection bias cannot leak the graph channel onto non-graph tokens. ``r=0 ⇒
+        θ=0 ⇒ identity`` holds regardless of the projections.
+        """
+        layers = self._decoder_layers()
+        if len(layers) == 0:
+            return
+        mod, orig_attn_fn = _wire_resolve_orig_attn_fn(self, layers[0].self_attn)
+        self._wire_modeling_module = mod
+
+        active_flags = resolve_mask_active_flags(layers, self._wire_layer_scope)
+        gen = torch.Generator(device="cpu").manual_seed(self._wire_omega_seed)
+        device = self.pe_gain.device
+        for idx, (layer, active) in enumerate(zip(layers, active_flags)):
+            attn = layer.self_attn
+            # KV-shared layers reuse an upstream layer's keys, which already carry THAT
+            # layer's ω phase; rotating q here with a different ω would break the
+            # relative-only property, so they are inactive entirely rather than q-only.
+            # (Dead on gemma-4-31B: num_kv_shared_layers=0.)
+            if getattr(attn, "is_kv_shared_layer", False):
+                active = False
+            object.__setattr__(attn, "_wire_model", self)
+            attn._wire_orig_attn_fn = orig_attn_fn
+            attn._wire_active = bool(active)
+            attn.config._attn_implementation = _WIRE_IMPL
+            if not active:
+                continue
+            planes = wire_rope_planes(attn, self._wire_rotate_nope)
+            if planes <= 0:
+                raise ValueError(
+                    f"layer {idx}: wire_rope_planes computed {planes} rotatable planes "
+                    "(partial_rotary_factor too small for this head_dim) — WIRE would "
+                    "be a no-op there. Set rotate_nope_planes=True or exclude the layer.")
+            # Reparameterized frequencies: ω = σ_ℓ · ε with ε ~ N(0, I) FROZEN and σ_ℓ
+            # a learnable per-layer scalar. ω is then a genuine Gaussian sample (the
+            # direction is fixed by the draw, Theorem 3's hypothesis) while the learned
+            # quantity is exactly the σ that appears in qᵀk(1 − σ²R(i,j)/2). ε is a
+            # persistent buffer so it is checkpointed rather than regenerated.
+            eps = torch.randn(planes, self._wire_d_model, generator=gen)
+            self._wire_eps.register_buffer(str(idx), eps.to(device), persistent=True)
+            self._wire_sigma[str(idx)] = nn.Parameter(
+                torch.tensor(self._wire_sigma_init, device=device),
+                requires_grad=not self._wire_freeze_sigma)
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        self.llm.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
+
+    def gradient_checkpointing_disable(self):
+        self.llm.gradient_checkpointing_disable()
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)  # defer to nn.Module first
+        except AttributeError:
+            return getattr(self.llm, name)
+
+    # ------------------------------------------------------------------- signal
+
+    def active_layer_indices(self) -> list[int]:
+        """Decoder-layer indices carrying WIRE, in depth order."""
+        return sorted(int(k) for k in self._wire_sigma.keys())
+
+    def build_wire_signal(self, graphs, injection_maps, seq_len: int, device,
+                          permutation=None) -> torch.Tensor:
+        """Assemble ``r`` ``[B, seq, m]`` — the gated Ψ placed at node-token spans.
+
+        ``permutation`` is threaded to ``pe_model`` exactly as ``build_pe_signal`` does,
+        for the eval-time permutation-equivariance check (Lemma 1: WIRE is equivariant
+        to node reordering up to eigenvector sign flips / degenerate-subspace rotations).
+
+        Ψ is gated (``·tanh(pe_gain)``) BEFORE the measurements below, so every angle
+        quoted here is the one actually applied.
+
+        Measures the small-angle premise per forward, on the ``[N, m]`` node rows (not
+        per token — the check is O(N²) on a ~100-row matrix, not on the sequence):
+
+        - ``σ·max‖Ψ_i − Ψ_j‖`` → ``_wire_psi_span`` / ``_wire_measured_angle``. This is
+          the Theorem 3 expansion parameter (the correction is ``ω²‖Ψ_i−Ψ_j‖²/2`` with
+          ``O(ω⁴)`` error) and the ONLY quantity ``max_angle`` clamps.
+        - ``σ·max‖Ψ_i‖`` → ``_wire_measured_row_angle``. Diagnostic only, never
+          clamped and not surfaced in :meth:`wire_telemetry`. Recorded because cos/sin
+          are periodic: if ``‖Ψ‖`` grew with graph size the angles would wrap and the
+          leading-order reading would fail silently at large N.
+
+        Scope of the clamp, stated exactly: ``span`` is the pairwise spread over NODE
+        rows, so it bounds node↔node phase differences. Non-graph tokens carry ``r=0``,
+        so a node↔non-node pair sees ``‖Ψ_i − 0‖`` = the ROW norm, which ``span`` does
+        not bound — and on a single-node (or all-equal-Ψ) graph ``span`` is 0, so no
+        clamp applies at all while the row angle is nonzero. In practice the two terms
+        are the same order (‖Ψ_i‖ ≈ 1.1·√d_model, measured), but do not read
+        ``max_angle`` as a bound on every angle appearing in the scores.
+
+        The clamp itself lives in :meth:`layer_scale_factor` and is unconditional, so
+        nothing here can fail a run; the ``RuntimeError`` below fires only if the clamp
+        arithmetic is wrong, and the ``RuntimeWarning`` (once per model) announces
+        saturation.
+        """
+        B = len(injection_maps)
+        r = torch.zeros(B, seq_len, self._wire_d_model, device=device, dtype=torch.float32)
+        worst_pair = 0.0
+        worst_row = 0.0
+        for b in range(B):
+            pe = self.pe_model(graphs[b], permutation=permutation).float()   # [N, m]
+            pe = pe * torch.tanh(self.pe_gain)
+            with torch.no_grad():
+                worst_row = max(worst_row, float(pe.norm(dim=-1).max()))
+                if pe.shape[0] > 1:
+                    worst_pair = max(worst_pair, float(torch.cdist(pe, pe).max()))
+            wire_place_at_node_spans(r, b, pe, injection_maps[b], seq_len)
+        # Ψ span for this forward; layer_scale_factor() combines it with each σ_ℓ.
+        # EXACT pairwise max via cdist, not the O(N·m) bound 2·max‖Ψ_i−μ‖. The exact
+        # form is tighter (the bound over-clamps by up to 2x, needlessly shrinking the
+        # signal) and is cheap at the N this repo supports: MEASURED on CPU at m=1024,
+        # 0.33 ms at N=100, 0.55 ms at N=250, 1.12 ms at N=500, 2.47 ms at N=1000
+        # (the O(N·m) bound is 0.15-0.29 ms across the same range). Both are SOUND
+        # guards — the bound can only over-clamp, never under-clamp — so switching to it
+        # is safe if N ever grows enough for the quadratic term to matter.
+        self._wire_psi_span = worst_pair
+        with torch.no_grad():
+            sigmas = [float(p.detach().abs()) for p in self._wire_sigma.values()]
+        sigma_max = max(sigmas) if sigmas else 0.0
+        # Pre-clamp diagnostics (what the angle WOULD have been).
+        self._wire_measured_angle = sigma_max * worst_pair
+        self._wire_measured_row_angle = sigma_max * worst_row
+        # POST-CLAMP invariant. layer_scale_factor() pins every layer's effective angle
+        # at or below max_angle unconditionally, so this can no longer be reached by any
+        # config value or optimizer trajectory — it fires ONLY if the clamp arithmetic
+        # itself is wrong. Kept as a live assertion precisely because the guarantee is
+        # now structural rather than checked.
+        eff_max = max((float(self._wire_sigma[str(li)].detach().abs())
+                       * self.layer_scale_factor(li) * worst_pair)
+                      for li in self.active_layer_indices()) if self._wire_sigma else 0.0
+        self._wire_effective_angle = eff_max
+        if eff_max < self._wire_measured_angle * (1.0 - 1e-9) and not self._wire_warned_angle:
+            self._wire_warned_angle = True
+            warnings.warn(
+                f"WIRE clamp engaged: raw angle {self._wire_measured_angle:.4f} exceeds "
+                f"max_angle {self._wire_max_angle:.4f}; effective angle pinned to "
+                f"{eff_max:.4f}. Training continues — but σ is now SATURATED, so it can "
+                "keep growing with no effect on the model. Watch wire/sigma_raw_max vs "
+                "wire/sigma_eff_max in the logs. Warned once per model.",
+                RuntimeWarning, stacklevel=2)
+        if eff_max > self._wire_max_angle * (1.0 + 1e-5):
+            raise RuntimeError(
+                "WIRE clamp implementation bug: post-clamp angle "
+                f"{eff_max:.6f} exceeds max_angle {self._wire_max_angle:.6f} even though "
+                "layer_scale_factor() is applied unconditionally. This is NOT a config "
+                "or optimizer condition (σ can no longer reach it) — it means the clamp "
+                "arithmetic in layer_scale_factor/layer_omega is wrong. "
+                f"(span={worst_pair:.6f}, max|σ_raw|={sigma_max:.6g})")
+        return r
+
+    # ------------------------------------------------------------------ forward
+
+    def _arm(self, graphs, injection_maps, seq_len, device):
+        """Build ``r`` and publish it where the patched attention fns read it."""
+        self._wire_signal = self.build_wire_signal(
+            graphs, injection_maps, seq_len, device)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        labels: torch.Tensor | None = None,
+        graphs: Batch | None = None,
+        injection_maps: list[dict[int, list[tuple[int, int]]]] | None = None,
+        **kwargs,
+    ):
+        """Prompt forward with the graph channel armed.
+
+        ``input_ids`` are passed straight through (no ``inputs_embeds`` path): WIRE
+        never touches the embeddings, only q/k inside the attention layers. The signal
+        is armed only when graphs, injection maps AND input_ids are all present, and
+        explicitly cleared otherwise so a stale signal from a previous batch cannot
+        leak into an ungrounded forward.
+        """
+        kwargs.pop("inputs_embeds", None)
+        kwargs.pop("input_ids", None)
+        if graphs is not None and injection_maps is not None and input_ids is not None:
+            self._arm(graphs, injection_maps, input_ids.shape[1], input_ids.device)
+        else:
+            self._wire_signal = None
+        try:
+            return self.llm(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                **kwargs,
+            )
+        finally:
+            # Disarm unless under gradient checkpointing (backward recomputes the
+            # attention forwards and must see the same signal; every forward rebuilds it).
+            if not getattr(self.llm, "is_gradient_checkpointing", False):
+                self._wire_signal = None
+
+    def generate_with_graph(self, input_ids=None, graphs=None, injection_maps=None,
+                            **kwargs):
+        """``generate`` with the graph channel armed for the prefill forward.
+
+        Present so the decode limitation is reached LOUDLY rather than by a silent
+        fall-through: the first cached decode step raises from the attention fn (see
+        :func:`_wire_attention_forward`) unless ``decode='skip'``.
+        """
+        self._arm(graphs, injection_maps, input_ids.shape[1], input_ids.device)
+        try:
+            return self.llm.generate(input_ids=input_ids, **kwargs)
+        finally:
+            self._wire_signal = None
 
 
 def find_last_graph_scope(input_ids_b, tokenizer) -> int:

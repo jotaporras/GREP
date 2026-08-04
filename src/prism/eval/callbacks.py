@@ -281,6 +281,13 @@ class GradientDebugCallback(TrainerCallback):
             metrics["debug/grad_norm_gt_blocks"] = g.get("gt_blocks", 0.0)
             if hasattr(inner.pe_model, "pe_model"):  # inner R-PEARL
                 metrics["debug/grad_norm_rpearl"] = g.get("rpearl", 0.0)
+        # wire_llm: raw vs effective sigma, the realised angle, and whether the clamp
+        # engaged. Logged (not just warned) because a clamped sigma keeps growing with
+        # NO effect on the model — the parameter silently stops meaning anything while
+        # loss curves still look healthy. wire/sigma_raw_max diverging from
+        # wire/sigma_eff_max is the signature.
+        if hasattr(inner, "wire_telemetry"):
+            metrics.update(inner.wire_telemetry())
 
         if wandb.run is not None:
             wandb.log(metrics, step=state.global_step)

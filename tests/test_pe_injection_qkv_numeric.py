@@ -455,6 +455,60 @@ def test_cold_start_gate_blocks_structural_grad_but_not_gate():
     assert not leaked, f"pe_model got grad through a closed gate: {leaked}"
 
 
+# --------------------------------------------------------------------------- #
+# WIRE: the SECOND rotation composes with the model's own RoPE.                #
+# --------------------------------------------------------------------------- #
+
+def test_wire_second_rotation_composes_with_family_rope():
+    """``WireGraphLLM``'s rotation, applied to already-RoPE'd q/k, equals one rotation
+    by the summed angle — checked against the model family's OWN ``rotate_half`` /
+    ``apply_rotary_pos_emb`` rather than a reimplementation of them.
+
+    This is the property that makes the post-RoPE hook point valid at all: Gemma
+    rotates q/k before dispatching to the attention interface, so WIRE can only be
+    equivalent to in-layer WIRE if the two rotations act in the same 2-D planes and
+    therefore commute and add. If the channel pairing ever diverges (e.g. adopting the
+    paper's literal alternate-entry permutation P from Eq. 11 instead of Gemma's
+    half-split), this fails.
+    """
+    import importlib
+
+    from prism.models.gnn_llm import _wire_rotate, wire_cos_sin
+
+    llm = _gemma()
+    if llm is None:
+        return _skip("gemma4_unified unavailable")
+    attn = list(llm.model.layers)[0].self_attn
+    mod = importlib.import_module(type(attn).__module__)
+
+    torch.manual_seed(40)
+    b, h, s, hd, m = 1, 2, 5, attn.head_dim, 4
+    x = torch.randn(b, h, s, hd)
+    text = torch.randn(b, s, hd // 2)            # text RoPE angles per plane
+    r = torch.randn(b, s, m)
+    omega = torch.randn(hd // 2, m) * 0.3
+
+    def emb(ang):
+        e = torch.cat((ang, ang), dim=-1)
+        return e.cos(), e.sin()
+
+    # Step 1: the family's own RoPE. Step 2: WIRE on top.
+    tc, ts = emb(text)
+    roped = mod.apply_rotary_pos_emb(x, tc, ts, unsqueeze_dim=1)
+    wc, ws = wire_cos_sin(r, omega, hd)
+    two_step = _wire_rotate(roped, wc, ws)
+
+    # Single rotation by the summed angle, via the family's own apply_rotary_pos_emb.
+    theta = r.float() @ omega.float().t()
+    sc, ss = emb(text + theta)
+    one_step = mod.apply_rotary_pos_emb(x, sc, ss, unsqueeze_dim=1)
+
+    d = (two_step - one_step).abs().max().item()
+    assert d < 1e-5, f"WIRE does not compose with the family's RoPE (max|Δ|={d:.2e})"
+    # Vacuity guard: the rotation actually moved something.
+    assert (two_step - roped).abs().max().item() > 1e-3, "WIRE rotation was a no-op"
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

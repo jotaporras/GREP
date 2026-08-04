@@ -16,13 +16,44 @@ defaults:
   - _self_
 
 name: e9_ms_s2
+
+# GT hyperparameters — pinned to the Stage-3 architecture so the GT trained here is the
+# one Stage 3 consumes, and so the pretrained nav-GT state_dict (pe_gt_from) loads.
+# structural_lr_mult is left at its base default (1.0): Stage 2 must TRAIN the GT.
+gnn:
+  arch: learnable_graph_mask
+  d_model: 1024
+  dropout: 0.1
+  use_layer_norm: true
+  eps: 1e-6
+  pe_hidden_channels: 256
+  pe_num_layers: 5
+  num_samples: 320
+  k_pe: 3
+  pe_node_features: random
+  gt_num_layers: 3
+  gt_heads: 8
+  k_gt: 2
+  mask_alpha: 0.0
+  mask_layer_scope: dense
+  mask_psi_scale: cosine
+  mask_k_hops: 1
+  mask_symmetrize: true
+  mask_use_edges: true
+  pe_gt_from: outputs/e9_multistage_training/suite5/path_navigator_gt.pt
+  semantic_gt_from: null
+
+data:
+  # Plain SBM adjacency into the GT — no Gaussian edge_weight attached.
+  edge_weights: binary
+
 wandb:
   run_name: e9_ms_stage2_pe
 eval:
   # Bound eval cost over the long PE-only run (eval every 2 epochs).
   epoch_interval: 2.0
 trainer:
-  learning_rate: 0.005
+  learning_rate: 3e-7
   # "As long as it takes" — generous; bump or pass trainer.max_steps as needed.
   epochs: 8
   loss_target: edge_list

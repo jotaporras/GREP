@@ -26,7 +26,7 @@ model:
 gnn:
   # Master architecture switch — determines which gnn.* keys the code actually reads;
   # the rest compose harmlessly.
-  #   llm | rpearl_llm | rpearl_gt_llm | gt_llm | graph_mask_llm | learnable_graph_mask
+  #   llm | rpearl_llm | rpearl_gt_llm | gt_llm | graph_mask_llm | learnable_graph_mask | wire_llm
   arch: rpearl_llm
 
   # --- Numerics shared by the R-PEARL encoder AND the Graph Transformer + PE gate ---
@@ -86,6 +86,43 @@ gnn:
   mask_alpha: 0.7            # edge value = alpha + (1-alpha)*sim; non-edge = blocked (alpha in [0,1))
   mask_layer_scope: dense    # "all" = every layer | "dense" = all global layers | "dense_top_half" = deeper half of globals | "dense_first" = first global only
   mask_psi_scale: cosine     # "cosine" (row-normalized, sim in [-1,1]) | "inv_sqrt_d" (Gemma-style raw/sqrt(D))
+
+  # --- wire_llm (WIRE: Psi enters as a ROTATION of q/k, not an added signal) ---
+  # q_i -> R(theta_i) q_i, k_j -> R(theta_j) k_j with theta_n = omega_n . Psi_i, composed
+  # on top of Gemma's own RoPE. Reuses the gt_*/pe_* GT above as the Psi producer.
+  # Requires pe_node_features=random. NOTE: this downweights attention by a LEARNED
+  # Psi-distance; the effective-resistance reading of WIRE Theorem 3 additionally needs
+  # Psi = [u_k/sqrt(lambda_k)], which the mean-pooled GT readout does NOT provide.
+  wire_layer_scope: dense      # "all" | "dense" | "dense_top_half" | "dense_first" (as mask_layer_scope)
+  # Frequencies are reparameterised as omega = sigma_l * eps_l: eps is drawn ONCE from
+  # N(0, I) (seeded below, frozen, checkpointed) and sigma_l is a LEARNABLE per-layer
+  # scalar. So omega stays a genuine Gaussian sample (Theorem 3's hypothesis) while the
+  # trained quantity is exactly the omega in q^T k (1 - omega^2 R(i,j)/2). ONE table per
+  # LAYER, shared by all heads: the modulation is computed once per layer (H x less
+  # work) and each head keeps its own q^T k. Monte-Carlo samples come from the P rotary
+  # planes in the shared table, so the count DIFFERS BY LAYER TYPE (31B: 256 planes on
+  # global head_dim=512, 128 on sliding head_dim=256, or 64 global when
+  # wire_rotate_nope_planes=false) — a real variance asymmetry across layers.
+  # sigma_init: only sigma*||Psi_i - Psi_j|| matters, and it must START small. SCALE WITH
+  # 1/sqrt(d_model): the GT's output LayerNorm pins ||Psi_i|| ~ sqrt(d_model) (measured
+  # 8.9 @ d_model=64, 35.4 @ 1024, and FLAT in node count), so 0.01 puts the angle near
+  # 0.4 rad at d_model=1024. At d_model=2048/4096 divide by sqrt(2)/2 respectively.
+  wire_sigma_init: 0.01
+  wire_freeze_sigma: false     # true pins sigma = the literal-Theorem-3 A/B arm
+  wire_omega_seed: 0           # seed for the frozen eps draw (eps itself is saved in gnn_weights.pt)
+  # Gemma global layers use rope_type=proportional with partial_rotary_factor=0.25: only
+  # int(0.25*head_dim/2) planes carry text RoPE, the rest are NoPE. true also rotates
+  # those position-free channels.
+  wire_rotate_nope_planes: false
+  # The ONLY angle threshold. sigma is trainable, so this is enforced by an EXACT,
+  # UNCONDITIONAL clamp (layer_scale_factor): the effective sigma is scaled so
+  # sigma_eff * max||Psi_i - Psi_j|| <= wire_max_angle on every forward, by construction.
+  # It can never fail a run. Because a clamped sigma keeps growing with no effect, watch
+  # wire/sigma_raw_max vs wire/sigma_eff_max and wire/clamp_engaged in the logs —
+  # saturation is otherwise invisible. (A previous wire_hard_max_angle that RAISED was
+  # removed: no training run may be killed by the angle guard.)
+  wire_max_angle: 1.0
+  wire_decode: error           # "error" = fail loud at cached decode (keys carry no graph phase) | "skip" = diagnostic only
 
   # Two-group LR: structural (GT/PE) params train at structural_lr_mult x base LR
   # (GraphSFTTrainer.create_optimizer). 1.0 = no boost.

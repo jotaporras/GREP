@@ -213,6 +213,21 @@ class GraphSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
                 {"pe_model": self.model.pe_model.state_dict()},
                 os.path.join(output_dir, "gnn_weights.pt"),
             )
+        elif self.gnn_config.get("architecture") == "wire_llm":
+            # WIRE: the Ψ producer, the angle gate, the frozen ε directions and the
+            # learned per-layer σ. ε is SAVED rather than reconstructed from
+            # wire_omega_seed: regenerating it would make the checkpoint depend on torch
+            # RNG determinism across versions/devices, which is exactly the silent-drift
+            # failure mode. (The seed is still recorded in train_config.json.)
+            torch.save(
+                {
+                    "pe_model": self.model.pe_model.state_dict(),
+                    "pe_gain": self.model.pe_gain.data,
+                    "wire_eps": self.model._wire_eps.state_dict(),
+                    "wire_sigma": self.model._wire_sigma.state_dict(),
+                },
+                os.path.join(output_dir, "gnn_weights.pt"),
+            )
         elif self.gnn_config.get("architecture") == "rpearl_gt_llm":
             # Full GT: save the whole GraphTransformer (includes R-PEARL inside) + projection head.
             torch.save(

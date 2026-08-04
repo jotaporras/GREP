@@ -13,6 +13,7 @@ from prism.models.gnn_llm import (
     GraphAugmentedLLM,
     GraphMaskLLM,
     LearnableGraphMaskLLM,
+    WireGraphLLM,
     build_injection_map,
     find_last_graph_scope,
     node_token_variants,
@@ -43,7 +44,8 @@ def _core_graph_model(model):
     """
     inner = model
     for _ in range(5):
-        if isinstance(inner, (GraphAugmentedLLM, GraphMaskLLM, LearnableGraphMaskLLM)):
+        if isinstance(inner, (GraphAugmentedLLM, GraphMaskLLM, LearnableGraphMaskLLM,
+                              WireGraphLLM)):
             return inner
         nxt = getattr(inner, "base_model", None)
         if nxt is None or nxt is inner:
@@ -225,6 +227,16 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
 
         injection_map = build_injection_map(input_ids_list, node_token_seqs, scope_start=scope_start)
 
+        if isinstance(graph_model, WireGraphLLM):
+            # WIRE rotates BOTH q and k, but the KV cache is written before the
+            # attention hook runs, so cached keys carry no graph rotation. Generation
+            # is therefore not wired (see WireGraphLLM.generate_with_graph). Fail here
+            # with the reason rather than falling through to the additive branch, which
+            # would silently run the model with the graph channel absent at decode.
+            raise NotImplementedError(
+                "WireGraphLLM is not wired for SPINE generation: decode-time key "
+                "re-rotation is unimplemented, so cached keys would carry no graph "
+                "phase. Train/score-only for now; see gnn_llm._wire_attention_forward.")
         if isinstance(graph_model, (GraphMaskLLM, LearnableGraphMaskLLM)):
             # Build and arm [1, 1, seq, seq] additive (adjacency or learned-relative-PE) bias;
             # both classes share build_structural_mask + _struct_bias; cleared in finally.

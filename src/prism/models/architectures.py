@@ -164,6 +164,43 @@ def build_planner_model(gnn, llm, tokenizer, *, disable_graph_token_rope=False,
 
         if freeze_llm:
             model.llm.requires_grad_(False)
+    elif gnn.arch == "wire_llm":
+        # WIRE: Ψ enters as a ROTATION of q/k (not an added signal). Reuses the same
+        # standalone GraphTransformer Ψ producer as learnable_graph_mask, but consumes
+        # Ψ as rotation angles, so there is no pe_proj/pe_norm to the LLM hidden size.
+        if gnn.pe_node_features != "random":
+            raise ValueError(
+                "architecture 'wire_llm' currently supports only pe_node_features="
+                f"'random' (word-embedding feature prep is not wired). Got {gnn.pe_node_features!r}.")
+        pe_model = gt_module.GraphTransformer(
+            num_layers=gnn.gt_num_layers,
+            pe_hidden_channels=gnn.pe_hidden_channels,
+            pe_num_layers=gnn.pe_num_layers,
+            d_model=gnn.d_model,
+            heads=gnn.gt_heads,
+            num_samples=gnn.num_samples,
+            dropout=gnn.dropout,
+            k_pe=gnn.k_pe,
+            k_gt=gnn.k_gt,
+            eps=gnn.eps,
+            use_layer_norm=gnn.use_layer_norm,
+            node_feature_dim=None,
+        )
+        model = gnn_llm.WireGraphLLM(
+            llm, pe_model, d_model=gnn.d_model,
+            layer_scope=gnn.wire_layer_scope,
+            sigma_init=gnn.wire_sigma_init,
+            freeze_sigma=gnn.wire_freeze_sigma,
+            omega_seed=gnn.wire_omega_seed,
+            rotate_nope_planes=gnn.wire_rotate_nope_planes,
+            max_angle=gnn.wire_max_angle,
+            pe_gain_init=gnn.pe_gain_init,
+            decode=gnn.wire_decode,
+            pe_node_features=gnn.pe_node_features)
+        collator = data.SpineDataCollator(tokenizer, mlm=False)
+
+        if freeze_llm:
+            model.llm.requires_grad_(False)
     elif gnn.arch == "llm":
         # Pure LLM baseline; TokenIndexCollator carries graph-token index columns so
         # graph_acc/* metrics are comparable to graph architectures.
@@ -173,7 +210,7 @@ def build_planner_model(gnn, llm, tokenizer, *, disable_graph_token_rope=False,
         raise ValueError(
             f"Unknown architecture: {gnn.arch!r}. "
             "Choose 'rpearl_llm', 'rpearl_gt_llm', 'gt_llm', 'graph_mask_llm', "
-            "'learnable_graph_mask', or 'llm'.")
+            "'learnable_graph_mask', 'wire_llm', or 'llm'.")
 
     return model, collator
 
