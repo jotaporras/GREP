@@ -115,6 +115,14 @@ class GraphSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
         self._set_loss_target(loss_target)
         if freeze_pe:
             # Stage-1 SFT: PE stays at init (gate closed); only LoRA trains.
+            # Freeze EXPLICITLY rather than relying on PEFT having frozen everything: with
+            # trainer.freeze_llm=true no adapter is attached (peft_config=None), so nothing
+            # ever froze the graph side and freeze_pe was a silent no-op.
+            for p in self.model.structural_parameters():
+                p.requires_grad = False
+            if getattr(self.model, "pe_norm", None) is not None:
+                for p in self.model.pe_norm.parameters():
+                    p.requires_grad = False
             return
         # Re-enable gradients on the graph-side params PEFT froze (each model class
         # reports its own via structural_parameters(); parameter-free archs return []).
@@ -191,8 +199,12 @@ class GraphSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
     # Shared run-metadata keys stored at the TOP LEVEL of train_config.json; every
     # other gnn_config entry (the arch hyperparameters) nests under "gnn". Loaders
     # flatten this back (and still read legacy flat gnn_config.json checkpoints).
+    # spine_tools / icl_examples belong here (not under "gnn"): they are PROMPT policy,
+    # and eval.checkpoint.resolve_prompt_policy reads them at the top level. Nesting them
+    # made that resolver always return the "predates the knob" fallback ("none", 0), so an
+    # ICL/tool-trained graph checkpoint was silently re-evaluated zero-shot and tool-free.
     _RUN_META_KEYS = ("architecture", "base_model", "text_edge_list", "injection_scope",
-                      "edge_weights")
+                      "edge_weights", "spine_tools", "icl_examples")
 
     def save_model(self, output_dir=None, _internal_call=False):
         output_dir = output_dir or self.args.output_dir
@@ -214,17 +226,24 @@ class GraphSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
                 os.path.join(output_dir, "gnn_weights.pt"),
             )
         elif self.gnn_config.get("architecture") == "wire_llm":
-            # WIRE: the Ψ producer, the angle gate, the frozen ε directions and the
-            # learned per-layer σ. ε is SAVED rather than reconstructed from
-            # wire_omega_seed: regenerating it would make the checkpoint depend on torch
-            # RNG determinism across versions/devices, which is exactly the silent-drift
-            # failure mode. (The seed is still recorded in train_config.json.)
+            # WIRE: the Ψ producer, the angle gate, and the frequency store. Which store
+            # is populated depends on gnn.wire_vanilla — the learnable ω table
+            # (wire_vanilla=true, the paper's form) or the frozen ε directions plus the
+            # learned per-layer σ (the expectation arm). BOTH key sets are always
+            # written (the unused one is an empty dict) so the checkpoint key set does
+            # not depend on the mode: a key present in one mode and absent in the other
+            # is exactly the silent-corruption case loaders.py guards against.
+            # ε/ω are SAVED rather than reconstructed from wire_omega_seed: regenerating
+            # them would make the checkpoint depend on torch RNG determinism across
+            # versions/devices, which is exactly the silent-drift failure mode. (The seed
+            # is still recorded in train_config.json.)
             torch.save(
                 {
                     "pe_model": self.model.pe_model.state_dict(),
                     "pe_gain": self.model.pe_gain.data,
                     "wire_eps": self.model._wire_eps.state_dict(),
                     "wire_sigma": self.model._wire_sigma.state_dict(),
+                    "wire_omega": self.model._wire_omega.state_dict(),
                 },
                 os.path.join(output_dir, "gnn_weights.pt"),
             )

@@ -15,6 +15,7 @@ from prism.training.trainers import (  # noqa: F401
     LossTargetMixin,
 )
 from prism.models import architectures
+from prism.models import gnn_llm
 from prism.models import loaders as model_loaders
 
 import json
@@ -36,6 +37,14 @@ from transformers import (
 )
 from peft import LoraConfig, PeftModel
 from trl import SFTConfig, SFTTrainer
+
+
+# Architectures whose graph channel is a bare Ψ producer (gt.build_psi_producer), so
+# they accept the notebook's pretrained navigator weights via gnn.pe_gt_from /
+# gnn.semantic_gt_from: the mask (Ψ Ψᵀ attention bias) and WIRE (Ψ as q/k rotation
+# angles). Everything else consumes Ψ through pe_proj into the LLM hidden space and has
+# no navigator wiring.
+_PSI_PRODUCER_ARCHS = ("learnable_graph_mask", "wire_llm")
 
 
 def train_model(config: omegaconf.DictConfig):
@@ -139,7 +148,7 @@ def train_model(config: omegaconf.DictConfig):
         )
     # Load the pretrained PE encoder first; a later init_pe_from carry (stage 2/3)
     # overwrites the whole pe_model, including this submodule.
-    if config.gnn.arch == "learnable_graph_mask" and config.gnn.pe_gt_from:
+    if config.gnn.arch in _PSI_PRODUCER_ARCHS and config.gnn.pe_gt_from:
         model_loaders.load_navigator_pe_into(
             model, config.gnn.pe_gt_from, config.gnn.semantic_gt_from)
     if config.trainer.init_pe_from:
@@ -147,6 +156,14 @@ def train_model(config: omegaconf.DictConfig):
             model, config.trainer.init_pe_from, config.gnn.arch
         )
     attach_existing_adapter = config.trainer.init_lora_from is not None
+    if config.trainer.freeze_lora and not attach_existing_adapter:
+        # freeze_lora is implemented via PeftModel.from_pretrained(is_trainable=...), so it
+        # has no effect on a FRESH adapter. Silently training the LoRA of a run configured
+        # to freeze it is exactly the kind of misconfigured baseline we must not produce.
+        raise ValueError(
+            "trainer.freeze_lora=true requires trainer.init_lora_from: it is applied when "
+            "an EXISTING adapter is attached (is_trainable=False). With a fresh adapter "
+            "there is nothing to freeze and the LoRA would train regardless.")
     if attach_existing_adapter:
         model = PeftModel.from_pretrained(
             model, config.trainer.init_lora_from, is_trainable=not config.trainer.freeze_lora
@@ -256,11 +273,15 @@ def train_model(config: omegaconf.DictConfig):
             **({k: config.gnn[k] for k in (
                 "wire_layer_scope", "wire_sigma_init", "wire_freeze_sigma",
                 "wire_omega_seed", "wire_rotate_nope_planes", "wire_max_angle",
-                "wire_decode")}
+                "wire_decode", "wire_vanilla", "wire_vanilla_omega_init")}
                if config.gnn.arch == "wire_llm" else {}),
-            # learnable_graph_mask navigator: record both sources so eval rebuilds the NavigatorPE.
+            # Navigator Ψ producer (learnable_graph_mask / wire_llm): record BOTH sources.
+            # pe_gt_from is provenance only (the Ψ topology is a standalone GT either way);
+            # semantic_gt_from is load-bearing — it is what makes the eval rebuild pick the
+            # legacy two-stage gt.TwoStagePE instead of the PE-only Ψ, so dropping it here
+            # would silently reload an old run as a different function.
             **({"pe_gt_from": config.gnn.pe_gt_from, "semantic_gt_from": config.gnn.semantic_gt_from}
-               if config.gnn.arch == "learnable_graph_mask" and config.gnn.pe_gt_from else {}),
+               if config.gnn.arch in _PSI_PRODUCER_ARCHS and config.gnn.pe_gt_from else {}),
             # graph_mask_llm / learnable_graph_mask adjacency (A) + fold + scope rebuild params.
             **({k: config.gnn[k] for k in ("mask_k_hops", "mask_symmetrize", "mask_use_edges",
                                            "mask_buggy_causal_fold", "mask_layer_scope")}
@@ -500,27 +521,40 @@ def _validate_config(config: omegaconf.DictConfig) -> None:
             raise ValueError(
                 f"gnn.wire_layer_scope must be one of ('all', 'dense', 'dense_top_half', "
                 f"'dense_first'), got {config.gnn.wire_layer_scope!r}")
-        if config.gnn.wire_decode not in ("error", "skip"):
+        # "error" stays ACCEPTED (checkpoints and configs predating decode-time key
+        # rotation recorded it); WireGraphLLM normalises it to "rotate" and warns.
+        if config.gnn.wire_decode not in gnn_llm.WIRE_DECODE_MODES + tuple(
+                gnn_llm.WIRE_DECODE_LEGACY):
             raise ValueError(
-                f"gnn.wire_decode must be 'error' or 'skip', got {config.gnn.wire_decode!r}")
+                f"gnn.wire_decode must be one of {gnn_llm.WIRE_DECODE_MODES} "
+                f"(legacy: {tuple(gnn_llm.WIRE_DECODE_LEGACY)}), "
+                f"got {config.gnn.wire_decode!r}")
         if float(config.gnn.wire_sigma_init) <= 0:
             raise ValueError(
                 f"gnn.wire_sigma_init must be > 0, got {config.gnn.wire_sigma_init}")
         if float(config.gnn.wire_max_angle) <= 0:
             raise ValueError(
                 f"gnn.wire_max_angle must be > 0, got {config.gnn.wire_max_angle}")
+        if config.gnn.wire_vanilla_omega_init not in gnn_llm.WIRE_VANILLA_OMEGA_INITS:
+            raise ValueError(
+                "gnn.wire_vanilla_omega_init must be one of "
+                f"{gnn_llm.WIRE_VANILLA_OMEGA_INITS}, got "
+                f"{config.gnn.wire_vanilla_omega_init!r}")
         if config.gnn.pe_node_features != "random":
             raise ValueError(
                 "arch='wire_llm' requires gnn.pe_node_features='random' "
                 f"(word-embedding feature prep is not wired). Got {config.gnn.pe_node_features!r}.")
     if config.gnn.pe_gt_from or config.gnn.semantic_gt_from:
-        if config.gnn.arch != "learnable_graph_mask":
+        if config.gnn.arch not in _PSI_PRODUCER_ARCHS:
             raise ValueError(
-                "gnn.pe_gt_from / semantic_gt_from are only supported for arch='learnable_graph_mask'.")
+                "gnn.pe_gt_from / semantic_gt_from are only supported for the Ψ-consuming "
+                f"architectures {_PSI_PRODUCER_ARCHS}, got arch={config.gnn.arch!r}.")
         if config.gnn.semantic_gt_from and not config.gnn.pe_gt_from:
             raise ValueError(
-                "gnn.semantic_gt_from requires gnn.pe_gt_from (the navigator needs both). "
-                "Set pe_gt_from alone for a GT-only Ψ producer.")
+                "gnn.semantic_gt_from requires gnn.pe_gt_from (the LEGACY two-stage Ψ "
+                "producer gt.TwoStagePE needs both). For a current run set pe_gt_from "
+                "alone: Ψ is the navigator's PE stage (gt.NavigatorPE, Ψ = PE_GT(graph)); "
+                "the Semantic GT is the AGT head and lives in gt.NavigatorGT.")
     if (config.data.injection_scope == "decode_consistent"
             and config.gnn.arch not in ("graph_mask_llm", "learnable_graph_mask")):
         raise ValueError(

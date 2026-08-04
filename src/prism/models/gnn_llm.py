@@ -137,7 +137,31 @@ AttentionInterface.register(_GRAPH_MASK_IMPL, _graph_mask_attention_forward)
 # WireGraphLLM.
 _WIRE_IMPL = "prism_wire"
 
-WIRE_DECODE_MODES = ("error", "skip")
+# "rotate" = the real decode path (prompt-position keys keep their graph phase, see
+# _wire_attention_forward); "skip" = the labeled diagnostic in which WIRE is OFF for
+# every cached step. "error" is a LEGACY value: it existed only while decode-time key
+# rotation was unimplemented, and is normalised to "rotate" in WireGraphLLM.__init__ so
+# checkpoints trained before this landed still evaluate.
+WIRE_DECODE_MODES = ("rotate", "skip")
+WIRE_DECODE_LEGACY = {"error": "rotate"}
+
+# ω initialisation strategies for wire_vanilla=True. These are exactly the reference
+# implementation's `cfg.gt.graphrope.init_omega` values, with its default ("zero"):
+# cederikhoefs/Graph-RoPE, graphgps/config/gt_config.py:75 and the init_omega_matrix
+# helper in graphgps/layer/graphrope.py. Only used in vanilla mode — the expectation
+# arm draws ε ~ N(0, I) and scales it by the learnable σ instead.
+#   "zero"        nn.init.zeros_ ⇒ θ = 0 at step 0 ⇒ the rotation is EXACTLY the
+#                 identity and ω learns away from it. Trainable at that point only
+#                 because the sin term is retained: ∂sin(θ)/∂ω = cos(θ)·r = r ≠ 0
+#                 while ∂cos(θ)/∂ω = −sin(θ)·r = 0. This is the reference DEFAULT.
+#   "uniform"     the reference's `"uniform"` branch is a bare `pass`, leaving torch's
+#                 default nn.Linear init, i.e. U(−1/√m, 1/√m). Reproduced literally.
+#   "exponential" the RoPE-style decay of the reference: rand(P, m) / 10000^(2i/P).
+#                 NOTE two quirks reproduced verbatim from the source: the exponent
+#                 denominator is P (= d/2), twice the decay rate of standard RoPE's
+#                 10000^(−2i/d); and the decay is CONSTANT along the spectral axis, so
+#                 every one of the m coordinates shares one profile.
+WIRE_VANILLA_OMEGA_INITS = ("zero", "uniform", "exponential")
 
 
 def wire_rope_planes(attn, rotate_nope: bool) -> int:
@@ -233,6 +257,41 @@ def _wire_rotate(x, cos, sin):
     return x * cos + torch.cat((-x2, x1), dim=-1) * sin
 
 
+def _wire_rotate_prefix(x, cos, sin, n: int):
+    """Rotate only the FIRST ``n`` positions of ``x`` ``[B, H, S, hd]``.
+
+    The tail carries ``r = 0`` ⇒ ``θ = 0`` ⇒ ``cos=1, sin=0`` ⇒ the identity, so it is
+    returned untouched and no cos/sin is built for it at all. ``cos``/``sin`` are
+    ``[B, S', hd]`` with ``S' >= n`` and are sliced, never padded. Out-of-place
+    throughout (autograd-safe), same as :func:`_wire_rotate`.
+    """
+    if n <= 0:
+        return x
+    seq = x.shape[-2]
+    if n >= seq:
+        return _wire_rotate(x, cos[:, :seq], sin[:, :seq])
+    head = _wire_rotate(x[..., :n, :], cos[:, :n], sin[:, :n])
+    return torch.cat((head, x[..., n:, :]), dim=-2)
+
+
+def wire_decode_key_slots_aligned(module) -> bool:
+    """True iff ``key slot j == token index j`` holds for ``module``'s KV cache.
+
+    That identity is what lets a cached step re-apply ``θ_j`` to key slot ``j``. It holds
+    for every full-attention layer — ``DynamicLayer.update`` only ever appends — and fails
+    for a sliding-window layer, which DROPS leading entries once the sequence passes its
+    window (``DynamicSlidingWindowLayer``, transformers 5.14.1). ``is_kv_shared_layer``
+    cannot reach here: :meth:`WireGraphLLM._install_wire` deactivates those outright.
+
+    Deliberately NOT checked against ``position_ids``: those are ROPE positions, not cache
+    slots, and ``generate`` re-derives them from the attention mask — so any padded prompt
+    (or a prompt token that happens to equal ``pad_token_id``) shifts them below the slot
+    index while the cache is still perfectly aligned. Comparing the two conflates padding
+    with cropping and aborts healthy runs.
+    """
+    return not getattr(module, "is_sliding", False)
+
+
 def _wire_attention_forward(module, query, key, value, attention_mask,
                             scaling=None, dropout=0.0, **kwargs):
     """Attention fn applying WIRE to the already-RoPE'd q/k.
@@ -241,13 +300,27 @@ def _wire_attention_forward(module, query, key, value, attention_mask,
     ``apply_rotary_pos_emb`` (``modeling_gemma4.py:1251`` for q, ``:1267`` for k) and
     AFTER the KV-cache write (``:1274``); Gemma dispatches here at ``:1282``. (Line
     numbers verified against transformers 5.14.1.) Two consequences: the text RoPE is
-    already applied, so this COMPOSES rather than replaces — and cached keys are
-    already stored WITHOUT the graph phase, which is why decode cannot work (below).
+    already applied, so this COMPOSES rather than replaces — and the cache stores
+    UNROTATED keys, which is what the decode branch below exists to repair.
 
     Rotates q and k by ``R(θ)``, ``θ_n = ω_n·r``. Same-plane rotations commute, so the
     score picks up ``r_j − r_i`` on top of the text phase ``p_j − p_i``. ``v`` and the
     attention mask are untouched and NO ``S×S`` (or ``N×N``) object is ever built —
     that is what keeps this linear-attention compatible rather than a bias-style RPE.
+
+    **Decode semantics (``wire_decode='rotate'``, the default).** ``r`` is a function of
+    POSITION only: :meth:`WireGraphLLM.build_wire_signal` reads the prompt injection map
+    once, so ``r_j`` is fixed for the whole rollout the moment node spans are known.
+    ``Cache.update`` returns the concatenation of the stored (unrotated) prefill keys and
+    the new key, so re-applying ``R(θ_j)`` to key slot ``j`` here reconstructs exactly the
+    key the prefill forward scored against — the score is again a function of
+    ``r_j − r_i`` only, and Theorem 3's relative-only hypothesis holds unchanged at every
+    step. Generated positions are absent from the injection map ⇒ ``r = 0`` ⇒ their keys
+    and the decode query are left bit-identical, which is the same prompt-only decode
+    wiring the additive (``GraphAugmentedLLM``) and mask families already use at eval.
+    The identity the re-rotation rests on — ``key slot j == token index j`` — is checked
+    per cached step by :func:`wire_decode_key_slots_aligned`; note it is a statement about
+    CACHE SLOTS, not about ``position_ids`` (see that function for why).
 
     With the signal absent, or on an inactive layer, this delegates untouched (``r=0``
     would also give the identity, but the early return avoids the work entirely).
@@ -260,32 +333,51 @@ def _wire_attention_forward(module, query, key, value, attention_mask,
             module, query, key, value, attention_mask,
             scaling=scaling, dropout=dropout, **kwargs)
 
-    q_len, k_len = query.shape[-2], key.shape[-2]
-    if r.shape[0] != query.shape[0] or r.shape[1] != q_len or k_len != q_len:
-        # Cached decode step (or a batch/length mismatch). WIRE assumes BOTH q and k
-        # carry the graph phase, and the KV cache is written BEFORE this hook runs, so
-        # cached keys carry none: silently falling through would violate the premise.
-        if model._wire_decode == "skip":
-            return module._wire_orig_attn_fn(
-                module, query, key, value, attention_mask,
-                scaling=scaling, dropout=dropout, **kwargs)
-        raise NotImplementedError(
-            "WireGraphLLM: cached decode step reached the WIRE attention layer "
-            f"(q_len={q_len}, k_len={k_len}, signal_len={r.shape[1]}). Keys are "
-            "written to the KV cache before this hook, so cached keys carry no graph "
-            "rotation; rotating only the query would break the relative-only property "
-            "Theorem 3 assumes. Decode-time key re-rotation is not implemented. Use "
-            "wire_decode='skip' ONLY as a diagnostic (it disables WIRE at decode)."
-        )
+    q_len, k_len, sig_len = query.shape[-2], key.shape[-2], r.shape[1]
+    if r.shape[0] != query.shape[0]:
+        raise RuntimeError(
+            f"WireGraphLLM: graph signal batch {r.shape[0]} != attention batch "
+            f"{query.shape[0]}. The signal is armed per forward from the SAME batch "
+            "(WireGraphLLM.forward / generate_with_graph); a mismatch means a stale "
+            "signal leaked across batches.")
 
     # ONE table for the whole layer (ω = σ_ℓ·ε), so the angles are computed once here
     # and broadcast over every head — H× less modulation work than a per-head table,
     # and the same frequencies necessarily rotate q and k, keeping Eq. 3 exact under GQA.
     omega = model.layer_omega(module.layer_idx, query.device)      # [P, m]
-    r = r.to(device=query.device)
-    cos, sin = wire_cos_sin(r, omega, module.head_dim)
-    query = _wire_rotate(query, cos, sin)
-    key = _wire_rotate(key, cos, sin)
+
+    if q_len == k_len == sig_len:
+        # Uncached forward (training, teacher-forced scoring, prefill): q and k are the
+        # same block and both carry the graph phase.
+        cos, sin = wire_cos_sin(r.to(device=query.device), omega, module.head_dim)
+        query = _wire_rotate(query, cos, sin)
+        key = _wire_rotate(key, cos, sin)
+    elif model._wire_decode == "skip":
+        pass                       # labeled diagnostic: WIRE OFF for every cached step
+    else:
+        if not wire_decode_key_slots_aligned(module):
+            raise NotImplementedError(
+                f"WireGraphLLM: layer {module.layer_idx} is a sliding-window layer "
+                f"reached at a cached step (q_len={q_len}, k_len={k_len}, "
+                f"signal_len={sig_len}). Its KV cache drops leading entries past the "
+                "window, so key slot j is no longer token index j and the graph phase "
+                "cannot be aligned. Set gnn.wire_layer_scope to a dense scope ('dense', "
+                "'dense_top_half', 'dense_first') — those carry WIRE on full-attention "
+                "layers only, whose cache is never cropped — or gnn.wire_decode='skip' "
+                "to run WIRE off at decode as a labeled diagnostic. "
+                "(WireGraphLLM.generate_with_graph refuses this up front; reaching here "
+                "means generate was driven around it.)")
+        # key slot j == token index j on a full-attention cache, and Cache.update returns
+        # keys ending where the queries do — so query slot 0 is token index k_len - q_len.
+        q_start = k_len - q_len
+        cos, sin = model.decode_cos_sin(module.layer_idx, omega, module.head_dim,
+                                        query.device)
+        key = _wire_rotate_prefix(key, cos, sin, min(sig_len, k_len))
+        # Query slots are absolute q_start..q_start+q_len-1; only those inside the
+        # prompt carry a phase (generated positions are absent from the injection map).
+        if q_start < sig_len:
+            query = _wire_rotate_prefix(query, cos[:, q_start:], sin[:, q_start:],
+                                        min(sig_len - q_start, q_len))
     return module._wire_orig_attn_fn(
         module, query, key, value, attention_mask,
         scaling=scaling, dropout=dropout, **kwargs)
@@ -392,7 +484,7 @@ def wire_place_at_node_spans(dest, b: int, rows, injection_map, seq_len: int) ->
 
 
 def node_adjacency(g, device, k_hops: int = 1, symmetrize: bool = True,
-                   use_edges: bool = True) -> torch.Tensor:
+                   use_edges: bool = True, permutation=None) -> torch.Tensor:
     """Boolean ``[N, N]`` node adjacency — True where two nodes may attend.
 
     Built from ``edge_index`` with self-loops (a node always sees itself and its own
@@ -400,12 +492,20 @@ def node_adjacency(g, device, k_hops: int = 1, symmetrize: bool = True,
     ``k_hops > 1``. ``use_edges=False`` ⇒ edgeless ablation: only self-loops remain.
     Shared by ``GraphMaskLLM`` and ``LearnableGraphMaskLLM`` (mirrors the undirected
     adjacency the GNN/GT consume).
+
+    ``permutation``: eval-time node relabelling (``models.utils.Permutation``), applied to
+    ``edge_index`` with EXACTLY the same call ``GraphTransformer.forward`` makes on the
+    Ψ side. It must be threaded here as well as into ``pe_model``: A and Ψ index the same
+    node axis, so permuting only one of them would mask a relabelled Ψ against an
+    unrelabelled topology — an inconsistency that is not a permutation of anything.
     """
     N = g.num_nodes
     adj = torch.zeros(N, N, dtype=torch.bool, device=device)
     ei = getattr(g, "edge_index", None)
     if use_edges and ei is not None and ei.numel() > 0:
         ei = ei.to(device)
+        if permutation is not None:
+            ei = permutation.apply(ei, N, device=device)
         adj[ei[0], ei[1]] = True
         if symmetrize:
             adj = adj | adj.t()
@@ -535,13 +635,14 @@ class GraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         except AttributeError:
             return getattr(self.llm, name)
 
-    def _node_adjacency(self, g, device) -> torch.Tensor:
+    def _node_adjacency(self, g, device, permutation=None) -> torch.Tensor:
         """Boolean ``[N, N]`` node adjacency (see module-level :func:`node_adjacency`)."""
         return node_adjacency(g, device, k_hops=self._mask_k_hops,
-                              symmetrize=self._mask_symmetrize, use_edges=self._mask_use_edges)
+                              symmetrize=self._mask_symmetrize, use_edges=self._mask_use_edges,
+                              permutation=permutation)
 
     def build_structural_mask(self, seq_len, graphs, injection_maps, device, dtype=None,
-                              key_injection_maps=None):
+                              key_injection_maps=None, permutation=None):
         """Additive attention bias ``[B, 1, seq, seq]`` — 0 allowed, ``finfo.min`` blocked.
 
         ``bias[b,0,i,j] = finfo.min`` iff tokens i and j BOTH belong to graph nodes
@@ -556,6 +657,10 @@ class GraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         from ``key_injection_maps`` — the decode-consistency rule of the decode-time
         design note §3 (answer mentions act as keys everywhere, as queries only where
         the assignment is decode-knowable). Default None = same map for both roles.
+
+        ``permutation``: eval-time node relabelling, applied to the adjacency (this class
+        has no Ψ, so A is the ONLY thing the permutation can touch). Without it
+        ``--permutation-seed`` is a no-op for this architecture.
         """
         if dtype is None:
             dtype = self.llm.get_input_embeddings().weight.dtype
@@ -571,7 +676,7 @@ class GraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             k_pos = (tok2node_k >= 0).nonzero(as_tuple=True)[0]
             if q_pos.numel() == 0 or k_pos.numel() == 0:
                 continue
-            adj = self._node_adjacency(g, device)        # [N, N] bool
+            adj = self._node_adjacency(g, device, permutation=permutation)   # [N, N] bool
             q_nid = tok2node_q[q_pos]                     # node id per query node-token
             k_nid = tok2node_k[k_pos]                     # node id per key node-token
             allowed = adj[q_nid][:, k_nid]                # [Pq, Pk] bool over pairs
@@ -776,13 +881,14 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         except AttributeError:
             return getattr(self.llm, name)
 
-    def _node_adjacency(self, g, device) -> torch.Tensor:
+    def _node_adjacency(self, g, device, permutation=None) -> torch.Tensor:
         """Boolean ``[N, N]`` node adjacency (see module-level :func:`node_adjacency`)."""
         return node_adjacency(g, device, k_hops=self._mask_k_hops,
-                              symmetrize=self._mask_symmetrize, use_edges=self._mask_use_edges)
+                              symmetrize=self._mask_symmetrize, use_edges=self._mask_use_edges,
+                              permutation=permutation)
 
     def build_structural_mask(self, seq_len, graphs, injection_maps, device, dtype=None,
-                              key_injection_maps=None):
+                              key_injection_maps=None, permutation=None):
         """Additive attention bias ``[B, 1, seq, seq]`` with the learned relative-PE mask.
 
         For token pairs (i, j) where BOTH tokens map to graph nodes::
@@ -798,6 +904,14 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         ``key_injection_maps``: optional separate map for the KEY role (queries wired
         from ``injection_maps``, keys from ``key_injection_maps`` — decode-consistency
         rule, decode-time design note §3). Default None = same map for both roles.
+
+        ``permutation``: eval-time node relabelling (``--permutation-seed``), threaded to
+        BOTH halves of the mask — ``pe_model`` (Ψ) and ``node_adjacency`` (A) — exactly as
+        ``GraphAugmentedLLM.build_pe_signal`` / ``WireGraphLLM.build_wire_signal`` thread
+        it to their single Ψ call. Both are required: the mask is
+        ``A ⊙ log-gate(ΨΨᵀ)``, so permuting one factor and not the other is not a
+        permutation of the mask at all, and permuting neither (the pre-fix behaviour)
+        makes the flag a silent no-op for this architecture.
         """
         if dtype is None:
             dtype = self.llm.get_input_embeddings().weight.dtype
@@ -814,8 +928,8 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             k_pos = (tok2node_k >= 0).nonzero(as_tuple=True)[0]
             if q_pos.numel() == 0 or k_pos.numel() == 0:
                 continue
-            adj = self._node_adjacency(g, device)              # [N, N] bool
-            psi = self.pe_model(g).float()                     # [N, D] (GT runs fp32)
+            adj = self._node_adjacency(g, device, permutation=permutation)   # [N, N] bool
+            psi = self.pe_model(g, permutation=permutation).float()   # [N, D] (GT runs fp32)
             if self._mask_psi_scale == "cosine":
                 psi = psi / psi.norm(dim=-1, keepdim=True).clamp_min(self._mask_eps)
                 sim = psi @ psi.t()                            # cosine ∈ [−1, 1]
@@ -1184,8 +1298,40 @@ class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
     identity, not an approximation — a stronger invariant than the additive family's,
     which needs bias-free projections to get it.
 
-    **What the theory does and does not give you.** Theorem 3 states, for
-    ``ω_i ~ N(0, ω²I)``::
+    **TWO MODES. Read this first — it decides which half of this docstring applies.**
+    ``vanilla`` (config ``gnn.wire_vanilla``) selects between the paper's algorithm and
+    an expectation-motivated variant of it. ``vanilla=True`` is the **DEFAULT**::
+
+        vanilla=True  (DEFAULT)   ω_ℓ is ONE LEARNABLE [P, m] table per layer, and that
+                                  is the whole mechanism. This is Alg. 1 / §3.3: "one
+                                  does not sample and average over an ensemble of random
+                                  WIRE transformations, but instead takes one learnable
+                                  instantiation." No ε, no σ, no Monte-Carlo reading —
+                                  the expectation those exist to serve is NEVER TAKEN.
+        vanilla=False             the expectation arm: ω_ℓ = σ_ℓ·ε_ℓ with ε ~ N(0, I)
+                                  FROZEN and σ_ℓ a learnable per-layer scalar, so ω is a
+                                  genuine Gaussian sample (Theorem 3's hypothesis) and σ
+                                  is exactly the ω in qᵀk(1 − ω²R(i,j)/2). Unchanged
+                                  from before the switch existed.
+
+    What is IDENTICAL in both modes, and must stay so:
+
+    - The rotation itself (:func:`_wire_rotate`, Eq. 11): ``cos ⊙ z + sin ⊙ Pz``. The
+      **sin term is RETAINED in both modes.** Dropping it is an expectation-motivated
+      approximation (``E[sin] = 0`` under a symmetric ω distribution) that appears
+      NOWHERE in the paper or its reference implementation, and it would destroy both
+      orthogonality and Eq. 3. It must never appear on either path.
+    - ω is ``[P, m]`` — one table per LAYER, shared by every head — in both modes. See
+      the frequencies section below for why that is the paper's own sanctioned choice
+      and the only one compatible with Gemma's GQA.
+    - The angle clamp stays ACTIVE in both modes. Its *justification* changes; see the
+      clamp section.
+    - ``r`` is Ψ from ``pe_model`` in both modes. Neither mode makes ``r`` the paper's
+      Alg. 1 feature — see the next section.
+
+    **What the theory does and does not give you** (this section describes the
+    ``vanilla=False`` arm; in vanilla mode no expectation is taken at all, so none of
+    it is claimed). Theorem 3 states, for ``ω_i ~ N(0, ω²I)``::
 
         E[(RoPE(r_i)q_i)ᵀ RoPE(r_j)k_j] = q_iᵀk_j (1 − ω²R(i,j)/2) + O(ω⁴)
 
@@ -1206,14 +1352,18 @@ class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
     degree-2 filter cannot reach it even in principle; the nonlinearities and
     attention blocks put the actual Ψ further away still.
 
-    **So: this class downweights attention by a learned Ψ-distance, NOT by effective
-    resistance.** Do not report effective-resistance or shortest-path-lower-bound
-    claims for runs of this class. Recovering the resistance reading means replacing
-    ``r`` with the spectral feature above — a different architecture, not a config.
-
-    Note also that a single layer's score is ONE draw of ω, not the expectation: the
+    Note that a single layer's score is ONE draw of ω, not the expectation: the
     identity above is an expectation over ω, and a single draw carries the full
     oscillatory ``cos``/``sin`` terms of the paper's Eq. 8.
+
+    **Alg. 1's ``r`` and Theorem 3's ``r`` are DIFFERENT features — do not conflate
+    them.** Alg. 1 (the algorithm ``vanilla=True`` implements) uses the plain Laplacian
+    eigenvector coordinates ``r_i = [u_k[i]]_{k=0}^{m-1}``. Theorem 3's
+    resistance-normalized ``[u_k[i]/√λ_k]_k`` appears ONLY in that theorem, as the
+    feature under which ``‖r_i−r_j‖² = R(i,j)``. So running vanilla mode is NOT a claim
+    about effective resistance even if ``r`` were exact eigenvectors — and here it is
+    neither: ``r`` is the learned Ψ described above. Both modes inherit that gap
+    equally; ``vanilla`` changes how ω is parameterized, never what ``r`` is.
 
     **Linear-attention compatibility is RETAINED here.** WIRE's headline architectural
     claim (§3.3) is that the structural downweighting arises without instantiating the
@@ -1222,33 +1372,62 @@ class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
     quadratic object is built at any point, and the property survives. Sharing ω across
     heads changes only how many times the angles are computed, never where they are
     applied. If this class is ever changed to apply the modulation to logits instead,
-    that property is forfeited and this paragraph must be rewritten.
+    that property is forfeited.
 
-    **Frequencies: ω = σ_ℓ · ε_ℓ, shared across heads.** Each in-scope layer holds ONE
-    table ``ε_ℓ ∈ R^{P×m}``, drawn once from ``N(0, I)`` (seeded by ``omega_seed``) and
-    kept FROZEN as a persistent buffer, plus one learnable scalar ``σ_ℓ``. The
-    frequencies used are ``ω_ℓ = σ_ℓ · s_ℓ · ε_ℓ`` (``s_ℓ`` is the angle clamp below,
-    exactly 1.0 in the normal regime), so ω remains a genuine Gaussian sample —
-    Theorem 3's hypothesis — while the trained quantity is exactly the ``ω`` that
-    appears in ``qᵀk(1 − ω²R(i,j)/2)``. ``freeze_sigma=True`` pins σ for the literal-
-    Theorem-3 A/B arm.
+    **Frequencies.** Every in-scope layer holds ONE ``[P, m]`` table, shared by every
+    head. What that table IS differs by mode::
 
-    One table per LAYER, not per head: the modulation is therefore identical for every
-    head, computed once per layer and broadcast — H× less angle work — while each head
-    keeps its own ``qᵀk`` entirely (no content is averaged across heads; doing so would
-    collapse multi-head attention to a single shared pattern). Sharing across heads also
-    guarantees q and k are rotated by the same frequencies under GQA, which is what
-    makes Eq. 3 exact when one key head serves several query heads.
+        vanilla=True    _wire_omega[ℓ] : nn.Parameter [P, m]   ω_ℓ = s_ℓ · Ω_ℓ
+                        The paper's ω, learned directly. Initialised per
+                        ``vanilla_omega_init`` (default "zero" — the reference
+                        implementation's own default, giving θ = 0 and hence the EXACT
+                        identity at step 0). ``_wire_eps`` / ``_wire_sigma`` stay EMPTY.
+
+        vanilla=False   _wire_eps[ℓ]   : buffer    [P, m]   frozen ε ~ N(0, I)
+                        _wire_sigma[ℓ] : Parameter scalar   learnable σ_ℓ
+                        ω_ℓ = σ_ℓ · s_ℓ · ε_ℓ. ``_wire_omega`` stays EMPTY.
+
+    (``s_ℓ`` is the angle clamp below, exactly 1.0 in the normal regime.)
+    ``freeze_sigma=True`` pins the learnable term in BOTH modes — σ in the expectation
+    arm, Ω in vanilla — and drops it from :meth:`structural_parameters`.
+
+    Zero init is trainable *because the sin term is retained*: at ``θ = 0``,
+    ``∂cos(θ)/∂ω = −sin(θ)·r = 0`` but ``∂sin(θ)/∂ω = cos(θ)·r = r ≠ 0``. An
+    implementation that dropped sin as an ``E[sin] = 0`` approximation would make the
+    paper's own default init a dead starting point.
+
+    **One table per LAYER, not per head — in both modes, and this is load-bearing.**
+    §3.1 budgets "dm/2 parameters per transformer layer" and explicitly sanctions
+    sharing: "For additional savings, one can share WIRE weights between layers or
+    heads." The reference implementation applies its single per-layer table to the full
+    ``[b, n, d]`` q and k *before* the head split, which under ordinary MHA hands each
+    head a distinct contiguous slice — but q and k have the SAME head count there, so
+    head ``h``'s query and head ``h``'s key still share a slice and Eq. 3 holds.
+
+    That construction does not survive Gemma's **GQA**, and this is the reason head
+    sharing is not merely a saving here. Gemma-4-31B has 32 query heads against 16 kv
+    heads on sliding layers and 4 on global. Query head ``h`` is dotted against kv head
+    ``h // n_rep``. Per-query-head frequencies would rotate them by different ω, so
+    ``qᵀR(θ_j)ᵀR(θ_i)k`` would no longer collapse to a function of ``r_j − r_i`` and the
+    relative-only property Eq. 3 asserts would break outright; keys are also stored and
+    cached once per kv head, so they cannot physically carry a per-query-head rotation
+    in the first place. Sharing one table across all heads makes q and k rotate
+    identically by construction, which is what
+    ``tests/test_wire_injection.test_relative_only_holds_under_gqa`` asserts end to end.
+    Each head still keeps its own ``qᵀk`` entirely — no content is averaged across heads.
 
     **Monte-Carlo sample count differs by layer type — and the DEFAULT inverts the
-    asymmetry.** With ω shared across heads, the Step-1 averaging comes from the ``P``
+    asymmetry.** THIS SECTION APPLIES TO ``vanilla=False`` ONLY: in vanilla mode no
+    expectation is taken, so ``P`` is a parameter count, not a sample count, and none of
+    the variance reasoning below is claimed. With ω shared across heads, the Step-1
+    averaging comes from the ``P``
     rotary planes in the shared table (Eq. 8's sum over ``k``), plus independence
     across depth; the variance falls as ``1/P``. ``P`` is :func:`wire_rope_planes`,
     and it is NOT uniform across layers. gemma-4-31B::
 
         layer type   head_dim   rotate_nope_planes=False   =True
         global        512        64  (factor 0.25)          256
-        sliding       256       128 (no factor)             128
+        sliding       256       128  (no factor)            128
 
     At the DEFAULT (``rotate_nope_planes=False``) the global layers are the WORSE
     estimator — 64 samples against the sliding layers' 128 — and flipping the flag to
@@ -1278,10 +1457,41 @@ class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
     **The clamp, and the one hazard it creates.** ``max_angle`` is the ONLY angle
     threshold; a former ``hard_max_angle`` that RAISED has been deleted, because no
     training run may be killed by the angle guard. :meth:`layer_scale_factor` returns
-    ``min(1.0, max_angle / (|σ_ℓ|·span))`` and :meth:`layer_omega` applies it
-    unconditionally. Inside the bound the factor is EXACTLY 1.0, so the identity case
-    goes down the same code path, and the effective angle satisfies the bound by
-    construction on every forward.
+    ``min(1.0, max_angle / (scale_ℓ·span))`` and :meth:`layer_omega` applies it
+    unconditionally. ``scale_ℓ`` is :meth:`layer_omega_scale` — ``|σ_ℓ|`` in the
+    expectation arm, ``max_n‖Ω_ℓ[n]‖₂/√m`` in vanilla, normalised so ``max_angle``
+    means the same thing on both sides of the switch. Inside the bound the factor is
+    EXACTLY 1.0, so the identity case goes down the same code path, and the effective
+    angle satisfies the bound by construction on every forward.
+
+    **THE CLAMP IS KEPT IN VANILLA MODE. This is a DELIBERATE, VISIBLE departure from
+    the paper — the one thing ``vanilla=True`` does not strip.** Neither the paper nor
+    the reference implementation bounds ``θ`` in any way. It is kept anyway, for four
+    reasons, and the reader is entitled to disagree with the trade:
+
+    1. The standing requirement is mode-independent: no run may be killed by the angle
+       guard, and the guard may never be violated. The clamp is the ONLY thing bounding
+       angle magnitude. Removing it in vanilla mode would leave nothing at all.
+    2. It costs nothing in fidelity in the healthy regime. ``layer_scale_factor``
+       returns *exactly* ``1.0`` inside the bound — not approximately — so on any run
+       that never saturates, vanilla mode is the paper's algorithm bit for bit. It is a
+       guard that fires, not a term that is always present.
+    3. The paper's implicit bound does not transfer. Its ``r`` is Laplacian eigenvector
+       coordinates (``‖u_k‖₂ = 1``, so ``|u_k[i]| ≤ 1``); its default ``init_omega`` is
+       ZERO, so θ starts at 0 and grows only as gradients push it. Here ``r`` is Ψ from a
+       learned ``GraphTransformer`` whose FINAL ``SparseTransformerBlock`` is built with
+       ``normalize=False`` (``gt.py:307``/``:457``) — nothing pins ‖Ψ‖, which is MEASURED
+       at ≈1.1·√d_model (35.4 at d_model=1024) and is free to drift during training.
+    4. Without a Taylor expansion the *justification* changes but the hazard does not.
+       Vanilla mode has no expansion to protect, so the "Taylor guard" reading is void —
+       but cos/sin are still 2π-periodic, so once ``|θ| ≫ π`` the map from Ψ-distance to
+       attention modulation stops being monotone and ``∂/∂ω`` oscillates. That is an
+       optimisation failure rather than a theory failure, and it presents identically:
+       "worked at N=30, noise at N=100".
+
+    What now bounds the angles in vanilla mode is therefore exactly what bounds them in
+    the expectation arm — ``max_angle``, enforced by construction — and NOT any property
+    of the paper's algorithm. The saturation hazard below applies unchanged to Ω.
 
     The cost is a **biased gradient once the clamp saturates.** The factor is
     detached, so ``ω = σ·s·ε`` has ``dω/dσ = s·ε ≠ 0`` and autograd dutifully reports
@@ -1290,27 +1500,52 @@ class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
     range of raw σ, so the TRUE ``dL/dσ`` is zero and the reported value is an
     artifact of treating ``s`` as constant. Consequence: **σ can drift upward
     indefinitely with no corrective signal and no effect on the model, while training
-    looks perfectly healthy.** Nothing detects this automatically. ``wire/sigma_raw_max``
+    looks perfectly healthy.** The same holds verbatim for Ω in vanilla mode: ``s`` is
+    detached there too, so ``ω = s·Ω`` reports a non-zero ``dL/dΩ`` while the applied
+    angle is pinned. Nothing detects this automatically. ``wire/sigma_raw_max``
     diverging from ``wire/sigma_eff_max`` in :meth:`wire_telemetry` (equivalently
     ``wire/clamp_engaged == 1``) is the ONLY signal, and a one-shot ``RuntimeWarning``
     fires the first time it happens. A saturated run is NOT an A/B over σ — it is a
     fixed-angle run at ``max_angle``, and must be reported as one.
 
-    **Decode is unsupported and fails loud.** ``decode="error"`` (the default) raises
-    ``NotImplementedError`` at the first cached decode step. The KV cache is written
-    at ``modeling_gemma4.py:1274``, BEFORE this hook, so cached keys carry no graph
-    phase; rotating only the query would leave an absolute ``+r_i`` in the score and
-    destroy the relative-only property Theorem 3 assumes. Re-rotating cached keys at
-    decode time is not implemented. ``decode="skip"`` falls through to stock attention
-    on cached steps — a labeled diagnostic in which WIRE is OFF for every generated
-    token, never a result. The prompt forward (training, teacher-forced eval) is
-    unaffected either way.
+    **Decode: cached keys are re-rotated.** ``decode="rotate"`` (the default). The KV
+    cache is written at ``modeling_gemma4.py:1274``, BEFORE this hook, so it stores
+    UNROTATED keys — but ``r`` is a function of POSITION only (:meth:`build_wire_signal`
+    reads the prompt injection map once), so re-applying ``R(θ_j)`` to key slot ``j`` at
+    every step reconstructs exactly the key the prefill forward scored against. The
+    score stays a function of ``r_j − r_i`` alone and Theorem 3's relative-only
+    hypothesis is untouched. Generated positions are absent from the injection map ⇒
+    ``r = 0`` ⇒ their keys and the decode query are bit-identical to stock — the same
+    prompt-only decode wiring ``GraphAugmentedLLM`` and the mask family already use at
+    eval, so this is consistent with ``injection_scope`` ``prompt_only`` /
+    ``exclude_supervised`` exactly and with ``full_sequence`` up to the response-token
+    asymmetry the whole repo shares. ``decode_consistent`` is NOT wired for WIRE
+    (rejected in ``train_v3._validate_config`` and again in ``inference.py``).
+    ``decode="skip"`` falls through to stock attention on cached steps — a labeled
+    diagnostic in which WIRE is OFF for every generated token, never a result. The
+    prompt forward (training, teacher-forced eval) is unaffected either way.
+
+    The one scope that cannot decode is ``layer_scope="all"``: sliding-window layers
+    crop their KV cache past the window, so key slot 0 stops being absolute position 0.
+    :meth:`assert_decode_supported` raises for it BEFORE generating, naming the knob.
 
     **Config switches.** All of them, and nothing else, fork behavior. Hydra keys are
     ``gnn.wire_*`` (``experiments/base_config.yaml``), wired in
     ``architectures.build_model``::
 
         arg (config key)                   default    effect / what the other side does
+        vanilla (wire_vanilla)             True       THE MODE SWITCH (see the top of
+                                                      this docstring). True = the paper's
+                                                      algorithm: one learnable ω table per
+                                                      layer, no ε/σ, no expectation
+                                                      machinery on the active path. False
+                                                      = the ω = σ·ε expectation arm.
+        vanilla_omega_init                 "zero"     ω init when vanilla=True. "zero"
+          (wire_vanilla_omega_init)                   (reference default) ⇒ θ=0 ⇒ exact
+                                                      identity at step 0. Also "uniform",
+                                                      "exponential" — the reference
+                                                      implementation's own three values.
+                                                      Inert when vanilla=False.
         layer_scope (wire_layer_scope)     "dense"    WIRE on Gemma full_attention
                                                       (global) layers only. "all" = every
                                                       layer incl. sliding; "dense_top_half"
@@ -1318,14 +1553,23 @@ class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
                                                       "dense_first" = shallowest global.
         sigma_init (wire_sigma_init)       0.01       initial σ_ℓ, every in-scope layer.
                                                       Larger ⇒ larger angle; scale as
-                                                      1/√d_model (see Args).
-        freeze_sigma (wire_freeze_sigma)   False      σ trains, inside the structural LR
-                                                      group. True pins σ at sigma_init and
-                                                      drops it from
+                                                      1/√d_model (see Args). INERT when
+                                                      vanilla=True (ω init is chosen by
+                                                      vanilla_omega_init instead).
+        freeze_sigma (wire_freeze_sigma)   False      the learnable frequency term trains,
+                                                      inside the structural LR group. True
+                                                      pins it and drops it from
                                                       structural_parameters() (still
-                                                      checkpointed) = literal-Theorem-3 arm.
-        omega_seed (wire_omega_seed)       0          seed of the frozen ε draw. Any other
-                                                      int ⇒ a different Monte-Carlo draw.
+                                                      checkpointed). Pins σ when
+                                                      vanilla=False (= literal-Theorem-3
+                                                      arm) and Ω when vanilla=True.
+        omega_seed (wire_omega_seed)       0          seed of the frozen ε draw
+                                                      (vanilla=False) or of the
+                                                      uniform/exponential ω draw
+                                                      (vanilla=True). Any other int ⇒ a
+                                                      different draw. Inert under
+                                                      vanilla_omega_init="zero", which is
+                                                      deterministic.
         rotate_nope_planes                 False      rotate only the text-RoPE planes.
           (wire_rotate_nope_planes)                   True also rotates the NoPE planes
                                                       (4× more planes on 31B globals; see
@@ -1336,8 +1580,11 @@ class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
                                                       saturates sooner (see the hazard).
         pe_gain_init                       1.0        gate tanh(pe_gain), init ≈ 0.76.
                                                       0.0 ⇒ θ=0 ⇒ exact identity cold start.
-        decode (wire_decode)               "error"    raise at the first cached decode
-                                                      step. "skip" = diagnostic only.
+        decode (wire_decode)               "rotate"   re-rotate cached prompt keys each
+                                                      decode step. "skip" = WIRE off at
+                                                      decode, diagnostic only. "error" is
+                                                      a legacy value normalised to
+                                                      "rotate" (warned, not silent).
         pe_node_features                   "random"   GT samples its own probes. Anything
                                                       else is rejected in __init__.
 
@@ -1348,11 +1595,22 @@ class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
       ``tests/test_wire_*.py`` has exactly one ``full_attention`` layer (transformers
       forces the last layer global), so all three scopes resolve to the same single
       layer. Their divergence on a real 31B stack is untested.
-    - ``loaders.load_pe_weights_into`` has no ``wire_llm`` branch, so multistage init
-      of a WIRE run from a prior GT checkpoint raises.
+    - Multistage init (``loaders.load_pe_weights_into``) carries WIRE state only
+      between runs whose WIRE config MATCHES: a checkpoint written under a different
+      ``wire_layer_scope`` / ``wire_rotate_nope_planes`` / ``d_model`` raises rather
+      than remapping ε across layer sets or plane counts. Carrying from a prior GT
+      checkpoint loads Ψ only — the gate, ε and σ cold-start (reported by the loader),
+      so such a stage is NOT a WIRE resume. Crossing the ``wire_vanilla`` boundary
+      raises as well: ω = σ·ε and a free ω table are different parameterisations, so a
+      checkpoint from one mode carries no frequencies the other can read, and silently
+      cold-starting them while reporting a resume is exactly the failure this refuses.
     - ``pe_node_features="word_embeddings"`` is unsupported (rejected in ``__init__``
       and again in ``architectures.build_model``).
-    - Decode-time key re-rotation is not implemented (see above).
+    - Decode re-rotation covers the DENSE scopes only; ``layer_scope="all"`` raises
+      before generating (see above). Decoding under a sliding-window cache would need
+      the cropped cache's absolute offset, which is layout-dependent (crop vs ring).
+    - ``injection_scope='decode_consistent'`` (generated node mentions carrying the
+      graph channel) is not wired for WIRE — it needs the mask family's q/kv split.
 
     **Deliberately omitted — do not add**: any pooled/accumulated cross-layer estimate
     or ``[N,N]``/``[S,S]`` score-level gate (that is a relative position encoding, the
@@ -1361,7 +1619,12 @@ class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
     are not in the LLM's hidden space, and renormalizing ``r`` would silently rescale
     the ``‖r_i−r_j‖`` the theorem is stated in — ``max_angle`` is the principled scale
     control instead); ``v`` injection (WIRE is q/k only); ``pe_node_features=
-    "word_embeddings"`` (not wired, fails loud).
+    "word_embeddings"`` (not wired, fails loud); **dropping the sin term of Eq. 8** on
+    either path (an ``E[sin] = 0`` approximation that exists nowhere in the paper or its
+    reference implementation, destroys orthogonality and Eq. 3, and would make the
+    paper's own ``init_omega="zero"`` default a gradient-dead start); per-query-head or
+    per-KV-head ω (breaks Eq. 3 under GQA, or needs a granularity the cached keys cannot
+    carry — see the frequencies section).
 
     Args:
         llm: base causal LLM (Gemma-4).
@@ -1390,6 +1653,17 @@ class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         pe_gain_init: gate ``tanh(pe_gain)``; 0.0 ⇒ θ=0 ⇒ exact identity cold start.
         decode: ``"error"`` (default) or ``"skip"`` — see :func:`_wire_attention_forward`.
         pe_node_features: must be ``"random"``; anything else is rejected here.
+        vanilla: **DEFAULT True.** Run strictly the paper's algorithm — ω is one
+            learnable ``[P, m]`` table per layer (§3.3's "one learnable instantiation")
+            and every expectation/Monte-Carlo-motivated construct is off the active
+            path. False restores the ``ω = σ·ε`` expectation arm unchanged. The angle
+            clamp is the one guard retained in BOTH modes; see the clamp section for the
+            reasoning and for what it costs. The two modes' checkpoints are NOT
+            interchangeable (different frequency stores) and ``loaders`` refuses to mix
+            them rather than cold-starting ω silently.
+        vanilla_omega_init: ω initialisation when ``vanilla=True``; one of
+            :data:`WIRE_VANILLA_OMEGA_INITS`. Default ``"zero"``, which is the reference
+            implementation's own default and gives an exact-identity cold start.
     """
 
     def __init__(self, llm: nn.Module, pe_model: nn.Module, d_model: int,
@@ -1397,7 +1671,8 @@ class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
                  freeze_sigma: bool = False, omega_seed: int = 0,
                  rotate_nope_planes: bool = False, max_angle: float = 1.0,
                  pe_gain_init: float = 1.0,
-                 decode: str = "error", pe_node_features: str = "random"):
+                 decode: str = "rotate", pe_node_features: str = "random",
+                 vanilla: bool = True, vanilla_omega_init: str = "zero"):
         # Wrapper is not a registered HF architecture or MoE class; force "eager" so
         # PreTrainedModel doesn't reject SDPA/flash or expert-impl validation.
         config = copy.copy(llm.config)
@@ -1414,6 +1689,18 @@ class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
 
         if layer_scope not in MASK_LAYER_SCOPES:
             raise ValueError(f"layer_scope must be one of {MASK_LAYER_SCOPES}, got {layer_scope!r}")
+        if decode in WIRE_DECODE_LEGACY:
+            # Back-compat: "error" existed ONLY as a guard while decode-time key rotation
+            # was unimplemented. It is implemented now, so checkpoints (and configs) that
+            # recorded the old value evaluate under "rotate" instead of failing. Announced,
+            # never silent — the recorded provenance value and the active one differ.
+            new = WIRE_DECODE_LEGACY[decode]
+            warnings.warn(
+                f"wire_decode={decode!r} is a legacy value from before decode-time key "
+                f"rotation existed; running as {new!r}. Set gnn.wire_decode={new!r} "
+                "explicitly (or 'skip' for the WIRE-off-at-decode diagnostic).",
+                DeprecationWarning, stacklevel=2)
+            decode = new
         if decode not in WIRE_DECODE_MODES:
             raise ValueError(f"decode must be one of {WIRE_DECODE_MODES}, got {decode!r}")
         if pe_node_features != "random":
@@ -1424,7 +1711,13 @@ class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             raise ValueError(f"sigma_init must be > 0, got {sigma_init}")
         if not max_angle > 0:
             raise ValueError(f"max_angle must be > 0, got {max_angle}")
+        if vanilla_omega_init not in WIRE_VANILLA_OMEGA_INITS:
+            raise ValueError(
+                f"vanilla_omega_init must be one of {WIRE_VANILLA_OMEGA_INITS}, "
+                f"got {vanilla_omega_init!r}")
 
+        self._wire_vanilla = bool(vanilla)
+        self._wire_vanilla_omega_init = vanilla_omega_init
         self._wire_d_model = int(d_model)
         self._wire_layer_scope = layer_scope
         self._wire_sigma_init = float(sigma_init)
@@ -1448,11 +1741,29 @@ class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         self._wire_measured_angle: float | None = None      # σ·max‖Ψ_i−Ψ_j‖
         self._wire_measured_row_angle: float | None = None  # σ·max‖Ψ_i‖
         self._wire_modeling_module = None
+        # Per-layer (cos, sin) of the PROMPT positions' angles, reused across the decode
+        # steps of one generate() call (see decode_cos_sin). Cleared whenever the signal
+        # is (re)armed, so it can never outlive the r it was built from.
+        self._wire_decode_cos_sin: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 
-        # ε: frozen unit-Gaussian directions, one [P, m] buffer per in-scope layer.
-        # σ: learnable per-layer scale. ω = σ_ℓ · ε_ℓ (see _install_wire).
+        # Frequency stores. EXACTLY ONE of these is populated, selected by `vanilla`:
+        #
+        #   vanilla=True (DEFAULT, the paper's algorithm) — `_wire_omega` holds ONE
+        #     LEARNABLE [P, m] table per in-scope layer, which IS the paper's ω. No ε,
+        #     no σ: §3.3 takes "one learnable instantiation" rather than sampling and
+        #     averaging, so there is nothing to reparameterise. `_wire_eps` and
+        #     `_wire_sigma` stay EMPTY.
+        #
+        #   vanilla=False (the expectation arm) — ε: frozen unit-Gaussian directions,
+        #     one [P, m] buffer per in-scope layer; σ: learnable per-layer scale;
+        #     ω = σ_ℓ · ε_ℓ. `_wire_omega` stays EMPTY.
+        #
+        # All three are constructed unconditionally (empty in the unused mode) so the
+        # checkpoint key set is IDENTICAL in both modes — a key written in one mode and
+        # absent in the other is exactly the silent-corruption case the loader guards.
         self._wire_eps = nn.Module()
         self._wire_sigma = nn.ParameterDict()
+        self._wire_omega = nn.ParameterDict()
         self._install_wire()
 
     def layer_scale_factor(self, layer_idx: int) -> float:
@@ -1478,29 +1789,111 @@ class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         span = self._wire_psi_span
         if span is None or span <= 0:
             return 1.0
-        sigma_abs = float(self._wire_sigma[str(layer_idx)].detach().abs())
-        measured = sigma_abs * span
+        measured = self.layer_omega_scale(layer_idx) * span
         if measured <= 0.0:
             return 1.0
         return min(1.0, self._wire_max_angle / measured)
 
+    def layer_omega_scale(self, layer_idx: int) -> float:
+        """Detached per-layer scalar summarising ω's magnitude, in ONE convention.
+
+        This is the quantity the clamp and every ``wire/sigma_*`` telemetry key are
+        stated in, so both modes are directly comparable and ``max_angle`` means the
+        same thing on either side of the switch::
+
+            vanilla=False   |σ_ℓ|                     (ω = σ_ℓ·ε_ℓ, ε ~ N(0, I))
+            vanilla=True    max_n‖ω_ℓ[n]‖₂ / √m       (ω_ℓ is the table itself)
+
+        The ``√m`` in the vanilla form is what makes the two agree rather than differ by
+        a factor of √m: under the reparameterisation ‖ε_n‖₂ ≈ √m, so
+        ``max_n‖ω_n‖₂/√m ≈ |σ|``. Both are therefore a scale on the SAME
+        ``σ·span`` proxy the clamp has always used, not a change of units.
+
+        Note this is a proxy, not a bound: the true angle spread is
+        ``max_n|ω_n·(Ψ_i−Ψ_j)| ≤ max_n‖ω_n‖₂·span``, which is ``√m`` times this. That
+        was already true of ``|σ_ℓ|`` before vanilla mode existed and is preserved
+        deliberately — changing it would silently re-scale every existing
+        ``wire_max_angle`` in the shipped configs.
+        """
+        if self._wire_vanilla:
+            om = self._wire_omega[str(layer_idx)].detach()
+            return float(om.norm(dim=-1).max()) * (self._wire_d_model ** -0.5)
+        return float(self._wire_sigma[str(layer_idx)].detach().abs())
+
     def layer_omega(self, layer_idx: int, device=None):
-        """``ω_ℓ = σ_ℓ · s_ℓ · ε_ℓ`` — the clamped frequencies actually used.
+        """The clamped frequencies actually used. Shape ``[P, m]`` in BOTH modes::
 
-        Shape ``[P, m]`` — ONE table for the whole layer, shared by every head, so the
-        angles are computed once per layer and broadcast (see :func:`_wire_rotate`).
+            vanilla=True    ω_ℓ = s_ℓ · Ω_ℓ        (Ω_ℓ the learnable table)
+            vanilla=False   ω_ℓ = σ_ℓ · s_ℓ · ε_ℓ
 
-        ``s_ℓ`` is the detached, unconditional factor from :meth:`layer_scale_factor`.
-        The multiply is out-of-place and ``ε`` is a frozen buffer, so this is
-        autograd-safe; gradient still reaches ``σ`` (scaled by ``s_ℓ``) — but read the
+        ONE table for the whole layer, shared by every head, so the angles are computed
+        once per layer and broadcast (see :func:`_wire_rotate`). Head sharing is not
+        this repo's invention: §3.1 lists it explicitly ("one can share WIRE weights
+        between layers or heads"), and it is the only granularity under which Eq. 3
+        stays exact given Gemma's GQA — see the class docstring.
+
+        ``s_ℓ`` is the detached, unconditional factor from :meth:`layer_scale_factor`;
+        it is EXACTLY 1.0 inside the bound, so in the normal regime vanilla mode
+        returns the learned table unmodified. The multiply is out-of-place, so this is
+        autograd-safe; gradient reaches ``Ω`` / ``σ`` (scaled by ``s_ℓ``) — but read the
         bias warning on :meth:`layer_scale_factor` before trusting it under saturation.
         """
+        if self._wire_vanilla:
+            omega = self._wire_omega[str(layer_idx)]
+            if device is not None:
+                omega = omega.to(device)
+            return self.layer_scale_factor(layer_idx) * omega
         eps = getattr(self._wire_eps, str(layer_idx))
         sigma = self._wire_sigma[str(layer_idx)]
         if device is not None:
             eps = eps.to(device)
             sigma = sigma.to(device)
         return (sigma * self.layer_scale_factor(layer_idx)) * eps
+
+    def decode_cos_sin(self, layer_idx: int, omega, head_dim: int, device):
+        """Cached ``(cos, sin)`` of the PROMPT positions' WIRE angles for ``layer_idx``.
+
+        A position's graph phase is fixed the moment its node span is known
+        (:meth:`build_wire_signal` reads the prompt injection map ONCE), so these are
+        constant for the whole ``generate`` call. Computing them once instead of per
+        decode step removes the ``[S, m] × [m, P]`` angle product from the inner loop —
+        at S=2k, m=1024, P=64 that is ~131 MFLOP per active layer per token.
+
+        Cached ONLY under ``no_grad``: a stored cos/sin would freeze ``ω`` (hence ``σ``)
+        out of the autograd graph, so a grad-enabled cached step recomputes exactly
+        rather than silently detaching. Decode always runs under ``no_grad``.
+        """
+        cached = self._wire_decode_cos_sin.get(layer_idx)
+        if cached is not None and cached[0].device == device:
+            return cached
+        cos, sin = wire_cos_sin(self._wire_signal.to(device), omega, head_dim)
+        if not torch.is_grad_enabled():
+            self._wire_decode_cos_sin[layer_idx] = (cos, sin)
+        return cos, sin
+
+    def assert_decode_supported(self) -> None:
+        """Fail loud BEFORE generating if a WIRE-active layer cannot be decoded.
+
+        Sliding-window layers crop their KV cache once the sequence passes the window, so
+        key slot 0 stops being absolute position 0 and the per-position graph phase can no
+        longer be aligned (see :func:`_wire_attention_forward`). Every ``dense*`` scope
+        excludes them by construction (:func:`resolve_mask_active_flags`), so this can only
+        fire for ``gnn.wire_layer_scope='all'`` — and it fires here, not halfway through a
+        rollout. ``wire_decode='skip'`` is exempt: WIRE is off at decode there anyway.
+        """
+        if self._wire_decode == "skip":
+            return
+        layers = self._decoder_layers()
+        sliding = [i for i in self.active_layer_indices()
+                   if getattr(layers[i].self_attn, "is_sliding", False)]
+        if sliding:
+            raise NotImplementedError(
+                f"WireGraphLLM: layer_scope={self._wire_layer_scope!r} put WIRE on "
+                f"sliding-window layers {sliding}, whose KV cache is cropped past the "
+                "window — key slot 0 stops being absolute position 0 and the graph phase "
+                "cannot be aligned to the cached keys. Train/evaluate with a dense "
+                "gnn.wire_layer_scope ('dense', 'dense_top_half', 'dense_first'), or set "
+                "gnn.wire_decode='skip' to run WIRE-off-at-decode as a labeled diagnostic.")
 
     def wire_telemetry(self) -> dict:
         """Per-forward scalars for the training logs (``GradientDebugCallback``, which
@@ -1521,19 +1914,27 @@ class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
 
         Per-layer ``wire/sigma_raw/L{i}`` and ``wire/sigma_eff/L{i}`` make the
         saturation attributable to specific layers. With no graph armed (``span is
-        None``) only ``wire/psi_span`` (NaN) and ``wire/max_angle`` are returned.
+        None``) only ``wire/psi_span`` (NaN), ``wire/max_angle`` and ``wire/vanilla``
+        are returned.
+
+        The key names say "sigma" in BOTH modes: they carry
+        :meth:`layer_omega_scale`, which is ``|σ_ℓ|`` in the expectation arm and
+        ``max_n‖ω_ℓ[n]‖₂/√m`` in vanilla — one convention, so a log is comparable
+        across the switch. ``wire/vanilla`` records which mode produced the row, so a
+        run can never be read under the wrong one.
         """
         span = self._wire_psi_span
         out = {
             "wire/psi_span": float(span) if span is not None else float("nan"),
             "wire/max_angle": self._wire_max_angle,
+            "wire/vanilla": int(self._wire_vanilla),
         }
         if span is None:
             return out
         raw, eff, scales, clamped = [], [], [], 0
         for li in self.active_layer_indices():
             s = self.layer_scale_factor(li)
-            sig = float(self._wire_sigma[str(li)].detach().abs())
+            sig = self.layer_omega_scale(li)
             raw.append(sig)
             eff.append(sig * s)
             scales.append(s)
@@ -1557,13 +1958,17 @@ class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
     # ------------------------------------------------------------------ wiring
 
     def structural_parameters(self) -> list[nn.Parameter]:
-        """Graph-side params for the boosted-LR group: the Ψ producer, the gate, and
-        the per-layer ``σ_ℓ`` **only when learnable** (under ``freeze_sigma`` they carry
-        ``requires_grad=False`` and must not enter an optimizer group). ``ε`` is never
-        here — it is a frozen persistent buffer, not a parameter."""
+        """Graph-side params for the boosted-LR group: the Ψ producer, the gate, and the
+        layer's learnable frequency term **only when learnable** (under ``freeze_sigma``
+        it carries ``requires_grad=False`` and must not enter an optimizer group).
+
+        The frequency term is the ω table itself in vanilla mode (§3.3's "one learnable
+        instantiation") and the per-layer scalar ``σ_ℓ`` in the expectation arm. ``ε`` is
+        never here — it is a frozen persistent buffer, not a parameter."""
         params = list(self.pe_model.parameters()) + [self.pe_gain]
         if not self._wire_freeze_sigma:
-            params += list(self._wire_sigma.values())
+            store = self._wire_omega if self._wire_vanilla else self._wire_sigma
+            params += list(store.values())
         return params
 
     def _decoder_layers(self):
@@ -1614,6 +2019,14 @@ class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
                     f"layer {idx}: wire_rope_planes computed {planes} rotatable planes "
                     "(partial_rotary_factor too small for this head_dim) — WIRE would "
                     "be a no-op there. Set rotate_nope_planes=True or exclude the layer.")
+            if self._wire_vanilla:
+                # PAPER FORM (§3.3): ω is ONE learnable table per layer, full stop.
+                # There is no ε and no σ to reparameterise — the expectation the σ·ε
+                # split exists to serve is never taken here.
+                self._wire_omega[str(idx)] = nn.Parameter(
+                    self._init_vanilla_omega(planes, gen).to(device),
+                    requires_grad=not self._wire_freeze_sigma)
+                continue
             # Reparameterized frequencies: ω = σ_ℓ · ε with ε ~ N(0, I) FROZEN and σ_ℓ
             # a learnable per-layer scalar. ω is then a genuine Gaussian sample (the
             # direction is fixed by the draw, Theorem 3's hypothesis) while the learned
@@ -1624,6 +2037,29 @@ class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             self._wire_sigma[str(idx)] = nn.Parameter(
                 torch.tensor(self._wire_sigma_init, device=device),
                 requires_grad=not self._wire_freeze_sigma)
+
+    def _init_vanilla_omega(self, planes: int, gen) -> torch.Tensor:
+        """Draw one ``[P, m]`` vanilla-mode ω table per :data:`WIRE_VANILLA_OMEGA_INITS`.
+
+        Reproduces the reference implementation's ``init_omega_matrix``
+        (cederikhoefs/Graph-RoPE, ``graphgps/layer/graphrope.py``) literally, including
+        its default (``"zero"``) and the two quirks of its ``"exponential"`` branch
+        documented on :data:`WIRE_VANILLA_OMEGA_INITS`. ``gen`` is the ``omega_seed``
+        generator, so a seeded run is reproducible for the two random strategies; it is
+        unused (and the seed inert) for ``"zero"``.
+        """
+        m = self._wire_d_model
+        if self._wire_vanilla_omega_init == "zero":
+            return torch.zeros(planes, m)
+        if self._wire_vanilla_omega_init == "uniform":
+            # torch's default nn.Linear init, which the reference's "uniform" branch
+            # leaves in place: U(-1/sqrt(in_features), 1/sqrt(in_features)).
+            bound = m ** -0.5
+            return torch.empty(planes, m).uniform_(-bound, bound, generator=gen)
+        # "exponential": rand(P, m) / 10000^(2i/P), i the plane index.
+        rand_freqs = torch.rand(planes, m, generator=gen)
+        i = torch.arange(planes, dtype=torch.float32).unsqueeze(1)
+        return rand_freqs / (10000.0 ** (2.0 * i / planes))
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         self.llm.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
@@ -1640,8 +2076,13 @@ class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
     # ------------------------------------------------------------------- signal
 
     def active_layer_indices(self) -> list[int]:
-        """Decoder-layer indices carrying WIRE, in depth order."""
-        return sorted(int(k) for k in self._wire_sigma.keys())
+        """Decoder-layer indices carrying WIRE, in depth order.
+
+        Read off whichever frequency store this mode populated (``_wire_omega`` in
+        vanilla, ``_wire_sigma`` in the expectation arm); the other is empty.
+        """
+        store = self._wire_omega if self._wire_vanilla else self._wire_sigma
+        return sorted(int(k) for k in store.keys())
 
     def build_wire_signal(self, graphs, injection_maps, seq_len: int, device,
                           permutation=None) -> torch.Tensor:
@@ -1657,9 +2098,13 @@ class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         Measures the small-angle premise per forward, on the ``[N, m]`` node rows (not
         per token — the check is O(N²) on a ~100-row matrix, not on the sequence):
 
-        - ``σ·max‖Ψ_i − Ψ_j‖`` → ``_wire_psi_span`` / ``_wire_measured_angle``. This is
-          the Theorem 3 expansion parameter (the correction is ``ω²‖Ψ_i−Ψ_j‖²/2`` with
-          ``O(ω⁴)`` error) and the ONLY quantity ``max_angle`` clamps.
+        - ``σ·max‖Ψ_i − Ψ_j‖`` → ``_wire_psi_span`` / ``_wire_measured_angle``, with
+          ``σ`` read via :meth:`layer_omega_scale` so both modes report one convention.
+          In the expectation arm this is the Theorem 3 expansion parameter (the
+          correction is ``ω²‖Ψ_i−Ψ_j‖²/2`` with ``O(ω⁴)`` error). In VANILLA mode there
+          is no expansion to be the parameter OF — the same quantity is measured and
+          clamped purely as a periodicity guard on the angle (see the class docstring's
+          clamp section). Either way it is the ONLY quantity ``max_angle`` clamps.
         - ``σ·max‖Ψ_i‖`` → ``_wire_measured_row_angle``. Diagnostic only, never
           clamped and not surfaced in :meth:`wire_telemetry`. Recorded because cos/sin
           are periodic: if ``‖Ψ‖`` grew with graph size the angles would wrap and the
@@ -1700,7 +2145,9 @@ class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         # is safe if N ever grows enough for the quadratic term to matter.
         self._wire_psi_span = worst_pair
         with torch.no_grad():
-            sigmas = [float(p.detach().abs()) for p in self._wire_sigma.values()]
+            # layer_omega_scale() is the ONE convention both modes report in: |σ_ℓ| in
+            # the expectation arm, max_n‖ω_ℓ[n]‖₂/√m in vanilla (see that method).
+            sigmas = [self.layer_omega_scale(li) for li in self.active_layer_indices()]
         sigma_max = max(sigmas) if sigmas else 0.0
         # Pre-clamp diagnostics (what the angle WOULD have been).
         self._wire_measured_angle = sigma_max * worst_pair
@@ -1710,9 +2157,10 @@ class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         # config value or optimizer trajectory — it fires ONLY if the clamp arithmetic
         # itself is wrong. Kept as a live assertion precisely because the guarantee is
         # now structural rather than checked.
-        eff_max = max((float(self._wire_sigma[str(li)].detach().abs())
+        active = self.active_layer_indices()
+        eff_max = max((self.layer_omega_scale(li)
                        * self.layer_scale_factor(li) * worst_pair)
-                      for li in self.active_layer_indices()) if self._wire_sigma else 0.0
+                      for li in active) if active else 0.0
         self._wire_effective_angle = eff_max
         if eff_max < self._wire_measured_angle * (1.0 - 1e-9) and not self._wire_warned_angle:
             self._wire_warned_angle = True
@@ -1735,10 +2183,15 @@ class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
 
     # ------------------------------------------------------------------ forward
 
-    def _arm(self, graphs, injection_maps, seq_len, device):
-        """Build ``r`` and publish it where the patched attention fns read it."""
+    def _arm(self, graphs, injection_maps, seq_len, device, permutation=None):
+        """Build ``r`` and publish it where the patched attention fns read it.
+
+        Drops any cached decode angles first: they are derived from the PREVIOUS ``r``
+        and must never outlive it.
+        """
+        self._wire_decode_cos_sin.clear()
         self._wire_signal = self.build_wire_signal(
-            graphs, injection_maps, seq_len, device)
+            graphs, injection_maps, seq_len, device, permutation=permutation)
 
     def forward(
         self,
@@ -1775,20 +2228,31 @@ class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             # attention forwards and must see the same signal; every forward rebuilds it).
             if not getattr(self.llm, "is_gradient_checkpointing", False):
                 self._wire_signal = None
+                self._wire_decode_cos_sin.clear()
 
     def generate_with_graph(self, input_ids=None, graphs=None, injection_maps=None,
-                            **kwargs):
-        """``generate`` with the graph channel armed for the prefill forward.
+                            permutation=None, **kwargs):
+        """``generate`` with the graph channel armed for prefill AND every decode step.
 
-        Present so the decode limitation is reached LOUDLY rather than by a silent
-        fall-through: the first cached decode step raises from the attention fn (see
-        :func:`_wire_attention_forward`) unless ``decode='skip'``.
+        The signal is built ONCE over the prompt and stays armed for the whole rollout:
+        the attention fn re-applies each prompt position's rotation to the cached keys
+        every step, and generated positions carry ``r = 0`` (they are absent from the
+        prompt injection map), exactly as ``injection_scope='prompt_only'`` trains them.
+        See :func:`_wire_attention_forward` for the decode semantics and
+        :meth:`assert_decode_supported` for the one scope that cannot be decoded.
+
+        ``permutation`` is threaded to the Ψ producer for the eval-time
+        permutation-equivariance sweep, exactly as ``GraphAugmentedLLM.build_pe_signal``
+        does — WIRE is equivariant to node reordering (Lemma 1).
         """
-        self._arm(graphs, injection_maps, input_ids.shape[1], input_ids.device)
+        self.assert_decode_supported()
+        self._arm(graphs, injection_maps, input_ids.shape[1], input_ids.device,
+                  permutation=permutation)
         try:
             return self.llm.generate(input_ids=input_ids, **kwargs)
         finally:
             self._wire_signal = None
+            self._wire_decode_cos_sin.clear()
 
 
 def find_last_graph_scope(input_ids_b, tokenizer) -> int:
@@ -2034,18 +2498,21 @@ class MaskDecodeInjector:
     """
 
     def __init__(self, model, pyg_graph, prompt_injection_map, prompt_len,
-                 node_token_seqs):
+                 node_token_seqs, permutation=None):
         self.model = model
         self.node_token_seqs = node_token_seqs
         self.prompt_len = prompt_len
         self.generated: list[int] = []
         self._committed: set = set()
         self.device = next(model.parameters()).device
-        adj = model._node_adjacency(pyg_graph, self.device)
+        # `permutation` must match the one build_structural_mask used for the prefill bias:
+        # the decode rows index the SAME node axis, so a permuted prefill with an
+        # unpermuted decode extension would mix two different node labellings mid-rollout.
+        adj = model._node_adjacency(pyg_graph, self.device, permutation=permutation)
         if hasattr(model, "pe_model"):
             # LearnableGraphMaskLLM: learned relative-PE values on allowed pairs.
             with torch.no_grad():
-                psi = model.pe_model(pyg_graph).float()
+                psi = model.pe_model(pyg_graph, permutation=permutation).float()
                 if model._mask_psi_scale == "cosine":
                     psi = psi / psi.norm(dim=-1, keepdim=True).clamp_min(model._mask_eps)
                     sim = psi @ psi.t()

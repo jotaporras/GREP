@@ -123,37 +123,11 @@ def build_planner_model(gnn, llm, tokenizer, *, disable_graph_token_rope=False,
                 "architecture 'learnable_graph_mask' currently supports only "
                 "pe_node_features='random' (the mask GT samples probes; word-embedding "
                 f"feature prep is not wired). Got {gnn.pe_node_features!r}.")
-        if gnn.pe_gt_from and gnn.semantic_gt_from:
-            # Navigator Ψ producer: the notebook's pretrained PE GT + Semantic GT composed
-            # sequentially (Ψ = SemanticGT(PE_GT(graph)), seed 0). Weights loaded in train_v3.
-            # GT-only (pe_gt_from set, semantic_gt_from unset) falls through to the standalone
-            # GraphTransformer below, into which load_navigator_pe_into loads the pretrained GT.
-            pe_gt = gt_module.GraphTransformer(
-                num_layers=gnn.gt_num_layers, pe_hidden_channels=gnn.pe_hidden_channels,
-                pe_num_layers=gnn.pe_num_layers, d_model=gnn.d_model, heads=gnn.gt_heads,
-                num_samples=gnn.num_samples, dropout=gnn.dropout, k_pe=gnn.k_pe, k_gt=gnn.k_gt,
-                eps=gnn.eps, use_layer_norm=gnn.use_layer_norm, node_feature_dim=None,
-            )
-            semantic_gt = gt_module.SemanticGraphTransformer(
-                node_feature_dim=gnn.d_model, d_model=gnn.d_model, num_layers=gnn.gt_num_layers,
-                heads=gnn.gt_heads, dropout=gnn.dropout, k_gt=gnn.k_gt,
-            )
-            pe_model = gt_module.NavigatorPE(pe_gt, semantic_gt)
-        else:
-            pe_model = gt_module.GraphTransformer(
-                num_layers=gnn.gt_num_layers,
-                pe_hidden_channels=gnn.pe_hidden_channels,
-                pe_num_layers=gnn.pe_num_layers,
-                d_model=gnn.d_model,
-                heads=gnn.gt_heads,
-                num_samples=gnn.num_samples,
-                dropout=gnn.dropout,
-                k_pe=gnn.k_pe,
-                k_gt=gnn.k_gt,
-                eps=gnn.eps,
-                use_layer_norm=gnn.use_layer_norm,
-                node_feature_dim=_node_feature_dim,
-            )
+        # Ψ producer: a standalone GT (the navigator's PE stage — gt.NavigatorPE's half),
+        # or the LEGACY two-stage gt.TwoStagePE when semantic_gt_from is recorded. Built by
+        # gt.build_psi_producer, the single site eval rebuilds from too. Weights are loaded
+        # afterwards in train_v3 (load_navigator_pe_into).
+        pe_model = gt_module.build_psi_producer(gnn, node_feature_dim=_node_feature_dim)
         model = gnn_llm.LearnableGraphMaskLLM(
             llm, pe_model, alpha=gnn.mask_alpha,
             layer_scope=gnn.mask_layer_scope,
@@ -172,20 +146,10 @@ def build_planner_model(gnn, llm, tokenizer, *, disable_graph_token_rope=False,
             raise ValueError(
                 "architecture 'wire_llm' currently supports only pe_node_features="
                 f"'random' (word-embedding feature prep is not wired). Got {gnn.pe_node_features!r}.")
-        pe_model = gt_module.GraphTransformer(
-            num_layers=gnn.gt_num_layers,
-            pe_hidden_channels=gnn.pe_hidden_channels,
-            pe_num_layers=gnn.pe_num_layers,
-            d_model=gnn.d_model,
-            heads=gnn.gt_heads,
-            num_samples=gnn.num_samples,
-            dropout=gnn.dropout,
-            k_pe=gnn.k_pe,
-            k_gt=gnn.k_gt,
-            eps=gnn.eps,
-            use_layer_norm=gnn.use_layer_norm,
-            node_feature_dim=None,
-        )
+        # Same Ψ-producer factory as learnable_graph_mask: a standalone GT (navigator PE
+        # weights poured in next by train_v3), or the legacy two-stage producer.
+        # WIRE consumes Ψ as rotation angles; the producer's topology is identical.
+        pe_model = gt_module.build_psi_producer(gnn)
         model = gnn_llm.WireGraphLLM(
             llm, pe_model, d_model=gnn.d_model,
             layer_scope=gnn.wire_layer_scope,
@@ -196,7 +160,12 @@ def build_planner_model(gnn, llm, tokenizer, *, disable_graph_token_rope=False,
             max_angle=gnn.wire_max_angle,
             pe_gain_init=gnn.pe_gain_init,
             decode=gnn.wire_decode,
-            pe_node_features=gnn.pe_node_features)
+            pe_node_features=gnn.pe_node_features,
+            # Default TRUE (the paper's algorithm) and it must agree with the class
+            # signature and base_config.yaml — an absent key must not silently select
+            # the expectation arm.
+            vanilla=gnn.get("wire_vanilla", True),
+            vanilla_omega_init=gnn.get("wire_vanilla_omega_init", "zero"))
         collator = data.SpineDataCollator(tokenizer, mlm=False)
 
         if freeze_llm:

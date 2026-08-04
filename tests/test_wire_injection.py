@@ -35,6 +35,7 @@ from torch_geometric.data import Data
 
 from prism.models.gnn_llm import (
     WireGraphLLM,
+    _wire_rotate_prefix,
     wire_cos_sin,
     wire_rope_planes,
 )
@@ -70,8 +71,14 @@ def _gemma4(num_layers=4, seed=0):
 
 def _wrap(llm, d_model=16, layer_scope="dense", omega_scale=0.05,
           rotate_nope_planes=False, pe_gain_init=1.0, omega_learnable=True,
-          max_angle=8.0):
-    """Wrap with a real GraphTransformer Ψ producer (scaled down)."""
+          max_angle=8.0, vanilla=False, **kw):
+    """Wrap with a real GraphTransformer Ψ producer (scaled down).
+
+    ``vanilla=False`` by DEFAULT here even though the class default is True: every test
+    in this module that touches ε/σ is a test of the EXPECTATION ARM and must pin it
+    explicitly. The vanilla path (the shipped default) has its own tests at the bottom
+    of the file, and ``test_default_mode_is_vanilla`` asserts the class default itself.
+    """
     torch.manual_seed(1)
     gt = GraphTransformer(
         num_layers=2, pe_hidden_channels=16, pe_num_layers=2, d_model=d_model,
@@ -80,7 +87,7 @@ def _wrap(llm, d_model=16, layer_scope="dense", omega_scale=0.05,
         llm, gt, d_model=d_model, layer_scope=layer_scope,
         sigma_init=omega_scale, rotate_nope_planes=rotate_nope_planes,
         pe_gain_init=pe_gain_init, freeze_sigma=not omega_learnable,
-        max_angle=max_angle).eval()
+        max_angle=max_angle, vanilla=vanilla, **kw).eval()
 
 
 def _path_graph(n=3):
@@ -497,10 +504,16 @@ def test_angle_is_measured_every_forward_and_never_raises():
     assert tight._wire_measured_angle > tight._wire_effective_angle, "clamp did not bite"
 
 
-def test_decode_step_fails_loud():
-    """A cached decode step must NOT silently skip: WIRE assumes q AND k are rotated,
-    and the KV cache is written before the hook runs, so cached keys carry no graph
-    phase. Silently falling through would be a premise violation."""
+def test_decode_step_never_silently_skips():
+    """A cached decode step must NEVER silently fall through to stock attention.
+
+    WIRE's premise is that q AND k carry the graph phase, and the KV cache stores keys
+    written BEFORE the hook — so a cached step either re-rotates them (``decode='rotate'``,
+    asserted numerically in ``test_wire_decode_matches_full_sequence_forward``) or is the
+    LABELLED ``decode='skip'`` diagnostic. The historical third option — raising
+    ``NotImplementedError`` because re-rotation was unbuilt — is gone; this test now pins
+    that the rotation actually reaches the cached keys instead.
+    """
     llm = _gemma4()
     if llm is None:
         return _skip("gemma4 unavailable")
@@ -509,14 +522,32 @@ def test_decode_step_fails_loud():
     ids = torch.randint(0, 64, (1, 8))
     g = _tiny_graph(3)
     inj = {0: [(2, 3)], 1: [(4, 5)], 2: [(6, 7)]}
-    raised = ""
+
+    rotated = []
+    real_rotate = _wire_rotate_prefix
+
+    def spy(x, cos, sin, n):
+        rotated.append((tuple(x.shape), n))
+        return real_rotate(x, cos, sin, n)
+
+    gnn_llm_mod = sys.modules["prism.models.gnn_llm"]
+    gnn_llm_mod._wire_rotate_prefix = spy
     try:
         with torch.no_grad():
-            wrap.generate_with_graph(input_ids=ids, graphs=[g], injection_maps=[inj],
-                                     max_new_tokens=2)
-    except NotImplementedError as e:
-        raised = str(e)
-    assert "decode" in raised.lower(), f"expected a loud decode NotImplementedError, got {raised!r}"
+            out = wrap.generate_with_graph(input_ids=ids, graphs=[g], injection_maps=[inj],
+                                           max_new_tokens=2, do_sample=False,
+                                           use_cache=True, pad_token_id=0)
+    finally:
+        gnn_llm_mod._wire_rotate_prefix = real_rotate
+
+    assert out.shape[1] > ids.shape[1], "decode produced no tokens"
+    # Cached steps must have rotated KEY tensors longer than the prompt (k_len > 8).
+    assert any(shape[-2] > ids.shape[1] for shape, _ in rotated), (
+        "no cached-step rotation happened — the decode branch fell through silently "
+        f"(rotations seen: {rotated!r})")
+    assert all(n == ids.shape[1] for _, n in rotated), (
+        "cached steps must rotate exactly the prompt-length prefix (generated positions "
+        f"carry r=0): {rotated!r}")
 
 
 def test_no_parameter_or_buffer_shape_depends_on_node_count():
@@ -982,10 +1013,828 @@ def test_eps_and_sigma_survive_a_checkpoint_roundtrip():
     # A different seed really does give different ε (so the round-trip is not vacuous).
     c_seeded = WireGraphLLM(
         _gemma4(), a.pe_model, d_model=a._wire_d_model, omega_seed=1234,
-        freeze_sigma=True)
+        freeze_sigma=True, vanilla=False)
     k0 = next(iter(saved_eps))
     assert not torch.equal(saved_eps[k0], c_seeded._wire_eps.state_dict()[k0]), \
         "omega_seed has no effect — the ε draw is not actually seeded"
+
+
+def _wire_ckpt_dict(model):
+    """EXACTLY what ``trainers.PRISMTrainer.save_model`` writes for ``wire_llm``.
+
+    Mirrored here (rather than driving a real Trainer) so the multistage tests below
+    stay a pure loader test; the key set is asserted against the trainer's contract.
+    """
+    d = {
+        "pe_model": {k: v.clone() for k, v in model.pe_model.state_dict().items()},
+        "pe_gain": model.pe_gain.data.clone(),
+        "wire_eps": {k: v.clone() for k, v in model._wire_eps.state_dict().items()},
+        "wire_sigma": {k: v.clone() for k, v in model._wire_sigma.state_dict().items()},
+        "wire_omega": {k: v.clone() for k, v in model._wire_omega.state_dict().items()},
+    }
+    # The KEY SET is mode-independent by design (the unused store writes an empty dict):
+    # a key present in one mode and absent in the other is the silent-corruption case.
+    assert set(d) == {"pe_model", "pe_gain", "wire_eps", "wire_sigma", "wire_omega"}, \
+        "wire_llm checkpoint contract changed — update trainers.save_model too"
+    return d
+
+
+def _write_ckpt(state, tmpdir):
+    import os
+    torch.save(state, os.path.join(tmpdir, "gnn_weights.pt"))
+    return tmpdir
+
+
+def _perturb(model, delta=0.137):
+    """Move every carried tensor off its init so a carry test cannot pass vacuously."""
+    with torch.no_grad():
+        for p in model.pe_model.parameters():
+            p.add_(delta)
+        model.pe_gain.add_(delta)
+        for b in model._wire_eps.buffers():
+            b.add_(delta)
+        for p in model._wire_sigma.values():
+            p.add_(delta)
+        for p in model._wire_omega.values():
+            p.add_(delta)
+
+
+def test_multistage_wire_to_wire_carry_is_exact():
+    """Stage-N init from a prior ``wire_llm`` run carries Ψ, the gate, ε AND σ exactly.
+
+    ω = σ·ε is the rotation the run trained with; carrying Ψ while cold-starting ε
+    would silently rotate by different frequencies than the source model learned.
+    """
+    llm = _gemma4()
+    if llm is None:
+        return _skip("gemma4 unavailable")
+    import tempfile
+
+    from prism.models import loaders
+
+    src = _wrap(llm, pe_gain_init=0.3)
+    _perturb(src)
+    dst = _wrap(_gemma4(seed=99), pe_gain_init=1.0)
+    fresh_gain = float(dst.pe_gain.detach())
+
+    with tempfile.TemporaryDirectory() as td:
+        _write_ckpt(_wire_ckpt_dict(src), td)
+        loaders.load_pe_weights_into(dst, td, "wire_llm")
+
+    assert float(dst.pe_gain.detach()) != fresh_gain, "pe_gain not carried"
+    assert abs(float(dst.pe_gain.detach()) - float(src.pe_gain.detach())) < 1e-12
+    for k, v in src.pe_model.state_dict().items():
+        assert torch.equal(v, dst.pe_model.state_dict()[k]), f"pe_model.{k} not carried"
+    for k, v in src._wire_eps.state_dict().items():
+        assert torch.equal(v, dst._wire_eps.state_dict()[k]), f"ε {k} not carried"
+    for k, v in src._wire_sigma.state_dict().items():
+        assert torch.equal(v, dst._wire_sigma.state_dict()[k]), f"σ {k} not carried"
+    li = _global_layer_idx(dst.llm)
+    assert torch.equal(src.layer_omega(li).detach(), dst.layer_omega(li).detach()), \
+        "ω differs after the multistage carry"
+
+
+def test_multistage_gt_only_checkpoint_cold_starts_wire_terms():
+    """A prior GT / mask checkpoint has no ``wire_*``: carry Ψ, cold-start the rest.
+
+    A partial carry must not be mistaken for a full WIRE resume — ε/σ/pe_gain stay at
+    their fresh-init values, which the loader reports.
+    """
+    llm = _gemma4()
+    if llm is None:
+        return _skip("gemma4 unavailable")
+    import tempfile
+
+    from prism.models import loaders
+
+    src = _wrap(llm)
+    _perturb(src)
+    dst = _wrap(_gemma4(seed=99), pe_gain_init=1.0)
+    fresh_gain = float(dst.pe_gain.detach())
+    fresh_eps = {k: v.clone() for k, v in dst._wire_eps.state_dict().items()}
+    fresh_sigma = {k: v.clone() for k, v in dst._wire_sigma.state_dict().items()}
+
+    # rpearl_gt_llm layout: the Ψ producer under "gt_model", plus additive-injection
+    # heads WIRE deliberately has no counterpart for.
+    ckpt = {"gt_model": src.pe_model.state_dict(),
+            "pe_proj": {"weight": torch.zeros(4, src._wire_d_model)},
+            "pe_gain": src.pe_gain.data.clone()}
+    with tempfile.TemporaryDirectory() as td:
+        _write_ckpt(ckpt, td)
+        loaders.load_pe_weights_into(dst, td, "wire_llm")
+
+    for k, v in src.pe_model.state_dict().items():
+        assert torch.equal(v, dst.pe_model.state_dict()[k]), f"pe_model.{k} not carried"
+    assert float(dst.pe_gain.detach()) == fresh_gain, \
+        "pe_gain carried from a non-WIRE checkpoint (it gates an additive PE there, an angle here)"
+    for k, v in fresh_eps.items():
+        assert torch.equal(v, dst._wire_eps.state_dict()[k]), f"ε {k} moved off cold start"
+    for k, v in fresh_sigma.items():
+        assert torch.equal(v, dst._wire_sigma.state_dict()[k]), f"σ {k} moved off cold start"
+
+
+def test_multistage_wire_hparam_drift_raises():
+    """Config drift must raise, never silently partially load.
+
+    (a) GT hyperparameters that do not reproduce the pretrained Ψ producer;
+    (b) an ε plane count from a different ``wire_rotate_nope_planes`` / head width.
+    """
+    llm = _gemma4()
+    if llm is None:
+        return _skip("gemma4 unavailable")
+    import tempfile
+
+    from prism.models import loaders
+    from prism.models.gt import GraphTransformer
+
+    src = _wrap(llm)
+    ckpt = _wire_ckpt_dict(src)
+
+    # (a) GT depth drift: the carried state_dict has keys the target GT lacks.
+    torch.manual_seed(1)
+    deep_gt = GraphTransformer(num_layers=4, pe_hidden_channels=16, pe_num_layers=2,
+                               d_model=16, heads=2, num_samples=8, dropout=0.0,
+                               k_pe=2, k_gt=2)
+    drifted = WireGraphLLM(_gemma4(seed=7), deep_gt, d_model=16, sigma_init=0.05,
+                           max_angle=8.0, vanilla=False).eval()
+    raised = ""
+    with tempfile.TemporaryDirectory() as td:
+        _write_ckpt(ckpt, td)
+        try:
+            loaders.load_pe_weights_into(drifted, td, "wire_llm")
+        except RuntimeError as e:
+            raised = str(e)
+    assert "gnn." in raised and ("missing" in raised or "unexpected" in raised), \
+        f"expected a loud GT-drift RuntimeError naming the gnn.* knobs, got {raised!r}"
+
+    # (b) plane-count drift: ε is [P, m] and P follows wire_rotate_nope_planes.
+    wide = _wrap(_gemma4(seed=7), rotate_nope_planes=True)
+    assert set(wide._wire_eps.state_dict()) == set(ckpt["wire_eps"]), \
+        "fixture must differ in PLANE COUNT only, not in the active layer set"
+    assert any(wide._wire_eps.state_dict()[k].shape != v.shape
+               for k, v in ckpt["wire_eps"].items()), "fixture has no plane-count drift"
+    raised = ""
+    with tempfile.TemporaryDirectory() as td:
+        _write_ckpt(ckpt, td)
+        try:
+            loaders.load_pe_weights_into(wide, td, "wire_llm")
+        except RuntimeError as e:
+            raised = str(e)
+    assert "wire_rotate_nope_planes" in raised, \
+        f"expected a loud ε-shape RuntimeError naming the knob, got {raised!r}"
+
+
+# --------------------------------------------------------------------------- #
+# Decode: cached-step key re-rotation (wire_decode='rotate').                   #
+# --------------------------------------------------------------------------- #
+
+def _prompt_injection_map(n_nodes, prompt_len):
+    """One 1-token span per node inside the prompt, disjoint and in range."""
+    return {i: [(1 + i, 2 + i)] for i in range(n_nodes) if 2 + i <= prompt_len}
+
+
+def _armed(wrap, r):
+    """Arm an explicit signal, dropping any decode-angle cache built from a previous one."""
+    wrap._wire_signal = r
+    wrap._wire_decode_cos_sin.clear()
+
+
+def test_wire_decode_matches_full_sequence_forward():
+    """GATING TEST. Cached greedy decode must reproduce, step for step, the logits of an
+    UNCACHED forward over the same tokens under the same semantics.
+
+    The semantics: ``r`` is a function of position only, so the full-sequence signal is
+    the prompt signal zero-padded over the generated positions (generated tokens are
+    absent from the injection map ⇒ r = 0). If the decode branch forgot to re-rotate the
+    cached prompt keys — or rotated them by the wrong angle, or misaligned the position
+    offset — the cached score would carry a different ``r_j − r_i`` and these logits
+    would diverge. This is the one test that would catch a wrong rotation.
+    """
+    llm = _gemma4()
+    if llm is None:
+        return _skip("gemma4 unavailable")
+    wrap = _wrap(llm)                       # layer_scope='dense' (global layers only)
+    g = _path_graph(3)
+    ids = torch.randint(0, 64, (1, 7))
+    L, T = ids.shape[1], 4
+    imap = _prompt_injection_map(3, L)
+
+    # ONE Ψ draw: the GT samples random probes, so re-arming would give a different r.
+    with torch.no_grad():
+        r = wrap.build_wire_signal([g], [imap], L, ids.device)
+    assert float(r.abs().max()) > 0, "signal is all-zero — the test would be vacuous"
+
+    _armed(wrap, r)
+    with torch.no_grad():
+        gen = wrap.llm.generate(
+            input_ids=ids, max_new_tokens=T, do_sample=False, use_cache=True,
+            pad_token_id=0, return_dict_in_generate=True, output_scores=True)
+    assert gen.sequences.shape[1] == L + T, "generation stopped early — nothing to compare"
+
+    r_full = torch.cat((r, r.new_zeros(1, T, r.shape[-1])), dim=1)
+    _armed(wrap, r_full)
+    with torch.no_grad():
+        full = wrap.llm(input_ids=gen.sequences, use_cache=False).logits
+    _armed(wrap, None)
+
+    worst = max((full[:, L - 1 + t] - gen.scores[t]).abs().max().item() for t in range(T))
+    assert worst < 1e-4, (
+        f"cached decode diverges from the uncached forward (max|Δlogit|={worst:.3e}) — "
+        "the cached keys are not carrying the graph rotation the prefill scored with")
+
+
+def test_wire_decode_actually_rotates_cached_keys():
+    """The gating test above is only meaningful if 'skip' (WIRE off at decode) DIFFERS.
+
+    Same prompt, same Ψ, same greedy steps: 'rotate' re-rotates the cached prompt keys,
+    'skip' delegates untouched. If the two agree the rotation is inert at decode and the
+    consistency check proves nothing.
+    """
+    llm = _gemma4()
+    if llm is None:
+        return _skip("gemma4 unavailable")
+    wrap = _wrap(llm)
+    g = _path_graph(3)
+    ids = torch.randint(0, 64, (1, 7))
+    L, T = ids.shape[1], 4
+    with torch.no_grad():
+        r = wrap.build_wire_signal([g], [imap := _prompt_injection_map(3, L)], L, ids.device)
+
+    def scores(mode):
+        wrap._wire_decode = mode
+        _armed(wrap, r)
+        with torch.no_grad():
+            out = wrap.llm.generate(
+                input_ids=ids, max_new_tokens=T, do_sample=False, use_cache=True,
+                pad_token_id=0, return_dict_in_generate=True, output_scores=True)
+        _armed(wrap, None)
+        return out.scores
+
+    rot, skip = scores("rotate"), scores("skip")
+    wrap._wire_decode = "rotate"
+    # Step 0 is the prefill logit (identical by construction); the DECODE steps must differ.
+    delta = max((rot[t] - skip[t]).abs().max().item() for t in range(1, T))
+    assert delta > 1e-5, (
+        f"wire_decode='rotate' and 'skip' produce identical decode logits (max|Δ|={delta:.2e}) "
+        "— the cached-key rotation is inert, so the consistency test is vacuous")
+    assert imap  # silence the walrus
+
+
+def test_wire_decode_survives_shifted_position_ids():
+    """REGRESSION. Decode must key off CACHE SLOTS, not ``position_ids``.
+
+    ``generate`` re-derives ``position_ids`` from the attention mask, so a prompt that is
+    padded — or merely contains a token equal to ``pad_token_id`` — gets positions BELOW
+    the cache-slot index while the cache itself is perfectly aligned. An alignment check
+    written against ``position_ids`` reads that as a cropped cache and aborts a healthy
+    run (it did, flakily, whenever a random prompt happened to contain the pad id).
+
+    Here the prompt is deliberately half pad ids and the decode logits must still match
+    the uncached forward exactly, as in the gating test.
+    """
+    llm = _gemma4()
+    if llm is None:
+        return _skip("gemma4 unavailable")
+    wrap = _wrap(llm)
+    pad = 0
+    ids = torch.randint(1, 64, (1, 8))
+    ids[0, :4] = pad                                  # left "padding" -> shifted positions
+    attn = torch.ones_like(ids)
+    attn[0, :4] = 0
+    L, T = ids.shape[1], 3
+    with torch.no_grad():
+        r = wrap.build_wire_signal([_path_graph(3)], [{0: [(5, 6)], 1: [(6, 7)]}],
+                                   L, ids.device)
+    _armed(wrap, r)
+    with torch.no_grad():
+        gen = wrap.llm.generate(
+            input_ids=ids, attention_mask=attn, max_new_tokens=T, do_sample=False,
+            use_cache=True, pad_token_id=pad, return_dict_in_generate=True,
+            output_scores=True)
+    steps = gen.sequences.shape[1] - L
+    assert steps > 0, "nothing generated — the regression would not be exercised"
+
+    r_full = torch.cat((r, r.new_zeros(1, steps, r.shape[-1])), dim=1)
+    _armed(wrap, r_full)
+    with torch.no_grad():
+        full = wrap.llm(input_ids=gen.sequences, attention_mask=torch.cat(
+            (attn, attn.new_ones(1, steps)), dim=1), use_cache=False).logits
+    _armed(wrap, None)
+    worst = max((full[:, L - 1 + t] - gen.scores[t]).abs().max().item()
+                for t in range(steps))
+    assert worst < 1e-4, (
+        f"padded-prompt decode diverges from the uncached forward (max|Δ|={worst:.3e})")
+
+
+def test_wire_generate_with_graph_runs_and_disarms():
+    """``generate_with_graph`` must produce tokens (no NotImplementedError) and leave the
+    signal AND the decode-angle cache cleared, so nothing leaks into the next sample."""
+    llm = _gemma4()
+    if llm is None:
+        return _skip("gemma4 unavailable")
+    wrap = _wrap(llm)
+    ids = torch.randint(0, 64, (1, 7))
+    out = wrap.generate_with_graph(
+        input_ids=ids, graphs=[_path_graph(3)],
+        injection_maps=[_prompt_injection_map(3, ids.shape[1])],
+        max_new_tokens=5, do_sample=False, use_cache=True, pad_token_id=0)
+    assert out.shape[0] == 1 and out.shape[1] > ids.shape[1], \
+        f"no tokens generated (out {tuple(out.shape)} vs prompt {tuple(ids.shape)})"
+    assert wrap._wire_signal is None, "_wire_signal must be disarmed after generate"
+    assert not wrap._wire_decode_cos_sin, "decode angle cache must be cleared after generate"
+
+
+def test_wire_generate_threads_permutation():
+    """``permutation`` must reach the Ψ producer (the --permutation-seed sweep mode).
+
+    Asserted at the producer, not on the output: a permuted graph relabels the nodes, so
+    a run that ignored the kwarg would silently score the UNPERMUTED graph.
+    """
+    llm = _gemma4()
+    if llm is None:
+        return _skip("gemma4 unavailable")
+    wrap = _wrap(llm)
+    seen = []
+    real = wrap.pe_model.forward
+
+    def spy(data, permutation=None):
+        seen.append(permutation)
+        return real(data, permutation=permutation)
+
+    wrap.pe_model.forward = spy
+    perm = Permutation(7)
+    ids = torch.randint(0, 64, (1, 7))
+    try:
+        wrap.generate_with_graph(
+            input_ids=ids, graphs=[_path_graph(3)],
+            injection_maps=[_prompt_injection_map(3, ids.shape[1])],
+            permutation=perm, max_new_tokens=3, do_sample=False, use_cache=True,
+            pad_token_id=0)
+    finally:
+        wrap.pe_model.forward = real
+    assert seen and seen[0] is perm, \
+        f"permutation did not reach the Psi producer (saw {seen!r})"
+
+
+def test_wire_layer_scope_all_rejects_decode():
+    """``layer_scope='all'`` puts WIRE on sliding-window layers, whose KV cache is cropped
+    past the window — key slot 0 stops being absolute position 0. It must fail BEFORE
+    generating, naming the config knob, not blanket-fail every WIRE run."""
+    llm = _gemma4()
+    if llm is None:
+        return _skip("gemma4 unavailable")
+    wrap = _wrap(llm, layer_scope="all")
+    ids = torch.randint(0, 64, (1, 7))
+    raised = ""
+    try:
+        wrap.generate_with_graph(
+            input_ids=ids, graphs=[_path_graph(3)],
+            injection_maps=[_prompt_injection_map(3, 7)],
+            max_new_tokens=3, do_sample=False, use_cache=True, pad_token_id=0)
+    except NotImplementedError as e:
+        raised = str(e)
+    assert "wire_layer_scope" in raised, \
+        f"expected a loud pre-generation error naming gnn.wire_layer_scope, got {raised!r}"
+    # ...and the same model under 'skip' (WIRE off at decode) is explicitly allowed.
+    wrap._wire_decode = "skip"
+    out = wrap.generate_with_graph(
+        input_ids=ids, graphs=[_path_graph(3)],
+        injection_maps=[_prompt_injection_map(3, 7)],
+        max_new_tokens=3, do_sample=False, use_cache=True, pad_token_id=0)
+    assert out.shape[1] > ids.shape[1]
+
+
+def test_wire_decode_legacy_error_normalises_to_rotate():
+    """Checkpoints written before decode existed recorded wire_decode='error'. They must
+    still evaluate: the value is normalised to 'rotate' and the substitution is WARNED,
+    never silent. 'skip' keeps its meaning; anything else still raises."""
+    import warnings as _w
+    llm = _gemma4()
+    if llm is None:
+        return _skip("gemma4 unavailable")
+    with _w.catch_warnings(record=True) as caught:
+        _w.simplefilter("always")
+        wrap = _wrap(llm)
+        wrap._wire_decode = "x"                       # placeholder, replaced below
+        from prism.models.gnn_llm import WireGraphLLM as _W
+        legacy = _W(llm, wrap.pe_model, d_model=16, decode="error", max_angle=8.0)
+    assert legacy._wire_decode == "rotate", \
+        f"legacy 'error' must normalise to 'rotate', got {legacy._wire_decode!r}"
+    assert any("legacy" in str(c.message) for c in caught), \
+        "the legacy normalisation must be announced (DeprecationWarning), not silent"
+    raised = ""
+    try:
+        _W(llm, wrap.pe_model, d_model=16, decode="bogus", max_angle=8.0)
+    except ValueError as e:
+        raised = str(e)
+    assert "decode must be one of" in raised, f"unknown mode not rejected: {raised!r}"
+
+
+def test_wire_is_routed_as_graph_augmented_at_eval():
+    """``evaluate._is_graph_augmented`` must recognise WireGraphLLM.
+
+    A missing entry does not fail loudly: it routes the checkpoint to the PLAIN-LLM
+    client and evaluates it with the graph channel silently absent. Also pinned against
+    the config-side list ``evaluate._GNN_ARCHITECTURES``.
+    """
+    from prism.eval import evaluate as _ev
+    llm = _gemma4()
+    if llm is None:
+        return _skip("gemma4 unavailable")
+    wrap = _wrap(llm)
+    assert _ev._is_graph_augmented(wrap), \
+        "WireGraphLLM must route to GraphAugmentedInMemoryLLM, not the plain client"
+    assert "wire_llm" in _ev._GNN_ARCHITECTURES
+
+
+# --------------------------------------------------------------------------- #
+# wire_vanilla: the paper's algorithm, and the DEFAULT.                        #
+#                                                                              #
+# Vanilla mode replaces omega = sigma*eps with ONE LEARNABLE [P, m] table per   #
+# layer (Alg. 1 / 3.3 "one learnable instantiation"). These tests pin (a) that  #
+# it is the default in all three registration sites, (b) that the expectation   #
+# machinery is genuinely OFF the active path, (c) that everything the rotation  #
+# depends on still holds, and (d) that the two modes' checkpoints do not mix.   #
+# --------------------------------------------------------------------------- #
+
+def _vanilla(llm=None, d_model=16, **kw):
+    """Vanilla-mode wrapper. Mirrors ``_wrap`` but leaves ``vanilla`` at the DEFAULT."""
+    torch.manual_seed(1)
+    gt = GraphTransformer(
+        num_layers=2, pe_hidden_channels=16, pe_num_layers=2, d_model=d_model,
+        heads=2, num_samples=8, dropout=0.0, k_pe=2, k_gt=2)
+    kw.setdefault("pe_gain_init", 1.0)
+    kw.setdefault("max_angle", 8.0)
+    return WireGraphLLM(llm or _gemma4(), gt, d_model=d_model, **kw).eval()
+
+
+def test_default_mode_is_vanilla():
+    """THE DEFAULT. Asserted at all three registration sites, because a default that
+    disagrees between them is how a run silently trains the wrong architecture."""
+    llm = _gemma4()
+    if llm is None:
+        return _skip("gemma4 unavailable")
+    import inspect
+
+    import omegaconf
+
+    # (1) the class signature.
+    sig = inspect.signature(WireGraphLLM.__init__)
+    assert sig.parameters["vanilla"].default is True, \
+        "WireGraphLLM.__init__ default for `vanilla` is not True"
+    assert sig.parameters["vanilla_omega_init"].default == "zero"
+
+    # (2) a model built with NO explicit setting comes up vanilla.
+    w = _vanilla(llm)
+    assert w._wire_vanilla is True, "constructing without `vanilla` did not give vanilla"
+    assert len(w._wire_omega) > 0, "vanilla model has no omega table"
+    assert len(w._wire_eps.state_dict()) == 0 and len(w._wire_sigma) == 0, \
+        "vanilla model still built the expectation arm's eps/sigma"
+
+    # (3) the shipped Hydra config.
+    cfg = omegaconf.OmegaConf.load("experiments/base_config.yaml")
+    assert cfg.gnn.wire_vanilla is True, "base_config.yaml does not default to vanilla"
+    assert cfg.gnn.wire_vanilla_omega_init == "zero"
+
+    # (4) architectures.build_planner_model with the key ABSENT must still pick vanilla
+    #     (the eval-time loader deliberately defaults the other way; see loaders.py).
+    from prism.models.architectures import build_planner_model
+    gnn = cfg.gnn
+    gnn.arch = "wire_llm"
+    gnn.d_model = 16
+    gnn.pe_hidden_channels = 16
+    gnn.num_samples = 4
+    gnn.gt_heads = 2
+    gnn.pe_gain_init = 1.0
+    del gnn["wire_vanilla"]                      # simulate a config predating the key
+
+    class _Tok:
+        pad_token_id = 0
+        eos_token_id = 1
+
+    model, _ = build_planner_model(gnn, _gemma4(), _Tok())
+    assert model._wire_vanilla is True, \
+        "architectures.build_model defaults `vanilla` to False when the key is absent"
+
+
+def test_vanilla_omega_is_one_learnable_table_per_layer():
+    """3.3: omega IS the learned parameter. No eps, no sigma, no reparameterisation."""
+    llm = _gemma4()
+    if llm is None:
+        return _skip("gemma4 unavailable")
+    w = _vanilla(llm)
+    li = _global_layer_idx(llm)
+    attn = list(w._decoder_layers())[li].self_attn
+    planes = wire_rope_planes(attn, rotate_nope=False)
+
+    om = w._wire_omega[str(li)]
+    assert om.shape == (planes, w._wire_d_model), \
+        f"omega is {tuple(om.shape)}, not [P, m] = {(planes, w._wire_d_model)}"
+    assert isinstance(om, torch.nn.Parameter) and om.requires_grad, \
+        "omega must be a LEARNABLE parameter in vanilla mode (3.3)"
+    assert any(k.endswith(f"_wire_omega.{li}") for k in w.state_dict()), \
+        "omega missing from state_dict"
+    # It is in the structural LR group, and the frozen-buffer eps is nowhere.
+    assert id(om) in {id(p) for p in w.structural_parameters()}, \
+        "learnable omega missing from the structural LR group"
+    assert not any("_wire_eps" in k or "_wire_sigma" in k for k in w.state_dict()), \
+        "vanilla mode still carries expectation-arm state in the checkpoint"
+
+    # active_layer_indices reads the vanilla store.
+    act = [i for i, l in enumerate(w._decoder_layers())
+           if getattr(l.self_attn, "_wire_active", False)]
+    assert w.active_layer_indices() == act
+
+
+def test_vanilla_zero_init_is_exact_identity_but_still_trainable():
+    """The reference default init_omega="zero" gives theta=0 => EXACT identity, and it
+    is a live starting point ONLY because the sin term of Eq. 8 is retained:
+    d sin(theta)/d omega = cos(theta)*r = r != 0 at theta=0, while d cos/d omega = 0."""
+    llm = _gemma4()
+    if llm is None:
+        return _skip("gemma4 unavailable")
+    w = _vanilla(llm, vanilla_omega_init="zero")
+    for li in w.active_layer_indices():
+        assert float(w._wire_omega[str(li)].abs().max()) == 0.0, "zero init is not zero"
+
+    ids = torch.randint(0, 64, (1, 8))
+    g, inj = _tiny_graph(3), {0: [(2, 3)], 1: [(4, 5)], 2: [(6, 7)]}
+    with torch.no_grad():
+        out = w(input_ids=ids, graphs=[g], injection_maps=[inj]).logits
+        stock = w.llm(input_ids=ids).logits
+    assert torch.equal(out, stock), \
+        "zero-init vanilla is not BIT-IDENTICAL to the stock LLM (rotation must be exact identity)"
+
+    # ...and gradient still reaches omega, so it is not a dead start.
+    out2 = w(input_ids=ids, graphs=[g], injection_maps=[inj])
+    out2.logits.float().square().mean().backward()
+    gs = [p.grad for p in w._wire_omega.values() if p.grad is not None]
+    assert gs and max(float(gd.abs().max()) for gd in gs) > 0, \
+        "omega got no gradient at zero init — the sin term has been dropped somewhere"
+    assert all(torch.isfinite(gd).all().item() for gd in gs)
+
+
+def test_vanilla_omega_init_strategies():
+    """All three reference values construct, are finite, and the random ones are seeded."""
+    llm = _gemma4()
+    if llm is None:
+        return _skip("gemma4 unavailable")
+    from prism.models.gnn_llm import WIRE_VANILLA_OMEGA_INITS
+    assert WIRE_VANILLA_OMEGA_INITS == ("zero", "uniform", "exponential")
+
+    for init in WIRE_VANILLA_OMEGA_INITS:
+        a = _vanilla(_gemma4(), vanilla_omega_init=init, omega_seed=3)
+        b = _vanilla(_gemma4(), vanilla_omega_init=init, omega_seed=3)
+        k = next(iter(a._wire_omega))
+        assert torch.isfinite(a._wire_omega[k]).all(), f"{init}: non-finite omega"
+        assert torch.equal(a._wire_omega[k], b._wire_omega[k]), \
+            f"{init}: same seed gave a different draw"
+        if init != "zero":
+            assert float(a._wire_omega[k].abs().max()) > 0, f"{init}: drew all zeros"
+            d = _vanilla(_gemma4(), vanilla_omega_init=init, omega_seed=999)
+            assert not torch.equal(a._wire_omega[k], d._wire_omega[k]), \
+                f"{init}: omega_seed has no effect"
+    # Invalid value rejected, naming the knob.
+    try:
+        _vanilla(_gemma4(), vanilla_omega_init="nope")
+        raise AssertionError("invalid vanilla_omega_init was not rejected")
+    except ValueError as e:
+        assert "vanilla_omega_init" in str(e)
+
+
+def test_vanilla_relative_only_holds_under_gqa():
+    """Eq. 3 end to end in VANILLA mode: shifting r by a constant leaves every q.k score
+    unchanged. This is the invariant the shared-across-heads omega exists to protect —
+    a key head serves several query heads, so q and k must rotate by identical omega."""
+    llm = _gemma4()
+    if llm is None:
+        return _skip("gemma4 unavailable")
+    # Non-zero omega, or the test is vacuous (zero init => rotation is the identity).
+    wrap = _vanilla(llm, vanilla_omega_init="uniform", omega_seed=5)
+    li = _global_layer_idx(llm)
+    attn = list(wrap._decoder_layers())[li].self_attn
+    assert attn.num_key_value_groups > 1, "fixture is not GQA — test would be vacuous"
+
+    ids = torch.randint(0, 64, (1, 6))
+    torch.manual_seed(22)
+    r = torch.randn(1, 6, wrap._wire_d_model) * 0.4
+    c = torch.randn(1, 1, wrap._wire_d_model) * 0.4
+
+    def scores(sig):
+        cap = _capture_qk(wrap, ids, sig, li)
+        q, k = cap["q"], cap["k"]
+        k = k.repeat_interleave(attn.num_key_value_groups, dim=1)   # mirrors repeat_kv
+        return q @ k.transpose(-1, -2)
+
+    s0, s1 = scores(r), scores(r + c)
+    d = (s0 - s1).abs().max().item()
+    assert d < 1e-3, f"vanilla scores moved under a global r shift (max|delta|={d:.2e})"
+    assert (s0 - scores(None)).abs().max().item() > 1e-3, "WIRE inert — vacuous test"
+
+
+def test_vanilla_omega_is_shared_across_heads():
+    """One [P, m] table per LAYER: q and k are rotated by the SAME frequencies, which is
+    what keeps Eq. 3 exact under GQA (3.1 sanctions head sharing explicitly)."""
+    llm = _gemma4()
+    if llm is None:
+        return _skip("gemma4 unavailable")
+    wrap = _vanilla(llm, vanilla_omega_init="uniform", omega_seed=5)
+    li = _global_layer_idx(llm)
+    attn = list(wrap._decoder_layers())[li].self_attn
+    omega = wrap.layer_omega(li)
+    assert omega.dim() == 2, f"omega must be [P, m], got {tuple(omega.shape)}"
+
+    ids = torch.randint(0, 64, (1, 6))
+    torch.manual_seed(21)
+    r = torch.randn(1, 6, wrap._wire_d_model) * 0.5
+    off = _capture_qk(wrap, ids, None, li)
+    on = _capture_qk(wrap, ids, r, li)
+    cos, sin = wire_cos_sin(r, omega.detach(), attn.head_dim)
+    from prism.models.gnn_llm import _wire_rotate
+    dq = (on["q"] - _wire_rotate(off["q"], cos, sin)).abs().max().item()
+    dk = (on["k"] - _wire_rotate(off["k"], cos, sin)).abs().max().item()
+    assert dq < 1e-5, f"query rotation != shared omega (max|delta|={dq:.2e})"
+    assert dk < 1e-5, f"key rotation != shared omega (max|delta|={dk:.2e})"
+    assert (on["q"] - off["q"]).abs().max().item() > 1e-4, "rotation inert — vacuous"
+
+
+def test_vanilla_has_no_expectation_machinery_on_the_active_path():
+    """The point of the switch: sigma/eps must not participate in vanilla mode at all."""
+    llm = _gemma4()
+    if llm is None:
+        return _skip("gemma4 unavailable")
+    w = _vanilla(llm, vanilla_omega_init="uniform", omega_seed=5)
+    li = w.active_layer_indices()[0]
+
+    # omega == the table itself (times the clamp factor, which is 1.0 here).
+    assert w.layer_scale_factor(li) == 1.0
+    assert torch.equal(w.layer_omega(li).detach(), w._wire_omega[str(li)].detach()), \
+        "layer_omega applied something other than the learned table"
+    # No sigma to freeze, no eps buffer to draw.
+    assert str(li) not in w._wire_sigma and not hasattr(w._wire_eps, str(li))
+
+    # freeze_sigma pins the LEARNABLE term in vanilla too (that term is omega).
+    f = _vanilla(_gemma4(), freeze_sigma=True)
+    for p in f._wire_omega.values():
+        assert not p.requires_grad, "freeze_sigma did not pin omega in vanilla mode"
+        assert id(p) not in {id(x) for x in f.structural_parameters()}, \
+            "frozen omega leaked into the structural LR group"
+    assert any("_wire_omega" in k for k in f.state_dict()), "omega missing from state_dict"
+
+
+def test_vanilla_clamp_is_retained_and_visible():
+    """DELIBERATE DEPARTURE FROM THE PAPER: the angle clamp stays ON in vanilla mode.
+    Neither the paper nor the reference bounds theta; it is kept because nothing else
+    bounds it here (Psi comes from a GT whose final block has normalize=False). Assert
+    it (a) never raises, (b) holds by construction, (c) is EXACTLY the identity inside
+    the bound, and (d) reports saturation in telemetry rather than failing silently."""
+    llm = _gemma4()
+    if llm is None:
+        return _skip("gemma4 unavailable")
+    import warnings as _w
+    g = _tiny_graph(4)
+    inj = {i: [(i, i + 1)] for i in range(4)}
+
+    # Inside the bound: factor is EXACTLY 1.0 => the paper's algorithm, bit for bit.
+    w = _vanilla(_gemma4(), vanilla_omega_init="zero", max_angle=1.0)
+    w.build_wire_signal([g], [inj], seq_len=8, device=torch.device("cpu"))
+    for li in w.active_layer_indices():
+        assert w.layer_scale_factor(li) == 1.0, "clamp not identity inside the bound"
+
+    # Adversarially large omega must NOT raise and must stay inside the bound.
+    for mult in (1.0, 10.0, 1e2, 1e3):
+        w2 = _vanilla(_gemma4(), vanilla_omega_init="uniform", omega_seed=5,
+                      max_angle=0.25)
+        with torch.no_grad():
+            for k in w2._wire_omega:
+                w2._wire_omega[k].mul_(mult)
+        with _w.catch_warnings():
+            _w.simplefilter("ignore")
+            w2.build_wire_signal([g], [inj], seq_len=8, device=torch.device("cpu"))
+        span = w2._wire_psi_span
+        for li in w2.active_layer_indices():
+            eff = w2.layer_omega_scale(li) * w2.layer_scale_factor(li)
+            assert eff * span <= w2._wire_max_angle * (1 + 1e-6), (
+                f"mult={mult}: post-clamp angle {eff * span:.6f} > "
+                f"max_angle {w2._wire_max_angle}")
+        assert w2._wire_effective_angle <= w2._wire_max_angle * (1 + 1e-5)
+
+    # Saturation is VISIBLE, and gradient still reaches omega.
+    ids = torch.randint(0, 64, (1, 8))
+    inj8 = {0: [(2, 3)], 1: [(4, 5)], 2: [(6, 7)]}
+    w3 = _vanilla(_gemma4(), vanilla_omega_init="uniform", omega_seed=5, max_angle=1e-3)
+    with torch.no_grad():
+        for k in w3._wire_omega:
+            w3._wire_omega[k].mul_(100.0)
+    with _w.catch_warnings():
+        _w.simplefilter("ignore")
+        out = w3(input_ids=ids, graphs=[_tiny_graph(3)], injection_maps=[inj8])
+    assert torch.isfinite(out.logits).all(), "non-finite logits under a clamped omega"
+    out.logits.float().square().mean().backward()
+    gs = [p.grad for p in w3._wire_omega.values() if p.grad is not None]
+    assert gs and all(torch.isfinite(gd).all().item() for gd in gs)
+
+    t = w3.wire_telemetry()
+    assert t["wire/vanilla"] == 1, "telemetry does not record the mode"
+    assert t["wire/clamp_engaged"] == 1, "clamp engaged but not reported"
+    assert t["wire/sigma_raw_max"] > t["wire/sigma_eff_max"], \
+        "saturation invisible: raw and effective scale reported identical"
+    assert t["wire/angle_eff_max"] <= t["wire/max_angle"] * (1 + 1e-6)
+    for key in ("wire/psi_span", "wire/scale_min", "wire/clamped_layers"):
+        assert key in t, f"telemetry missing {key}"
+    assert all(isinstance(v, (int, float)) for v in t.values())
+
+
+def test_vanilla_checkpoint_roundtrip_and_no_cross_mode_mixing():
+    """Round-trip in BOTH modes, and refuse to mix them.
+
+    The saved key SET is mode-independent (the unused store writes an empty dict), but
+    the populated store differs. Loading a vanilla checkpoint into an expectation-arm
+    model (or vice versa) would otherwise cold-start omega while reporting a resume."""
+    llm = _gemma4()
+    if llm is None:
+        return _skip("gemma4 unavailable")
+    import tempfile
+
+    from prism.models import loaders
+
+    # ---- vanilla round-trip -------------------------------------------------
+    a = _vanilla(llm, vanilla_omega_init="uniform", omega_seed=5)
+    _perturb(a)
+    ck_v = _wire_ckpt_dict(a)
+    assert ck_v["wire_omega"] and not ck_v["wire_eps"] and not ck_v["wire_sigma"], \
+        "vanilla checkpoint did not populate exactly wire_omega"
+
+    b = _vanilla(_gemma4(seed=99), vanilla_omega_init="uniform", omega_seed=5)
+    with tempfile.TemporaryDirectory() as td:
+        _write_ckpt(ck_v, td)
+        loaders.load_pe_weights_into(b, td, "wire_llm")
+    for k, v in ck_v["wire_omega"].items():
+        assert torch.equal(v, b._wire_omega.state_dict()[k]), f"omega {k} changed on reload"
+    li = _global_layer_idx(b.llm)
+    assert torch.equal(a.layer_omega(li).detach(), b.layer_omega(li).detach()), \
+        "omega differs after reload"
+    assert torch.equal(a.pe_gain.data, b.pe_gain.data), "gate not carried"
+
+    # ---- expectation-arm round-trip ----------------------------------------
+    c = _wrap(_gemma4(), omega_learnable=False)
+    _perturb(c)
+    ck_e = _wire_ckpt_dict(c)
+    assert ck_e["wire_eps"] and ck_e["wire_sigma"] and not ck_e["wire_omega"], \
+        "expectation checkpoint did not populate exactly wire_eps/wire_sigma"
+    d = _wrap(_gemma4(seed=99), omega_learnable=False)
+    with tempfile.TemporaryDirectory() as td:
+        _write_ckpt(ck_e, td)
+        loaders.load_pe_weights_into(d, td, "wire_llm")
+    assert torch.equal(c.layer_omega(li).detach(), d.layer_omega(li).detach()), \
+        "omega = sigma*eps differs after reload"
+
+    # ---- crossing the boundary must RAISE, not cold-start -------------------
+    for ckpt, target, label in ((ck_v, _wrap(_gemma4()), "vanilla ckpt -> expectation model"),
+                                (ck_e, _vanilla(_gemma4()), "expectation ckpt -> vanilla model")):
+        raised = ""
+        with tempfile.TemporaryDirectory() as td:
+            _write_ckpt(ckpt, td)
+            try:
+                loaders.load_pe_weights_into(target, td, "wire_llm")
+            except KeyError as e:
+                raised = str(e)
+        assert "wire_vanilla" in raised, \
+            f"{label}: expected a loud cross-mode KeyError naming the knob, got {raised!r}"
+
+
+def test_vanilla_forward_decode_and_permutation_still_work():
+    """The mode switch must not disturb anything the rotation is wired into: a forward
+    that changes the logits, a generate that produces tokens and disarms, and the
+    permutation threading used by the eval-time equivariance sweep."""
+    llm = _gemma4()
+    if llm is None:
+        return _skip("gemma4 unavailable")
+    from prism.models.utils import Permutation
+
+    w = _vanilla(llm, vanilla_omega_init="uniform", omega_seed=5)
+    ids = torch.randint(0, 64, (1, 8))
+    g, inj = _tiny_graph(3), {0: [(2, 3)], 1: [(4, 5)], 2: [(6, 7)]}
+
+    with torch.no_grad():
+        out = w(input_ids=ids, graphs=[g], injection_maps=[inj]).logits
+        stock = w.llm(input_ids=ids).logits
+    assert torch.isfinite(out).all()
+    assert (out - stock).abs().max().item() > 1e-5, "vanilla forward is inert"
+    assert w._wire_signal is None, "signal not disarmed after forward"
+
+    with torch.no_grad():
+        o = w.generate_with_graph(input_ids=ids, graphs=[g], injection_maps=[inj],
+                                  max_new_tokens=3, do_sample=False)
+    assert o.shape[1] > ids.shape[1], "vanilla generate produced no tokens"
+    assert w._wire_signal is None and not w._wire_decode_cos_sin, \
+        "generate left the signal or the decode-angle cache armed"
+
+    # Permutation takes the seed only; num_nodes is an `apply` argument (models/utils.py:19).
+    perm = Permutation(seed=0)
+    r0 = w.build_wire_signal([g], [inj], 8, torch.device("cpu"))
+    r1 = w.build_wire_signal([g], [inj], 8, torch.device("cpu"), permutation=perm)
+    assert torch.isfinite(r1).all() and r0.shape == r1.shape
 
 
 if __name__ == "__main__":

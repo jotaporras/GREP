@@ -3,18 +3,30 @@
 ``LearnableGraphMaskLLM`` adds a *learned* additive bias on the attention logits at
 node-token positions::
 
-    M[i,j] = alpha + (1-alpha)*sim(Psi_i, Psi_j)   adjacent / self-loop
-    M[i,j] = finfo.min                              non-adjacent (hard block)
+    M[i,j] = log(alpha + (1-alpha)*sim(Psi_i, Psi_j))   adjacent / self-loop
+    M[i,j] = finfo.min                                   non-adjacent (hard block)
 
 where ``Psi = pe_model(graph)`` and the N×N form is the outer product ``Psi Psi^T``.
+
+The ``log`` makes the bias a MULTIPLICATIVE (Hadamard) gate on the post-softmax attention
+weights, which is the documented design (see ``LearnableGraphMaskLLM`` and
+``MaskDecodeInjector``). Consequences the assertions below rely on: the allowed range is
+``[log(2*alpha-1), 0]``, not ``[2*alpha-1, 1]``; and a cosine self-loop scores
+``log(1) = 0``, i.e. numerically indistinguishable from an untouched non-node pair — so
+"is this pair blocked?" must be tested as ``> NEG/2``, never as ``!= 0``.
+
 These tests assert the mask math directly (hard block, scaling bound, no fully-masked
 row, differentiability w.r.t. the PE), the dense-only layer routing (flag AND behavior),
-and — critically — the REAL SDPA path with a padded batch (the eager/CPU path cannot
-surface the boolean-mask bug). A tiny **stub PE** (Linear over per-node features) isolates
-the mask math from the real GraphTransformer; it is graph-size independent and differentiable.
+the ``--permutation-seed`` acceptance check (the permutation must reach BOTH Psi and the
+adjacency, and must not be inert), and — critically — the REAL SDPA path with a padded
+batch (the eager/CPU path cannot surface the boolean-mask bug). A tiny **stub PE** (Linear
+over per-node features) isolates the mask math from the real GraphTransformer; the
+permutation tests instead use the real GT (probes pinned) because only a topology-dependent
+Psi can observe a relabelling at all.
 
 Runs on GPU when available (the SDPA path is the realistic one); falls back to CPU.
 """
+import math
 import sys
 sys.path.insert(0, "src")
 
@@ -87,7 +99,7 @@ def _mask(wrap, seq, graphs, imap):
 
 def test_hard_block_nonadjacent_and_learned_allowed():
     """node2 isolated; node0–node1 share an edge. Non-adjacent node pairs are finfo.min;
-    adjacent pairs carry the learned value α+(1-α)·sim (finite, nonzero); node↔non-node
+    adjacent pairs carry the learned value log(α+(1-α)·sim) (finite, nonzero); node↔non-node
     and non-node rows stay 0."""
     wrap = _wrap()
     seq = 8
@@ -97,25 +109,35 @@ def test_hard_block_nonadjacent_and_learned_allowed():
 
     assert bias[5, 1] == NEG and bias[5, 3] == NEG       # node2 -> node0/node1: no edge
     assert torch.isfinite(bias[3, 1]) and bias[3, 1] != NEG and bias[3, 1] != 0  # edge: learned
-    assert torch.isclose(bias[1, 1], torch.tensor(1.0))  # cosine self-sim = 1
-    assert torch.isclose(bias[5, 5], torch.tensor(1.0))
+    # cosine self-sim = 1 -> gate = 1 -> log-gate = 0 (an unbiased, fully-visible pair)
+    assert torch.isclose(bias[1, 1], torch.tensor(0.0), atol=1e-6)
+    assert torch.isclose(bias[5, 5], torch.tensor(0.0), atol=1e-6)
     assert bias[5, 0] == 0                                # node -> BOS (non-node): untouched
     assert torch.all(bias[7] == 0)                       # non-node row
 
 
 def test_cosine_bound_and_self_similarity():
-    """psi_scale='cosine' -> every allowed entry in [2α-1, 1]; diagonal (self-loop) = 1."""
+    """psi_scale='cosine' -> every allowed entry in [log(2α-1), 0]; diagonal (self-loop) = 0.
+
+    sim ∈ [-1, 1] ⇒ gate = α+(1-α)·sim ∈ [2α-1, 1] ⇒ log-gate ∈ [log(2α-1), 0].
+    """
     alpha = 0.7
     wrap = _wrap(alpha=alpha, psi_scale="cosine")
     seq = 8
     imap = [{0: [(1, 2)], 1: [(3, 4)], 2: [(5, 6)]}]
     g = _graph(3, edges=[(0, 1), (1, 2)])
     bias = _mask(wrap, seq, [g], imap)
-    allowed = bias[bias > NEG / 2]
-    allowed = allowed[allowed != 0]
-    assert allowed.min() >= (2 * alpha - 1) - 1e-4 and allowed.max() <= 1.0 + 1e-4
+    # Node-token positions only: a non-node entry is 0, and so is a self-loop log-gate,
+    # so the two cannot be separated by value — select by position instead.
+    node_pos = torch.tensor([1, 3, 5])
+    allowed = bias[node_pos][:, node_pos]
+    allowed = allowed[allowed > NEG / 2]
+    lo = math.log(2 * alpha - 1)
+    # Path 0-1-2 at k_hops=1: 3 self-loops + 2 edges x2 directions allowed; (0,2)/(2,0) blocked.
+    assert allowed.numel() == 7, allowed.numel()
+    assert allowed.min() >= lo - 1e-4 and allowed.max() <= 0.0 + 1e-4
     for p in (1, 3, 5):
-        assert torch.isclose(bias[p, p], torch.tensor(1.0))
+        assert torch.isclose(bias[p, p], torch.tensor(0.0), atol=1e-6)
 
 
 def test_mask_is_differentiable_wrt_pe():
@@ -125,7 +147,10 @@ def test_mask_is_differentiable_wrt_pe():
     imap = [{0: [(1, 2)], 1: [(3, 4)], 2: [(5, 6)]}]
     g = _graph(3, edges=[(0, 1), (1, 2)])
     bias = _mask(wrap, seq, [g], imap)
-    bias[bias > 0.1].sum().backward()   # .cpu() in _mask is differentiable
+    # Allowed log-gate entries are <= 0, so a positive threshold would select the EMPTY
+    # set and back-propagate an all-zero gradient without failing. Select the same way the
+    # inv_sqrt_d sibling test does: finite (not hard-blocked) and not an untouched pair.
+    bias[(bias > NEG / 2) & (bias != 0)].sum().backward()   # .cpu() in _mask is differentiable
     w = wrap.pe_model.lin.weight
     assert w.grad is not None and w.grad.abs().sum() > 0
 
@@ -143,14 +168,15 @@ def test_inv_sqrt_d_differentiable_and_finite():
 
 
 def test_no_node_row_is_fully_masked():
-    """Every node-token row keeps its diagonal (self-loop = 1.0) and BOS (= 0)."""
+    """Every node-token row keeps its diagonal (self-loop log-gate = 0.0) and BOS (= 0)."""
     wrap = _wrap()
     seq = 8
     imap = [{0: [(1, 2)], 1: [(3, 4)], 2: [(5, 6)]}]
     g = _graph(3, edges=[])  # no edges
     bias = _mask(wrap, seq, [g], imap)
     for p in (1, 3, 5):
-        assert torch.isclose(bias[p, p], torch.tensor(1.0))  # self-loop
+        assert bias[p, p] > NEG / 2                           # self-loop is never blocked
+        assert torch.isclose(bias[p, p], torch.tensor(0.0), atol=1e-6)
         assert bias[p, 0] == 0                                # BOS
     assert bias[3, 1] == NEG and bias[5, 3] == NEG
 
@@ -372,6 +398,99 @@ def test_gradient_debug_callback_handles_learnable_mask():
         log_history = []
         global_step = 1
     cb.on_log(None, _State(), None, model=model)          # must not raise (no pe_gain access)
+
+
+# ---------------------------------------------------------------------------
+# --permutation-seed (eval-time node relabelling) — ACCEPTANCE TEST
+#
+# This is the check that would have caught the silent no-op: before the fix
+# `build_structural_mask` took no `permutation` argument at all, so the whole
+# transferability sweep reported permuted numbers for an unpermuted graph.
+# ---------------------------------------------------------------------------
+
+def _real_gt_wrap(d=16):
+    """A mask model whose Ψ is the REAL GraphTransformer, with the R-PEARL probes pinned
+    (fixed_seed_mode) so Ψ is a deterministic function of the TOPOLOGY — the only way a
+    permutation can be observed at all."""
+    torch.manual_seed(0)
+    from prism.models import gt as gt_module
+    gt = gt_module.GraphTransformer(
+        num_layers=2, pe_hidden_channels=8, pe_num_layers=2, d_model=d, heads=2,
+        num_samples=8, dropout=0.0, k_pe=2, k_gt=1, node_feature_dim=None,
+        fixed_seed_mode=True, fixed_seed_value=11)
+    return LearnableGraphMaskLLM(_tiny_llm(), gt, layer_scope="all").eval()
+
+
+def test_permutation_moves_both_mask_factors():
+    """The mask is A ⊙ log-gate(ΨΨᵀ). BOTH factors must be computed on the relabelled
+    graph: permuting one and not the other is not a permutation of anything."""
+    from prism.models.utils import Permutation
+    wrap = _real_gt_wrap()
+    g = _graph(6, edges=[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)])
+    perm = Permutation(seed=3)
+    with torch.no_grad():
+        psi_0, psi_p = wrap.pe_model(g), wrap.pe_model(g, permutation=perm)
+    assert not torch.allclose(psi_0, psi_p), "permutation did not reach the Ψ producer"
+    a_0 = wrap._node_adjacency(g, DEVICE)
+    a_p = wrap._node_adjacency(g, DEVICE, permutation=perm)
+    assert not torch.equal(a_0, a_p), "permutation did not reach the adjacency A"
+
+
+def test_permutation_seed_is_not_inert_for_the_mask():
+    """FAIL-LOUD guard: a permuted mask must differ from the unpermuted one.
+
+    Passing this vacuously (identical masks) is exactly the pre-fix behaviour, in which
+    `--permutation-seed` changed nothing while the sweep reported it as applied.
+    """
+    from prism.models.utils import Permutation
+    wrap = _real_gt_wrap()
+    seq = 14
+    g = _graph(6, edges=[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)])
+    imap = [{i: [(2 * i + 1, 2 * i + 2)] for i in range(6)}]
+    with torch.no_grad():
+        base = _mask(wrap, seq, [g], imap)
+        permuted = wrap.build_structural_mask(
+            seq, [g], imap, DEVICE, dtype=torch.float32,
+            permutation=Permutation(seed=3))[0, 0].cpu()
+    assert not torch.allclose(base, permuted), \
+        "--permutation-seed is INERT for learnable_graph_mask (silent no-op)"
+
+
+def test_permutation_equals_an_explicitly_relabelled_graph():
+    """Where the theory says it must hold: permuting INSIDE build_structural_mask is
+    identical to relabelling edge_index up front and permuting nothing. That pins the
+    convention (Ψ and A relabelled together, node→token wiring untouched) and rules out a
+    fix that merely perturbs the mask."""
+    from prism.models.utils import Permutation
+    wrap = _real_gt_wrap()
+    seq = 14
+    edges = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)]
+    g = _graph(6, edges=edges)
+    imap = [{i: [(2 * i + 1, 2 * i + 2)] for i in range(6)}]
+    perm = Permutation(seed=3)
+    with torch.no_grad():
+        permuted = wrap.build_structural_mask(
+            seq, [g], imap, DEVICE, dtype=torch.float32, permutation=perm)[0, 0].cpu()
+        g2 = Data(x=g.x, num_nodes=6,
+                  edge_index=perm.apply(g.edge_index, 6, device=DEVICE))
+        g2.node_names = g.node_names
+        manual = _mask(wrap, seq, [g2], imap)
+    assert torch.allclose(permuted, manual, atol=1e-5), \
+        (permuted - manual).abs().max().item()
+
+
+def test_no_permutation_is_byte_identical_to_before():
+    """permutation=None must leave the mask exactly as the default call produces it —
+    the training path must not move."""
+    wrap = _real_gt_wrap()
+    seq = 14
+    g = _graph(6, edges=[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)])
+    imap = [{i: [(2 * i + 1, 2 * i + 2)] for i in range(6)}]
+    with torch.no_grad():
+        a = _mask(wrap, seq, [g], imap)
+        b = wrap.build_structural_mask(seq, [g], imap, DEVICE, dtype=torch.float32,
+                                       permutation=None)[0, 0].cpu()
+    assert torch.equal(a, b)
 
 
 if __name__ == "__main__":

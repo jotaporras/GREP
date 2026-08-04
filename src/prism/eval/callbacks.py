@@ -244,6 +244,14 @@ class GradientDebugCallback(TrainerCallback):
             # has no inner pe_model — guard so the debug callback doesn't crash.
             if hasattr(inner.pe_model, "pe_model"):
                 self._captured_grad_norms["rpearl"] = self._grad_norm(inner.pe_model.pe_model.parameters())
+        elif hasattr(inner.pe_model, "semantic_gt"):
+            # TwoStagePE (legacy): two stacked GTs. Reported SEPARATELY because the aggregate
+            # "gnn" norm hides the failure that matters here — one half (usually the
+            # probe PE GT, behind the head) receiving no gradient at all.
+            self._captured_grad_norms["nav_pe_gt"] = self._grad_norm(
+                inner.pe_model.pe_gt.parameters())
+            self._captured_grad_norms["nav_semantic_gt"] = self._grad_norm(
+                inner.pe_model.semantic_gt.parameters())
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
         if model is not None and self._supported(self._unwrap_peft(model)):
@@ -281,6 +289,9 @@ class GradientDebugCallback(TrainerCallback):
             metrics["debug/grad_norm_gt_blocks"] = g.get("gt_blocks", 0.0)
             if hasattr(inner.pe_model, "pe_model"):  # inner R-PEARL
                 metrics["debug/grad_norm_rpearl"] = g.get("rpearl", 0.0)
+        elif hasattr(inner.pe_model, "semantic_gt"):  # TwoStagePE (PE GT + Semantic GT)
+            metrics["debug/grad_norm_nav_pe_gt"] = g.get("nav_pe_gt", 0.0)
+            metrics["debug/grad_norm_nav_semantic_gt"] = g.get("nav_semantic_gt", 0.0)
         # wire_llm: raw vs effective sigma, the realised angle, and whether the clamp
         # engaged. Logged (not just warned) because a clamped sigma keeps growing with
         # NO effect on the model — the parameter silently stops meaning anything while

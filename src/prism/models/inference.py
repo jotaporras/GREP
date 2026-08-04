@@ -209,13 +209,6 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
             )
             return outputs[:, input_ids.shape[-1]:]
 
-        # Compute base embeddings once (plain X — Ψ is injected inside attention).
-        embeddings = (
-            graph_model.llm.get_input_embeddings()(input_ids)
-            .clone()
-            .to(input_ids.device)
-        )
-
         pyg_graph = pyg_graphs[-1]
         input_ids_list = input_ids[0].tolist()
         # Standalone + space-preceded tokenizations per node (100% injection).
@@ -228,15 +221,25 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
         injection_map = build_injection_map(input_ids_list, node_token_seqs, scope_start=scope_start)
 
         if isinstance(graph_model, WireGraphLLM):
-            # WIRE rotates BOTH q and k, but the KV cache is written before the
-            # attention hook runs, so cached keys carry no graph rotation. Generation
-            # is therefore not wired (see WireGraphLLM.generate_with_graph). Fail here
-            # with the reason rather than falling through to the additive branch, which
-            # would silently run the model with the graph channel absent at decode.
-            raise NotImplementedError(
-                "WireGraphLLM is not wired for SPINE generation: decode-time key "
-                "re-rotation is unimplemented, so cached keys would carry no graph "
-                "phase. Train/score-only for now; see gnn_llm._wire_attention_forward.")
+            # WIRE: the signal is armed over the prompt and stays armed for the whole
+            # rollout; the attention hook re-rotates the cached prompt keys each step and
+            # leaves generated positions at r=0 (prompt-only decode, same as the additive
+            # and mask branches below). generate_with_graph also disarms in a finally, so
+            # a stale signal can never leak into the next sample.
+            if self.injection_scope == "decode_consistent":
+                raise NotImplementedError(
+                    "injection_scope='decode_consistent' is not wired for WireGraphLLM: "
+                    "extending the graph channel to GENERATED node mentions needs the "
+                    "mask family's q/kv split (MaskDecodeInjector), which has no rotation "
+                    "analogue. Evaluate this checkpoint with a prompt-only scope, or "
+                    "retrain with data.injection_scope='prompt_only'.")
+            outputs = graph_model.generate_with_graph(
+                input_ids=input_ids, graphs=[pyg_graph], injection_maps=[injection_map],
+                permutation=self.permutation, attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens, **DECODE_KWARGS,
+                pad_token_id=self.tokenizer.eos_token_id,
+            )
+            return outputs[:, input_ids.shape[-1]:]
         if isinstance(graph_model, (GraphMaskLLM, LearnableGraphMaskLLM)):
             # Build and arm [1, 1, seq, seq] additive (adjacency or learned-relative-PE) bias;
             # both classes share build_structural_mask + _struct_bias; cleared in finally.
@@ -245,8 +248,12 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
             # attached across samples.
             hook_handle = None
             try:
+                # `permutation` reaches BOTH the Ψ producer and the adjacency inside
+                # build_structural_mask, so --permutation-seed actually relabels the graph
+                # the mask is computed on (it was silently ignored here before).
                 graph_model._struct_bias = graph_model.build_structural_mask(
-                    input_ids.shape[1], [pyg_graph], [injection_map], input_ids.device)
+                    input_ids.shape[1], [pyg_graph], [injection_map], input_ids.device,
+                    permutation=self.permutation)
                 # decode_consistent checkpoints extend the channel to generated
                 # mentions: a forward pre-hook arms a per-step bias row (span-end
                 # assignment, design note §2.2). Other scopes keep the historical
@@ -254,7 +261,8 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
                 if self.injection_scope == "decode_consistent":
                     injector = MaskDecodeInjector(
                         graph_model, pyg_graph, injection_map,
-                        input_ids.shape[1], node_token_seqs)
+                        input_ids.shape[1], node_token_seqs,
+                        permutation=self.permutation)
                     hook_handle = graph_model.llm.register_forward_pre_hook(
                         injector.pre_hook, with_kwargs=True)
                 outputs = graph_model.llm.generate(
@@ -271,6 +279,14 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
 
         # Base R-PEARL: build_pe_signal places Ψ at scoped node spans (tanh gate);
         # attention layers add it post-RoPE. Injection skips cached decode steps; disarmed in finally.
+        # Base embeddings (plain X — Ψ is injected inside attention). Built HERE, not above
+        # the branches: the WIRE and mask paths never read them, and an unconditional
+        # [1, seq, hidden] clone of the embedding table is real memory on every eval sample.
+        embeddings = (
+            graph_model.llm.get_input_embeddings()(input_ids)
+            .clone()
+            .to(input_ids.device)
+        )
         psi = graph_model.build_pe_signal(
             embeddings, [pyg_graph], [injection_map], permutation=self.permutation)
         graph_model._pe_signal = psi

@@ -23,6 +23,7 @@ from torch_geometric.data import Data
 
 from prism.models.gnn_llm import (
     MASK_LAYER_SCOPES,
+    WIRE_DECODE_LEGACY,
     WIRE_DECODE_MODES,
     WireGraphLLM,
     _wire_resolve_orig_attn_fn,
@@ -62,7 +63,11 @@ def _gt(d_model=16, seed=1):
 
 
 def _wrap(llm=None, d_model=16, **kw):
+    # vanilla=False by default: this module's assertions are about the EXPECTATION arm
+    # (eps buffers + learnable sigma). The vanilla path is covered in
+    # test_wire_injection.py, which also asserts the class default is vanilla=True.
     kw.setdefault("pe_gain_init", 1.0)
+    kw.setdefault("vanilla", False)
     return WireGraphLLM(llm or _gemma4(), _gt(d_model), d_model=d_model, **kw).eval()
 
 
@@ -250,9 +255,15 @@ def test_config_switch_matrix():
         "PASS" if (sig_ok and same_eps and diff_eps) else "FAIL")
     assert sig_ok and same_eps and diff_eps
 
-    # --- wire_decode: both values --------------------------------------------
-    for mode in WIRE_DECODE_MODES:
-        w = _wrap(decode=mode)
+    # --- wire_decode: every accepted value generates --------------------------
+    # Both live modes decode ('rotate' re-rotates the cached prompt keys, 'skip' runs
+    # WIRE off at decode), and the LEGACY 'error' — recorded by checkpoints written
+    # before the rotation existed — must normalise to 'rotate' rather than raise.
+    for mode in WIRE_DECODE_MODES + tuple(WIRE_DECODE_LEGACY):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            w = _wrap(decode=mode)
+        expected = WIRE_DECODE_LEGACY.get(mode, mode)
         err = ""
         gen_ok = False
         try:
@@ -262,14 +273,11 @@ def test_config_switch_matrix():
                                           do_sample=False)
             gen_ok = o.shape[1] > IDS.shape[1]
         except NotImplementedError as e:
-            err = str(e)[:40]
-        if mode == "error":
-            ok = bool(err)
-            meas = f"raised NotImplementedError: {err}"
-        else:
-            ok = gen_ok
-            meas = f"generated ok, out_len={o.shape[1] if gen_ok else 'n/a'}"
-        rec(f"wire_decode={mode}", "cached decode behaviour", meas,
+            err = str(e)[:60]
+        ok = gen_ok and w._wire_decode == expected
+        meas = (f"resolved={w._wire_decode!r} generated ok, out_len={o.shape[1]}"
+                if gen_ok else f"raised: {err}")
+        rec(f"wire_decode={mode}", f"cached decode behaviour (-> {expected})", meas,
             "PASS" if ok else "FAIL")
         assert ok
 

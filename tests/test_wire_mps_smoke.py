@@ -197,7 +197,16 @@ def _gnn_cfg(**overrides):
     gnn = cfg.gnn
     gnn.arch = "wire_llm"
     # Only the Ψ-producer width is shrunk (1024 -> 128) to keep the GT cheap; every
-    # wire_* switch keeps its shipped value unless a test overrides it.
+    # wire_* switch keeps its shipped value unless a test overrides it — EXCEPT
+    # wire_vanilla_omega_init. The shipped default ("zero") sets ω = 0, so θ = 0 and the
+    # rotation is EXACTLY the identity at step 0 (by design — ω learns away from it).
+    # That is the right default to ship, but it makes every row here vacuous: a smoke
+    # test cannot tell "wired correctly" from "not wired at all" when the channel is
+    # provably a no-op. "uniform" is the reference implementation's other init, so the
+    # rotation is live and the plumbing is genuinely exercised. The zero-init identity
+    # property is pinned separately by
+    # test_wire_injection.py::test_vanilla_zero_init_is_exact_identity_but_still_trainable.
+    gnn.wire_vanilla_omega_init = "uniform"
     gnn.d_model = 128
     gnn.pe_hidden_channels = 64
     gnn.num_samples = 8
@@ -423,11 +432,19 @@ def _grad_report(model):
 
     pe = [m(p) for p in model.pe_model.parameters()]
     pe = [x for x in pe if x is not None]
-    sigmas = {int(k): m(p) for k, p in model._wire_sigma.items()}
-    eps_grad = {i: getattr(model._wire_eps, str(i)).grad
-                for i in model.active_layer_indices()}
-    eps_rg = {i: getattr(model._wire_eps, str(i)).requires_grad
-              for i in model.active_layer_indices()}
+    # The trainable frequency store is mode-dependent: vanilla learns ω directly
+    # (_wire_omega, with _wire_eps/_wire_sigma empty), the expectation arm learns σ with
+    # ε frozen. Report whichever store this model actually trains under "sigma" so the
+    # downstream "frequencies receive gradient" check stays meaningful in both modes
+    # rather than going vacuously true over an empty dict.
+    freq_store = model._wire_omega if model._wire_vanilla else model._wire_sigma
+    sigmas = {int(k): m(p) for k, p in freq_store.items()}
+    # Iterate the buffers that EXIST rather than the active layer indices: in vanilla
+    # mode there is no ε at all, so the ε-gets-nothing invariant is trivially true
+    # (nothing to receive anything) instead of an AttributeError.
+    eps_names = [n for n, _ in model._wire_eps.named_buffers()]
+    eps_grad = {n: getattr(model._wire_eps, n).grad for n in eps_names}
+    eps_rg = {n: getattr(model._wire_eps, n).requires_grad for n in eps_names}
     all_finite = all(torch.isfinite(p.grad).all()
                      for p in model.parameters() if p.grad is not None)
     return {
@@ -559,12 +576,13 @@ def test_config_sides(label, over):
     assert active == _EXPECT_ACTIVE[scope], f"{scope}: active {active}"
     assert active == model.active_layer_indices() or scope == "all"
 
-    # rotate_nope widens ONLY the global layers' eps tables.
-    planes = {i: getattr(model._wire_eps, str(i)).shape[0]
-              for i in model.active_layer_indices()}
-    frozen = [p.requires_grad for p in model._wire_sigma.values()]
+    # rotate_nope widens ONLY the global layers' frequency tables. Read the store this
+    # mode populates — [P, m] either way, so the plane count is the same measurement.
+    freq_store = model._wire_omega if model._wire_vanilla else model._wire_sigma
+    planes = {i: model.layer_omega(i).shape[0] for i in model.active_layer_indices()}
+    frozen = [p.requires_grad for p in freq_store.values()]
     in_group = {id(p) for p in model.structural_parameters()}
-    sigma_in_group = [id(p) in in_group for p in model._wire_sigma.values()]
+    sigma_in_group = [id(p) in in_group for p in freq_store.values()]
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")

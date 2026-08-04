@@ -319,6 +319,54 @@ if __name__ == "__main__":
     sys.exit(1 if failed else 0)
 
 
+def _wire_ckpt_dir(tag, **gnn_over):
+    """A wire_llm-shaped checkpoint dir: train_config.json with a "gnn" block, which is
+    what `_is_gnn_checkpoint` keys on."""
+    d = _ckpt_dir(tag)
+    with open(os.path.join(d, "train_config.json"), "w") as f:
+        json.dump({"architecture": "wire_llm", "text_edge_list": "none",
+                   "injection_scope": "prompt_only", "edge_weights": "binary",
+                   "gnn": {"arch": "wire_llm", "wire_decode": "rotate", **gnn_over}}, f)
+    return d
+
+
+def test_main_routes_wire_checkpoint_as_graph_augmented_no_seed():
+    """A wire_llm checkpoint must take the GRAPH-AUGMENTED path in cross_eval mode and
+    write the cross_eval JSON, with its recorded train-time policy plumbed through.
+
+    Labelling it "llm" would silently score WIRE with the graph channel absent.
+    """
+    ckpt = _wire_ckpt_dir("wire_noseed")
+    rec = _Recorder(["g1"])
+    _run_main(["--checkpoint", ckpt, "--graphs", "/data/g.json", "--use-icl", "false"], rec)
+
+    out = os.path.join(ckpt, "eval_logs", "cross_eval", "g1.json")
+    assert os.path.exists(out), f"cross_eval output missing for wire_llm: {out}"
+    log = json.load(open(out))
+    assert log["architecture"] == "graph-augmented", (
+        f"wire_llm routed as {log['architecture']!r} — the graph channel would be absent")
+    assert log["text_edge_list"] == "none"
+    assert rec.calls[0]["edge_weights"] == "binary"
+    assert rec.calls[0]["injection_scope"] == "prompt_only"
+    assert rec.calls[0]["include_edge_list"] is False
+
+
+def test_main_routes_wire_checkpoint_with_permutation_seeds():
+    """The transferability mode: a wire_llm checkpoint must get one Permutation per seed
+    and one perm_<seed> dir + summary each — the mode the scalability sweep runs."""
+    ckpt = _wire_ckpt_dir("wire_seeded")
+    ckpt_name = os.path.basename(os.path.abspath(ckpt.rstrip("/")))
+    out = _out_dir("wire_seeded")
+    rec = _Recorder(["g1"])
+    _run_main(["--checkpoint", ckpt, "--graphs", "/data/g.json",
+               "--permutation-seed", "3", "11", "--output", out], rec)
+
+    for seed in (3, 11):
+        assert os.path.exists(os.path.join(out, f"perm_{seed}", f"{ckpt_name}_summary.json"))
+    assert [c["permutation_seed"] for c in rec.calls] == [3, 11]
+    assert all(c["permutation_is_none"] is False for c in rec.calls)
+
+
 def test_main_resolves_decode_consistent_from_train_config():
     """A checkpoint whose train_config.json records injection_scope=decode_consistent
     must thread that exact value into eval_model_multiple_graphs (the eval client

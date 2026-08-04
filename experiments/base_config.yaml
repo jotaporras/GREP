@@ -62,11 +62,18 @@ gnn:
   gt_heads: 8
   k_gt: 2
 
-  # learnable_graph_mask navigator mode: use the notebook (e9_gnn_navigation.ipynb) pretrained
-  # PE GT + Semantic GT (AGT), composed as NavigatorPE (Ψ = SemanticGT(PE_GT(graph)), seed 0),
-  # as the mask's Ψ producer. Both are plain state_dict .pt files (path_navigator_gt.pt /
-  # path_navigator_agt.pt). Set together for navigator mode; set pe_gt_from ALONE (semantic_gt_from
-  # null) for a GT-only Ψ producer (standalone GraphTransformer, Ψ = GT(graph), no AGT).
+  # Navigator PE (arch=learnable_graph_mask OR arch=wire_llm — both consume a bare Ψ
+  # producer). Ψ is the notebook (e9_gnn_navigation.ipynb) pretrained PE GT ALONE, i.e.
+  # gt.NavigatorPE's stage: Ψ = PE_GT(graph). The Semantic GT is the AGT head and belongs
+  # to gt.NavigatorGT (the autoregressive navigator), NOT to Ψ.
+  #   pe_gt_from      -> path_navigator_gt.pt, a plain state_dict poured into the
+  #                      standalone GraphTransformer gt.build_psi_producer returns.
+  #                      This is the ONLY knob a current run should set.
+  #   semantic_gt_from-> LEGACY. Setting it (together with pe_gt_from) selects
+  #                      gt.TwoStagePE, the pre-split producer Ψ = SemanticGT(PE_GT(graph)),
+  #                      and exists ONLY so checkpoints trained that way (the e13
+  #                      navigator arms) reload as the function they were trained as.
+  #                      Leave null for new runs.
   pe_gt_from: null
   semantic_gt_from: null
 
@@ -94,6 +101,35 @@ gnn:
   # Psi-distance; the effective-resistance reading of WIRE Theorem 3 additionally needs
   # Psi = [u_k/sqrt(lambda_k)], which the mean-pooled GT readout does NOT provide.
   wire_layer_scope: dense      # "all" | "dense" | "dense_top_half" | "dense_first" (as mask_layer_scope)
+  # THE MODE SWITCH. true (DEFAULT) = strictly the paper's algorithm: omega is ONE
+  # LEARNABLE [P, m] table per layer and nothing else. Section 3.3: "In practice, one does
+  # not sample and average over an ensemble of random WIRE transformations, but instead
+  # takes one learnable instantiation." No eps, no sigma, no Monte-Carlo framing — the
+  # expectation those exist to serve is never taken. The sin term of Eq. 8 is retained
+  # (dropping it is an expectation-motivated approximation and appears NOWHERE in the
+  # paper or its reference implementation; it also destroys orthogonality and Eq. 3).
+  # false = the expectation arm: omega = sigma_l * eps_l with eps ~ N(0, I) frozen and a
+  # learnable per-layer scalar sigma, plus the Theorem-3 telemetry. Unchanged from before
+  # this switch existed, and still the arm to use for a literal-Theorem-3 A/B.
+  # Frequencies are shared across heads in BOTH modes: 3.1 lists head sharing explicitly
+  # ("one can share WIRE weights between layers or heads"), and it is the only
+  # granularity that keeps Eq. 3 exact under Gemma's GQA, where one key head serves
+  # several query heads and so q and k must rotate by identical frequencies.
+  # The ANGLE CLAMP (wire_max_angle) stays ACTIVE in vanilla mode — see there for why.
+  wire_vanilla: true
+  # omega init for wire_vanilla=true ONLY. These are the reference implementation's own
+  # cfg.gt.graphrope.init_omega values and its default:
+  #   zero        (DEFAULT) omega = 0 => theta = 0 => the rotation is EXACTLY the identity
+  #               at step 0 and omega learns away from it. Trainable at that point only
+  #               because the sin term is kept: d sin(theta)/d omega = r != 0 there.
+  #   uniform     torch's default nn.Linear init, U(-1/sqrt(m), 1/sqrt(m)).
+  #   exponential RoPE-style rand(P, m) / 10000^(2i/P). Reproduced verbatim including two
+  #               quirks of the source: the exponent denominator is P (twice standard
+  #               RoPE's decay rate) and the decay is constant along the spectral axis.
+  # wire_sigma_init is INERT when wire_vanilla=true; wire_omega_seed seeds the uniform /
+  # exponential draws and is inert for "zero".
+  wire_vanilla_omega_init: zero
+  # --- the following apply when wire_vanilla=false (the expectation arm) ---
   # Frequencies are reparameterised as omega = sigma_l * eps_l: eps is drawn ONCE from
   # N(0, I) (seeded below, frozen, checkpointed) and sigma_l is a LEARNABLE per-layer
   # scalar. So omega stays a genuine Gaussian sample (Theorem 3's hypothesis) while the
@@ -104,9 +140,12 @@ gnn:
   # global head_dim=512, 128 on sliding head_dim=256, or 64 global when
   # wire_rotate_nope_planes=false) — a real variance asymmetry across layers.
   # sigma_init: only sigma*||Psi_i - Psi_j|| matters, and it must START small. SCALE WITH
-  # 1/sqrt(d_model): the GT's output LayerNorm pins ||Psi_i|| ~ sqrt(d_model) (measured
-  # 8.9 @ d_model=64, 35.4 @ 1024, and FLAT in node count), so 0.01 puts the angle near
-  # 0.4 rad at d_model=1024. At d_model=2048/4096 divide by sqrt(2)/2 respectively.
+  # 1/sqrt(d_model): ||Psi_i|| is MEASURED at ~1.1*sqrt(d_model) (8.9 @ d_model=64, 35.4
+  # @ 1024, and FLAT in node count), so 0.01 puts the angle near 0.4 rad at d_model=1024.
+  # At d_model=2048/4096 divide by sqrt(2)/2 respectively. NOTE this scaling is EMPIRICAL,
+  # not structural: GraphTransformer builds its FINAL SparseTransformerBlock with
+  # normalize=False (gt.py:307 / :457), so there is NO output LayerNorm pinning ||Psi_i||
+  # and training may move it. wire_max_angle below is the actual guarantee.
   wire_sigma_init: 0.01
   wire_freeze_sigma: false     # true pins sigma = the literal-Theorem-3 A/B arm
   wire_omega_seed: 0           # seed for the frozen eps draw (eps itself is saved in gnn_weights.pt)
@@ -122,7 +161,15 @@ gnn:
   # saturation is otherwise invisible. (A previous wire_hard_max_angle that RAISED was
   # removed: no training run may be killed by the angle guard.)
   wire_max_angle: 1.0
-  wire_decode: error           # "error" = fail loud at cached decode (keys carry no graph phase) | "skip" = diagnostic only
+  # Decode policy at cached steps. "rotate" = the real path: the KV cache stores UNROTATED
+  # keys, so each step re-applies R(theta_j) to the PROMPT key slots (r is a function of
+  # position only, so this reconstructs exactly the keys prefill scored against) and leaves
+  # generated positions at r=0 — prompt-only decode, matching the additive/mask families.
+  # "skip" = WIRE OFF for every generated token, a labeled diagnostic, never a result.
+  # "error" is still accepted for checkpoints/configs written before decode existed; it is
+  # normalised to "rotate" with a DeprecationWarning. NOTE wire_layer_scope="all" cannot
+  # decode (sliding-window caches are cropped) and raises before generating.
+  wire_decode: rotate          # "rotate" | "skip"  (legacy: "error" -> "rotate")
 
   # Two-group LR: structural (GT/PE) params train at structural_lr_mult x base LR
   # (GraphSFTTrainer.create_optimizer). 1.0 = no boost.

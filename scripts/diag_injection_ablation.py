@@ -91,6 +91,11 @@ def parse_args():
 
 ADDITIVE_ARCHS = ("rpearl_llm", "rpearl_gt_llm", "gt_llm")
 MASK_ARCHS = ("graph_mask_llm", "learnable_graph_mask")
+# WIRE injects Psi as a q/k ROTATION, but it carries the same tanh(pe_gain) angle gate as
+# the additive archs, so gain_override=0.0 gives theta=0 -> exact identity rotation. That
+# makes the additive 3-condition set literally applicable; the two DECODE-realizable mask
+# conditions are not (rotation has no q/kv split -- see inference._generate_tokens).
+WIRE_ARCHS = ("wire_llm",)
 
 
 def build_conditions(arch, pyg_graph, full_map, prompt_map, answer_start,
@@ -101,7 +106,8 @@ def build_conditions(arch, pyg_graph, full_map, prompt_map, answer_start,
     (None = leave the trained parameter untouched). ``no_injection`` must be
     logit-identical to the stock LLM while keeping the same forward code path as
     the other conditions:
-    - additive archs: full map + gain_override=0.0 (Ψ·tanh(0)=0). An empty map
+    - additive archs AND wire_llm: full map + gain_override=0.0 (Ψ·tanh(0)=0, so the
+      WIRE rotation angle is 0 and the rotation is the identity). An empty map
       would break gt_llm's word_embeddings feature prep, which requires every
       node to have a mention span.
     - mask archs: empty map → all-zero structural bias (no gate parameter exists).
@@ -115,7 +121,7 @@ def build_conditions(arch, pyg_graph, full_map, prompt_map, answer_start,
       of the inter-mention tokens (direct "current location" bias at the decision).
     """
     graphs = Batch.from_data_list([pyg_graph])
-    if arch in ADDITIVE_ARCHS:
+    if arch in ADDITIVE_ARCHS + WIRE_ARCHS:
         return [
             ("train_style", graphs, [full_map], None, None),
             ("prompt_only", graphs, [prompt_map], None, None),
@@ -167,8 +173,12 @@ def main():
     # Prompt policy (SPINE tools / few-shot count) recovered from the checkpoint so the
     # diagnostic tokenizes the SAME text the model was trained on.
     spine_tools, icl_examples = ckpt_mod.resolve_prompt_policy(args.checkpoint)
+    # Same Psi INPUT the run trained on: a binary-trained checkpoint diagnosed with the
+    # gaussian default feeds the GT different edge weights than it ever saw.
+    edge_weights = ckpt_mod.resolve_edge_weights(args.checkpoint) if is_gnn else "gaussian"
     print(f"[diag] checkpoint={args.checkpoint}")
-    print(f"[diag] arch={arch} text_edge_list={text_edge_list} val_file={args.val_file}")
+    print(f"[diag] arch={arch} text_edge_list={text_edge_list} "
+          f"edge_weights={edge_weights} val_file={args.val_file}")
 
     model, tokenizer, _ = ckpt_mod.load_checkpoint(args.checkpoint, four_bit=args.four_bit, device=args.device)
     device = next(model.parameters()).device
@@ -209,7 +219,8 @@ def main():
         attention_mask = torch.ones_like(input_ids)
         answer_start = example["answer_start"]
 
-        pyg_graph = data_utils.scene_graph_dict_to_pyg(example["scene_graph_dict"])
+        pyg_graph = data_utils.scene_graph_dict_to_pyg(
+            example["scene_graph_dict"], edge_weights=edge_weights)
         node_token_seqs = gnn_llm.node_token_variants(pyg_graph.node_names, tokenizer)
         scope_start = gnn_llm.find_last_graph_scope(example["input_ids"], tokenizer)
         full_map = gnn_llm.build_injection_map(

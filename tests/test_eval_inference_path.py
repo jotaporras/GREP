@@ -273,6 +273,122 @@ def test_core_graph_model_unwraps_peft_shell():
     assert _core_graph_model(core) is core
 
 
+# ---------------------------------------------------------------------------
+# wire_llm: the ROTATION branch of _generate_tokens (cached-key re-rotation)
+# ---------------------------------------------------------------------------
+
+def _wire_model(llm):
+    """`wire_llm`: a GraphTransformer Ψ producer feeding WireGraphLLM. Ψ enters as a
+    ROTATION of q/k inside attention, so this is its own dispatch branch in
+    _generate_tokens — the one that used to raise NotImplementedError."""
+    from prism.models.gnn_llm import WireGraphLLM
+    pe = gt_module.GraphTransformer(
+        num_layers=2, pe_hidden_channels=16, pe_num_layers=2, d_model=_HID,
+        heads=4, num_samples=4, dropout=0.0, k_pe=3, k_gt=3, eps=1e-8,
+        use_layer_norm=True, node_feature_dim=None)
+    return WireGraphLLM(llm, pe, d_model=_HID, layer_scope="dense",
+                        sigma_init=0.05, max_angle=8.0)
+
+
+def test_wire_generate_tokens_real_forward():
+    """wire_llm through the REAL eval client: prefill arms the signal, every cached
+    decode step re-rotates the prompt keys, tokens come back, and both the signal and
+    the decode-angle cache are cleared afterwards.
+
+    This is the eval path `scalability_evaluation` drives; it previously raised
+    NotImplementedError here, turning every sample into an error record.
+    """
+    try:
+        tok = _tokenizer()
+        model = _wire_model(_tiny_gemma(tok.vocab_size))
+    except Exception as e:  # noqa: BLE001
+        return _skip(f"gemma4_unified/tokenizer unavailable: {e}")
+    model.eval()
+    client = _make_client(GraphAugmentedInMemoryLLM, model, tok)
+    pyg = data_utils.scene_graph_dict_to_pyg(_SCENE)
+    input_ids, attn = _prompt_ids(tok)
+
+    out = client._generate_tokens(input_ids, attn, [pyg], max_new_tokens=4)
+
+    assert isinstance(out, torch.Tensor) and out.dtype == torch.long
+    assert out.dim() == 2 and out.shape[0] == 1 and 0 < out.shape[1] <= 4
+    assert model._wire_signal is None, "_wire_signal must be disarmed after generate"
+    assert not model._wire_decode_cos_sin, "decode angle cache must be cleared"
+
+
+def _learnable_mask_model(llm):
+    """`learnable_graph_mask`: a GraphTransformer Ψ producer feeding the LEARNED mask.
+    Shares the `_struct_bias` dispatch branch with GraphMaskLLM, but the bias depends on
+    Ψ — which is why `--permutation-seed` has to reach it."""
+    from prism.models.gnn_llm import LearnableGraphMaskLLM
+    pe = gt_module.GraphTransformer(
+        num_layers=2, pe_hidden_channels=16, pe_num_layers=2, d_model=_HID,
+        heads=4, num_samples=4, dropout=0.0, k_pe=3, k_gt=3, eps=1e-8,
+        use_layer_norm=True, node_feature_dim=None)
+    return LearnableGraphMaskLLM(llm, pe, alpha=0.7, layer_scope="dense")
+
+
+def test_learnable_mask_client_threads_the_permutation():
+    """`--permutation-seed` must reach `build_structural_mask`.
+
+    REGRESSION GUARD: the client used to call build_structural_mask with no permutation
+    argument at all, so every permuted-transferability number for this architecture was
+    produced on the UNPERMUTED graph while the report said otherwise. The spy asserts the
+    exact object the client was constructed with arrives at the mask builder.
+    """
+    try:
+        tok = _tokenizer()
+        model = _learnable_mask_model(_tiny_gemma(tok.vocab_size))
+    except Exception as e:  # noqa: BLE001
+        return _skip(f"gemma4_unified/tokenizer unavailable: {e}")
+    model.eval()
+    from prism.models.utils import Permutation
+    perm = Permutation(seed=5)
+    client = _make_client(GraphAugmentedInMemoryLLM, model, tok, permutation=perm)
+    pyg = data_utils.scene_graph_dict_to_pyg(_SCENE)
+    input_ids, attn = _prompt_ids(tok)
+
+    seen = {}
+    real = model.build_structural_mask
+
+    def _spy(*a, **kw):
+        seen["permutation"] = kw.get("permutation", "ABSENT")
+        return real(*a, **kw)
+
+    model.build_structural_mask = _spy
+    try:
+        out = client._generate_tokens(input_ids, attn, [pyg], max_new_tokens=4)
+    finally:
+        del model.build_structural_mask
+    assert seen.get("permutation") is perm, \
+        f"client did not thread --permutation-seed into the mask: {seen!r}"
+    assert isinstance(out, torch.Tensor) and out.dtype == torch.long
+    assert model._struct_bias is None, "_struct_bias must be cleared after generate"
+
+
+def test_wire_decode_consistent_scope_is_rejected():
+    """`injection_scope='decode_consistent'` has no rotation analogue (it needs the mask
+    family's q/kv split). It must fail LOUDLY at the client rather than decode
+    prompt-only and silently disagree with how the checkpoint was trained."""
+    try:
+        tok = _tokenizer()
+        model = _wire_model(_tiny_gemma(tok.vocab_size))
+    except Exception as e:  # noqa: BLE001
+        return _skip(f"gemma4_unified/tokenizer unavailable: {e}")
+    model.eval()
+    client = _make_client(GraphAugmentedInMemoryLLM, model, tok,
+                          injection_scope="decode_consistent")
+    pyg = data_utils.scene_graph_dict_to_pyg(_SCENE)
+    input_ids, attn = _prompt_ids(tok)
+    raised = ""
+    try:
+        client._generate_tokens(input_ids, attn, [pyg], max_new_tokens=2)
+    except NotImplementedError as e:
+        raised = str(e)
+    assert "decode_consistent" in raised, \
+        f"expected a loud rejection naming the scope, got {raised!r}"
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
