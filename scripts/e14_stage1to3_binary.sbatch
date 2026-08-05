@@ -39,8 +39,11 @@
 #      untrained noise regardless. Psi therefore comes ONLY from gnn.pe_gt_from, and
 #      trainer.freeze_pe=false lets Stage 3 fine-tune it from the navigator init.
 #
-# eval.data is data/n_30/... (the path that exists in this repo); the e13f template's
-# data/revised/... is stale and no longer present.
+# The training corpus (data.train_files / data.val_files) and the generation-eval graphs
+# (eval.data) all derive from DATA_ROOT below, defaulting to data/n_30/... — the path that
+# exists in this repo. The e13f template's data/revised/... is stale and no longer present,
+# and base_config.yaml still defaults train_files/val_files to it, so those two MUST be
+# passed explicitly or the run dies at dataset load.
 #
 # WARNING — model.disable_graph_token_rope=true is set below but is INERT for this arch.
 # build_planner_model forwards it only to the three GraphAugmentedLLM variants
@@ -56,12 +59,14 @@
 #   RUN_NAME (arg 1) -> wandb.run_name AND trainer.save_name (checkpoint subdir)
 #   TAG      (arg 2) -> wandb.tag (run group)
 #
-# Paths are env-overridable: STAGE1_LORA (the stage-1 LoRA this run continues from)
-# and NAV_GT (the pretrained navigator GT). Both default to a specific prior run id,
-# so a rerun needs them pointed at the new one.
+# Paths are env-overridable: DATA_ROOT (the training corpus; TRAIN_FILES / VAL_FILES /
+# TEST_GRAPHS derive from it and are individually overridable too), STAGE1_LORA (the
+# stage-1 LoRA this run continues from) and NAV_GT (the pretrained navigator GT).
+# STAGE1_LORA and NAV_GT default to a specific prior run id, so a rerun needs them
+# pointed at the new one.
 #
 # Submit:  sbatch scripts/e14_stage1to3_binary.sbatch [RUN_NAME] [TAG]
-#   env  :  RUN_NAME=... TAG=... STAGE1_LORA=... NAV_GT=... \
+#   env  :  RUN_NAME=... TAG=... DATA_ROOT=... STAGE1_LORA=... NAV_GT=... \
 #             sbatch scripts/e14_stage1to3_binary.sbatch
 # Local :  bash   scripts/e14_stage1to3_binary.sbatch [RUN_NAME] [TAG]
 
@@ -77,7 +82,17 @@ NAV_GT=${NAV_GT:-$PROJ/outputs/e9_multistage_training/suite8/path_navigator_gt.p
 # rerun (or a different cluster) produces a different run id, so pinning it here
 # would make the script silently unusable rather than reconfigurable.
 STAGE1_LORA=${STAGE1_LORA:-$PROJ/outputs/e9_multistage_training/e9_ms_stage1/e9_ms_stage1_sqgk4o3j/checkpoint-100}
-TEST_GRAPHS=data/n_30/gen/nav100_n30_gemma_data/split/test_graphs
+# TRAINING DATA SOURCE. One root; train/val/test all derive from it, so switching
+# corpora cannot leave the generation eval pointing at a different corpus than the SFT.
+# This must be set explicitly: base_config.yaml:183-184 still defaults train_files/
+# val_files to data/revised/..., which does NOT exist in this repo — inheriting it makes
+# the run die at datasets.load_dataset. Only eval.data was ever repointed here.
+# Override the root for a different corpus (e.g. DATA_ROOT=data/n_100/gen/nav_n100_gemma_data/split),
+# or the individual files for a variant split (e.g. TRAIN_FILES=.../formatted_all_new_2turn__train.json).
+DATA_ROOT=${DATA_ROOT:-data/n_30/gen/nav100_n30_gemma_data/split}
+TRAIN_FILES=${TRAIN_FILES:-$DATA_ROOT/formatted_all_new__train.json}
+VAL_FILES=${VAL_FILES:-$DATA_ROOT/formatted_all_new__val.json}
+TEST_GRAPHS=${TEST_GRAPHS:-$DATA_ROOT/test_graphs}
 # Few-shot TRAINING: 2 = the SPINE_ICL_EXAMPLES pair, matching eval.use_icl=true on the
 # transferability side (base_config.yaml:207 asks for the two to agree, since ICL also
 # moves the scene graph out of the system message into the query turn — PE injection
@@ -126,6 +141,8 @@ srun python -m prism.training.train_v3 \
     gnn.pe_gt_from="$NAV_GT" \
     gnn.semantic_gt_from=null \
     gnn.structural_lr_mult=0.0012 \
+    data.train_files="$TRAIN_FILES" \
+    data.val_files="$VAL_FILES" \
     data.text_edge_list=none \
     data.injection_scope=decode_consistent \
     data.edge_weights=binary \
