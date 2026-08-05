@@ -34,8 +34,9 @@
 #   SAVE_PATH    pickled eval graphs      FIG_DIR     where figures are written
 #   DEVICE       cuda | mps | cpu         (default: auto-detect, cuda here)
 #   TRAIN_EDGES / TRAIN_DISTS / TRAIN_PATHS
-#                1 = train that stage (default), 0 = LOAD its checkpoint instead.
-#                Set the earlier stages to 0 to resume a partial run without redoing them.
+#                1 = train that stage, 0 = LOAD its checkpoint from $SUITE instead.
+#                DEFAULTS ARE 0/0/1: stages 1-2 are already checkpointed under suite9,
+#                so this resumes into stage 3 rather than repeating ~15h of work.
 #
 # Paths are repo-relative and anchored under $PROJ, matching the e13f/e14 convention: an
 # absolute override passes through untouched, a relative one resolves under the cluster
@@ -44,7 +45,7 @@
 # surfacing after the first training stage.
 #
 # Submit:  sbatch scripts/e9_gnn_navigation.sbatch
-#   env  :  SUITE=suite10 TRAIN_EDGES=0 TRAIN_DISTS=0 \
+#   env  :  SUITE=suite10 TRAIN_EDGES=1 TRAIN_DISTS=1 \  # retrain stages 1-2
 #             sbatch scripts/e9_gnn_navigation.sbatch
 # Local :  bash   scripts/e9_gnn_navigation.sbatch
 
@@ -79,8 +80,14 @@ export EVAL_PATH=${EVAL_PATH:-data/n_100/gen/nav_n100_gemma_data/test_graphs}
 export SAVE_PATH=${SAVE_PATH:-data/pickle/e6_eval_graphs.pkl}
 export FIG_DIR=${FIG_DIR:-results/e9_gnn_navigation/$SUITE}
 export DEVICE=${DEVICE:-cuda}
-export TRAIN_EDGES=${TRAIN_EDGES:-1}
-export TRAIN_DISTS=${TRAIN_DISTS:-1}
+# Stages 1 and 2 are DONE and checkpointed under $SUITE (edge_detector*.pt, spd_gnn*.pt),
+# so this run LOADS them and trains only stage 3 (path navigator) — the stage that has no
+# checkpoint yet. Set TRAIN_EDGES=1 / TRAIN_DISTS=1 to retrain them from scratch, which
+# costs the full ~15h again. NOTE the loads are strict: if the gnn.* topology in this
+# script ever stops matching what produced those files, load_state_dict raises rather than
+# silently dropping weights.
+export TRAIN_EDGES=${TRAIN_EDGES:-0}
+export TRAIN_DISTS=${TRAIN_DISTS:-0}
 export TRAIN_PATHS=${TRAIN_PATHS:-1}
 
 echo "[$(date --iso-8601=seconds)] e9_gnn_navigation  suite=$SUITE  device=$DEVICE"

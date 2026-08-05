@@ -783,8 +783,8 @@ if train_edges:
     torch.save(detector.state_dict(), f'{SUITE_DIR}/edge_detector.pt')
     torch.save(detector.gnn.state_dict(), f'{SUITE_DIR}/edge_detector_{model_type}.pt')
 else:
-    detector.load_state_dict(torch.load(f'{SUITE_DIR}/edge_detector.pt'))
-    gnn.load_state_dict(torch.load(f'{SUITE_DIR}/edge_detector_{model_type}.pt'))
+    detector.load_state_dict(torch.load(f'{SUITE_DIR}/edge_detector.pt', map_location=device))
+    gnn.load_state_dict(torch.load(f'{SUITE_DIR}/edge_detector_{model_type}.pt', map_location=device))
 
 
 # #### Evaluation of Pre-Trained GNN on Edge Incidence
@@ -1133,8 +1133,8 @@ if train_dists:
     torch.save(detector.state_dict(), f'{SUITE_DIR}/edge_detector.pt')
     torch.save(detector.gnn.state_dict(), f'{SUITE_DIR}/edge_detector_{model_type}.pt')
 else:
-    detector.load_state_dict(torch.load(f'{SUITE_DIR}/edge_detector.pt'))
-    gnn.load_state_dict(torch.load(f'{SUITE_DIR}/edge_detector_{model_type}.pt'))
+    detector.load_state_dict(torch.load(f'{SUITE_DIR}/edge_detector.pt', map_location=device))
+    gnn.load_state_dict(torch.load(f'{SUITE_DIR}/edge_detector_{model_type}.pt', map_location=device))
 
 
 # In[26]:
@@ -1144,8 +1144,8 @@ if train_dists:
     torch.save(spd_gnn.state_dict(), f'{SUITE_DIR}/spd_gnn.pt')
     torch.save(spd_gnn.gnn.state_dict(), f'{SUITE_DIR}/spd_gnn_{model_type}.pt')
 else:
-    spd_gnn.load_state_dict(torch.load(f'{SUITE_DIR}/spd_gnn.pt'))
-    gnn.load_state_dict(torch.load(f'{SUITE_DIR}/spd_gnn_{model_type}.pt'))
+    spd_gnn.load_state_dict(torch.load(f'{SUITE_DIR}/spd_gnn.pt', map_location=device))
+    gnn.load_state_dict(torch.load(f'{SUITE_DIR}/spd_gnn_{model_type}.pt', map_location=device))
 
 
 # #### Evaluation of Pre-Trained GNN on Edge Incidence and Shortest-Paths Distance Estimation
@@ -1966,9 +1966,9 @@ if train_paths:
     torch.save(navigator.head.state_dict(), f'{SUITE_DIR}/path_navigator_agt.pt')
     torch.save(navigator.gnn.state_dict(), f'{SUITE_DIR}/path_navigator_{model_type}.pt')
 else:
-    navigator.load_state_dict(torch.load(f'{SUITE_DIR}/path_navigator.pt'))
-    navigator.gnn.load_state_dict(torch.load(f'{SUITE_DIR}/path_navigator_{model_type}.pt'))
-    gnn.load_state_dict(torch.load(f'{SUITE_DIR}/path_navigator_{model_type}.pt'))
+    navigator.load_state_dict(torch.load(f'{SUITE_DIR}/path_navigator.pt', map_location=device))
+    navigator.gnn.load_state_dict(torch.load(f'{SUITE_DIR}/path_navigator_{model_type}.pt', map_location=device))
+    gnn.load_state_dict(torch.load(f'{SUITE_DIR}/path_navigator_{model_type}.pt', map_location=device))
 
 
 # In[ ]:
@@ -1977,8 +1977,8 @@ else:
 if train_paths:
     torch.save(spd_gnn.state_dict(),  f'{SUITE_DIR}/spd_gnn.pt')
 else:
-    spd_gnn.load_state_dict(torch.load(f'{SUITE_DIR}/spd_gnn.pt'))
-    spd_gnn.gnn.load_state_dict(torch.load(f'{SUITE_DIR}/path_navigator_{model_type}.pt'))
+    spd_gnn.load_state_dict(torch.load(f'{SUITE_DIR}/spd_gnn.pt', map_location=device))
+    spd_gnn.gnn.load_state_dict(torch.load(f'{SUITE_DIR}/path_navigator_{model_type}.pt', map_location=device))
 
 
 # In[ ]:
@@ -1987,8 +1987,8 @@ else:
 if train_paths:
     torch.save(detector.state_dict(), f'{SUITE_DIR}/edge_detector.pt')
 else:
-    detector.load_state_dict(torch.load(f'{SUITE_DIR}/edge_detector.pt'))
-    detector.gnn.load_state_dict(torch.load(f'{SUITE_DIR}/path_navigator_{model_type}.pt'))
+    detector.load_state_dict(torch.load(f'{SUITE_DIR}/edge_detector.pt', map_location=device))
+    detector.gnn.load_state_dict(torch.load(f'{SUITE_DIR}/path_navigator_{model_type}.pt', map_location=device))
 
 
 # In[ ]:
