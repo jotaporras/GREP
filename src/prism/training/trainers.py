@@ -120,6 +120,8 @@ class GraphSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
             # ever froze the graph side and freeze_pe was a silent no-op.
             for p in self.model.structural_parameters():
                 p.requires_grad = False
+            for p in self._base_lr_parameters():
+                p.requires_grad = False
             if getattr(self.model, "pe_norm", None) is not None:
                 for p in self.model.pe_norm.parameters():
                     p.requires_grad = False
@@ -128,11 +130,22 @@ class GraphSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
         # reports its own via structural_parameters(); parameter-free archs return []).
         for p in self.model.structural_parameters():
             p.requires_grad = True
+        # Same treatment for graph-side params that belong at BASE LR rather than in the
+        # boosted group: PEFT froze them, they must be re-enabled, but create_optimizer
+        # must not sweep them into the multiplier. WIRE's ω/σ frequency table reports
+        # itself here (see WireGraphLLM.base_lr_parameters).
+        for p in self._base_lr_parameters():
+            p.requires_grad = True
         # pe_norm is a non-LoRA module trained at base LR (kept out of the boosted
         # structural group); re-enable it here so magnitude calibration adapts.
         if getattr(self.model, "pe_norm", None) is not None:
             for p in self.model.pe_norm.parameters():
                 p.requires_grad = True
+
+    def _base_lr_parameters(self):
+        """Graph-side params the model wants trained at base LR; [] if it declares none."""
+        fn = getattr(self.model, "base_lr_parameters", None)
+        return list(fn()) if callable(fn) else []
 
     def create_optimizer(self):
         """Two learning-rate groups: structural path (GT + R-PEARL + gate) at

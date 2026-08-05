@@ -2022,18 +2022,46 @@ class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
     # ------------------------------------------------------------------ wiring
 
     def structural_parameters(self) -> list[nn.Parameter]:
-        """Graph-side params for the boosted-LR group: the Ψ producer, the gate, and the
-        layer's learnable frequency term **only when learnable** (under ``freeze_sigma``
-        it carries ``requires_grad=False`` and must not enter an optimizer group).
+        """Graph-side params for the ``structural_lr_mult`` group: the Ψ producer and the
+        gate ONLY.
 
-        The frequency term is the ω table itself in vanilla mode (§3.3's "one learnable
-        instantiation") and the per-layer scalar ``σ_ℓ`` in the expectation arm. ``ε`` is
-        never here — it is a frozen persistent buffer, not a parameter."""
-        params = list(self.pe_model.parameters()) + [self.pe_gain]
-        if not self._wire_freeze_sigma:
-            store = self._wire_omega if self._wire_vanilla else self._wire_sigma
-            params += list(store.values())
-        return params
+        The frequency term (the ω table in vanilla mode, the per-layer scalar ``σ_ℓ`` in
+        the expectation arm) is DELIBERATELY excluded, so it trains at the base LR.
+        ``structural_lr_mult`` exists to damp the LR on a PRETRAINED Ψ producer — the
+        navigator GT poured in by ``gnn.pe_gt_from`` — so a large LR cannot destroy
+        weights that arrived already trained. ω has no pretrained state to protect: in
+        vanilla mode it starts at EXACTLY zero. Damping it by the same factor is what
+        makes WIRE unreachable from its own initialisation — MEASURED at the e14 setting
+        ``structural_lr_mult=0.0012`` (LR 3e-7): ω stays at ~1e-6 and the rotation angle
+        at ~5e-5 rad against a ``max_angle`` of 1.0, i.e. a numerical identity. At the
+        base LR the same 9 steps reach ~0.03 rad and a full epoch reaches O(0.5) rad.
+        This also matches :meth:`LearnableGraphMaskLLM.structural_parameters`, which puts
+        only the Ψ producer in the group, and ``base_config.yaml``'s own description of
+        the knob as covering "structural (GT/PE) params".
+
+        ``ε`` is never here either — it is a frozen persistent buffer, not a parameter.
+        The excluded frequencies are still TRAINED: they are reported by
+        :meth:`base_lr_parameters`, which ``GraphSFTTrainer`` unfreezes alongside
+        ``pe_norm`` so ``create_optimizer`` picks them up in the base-LR group."""
+        return list(self.pe_model.parameters()) + [self.pe_gain]
+
+    def base_lr_parameters(self) -> list[nn.Parameter]:
+        """Graph-side params trained at the BASE LR, i.e. outside ``structural_lr_mult``.
+
+        The learnable frequency term — the ω table in vanilla mode (§3.3's "one learnable
+        instantiation"), the per-layer scalar ``σ_ℓ`` in the expectation arm. Same role
+        ``pe_norm`` plays for the additive family: PEFT froze it, it must be re-enabled,
+        but it does NOT belong in the multiplier's group (see
+        :meth:`structural_parameters` for why damping a zero-initialised table is what
+        made WIRE unreachable from its own init).
+
+        Empty under ``freeze_sigma``, which pins the frequencies as the literal-Theorem-3
+        A/B arm — those params carry ``requires_grad=False`` from
+        :meth:`_install_wire` and must not be re-enabled."""
+        if self._wire_freeze_sigma:
+            return []
+        store = self._wire_omega if self._wire_vanilla else self._wire_sigma
+        return list(store.values())
 
     def _decoder_layers(self):
         """Return the decoder layer list (Gemma text-only: ``model.layers``; multimodal: ``get_decoder().layers``)."""
