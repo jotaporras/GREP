@@ -45,14 +45,21 @@
 # and base_config.yaml still defaults train_files/val_files to it, so those two MUST be
 # passed explicitly or the run dies at dataset load.
 #
-# WARNING — model.disable_graph_token_rope=true is set below but is INERT for this arch.
-# build_planner_model forwards it only to the three GraphAugmentedLLM variants
-# (architectures.py:49/74/98 — rpearl_llm / rpearl_gt_llm / gt_llm). LearnableGraphMaskLLM,
-# GraphMaskLLM and WireGraphLLM never receive it, so with arch=learnable_graph_mask the
-# node-name tokens keep their normal RoPE positions. The override is kept because it is
-# recorded verbatim in train_config.json and therefore states the intent for this run,
-# but do NOT read a result here as "identity-RoPE on graph tokens" — that would require
-# threading the flag into LearnableGraphMaskLLM.forward (it builds no position_ids today).
+# WARNING — DISABLE_GRAPH_TOKEN_ROPE (model.disable_graph_token_rope, default false) is
+# INERT for this arch. build_planner_model forwards it only to the three GraphAugmentedLLM
+# variants (architectures.py:49/74/98 — rpearl_llm / rpearl_gt_llm / gt_llm).
+# LearnableGraphMaskLLM, GraphMaskLLM and WireGraphLLM never receive it, so with
+# arch=learnable_graph_mask the node-name tokens keep their normal RoPE positions either
+# way — flipping the variable changes ONLY the value recorded in train_config.json. Do not
+# read a result here as "identity-RoPE on graph tokens" under any setting; that would
+# require threading the flag into LearnableGraphMaskLLM.forward (it builds no position_ids
+# today). The variable becomes load-bearing if the script is repointed at
+# gnn.arch=rpearl_llm / rpearl_gt_llm / gt_llm.
+#
+# NOTE the default is false, whereas earlier e14 runs hard-coded true. Nothing about the
+# computation changes, but train_config.json / the wandb config of new runs will disagree
+# with the old ones on this key. Pass DISABLE_GRAPH_TOKEN_ROPE=true to keep the old
+# recorded value.
 #
 # The wandb names are overridable, in priority order:
 #   positional arg  >  same-named env var  >  built-in default.
@@ -67,7 +74,7 @@
 #
 # Submit:  sbatch scripts/e14_stage1to3_binary.sbatch [RUN_NAME] [TAG]
 #   env  :  RUN_NAME=... TAG=... DATA_ROOT=... STAGE1_LORA=... NAV_GT=... \
-#             sbatch scripts/e14_stage1to3_binary.sbatch
+#             DISABLE_GRAPH_TOKEN_ROPE=false sbatch scripts/e14_stage1to3_binary.sbatch
 # Local :  bash   scripts/e14_stage1to3_binary.sbatch [RUN_NAME] [TAG]
 
 set -euo pipefail
@@ -105,6 +112,10 @@ TEST_GRAPHS=${TEST_GRAPHS:-$DATA_ROOT/test_graphs}
 # tool calls — switching the contract to an action list would ask the model for something
 # the data never demonstrates. Set DATA_ICL_EXAMPLES=0 to go back to zero-shot.
 DATA_ICL_EXAMPLES=${DATA_ICL_EXAMPLES:-2}
+# Identity-RoPE (position_id 0) on node-name tokens. See the WARNING above: inert under
+# arch=learnable_graph_mask, so this only sets what train_config.json records. Set true to
+# match what earlier e14 runs recorded.
+DISABLE_GRAPH_TOKEN_ROPE=${DISABLE_GRAPH_TOKEN_ROPE:-false}
 
 # wandb names: positional arg > env var > default. RUN_NAME also drives the
 # checkpoint subdir (trainer.save_name) so the on-disk run stays identifiable.
@@ -131,7 +142,7 @@ echo "  navigator GT: $NAV_GT   (Psi init; no init_pe_from, nothing overwrites i
 srun python -m prism.training.train_v3 \
     --config-name=e9_base_config \
     model.path="google/gemma-4-31B-it" \
-    model.disable_graph_token_rope=true \
+    model.disable_graph_token_rope="$DISABLE_GRAPH_TOKEN_ROPE" \
     gnn.arch=learnable_graph_mask \
     gnn.d_model=1024 gnn.dropout=0.1 gnn.pe_hidden_channels=256 gnn.pe_num_layers=5 \
     gnn.num_samples=320 gnn.k_pe=3 gnn.gt_num_layers=3 gnn.gt_heads=8 gnn.k_gt=2 \
