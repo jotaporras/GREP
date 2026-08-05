@@ -79,8 +79,13 @@ export HF_HUB_DISABLE_PROGRESS_BARS=1
 export TOKENIZERS_PARALLELISM=false
 export BITSANDBYTES_NOWELCOME=1
 
-SKEL_DIR="data/training/nav_n100_skeletons"
-RUN_DIR="data/gen/nav_n100_gemma_data"
+# Corpus root. Everything this script reads and writes hangs off it, so a run fills in
+# the EXISTING data/n_100 tree in place (skeletons under training/, populated graphs and
+# rollouts under gen/) with nothing to move afterwards. Overridable for a side-by-side
+# run: DATA_ROOT=data/n_100_v2 bash scripts/nav_n100_gemma_generate.sh
+DATA_ROOT="${DATA_ROOT:-data/n_100}"
+SKEL_DIR="${DATA_ROOT}/training/nav_n100_skeletons"
+RUN_DIR="${DATA_ROOT}/gen/nav_n100_gemma_data"
 SPLIT_DIR="${RUN_DIR}/split"
 
 INTRA_PROB=0.6

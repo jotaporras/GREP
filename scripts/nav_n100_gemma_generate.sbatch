@@ -19,7 +19,7 @@
 # FIXED run config (baked into the srun invocation below, not overridable):
 #   MODEL     google/gemma-4-31B-it  (dense 31B; forced via the inner script's
 #             $2 slot, which outranks $PRISM_HF_MODEL and the 26B-A4B default)
-#   N_GRAPHS  50                     (3rd positional arg)
+#   N_GRAPHS  33                     (3rd positional arg)
 #
 # Overridable inner-script knob (export before sbatch, or use --export):
 #   PRISM_HF_QUANT   none|4bit|8bit  (default 4bit; a b200 fits none=bf16 ~62GB)
@@ -41,5 +41,5 @@ source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "$ENV_NAME"
 
 # Inner script args: [GPU_ID] [MODEL] [N_GRAPHS]. GPU_ID=0 (allocation-relative);
-# MODEL forced to the dense 31B ($2 outranks $PRISM_HF_MODEL); N_GRAPHS=50.
-srun bash scripts/nav_n100_gemma_generate.sh 0 "google/gemma-4-31B-it" 50
+# MODEL forced to the dense 31B ($2 outranks $PRISM_HF_MODEL); N_GRAPHS=33.
+srun bash scripts/nav_n100_gemma_generate.sh 0 "google/gemma-4-31B-it" 33
