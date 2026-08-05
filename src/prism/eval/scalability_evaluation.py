@@ -223,11 +223,19 @@ def _make_progress_printer(samples_by_graph: dict[str, list[evaluate.EvalSample]
 # Main
 # ----------------------------------------------------------------------------
 
+# Decode-policy switches read out of the navigator config and handed straight to
+# NavigatorGT.__init__ (its defaults apply to any key the YAML omits). Everything that
+# forks navigator behaviour lives here — see experiments/e9_navigator_gt.yaml.
+_NAV_DECODE_KEYS = ("max_length", "mask_hops", "tag_dist", "tag_scale", "df", "target_var",
+                    "mu", "pe_base", "base_loc", "base_scale", "goal_loc", "cauchy_scale")
+
+
 def _load_navigator(config_path: str):
     """Build a NavigatorGT + its eval policy from a YAML config (see experiments/e9_navigator_gt.yaml).
 
-    Returns ``(model, edge_weights)``. The model is placed on CUDA when available (the sparse
-    CSR attention kernels are CPU/CUDA-only — MPS is unsupported), else CPU.
+    Returns ``(model, edge_weights)``. CUDA when available, else MPS (``SparseGraphAttention``
+    falls back to a math-identical dense path there — the sparse-CSR kernels are CPU/CUDA-only),
+    else CPU.
     """
     import torch
     import yaml
@@ -235,11 +243,17 @@ def _load_navigator(config_path: str):
 
     with open(config_path) as f:
         cfg = yaml.safe_load(f)["navigator"]
+    decode = {k: cfg[k] for k in _NAV_DECODE_KEYS if k in cfg}
     model = NavigatorGT.from_pretrained(
-        cfg["weights"], gt_kwargs=cfg["gt"], semantic_kwargs=cfg["semantic"],
-        max_length=cfg.get("max_length", 128))
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+        cfg["weights"], gt_kwargs=cfg["gt"], semantic_kwargs=cfg["semantic"], **decode)
+    device = ("cuda" if torch.cuda.is_available()
+              else "mps" if torch.backends.mps.is_available() else "cpu")
     model.to(device).eval()
+    print(f"  navigator device: {device}")
+    print("  navigator decode: " + "  ".join(f"{k}={getattr(model, a)}" for k, a in (
+        ("max_length", "MAX_LENGTH"), ("mask_hops", "MASK_HOPS"),
+        ("tag_dist", "TAG_DIST"), ("tag_std", "STD"), ("df", "DF"), ("t_scale", "SCALE"),
+        ("pe_base", "PE_BASE"), ("goal_loc", "GOAL_LOC"))))
     return model, cfg.get("edge_weights", "binary")
 
 

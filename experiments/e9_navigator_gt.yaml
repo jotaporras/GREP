@@ -3,10 +3,44 @@
 # `python -m prism.eval.scalability_evaluation --navigator-config <this>`; the GT /
 # semantic sub-blocks MUST match the checkpoint under `weights` (loaded strictly).
 navigator:
-  weights: outputs/e9_multistage_training/suite4/path_navigator.pt
-  max_length: 128
+  # suite8 = the current notebook run (blurry vision mask_hops=3 + sinusoidal step PE).
+  # suite7 is the same architecture/decode policy one iteration earlier; suite4 predates
+  # both (1-hop adjacency masking, no step PE) and does NOT match the decode policy below.
+  # Verified on disk: outputs/e9_multistage_training/suite8/path_navigator.pt (112 keys,
+  # shapes identical to suite7 — the gt/semantic blocks below are unchanged between them).
+  weights: outputs/e9_multistage_training/suite8/path_navigator.pt
   # Graph parsing policy for the eval scene graphs (matches the notebook: 'binary').
   edge_weights: binary
+
+  # Decode policy — MUST match the nav_cfg block of the training run that produced
+  # `weights`; these are the only switches that fork rollout behaviour.
+  max_length: 128     # hard cap on rollout length (also capped at N - 1 hops)
+  mask_hops: 3        # blurry vision: candidates = unvisited nodes within 3 BFS hops
+  pe_base: 10000      # sinusoidal step-code base
+  base_loc: 0.0       # Normal prior on untagged nodes
+  base_scale: 0.1
+  goal_loc: -5.0      # goal-tag location
+  cauchy_scale: 1.0   # graph.x is restored to Cauchy(base_loc, this) [N,1] after a rollout
+
+  # ---- goal / step TAG distribution -------------------------------------------------
+  # THREE scales exist around these suite8 weights and they do not agree:
+  #   (1) 0.005  — notebook GNNShortestPathNavigator.__init__: `self.STD = target_var ** 1/2`.
+  #                Python binds ** tighter than /, so this is (0.01 ** 1) / 2 = 0.005,
+  #                NOT sqrt(0.01) = 0.1. Almost certainly a precedence slip for
+  #                `target_var ** 0.5`. The notebook's own `generate` decodes with it.
+  #   (2) 0.1    — the suite8 TRAINING loop (notebook cell 79) tags with module-scope
+  #                STD = 0.1. This is the scale the weights were actually FITTED under.
+  #   (3) 0.0775 — this repo's earlier arm, StudentT(df=5, loc, sqrt(target_var*(df-2)/df)).
+  #                The notebook uses no Student's-T anywhere.
+  # Settings below reproduce the notebook CLASS (the instruction), i.e. (1): Normal at
+  # STD = 0.005 — 20x tighter than training, so decoding is off-distribution by
+  # construction. To decode at the scale the weights saw, set `tag_scale: 0.1`.
+  # RECOMMENDED for any number you intend to quote: tag_scale: 0.1.
+  tag_dist: normal    # 'normal' (notebook) | 'studentt' (previous repo arm)
+  target_var: 0.01    # -> STD = target_var ** 1/2 = 0.005 (verbatim notebook expression)
+  tag_scale: null     # explicit STD override; null = the notebook value above
+  df: 5               # Student's-T dof; only read when tag_dist == studentt
+  mu: 1.0             # parity only (unused: step order rides on the sinusoidal PE)
 
   # Probe-PE GraphTransformer (navigator.gnn). node_feature_dim omitted => random probes.
   gt:

@@ -769,9 +769,14 @@ _aggregate_path_metrics = path_validator.aggregate_path_metrics
 
 def _is_graph_augmented(model) -> bool:
     """True if `model` is (or wraps) a GraphAugmentedLLM / GraphMaskLLM /
-    LearnableGraphMaskLLM (including PEFT)."""
+    LearnableGraphMaskLLM / WireGraphLLM (including PEFT).
+
+    WireGraphLLM MUST be listed: a missing entry does not fail, it routes the checkpoint
+    to the plain-LLM client and evaluates it with the graph channel silently absent.
+    Keep in sync with `_GNN_ARCHITECTURES` (the config-side answer to the same question).
+    """
     graph_types = (gnn_llm.GraphAugmentedLLM, gnn_llm.GraphMaskLLM,
-                   gnn_llm.LearnableGraphMaskLLM)
+                   gnn_llm.LearnableGraphMaskLLM, gnn_llm.WireGraphLLM)
     if isinstance(model, graph_types):
         return True
     inner = getattr(getattr(model, "base_model", None), "model", None)
@@ -810,9 +815,7 @@ def _eval_navigator_single_graph(
     if permutation is not None:
         raise NotImplementedError(
             "NavigatorGT eval does not support node-index permutation (the seed features "
-            "and dense adjacency mask would also need permuting); pass permutation=None.")
-    from torch_geometric.utils import to_dense_adj
-
+            "and the BFS hop mask would also need permuting); pass permutation=None.")
     device = model._device()
     pyg = None
     total_correct = 0
@@ -823,8 +826,9 @@ def _eval_navigator_single_graph(
             if pyg is None:
                 pyg = data_utils.scene_graph_dict_to_pyg(es.graph, edge_weights)
                 pyg.edge_index = pyg.edge_index.to(device)
-                pyg.adj = to_dense_adj(
-                    pyg.edge_index, max_num_nodes=pyg.num_nodes).squeeze(0).bool().to(device)
+                # Blurry-vision mask input: all-pairs BFS hops, topology only (notebook
+                # `graph.hops`). Built once here; every rollout on this graph reuses it.
+                pyg.hops = model.hop_matrix(pyg, device)
                 model.invalidate_cache()
 
             start, goal = path_validator.resolve_start_goal(
@@ -935,6 +939,7 @@ def render_path_metrics_figure(
 # Architectures whose checkpoints carry a graph PE; everything else is a plain LLM.
 _GNN_ARCHITECTURES = (
     "rpearl_llm", "rpearl_gt_llm", "gt_llm", "graph_mask_llm", "learnable_graph_mask",
+    "wire_llm",
 )
 
 
@@ -1142,9 +1147,12 @@ class GraphTokenAccuracyMixin:
     def log(self, logs, *args, **kwargs):
         gta = getattr(self, "_gta", None)
         if gta is not None:
+            # int64, not float64: these are exact token COUNTS, so an integer sum is
+            # both exact and reduce-safe — and MPS has no float64 at all, so the old
+            # dtype raised (killing the run) on Apple-silicon training.
             counts = torch.tensor(
                 [gta["scene_c"], gta["scene_n"], gta["ans_c"], gta["ans_n"]],
-                dtype=torch.float64,
+                dtype=torch.long,
                 device=self.args.device,
             )
             if self.args.world_size > 1:

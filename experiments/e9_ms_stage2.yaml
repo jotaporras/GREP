@@ -40,7 +40,9 @@ gnn:
   mask_k_hops: 1
   mask_symmetrize: true
   mask_use_edges: true
-  pe_gt_from: outputs/e9_multistage_training/suite5/path_navigator_gt.pt
+  # suite8 = the current notebook run. (suite5 holds only edge_detector.pt / spd_gnn.pt —
+  # it never carried a path_navigator_gt.pt, so the old path could not load at all.)
+  pe_gt_from: outputs/e9_multistage_training/suite8/path_navigator_gt.pt
   semantic_gt_from: null
 
 data:

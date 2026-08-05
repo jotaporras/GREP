@@ -213,14 +213,20 @@ def test_flat_override_recipes_compose_and_validate():
 # _validate_config — coercion + domain rejection (loud failure on bad input)
 # ==========================================================================
 def _validation_cfg(eps="1e-6", loss_target="all", text_edge_list="present"):
-    """A minimal NESTED config carrying just the fields ``_validate_config`` reads:
-    ``config.gnn.eps``, ``config.gnn.arch``, ``config.trainer.loss_target``,
-    ``config.data.text_edge_list``."""
-    return OmegaConf.create({
-        "gnn": {"eps": eps, "arch": "rpearl_llm"},
-        "trainer": {"loss_target": loss_target},
-        "data": {"text_edge_list": text_edge_list},
-    })
+    """The SHIPPED experiments/base_config.yaml with just the knobs under test overridden.
+
+    Composed from the real file rather than hand-written: ``_validate_config`` reads a
+    growing surface (arch switches, gnn.pe_gt_from/semantic_gt_from, data.injection_scope,
+    data.spine_tools, eval.use_icl, ...), and a hand-listed subset silently rots into an
+    AttributeError on the first newly-read key — which is exactly what a stale stub did
+    here. Overriding the shipped defaults also means these tests exercise the defaults a
+    real run composes."""
+    cfg = OmegaConf.load("experiments/base_config.yaml")
+    cfg.gnn.arch = "rpearl_llm"
+    cfg.gnn.eps = eps
+    cfg.trainer.loss_target = loss_target
+    cfg.data.text_edge_list = text_edge_list
+    return cfg
 
 
 def test_validate_config_coerces_string_eps_to_float():

@@ -3,10 +3,11 @@ import warnings
 
 import torch
 from torch import nn, Tensor
-from torch.distributions import Normal
+from torch.distributions import Cauchy, Normal, StudentT
 from torch.utils.checkpoint import checkpoint
 from torch_geometric.data import Data
-from torch_geometric.utils import add_self_loops, coalesce, softmax, to_dense_adj
+from torch_geometric.utils import (add_self_loops, coalesce, softmax,
+                                   to_scipy_sparse_matrix)
 
 from prism.models.r_pearl import RandomGNNPositionalEncodings
 from prism.models.utils import SparseCSRDropout
@@ -468,27 +469,68 @@ class SemanticGraphTransformer(nn.Module):
 
 
 class NavigatorPE(nn.Module):
-    """Sequential PE from notebooks/e9_gnn_navigation.ipynb (GNNShortestPathNavigator):
-    the Semantic GT consumes the PE GT's output as its node features (navigator forward
-    with the navigation seed = 0, so head input = PE_GT(graph)).
+    """PE stage of the notebook navigator — the probe-PE Graph Transformer, NO AGT.
 
-    A drop-in ``pe_model`` for ``GraphAugmentedLLM``; both submodules are loaded from the
-    notebook's trained state dicts (pe_gt = path_navigator_gt.pt, semantic_gt =
-    path_navigator_agt.pt). ``semantic_gt.node_feature_dim`` must equal ``pe_gt.d_model``.
+    Ψ = ``pe_gt(graph)``. This is the PE half of
+    notebooks/e9_gnn_navigation.ipynb's ``GNNShortestPathNavigator`` (its ``gnn``
+    submodule; checkpoint ``path_navigator_gt.pt``) with the autoregressive head
+    deliberately absent: the AGT (``SemanticGraphTransformer`` + classifier +
+    autoregressive ``generate``) lives in :class:`NavigatorGT`, which extends this class.
+
+    Also the base of :class:`TwoStagePE`, the LEGACY Ψ = SemanticGT(PE_GT(·)) producer
+    kept only so pre-split checkpoints still reload (see that class).
+
+    A drop-in ``pe_model`` for the Ψ-consuming architectures; the state dict keys are
+    ``pe_gt.*``, so a plain ``GraphTransformer`` checkpoint needs the prefix strip in
+    ``loaders._load_psi_producer_state``.
 
     Args:
         pe_gt: a ``GraphTransformer`` (random-probe PE) -> [N, d_model].
-        semantic_gt: a ``SemanticGraphTransformer`` consuming [N, d_model].
+    """
+
+    def __init__(self, pe_gt: "GraphTransformer"):
+        super().__init__()
+        self.pe_gt = pe_gt
+
+    def forward(self, data, permutation=None) -> Tensor:
+        return self.pe_gt(data, permutation=permutation)           # [N, d_model]
+
+
+class TwoStagePE(NavigatorPE):
+    """LEGACY two-stage Ψ producer: ``Ψ = SemanticGT(PE_GT(graph))``.
+
+    This is what ``NavigatorPE`` used to be, before the PE/AGT split moved the Semantic
+    GT into :class:`NavigatorGT`. It is retained under its own name for ONE reason:
+    checkpoints trained with ``gnn.pe_gt_from`` AND ``gnn.semantic_gt_from`` (the e13
+    navigator arms) carry ``pe_model.pe_gt.*`` + ``pe_model.semantic_gt.*`` and their Ψ
+    IS the two-stage composition. Rebuilding those as a bare ``GraphTransformer`` would
+    evaluate a DIFFERENT function under the same weights, so the topology is reproduced
+    exactly instead. New runs should leave ``gnn.semantic_gt_from`` null (Ψ = PE GT
+    alone); ``loaders._load_psi_producer_state`` fails loud if a checkpoint and a rebuild
+    disagree about which of the two it is.
+
+    Args:
+        pe_gt: a ``GraphTransformer`` (random-probe PE) -> [N, d_model].
+        semantic_gt: a ``SemanticGraphTransformer`` consuming [N, d_model]; its
+            ``node_feature_dim`` must equal ``pe_gt.d_model``.
     """
 
     def __init__(self, pe_gt: "GraphTransformer", semantic_gt: "SemanticGraphTransformer"):
-        super().__init__()
-        self.pe_gt = pe_gt
+        super().__init__(pe_gt)
         self.semantic_gt = semantic_gt
 
     def forward(self, data, permutation=None) -> Tensor:
         pe = self.pe_gt(data, permutation=permutation)             # [N, d_model]
-        feed = Data(x=pe, edge_index=data.edge_index)              # seed = 0 -> head input = PE
+        edge_index = data.edge_index
+        if permutation is not None:
+            # Apply the SAME relabelling the PE GT applied, so the head refines Ψ over the
+            # graph the PE was computed on. Feeding the original edge_index here would mix a
+            # permuted-topology PE with unpermuted topology and silently break equivariance.
+            # The permutation is pre-applied rather than passed down: SemanticGraphTransformer
+            # rejects the kwarg because it cannot permute semantic node FEATURES — here the
+            # features ARE the PE, already in original node order, so only edges move.
+            edge_index = permutation.apply(edge_index, pe.size(0), device=pe.device)
+        feed = Data(x=pe, edge_index=edge_index)                   # seed = 0 -> head input = PE
         return self.semantic_gt(feed)                              # [N, d_model]
 
 
@@ -496,13 +538,39 @@ class NavigatorGT(NavigatorPE):
     """Autoregressive shortest-path navigator — the notebook's ``GNNShortestPathNavigator``
     (notebooks/e9_gnn_navigation.ipynb §3) rebuilt on this repo's GT blocks.
 
-    Extends :class:`NavigatorPE` (``pe_gt`` = probe PE ``GraphTransformer``; ``semantic_gt``
-    = ``SemanticGraphTransformer`` head) with a per-node scoring ``classifier`` and an
-    autoregressive :meth:`generate`. Unlike ``NavigatorPE`` (seed 0, a pure Ψ producer),
-    the head reads ``graph.x + PE`` where ``graph.x`` is the navigation SEED: start and
-    goal are provided EXPLICITLY, not parsed from text — the goal node is biased low
-    (``loc=-5``) and the current node carries the running step count, exactly as the
-    notebook seeds them. R-PEARL probes are x-independent, so the PE is cached per graph.
+    Extends :class:`NavigatorPE` (the PE stage: ``pe_gt``, a probe-PE ``GraphTransformer``)
+    with the AUTOREGRESSIVE head — the ``SemanticGraphTransformer`` ``semantic_gt`` (the
+    notebook's ``head``), a per-node scoring ``classifier``, and an autoregressive
+    :meth:`generate`. The AGT lives HERE, not in ``NavigatorPE``: ``NavigatorPE`` emits
+    Ψ = ``pe_gt(graph)`` and nothing else. The head reads ``graph.x + PE`` where
+    ``graph.x`` is the navigation SEED: start and
+    goal are provided EXPLICITLY, not parsed from text — the goal node carries a tag at
+    ``goal_loc`` and the current node a tag at the running step count, both offset by a
+    sinusoidal step code, exactly as the notebook seeds them. R-PEARL probes are
+    x-independent, so the PE is cached per graph.
+
+    Decoding uses the notebook's *blurry-vision* mask: the next node is chosen among the
+    unvisited nodes within ``mask_hops`` BFS hops of the current one (not just its direct
+    neighbours), so the emitted route may contain multi-hop jumps by construction.
+
+    .. warning:: **Tag-scale discrepancy in the source notebook (not fixed here).**
+       Three different tag scales appear around the suite8 weights:
+
+       * ``GNNShortestPathNavigator.__init__`` sets ``self.STD = target_var ** 1/2``.
+         Python binds ``**`` tighter than ``/``, so this is ``(target_var ** 1) / 2``
+         = ``0.01 / 2`` = **0.005**, NOT ``sqrt(0.01)`` = 0.1. Almost certainly an
+         operator-precedence slip for ``target_var ** 0.5``. ``generate`` uses it.
+       * The suite8 TRAINING loop (notebook cell 79) tags with the module-scope
+         ``STD`` = **0.1** — that is the scale the weights were actually fitted under.
+       * This class previously drew the tags from ``StudentT(df, loc, SCALE)`` with
+         ``SCALE = sqrt(target_var*(df-2)/df)`` = **0.0775**, a family the notebook
+         never uses.
+
+       The default (``tag_dist='normal'``, ``tag_scale=None``) reproduces the notebook
+       CLASS verbatim, i.e. 0.005 — so decoding runs at 1/20th the tag scale the weights
+       saw in training and is off-distribution by construction. Set ``tag_scale: 0.1``
+       in the config to decode at the training scale, or ``tag_dist: studentt`` for the
+       previous repo arm. See ``experiments/e9_navigator_gt.yaml``.
 
     Load the notebook checkpoint (``path_navigator.pt`` = ``navigator.state_dict()``, keys
     ``gnn.*`` / ``head.*`` / ``classifier.*``) with :meth:`from_pretrained`, which remaps
@@ -512,12 +580,50 @@ class NavigatorGT(NavigatorPE):
         pe_gt: a ``GraphTransformer`` (random-probe PE) -> [N, d_model].
         semantic_gt: a ``SemanticGraphTransformer`` consuming [N, d_model].
         max_length: hard cap on rollout length (the notebook's ``MAX_LENGTH``).
+        mask_hops: blurry-vision radius, in BFS hops, of the per-step candidate set.
+        tag_dist: goal / step tag family — ``'normal'`` (the notebook) or ``'studentt'``.
+        target_var: notebook ``target_var``. Drives BOTH ``STD`` (normal arm, via the
+            notebook's ``target_var ** 1/2``) and ``SCALE`` (studentt arm).
+        tag_scale: explicit override of the normal arm's ``STD``; ``None`` = notebook value.
+        df: Student's-T dof, and ``SCALE = sqrt(target_var * (df - 2) / df)``. Kept for
+            back-compat with configs that parameterise the tags by ``df``.
+        mu: retained for notebook/config parity (unused — step order rides on the
+            sinusoidal PE, not on the tag location).
+        pe_base: base of the sinusoidal step code (the notebook's ``PE_BASE``).
+        base_loc / base_scale: Normal prior seeded on every non-tagged node.
+        goal_loc: location of the goal node's tag.
+        cauchy_scale: scale of the ``Cauchy(base_loc, ·)`` [N, 1] prior ``generate``
+            restores ``graph.x`` to on exit (the notebook's ``CAUCHY_SCALE`` cleanup).
     """
 
     def __init__(self, pe_gt: "GraphTransformer", semantic_gt: "SemanticGraphTransformer",
-                 max_length: int = 128):
-        super().__init__(pe_gt, semantic_gt)
+                 max_length: int = 128, mask_hops: int = 3, df: float = 5.0,
+                 target_var: float = 0.01, mu: float = 1.0, pe_base: float = 10000.0,
+                 base_loc: float = 0.0, base_scale: float = 0.1, goal_loc: float = -5.0,
+                 tag_dist: str = "normal", tag_scale: float = None,
+                 cauchy_scale: float = 1.0):
+        super().__init__(pe_gt)
+        # The AGT head is owned by this class (NavigatorPE is the PE stage alone).
+        self.semantic_gt = semantic_gt
+        if tag_dist not in ("normal", "studentt"):
+            raise ValueError(
+                f"tag_dist must be 'normal' (the notebook) or 'studentt', got {tag_dist!r}")
         self.MAX_LENGTH = max_length
+        self.MASK_HOPS = mask_hops
+        self.TAG_DIST = tag_dist
+        self.DF = df
+        # Notebook parity, verbatim: GNNShortestPathNavigator.__init__ writes
+        #   self.STD = target_var ** 1/2
+        # which Python parses as (target_var ** 1) / 2 -> 0.005, not sqrt(0.01) = 0.1.
+        # Reproduced deliberately (see the class docstring warning); `tag_scale` overrides.
+        self.STD = (target_var ** 1 / 2) if tag_scale is None else float(tag_scale)
+        self.SCALE = (target_var * (df - 2.0) / df) ** 0.5
+        self.MU = mu
+        self.PE_BASE = pe_base
+        self.BASE_LOC = base_loc
+        self.BASE_SCALE = base_scale
+        self.GOAL_LOC = goal_loc
+        self.CAUCHY_SCALE = cauchy_scale
         self.shape = pe_gt.d_model                       # PE / seed feature width
         self.classifier = nn.Linear(self.shape, 1)
         # PE cache keyed on graph identity (R-PEARL probes ignore data.x).
@@ -540,36 +646,76 @@ class NavigatorGT(NavigatorPE):
         if self.cached_pe is None or not self.cached_pe.any() or self.graph is not graph:
             self.graph = graph
             self.cached_pe = self.pe_gt(graph, permutation=permutation)   # [N, d_model]
-        feed = graph.clone()
-        feed.x = graph.x + self.cached_pe
+        # Fresh Data (not graph.clone()): the head reads only x / edge_index, and the
+        # rollout calls this once per step — cloning the [N, N] hop matrix each time is pure cost.
+        feed = Data(x=graph.x + self.cached_pe, edge_index=graph.edge_index)
         return self.classifier(self.semantic_gt(feed))                    # [N, 1]
+
+    @staticmethod
+    @torch.no_grad()
+    def hop_matrix(graph: Data, device=None) -> Tensor:
+        """All-pairs BFS hop counts ``[N, N]`` (``inf`` where unreachable).
+
+        Topology only — never edge weights — so a metric distance can never reach the
+        blurry-vision mask (the notebook's ``graph.hops``).
+        """
+        from scipy.sparse.csgraph import shortest_path
+        adj = to_scipy_sparse_matrix(graph.edge_index.cpu(), num_nodes=graph.num_nodes)
+        hops = shortest_path(adj, method="D", unweighted=True, directed=False)
+        return torch.as_tensor(hops, dtype=torch.float, device=device)
 
     @torch.no_grad()
     def generate(self, graph: Data, node1: int, node2: int) -> Tensor:
-        """Autoregressively walk ``node1 -> node2`` under adjacency + visited masking.
+        """Autoregressively walk ``node1 -> node2`` under blurry-vision + visited masking.
 
-        Mirrors the notebook: seed every node ~N(0, 0.1), the goal ~N(-5, 0.1), and the
-        current node ~N(count, 0.1) as the step counter advances; at each step score all
-        nodes, mask to unvisited neighbours of the current node, and take the argmax.
-        Returns the ordered node-index path as a ``[len, 1]`` LongTensor.
+        Mirrors the notebook: seed every node ~N(base_loc, base_scale), tag the goal at
+        ``goal_loc`` and the current node at the running ``count``, both offset by the
+        sinusoidal step code ``sin(count / PE_BASE^(2⌊i/2⌋/D) + (i mod 2)·π/2)``; at each
+        step score all nodes, mask to the unvisited nodes within ``MASK_HOPS`` BFS hops of
+        the current one, and take the argmax. The walk is capped at the longest simple
+        path (``N - 1`` hops), and ``graph.x`` is restored to the notebook's [N, 1] Cauchy
+        prior on exit. Returns the ordered node-index path as a ``[len, 1]`` LongTensor.
+
+        The tag family/scale is ``TAG_DIST`` / ``STD`` (or ``DF``/``SCALE`` on the
+        ``studentt`` arm) — see the class docstring for the suite8 scale discrepancy.
         """
         device = self._device()
         N, D = graph.num_nodes, self.shape
-        adj = getattr(graph, "adj", None)
-        if adj is None:
-            adj = to_dense_adj(graph.edge_index, max_num_nodes=N).squeeze(0).bool()
-        adj = adj.to(device)
+        # Cached on the Data (once per graph) — the mask is topology-only, so it is
+        # invariant across rollouts on the same scene graph.
+        hops = getattr(graph, "hops", None)
+        if hops is None:
+            hops = graph.hops = self.hop_matrix(graph, device)
+        hops = hops.to(device)
 
-        graph.x = Normal(loc=0.0, scale=0.1).sample((N, D)).to(device)
-        graph.x[node2] = Normal(loc=-5.0, scale=0.1).sample((1, D)).to(device)
+        p = lambda v: torch.tensor(v, device=device, dtype=torch.float)
+        pc = lambda v: torch.tensor(float(v), dtype=torch.float)      # CPU-side parameter
+        # Goal / step tag sampler over a plain float `loc`. 'normal' is the notebook class
+        # verbatim; 'studentt' keeps the earlier repo arm for configs parameterised by `df`.
+        if self.TAG_DIST == "studentt":
+            # `aten::_standard_gamma` (StudentT -> Chi2 -> Gamma) has no MPS kernel: draw on
+            # CPU and move. The tag is per-rollout scratch, never differentiated, so this is
+            # math-identical and removes the PYTORCH_ENABLE_MPS_FALLBACK=1 requirement.
+            df, scale = pc(self.DF), pc(self.SCALE)
+            tag = lambda loc: StudentT(df, loc=pc(loc), scale=scale).sample((1, D)).to(device)
+        else:
+            std = p(self.STD)
+            tag = lambda loc: Normal(loc=p(loc), scale=std).sample((1, D))
+        # Loop-invariant halves of the positional code (per-coordinate wavelength / phase).
+        pe_scale = self.PE_BASE ** (2 * (torch.arange(D, device=device) // 2) / D)
+        pe_phase = (torch.arange(D, device=device) % 2) * (torch.pi / 2)
+
+        graph.x = Normal(loc=p(self.BASE_LOC), scale=p(self.BASE_SCALE)).sample((N, D))
+        graph.x[node2] = tag(self.GOAL_LOC) + torch.sin(pe_phase)
 
         count = 1.0
         preds = [node1]
         visited = {node1}
-        while not (preds[-1] == node2 or len(preds) > self.MAX_LENGTH):
+        max_hops = min(self.MAX_LENGTH, N - 1)   # cap at the longest simple path
+        while not (preds[-1] == node2 or len(preds) > max_hops):
             c = preds[-1]
-            graph.x[c] = Normal(loc=count, scale=0.1).sample((1, D)).to(device)
-            allowed = adj[c].clone()
+            graph.x[c] = tag(count) + torch.sin(count / pe_scale + pe_phase)
+            allowed = hops[c] <= self.MASK_HOPS
             if visited:
                 allowed[torch.as_tensor(sorted(visited), device=allowed.device)] = False
             if not bool(allowed.any()):
@@ -579,23 +725,30 @@ class NavigatorGT(NavigatorPE):
             preds.append(nxt)
             visited.add(nxt)
             count += 1.0
+
+        # Notebook cleanup: hand `graph.x` back as the [N, 1] Cauchy prior the other
+        # notebook heads (detector / SPD) read. The seed is per-rollout scratch either way.
+        # Drawn on CPU: `aten::cauchy_` has no MPS kernel (same reasoning as the tag draw).
+        graph.x = Cauchy(loc=pc(self.BASE_LOC),
+                         scale=pc(self.CAUCHY_SCALE)).sample((N, 1)).to(device)
         return torch.tensor([preds], device=device).T
 
     @classmethod
     def from_pretrained(cls, state_dict_path: str, *, gt_kwargs: dict,
-                        semantic_kwargs: dict, max_length: int = 128,
-                        map_location="cpu") -> "NavigatorGT":
+                        semantic_kwargs: dict, map_location="cpu",
+                        **nav_kwargs) -> "NavigatorGT":
         """Build a ``NavigatorGT`` and load the notebook's full-navigator state dict.
 
         ``state_dict_path`` is ``navigator.state_dict()`` (``path_navigator.pt``): keys
         ``gnn.*`` (the GraphTransformer), ``head.*`` (the SemanticGraphTransformer) and
         ``classifier.*``. They are remapped onto this class's ``pe_gt.*`` / ``semantic_gt.*``
         / ``classifier.*`` and loaded strictly (a mismatch means ``gt_kwargs`` /
-        ``semantic_kwargs`` do not reproduce the trained submodules).
+        ``semantic_kwargs`` do not reproduce the trained submodules). ``nav_kwargs`` are the
+        decode-policy arguments of ``__init__`` (``max_length``, ``mask_hops``, ``df``, …).
         """
         model = cls(GraphTransformer(**gt_kwargs),
                     SemanticGraphTransformer(**semantic_kwargs),
-                    max_length=max_length)
+                    **nav_kwargs)
         raw = torch.load(state_dict_path, map_location=map_location)
         remap = {}
         for k, v in raw.items():
@@ -616,3 +769,74 @@ class NavigatorGT(NavigatorPE):
                 f"semantic_kwargs must reproduce the trained submodules exactly.")
         model.eval()
         return model
+
+
+# ----------------------------------------------------------------------------
+# Ψ-producer factory (shared by the mask / rotation architectures)
+# ----------------------------------------------------------------------------
+def build_psi_producer(cfg, node_feature_dim: int = None) -> nn.Module:
+    """Build the Ψ producer for ``learnable_graph_mask`` / ``wire_llm`` from a gnn config.
+
+    ONE construction site, used by training (``architectures.build_planner_model``) and
+    by the eval-time checkpoint rebuild (``loaders.graph_augmented_llm_from_pretrained``)
+    for BOTH architectures, so a train/eval topology drift is structurally impossible.
+
+    Args:
+        cfg: any mapping over the ``gnn`` section — an OmegaConf ``DictConfig`` at train
+            time, the flat ``train_config.json`` dict at eval time. Read keys:
+            ``gt_num_layers``/``gt_heads``/``k_gt``/``d_model``/``dropout``/``eps``/
+            ``use_layer_norm``/``pe_hidden_channels``/``pe_num_layers``/``num_samples``/
+            ``k_pe``, plus the navigator switches ``pe_gt_from``/``semantic_gt_from``.
+        node_feature_dim: semantic input width for the standalone GT (``None`` = random
+            probes). Ignored in two-stage mode: the notebook's PE GT is probe-based.
+
+    Returns:
+        A standalone :class:`GraphTransformer` — Ψ = GT(graph) — for every current run.
+        ``gnn.pe_gt_from`` only says WHICH weights ``loaders.load_navigator_pe_into``
+        then pours into it (the notebook's ``path_navigator_gt.pt``); it does NOT change
+        the topology. This is the PE stage of :class:`NavigatorPE`: the AGT
+        (``SemanticGraphTransformer``) is NOT part of Ψ — it belongs to
+        :class:`NavigatorGT`.
+
+        The ONE exception is ``gnn.semantic_gt_from``: it is LEGACY and selects
+        :class:`TwoStagePE` (Ψ = SemanticGT(PE_GT(graph))), the pre-split producer, so
+        checkpoints from the e13 navigator arms keep reloading as the function they were
+        trained as. New runs must leave it null.
+
+    In the legacy two-stage arm the head takes its ``num_layers``/``heads``/``dropout``/
+    ``k_gt`` from the SAME ``gt_*`` keys as the PE GT and its ``node_feature_dim`` from
+    ``d_model``, because the notebook builds it from one ``model_hparams`` dict
+    (e9_gnn_navigation.ipynb, ``GNNShortestPathNavigator.__init__``). The strict load in
+    ``loaders.load_navigator_pe_into`` fails loudly if a checkpoint disagrees, so this is a
+    checked assumption, not a silent one. Weights are NOT loaded here — this returns the
+    topology only.
+    """
+    pe_gt_from, semantic_gt_from = cfg.get("pe_gt_from"), cfg.get("semantic_gt_from")
+    if semantic_gt_from and not pe_gt_from:
+        raise ValueError(
+            "gnn.semantic_gt_from is set but gnn.pe_gt_from is not: the legacy two-stage Ψ "
+            "producer needs BOTH (Ψ = SemanticGT(PE_GT(graph))). Leave semantic_gt_from "
+            "null — Ψ is the PE GT alone (gnn.pe_gt_from) for every current run.")
+    navigator = bool(pe_gt_from and semantic_gt_from)
+    pe_gt = GraphTransformer(
+        num_layers=cfg["gt_num_layers"],
+        pe_hidden_channels=cfg["pe_hidden_channels"],
+        pe_num_layers=cfg["pe_num_layers"],
+        d_model=cfg["d_model"],
+        heads=cfg["gt_heads"],
+        num_samples=cfg["num_samples"],
+        dropout=cfg["dropout"],
+        k_pe=cfg["k_pe"],
+        k_gt=cfg["k_gt"],
+        eps=cfg["eps"],
+        use_layer_norm=cfg["use_layer_norm"],
+        node_feature_dim=None if navigator else node_feature_dim,
+    )
+    if not navigator:
+        return pe_gt
+    semantic_gt = SemanticGraphTransformer(
+        node_feature_dim=cfg["d_model"], d_model=cfg["d_model"],
+        num_layers=cfg["gt_num_layers"], heads=cfg["gt_heads"],
+        dropout=cfg["dropout"], k_gt=cfg["k_gt"],
+    )
+    return TwoStagePE(pe_gt, semantic_gt)

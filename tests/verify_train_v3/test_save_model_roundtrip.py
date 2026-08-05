@@ -102,6 +102,17 @@ def _tiny_llm(seed):
     return Gemma4UnifiedForCausalLM(cfg)
 
 
+# Navigator-mode gnn config (the shape train_v3 dumps into train_config.json["gnn"]):
+# the Ψ producer is a NavigatorPE exactly when BOTH source paths are recorded. Dims match
+# the tiny fixtures above; the paths are never opened here (topology only).
+_NAV_GNN_CFG = {
+    "gt_num_layers": 2, "gt_heads": 2, "k_gt": 2, "d_model": 24, "dropout": 0.1,
+    "eps": 1e-6, "use_layer_norm": True, "pe_hidden_channels": 16, "pe_num_layers": 2,
+    "num_samples": 8, "k_pe": 2,
+    "pe_gt_from": "path_navigator_gt.pt", "semantic_gt_from": "path_navigator_agt.pt",
+}
+
+
 # --- Model factories: the SAME constructor calls architectures.build_planner_model makes. ---
 def _gt(seed):
     torch.manual_seed(seed)
@@ -134,6 +145,13 @@ def _build(arch, seed, use_pe_norm=True):
                                          pe_node_features="word_embeddings")
     if arch == "graph_mask_llm":
         return gnn_llm.GraphMaskLLM(_tiny_llm(seed), k_hops=1, symmetrize=True, use_edges=True)
+    if arch == "learnable_graph_mask":
+        # Navigator Ψ producer (NavigatorPE = notebook PE GT + Semantic GT head), built by
+        # the SAME factory architectures.build_planner_model and the eval loader both call.
+        torch.manual_seed(seed)
+        return gnn_llm.LearnableGraphMaskLLM(
+            _tiny_llm(seed), gt_module.build_psi_producer(_NAV_GNN_CFG),
+            alpha=0.7, layer_scope="all", k_hops=1, symmetrize=True, use_edges=True)
     raise ValueError(arch)
 
 
@@ -277,6 +295,54 @@ def test_graph_mask_writes_only_config_no_weights():
                               "mask_use_edges": False}}
     # ...and the production reader flattens it back to exactly the trainer's dict.
     assert model_loaders.load_gnn_config(out) == cfg
+
+
+# ==========================================================================
+# learnable_graph_mask in NAVIGATOR mode — one 'pe_model' key holding BOTH halves
+# ==========================================================================
+def test_roundtrip_learnable_graph_mask_navigator():
+    """save_model writes the WHOLE NavigatorPE (pe_gt.* + semantic_gt.*) under 'pe_model';
+    the eval loader rebuilds the producer from the recorded pe_gt_from/semantic_gt_from and
+    loads it strictly (loaders._load_psi_producer_state).
+
+    The two topologies' key sets are DISJOINT, so the second half of this test — rebuilding
+    WITHOUT the navigator keys — is the failure that a strict=False load would have hidden:
+    every tensor dropped, eval running on a randomly-initialised Ψ.
+    """
+    if _gemma4_missing():
+        return _skip(_gemma4_missing())
+    arch = "learnable_graph_mask"
+    A = _build(arch, seed=0)
+    assert isinstance(A.pe_model, gt_module.NavigatorPE), "fixture is not in navigator mode"
+    _perturb_structural(A)
+    out = _outdir("lgm_navigator")
+    _trainer_for(A, {"architecture": arch, **_NAV_GNN_CFG}, out).save_model(output_dir=out)
+
+    w = torch.load(os.path.join(out, "gnn_weights.pt"), map_location="cpu")
+    assert set(w.keys()) == {"pe_model"}, f"unexpected gnn_weights keys: {sorted(w.keys())}"
+    assert any(k.startswith("pe_gt.") for k in w["pe_model"]) and \
+        any(k.startswith("semantic_gt.") for k in w["pe_model"]), \
+        "the checkpoint must carry BOTH navigator halves"
+
+    # --- loader protocol: rebuild from the recorded config, then strict-load. ---
+    B = _build(arch, seed=1)
+    assert not _sd_equal(A.pe_model.state_dict(), B.pe_model.state_dict())   # no-op guard
+    model_loaders._load_psi_producer_state(B.pe_model, w["pe_model"], out, _NAV_GNN_CFG)
+    assert _sd_equal(A.pe_model.state_dict(), B.pe_model.state_dict()), \
+        "NavigatorPE failed to round-trip"
+
+    # --- provenance lost ⇒ standalone-GT rebuild ⇒ must RAISE, not silently drop. ---
+    gt_only_cfg = {k: v for k, v in _NAV_GNN_CFG.items()
+                   if k not in ("pe_gt_from", "semantic_gt_from")}
+    standalone = gt_module.build_psi_producer(gt_only_cfg)
+    raised = ""
+    try:
+        model_loaders._load_psi_producer_state(standalone, w["pe_model"], out, gt_only_cfg)
+    except RuntimeError as e:
+        raised = str(e)
+    # semantic_gt_from is the load-bearing knob: it is what selects the legacy two-stage Ψ.
+    assert "semantic_gt_from" in raised, \
+        f"expected a loud topology-mismatch error naming the provenance key, got {raised!r}"
 
 
 # ==========================================================================

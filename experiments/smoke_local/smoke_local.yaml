@@ -1,0 +1,41 @@
+# @package _global_
+# LOCAL MPS smoke (scratchpad only): tiny base LLM, real data, 2 optimizer steps.
+defaults:
+  - /base_config
+  - _self_
+name: smokelocal
+model:
+  path: Qwen/Qwen2.5-0.5B-Instruct
+gnn:
+  arch: learnable_graph_mask
+  d_model: 64
+  pe_hidden_channels: 16
+  pe_num_layers: 2
+  num_samples: 8
+  gt_num_layers: 2
+  gt_heads: 4
+  k_gt: 2
+  mask_layer_scope: all
+  wire_layer_scope: all
+data:
+  train_files: data/n_30/gen/nav100_n30_gemma_data/split/formatted_all_new__train.json
+  val_files: data/n_30/gen/nav100_n30_gemma_data/split/formatted_all_new__val.json
+  max_seq_length: 1024
+  debug: true
+  dataset_proportion: 0.02
+trainer:
+  checkpoint_dir: /private/tmp/claude-503/-Users-cyberlives-Documents-GitHub-GREP-PRISM/38a48254-750b-499a-ae31-21f3362eaa38/scratchpad/ckpt
+  save_name: smokelocal
+  device: 0
+  max_steps: 2
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 1
+  report_to: none
+  overwrite_ok: true
+eval:
+  data: data/n_30/gen/nav100_n30_gemma_data/split/test_graphs
+  num_graphs: 0
+  epoch_interval: 999.0
+wandb:
+  run_name: smokelocal
+  tag: smokelocal
