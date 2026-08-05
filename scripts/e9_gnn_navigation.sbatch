@@ -4,13 +4,13 @@
 #SBATCH --time=24:00:00
 #SBATCH --partition=dgx-b200
 #SBATCH --gpus=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
+#SBATCH --cpus-per-task=28
+#SBATCH --mem=224G
 # Header matches the e13f/e14 scripts: same partition, and an ABSOLUTE --output under
 # $PROJ. SLURM opens that file before the job body runs and will NOT create a missing
 # directory, so a relative `logs/...` path fails the job at submission with no
-# diagnostic — an in-script `mkdir` cannot rescue it. cpus/mem are lower than the LLM
-# jobs on purpose: this trains GNNs, not gemma-4-31B.
+# diagnostic — an in-script `mkdir` cannot rescue it. cpus/mem are the partition's enforced
+# 28 CPUs/GPU at 8 GB/CPU, not a sizing choice for this job.
 #
 # scripts/e9_gnn_navigation.py — the three-stage navigator pretraining that produces the
 # suite weights every graph arch loads as its Ψ producer:
@@ -67,7 +67,7 @@ export HF_HOME=${HF_HOME:-$ALELAB/hf_cache}
 export PYTHONPATH=${PYTHONPATH:-$PROJ/src}
 # SLURM 22.05+ stopped propagating --cpus-per-task to srun; pass it explicitly to avoid
 # "CPU binding outside of job step allocation" on dgx-b200 nodes (same as the e14 jobs).
-export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-8}"
+export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-28}"
 
 # Stage/suite knobs — every one is passed through to the .py untouched.
 export SUITE=${SUITE:-suite9}

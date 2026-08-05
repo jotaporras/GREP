@@ -4,8 +4,8 @@
 #SBATCH --time=24:00:00
 #SBATCH --partition=dgx-b200
 #SBATCH --gpus=1
-#SBATCH --cpus-per-task=14
-#SBATCH --mem=256G
+#SBATCH --cpus-per-task=28
+#SBATCH --mem=224G
 #
 # e14 no-permutation eval WITH SPINE tool-calling ENABLED — the tools-on counterpart
 # to scripts/e14_transferability.sbatch (which sets PRISM_DISABLE_SPINE_TOOLS). This
@@ -67,7 +67,7 @@ echo "  training policy (recorded, not consumed here): data.icl_examples=$DATA_I
 export HF_HOME=${HF_HOME:-$ALELAB/hf_cache}
 # SLURM 22.05+ stopped propagating --cpus-per-task to srun; pass it explicitly
 # to avoid "CPU binding outside of job step allocation" on dgx-b200 nodes.
-export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-14}"
+export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-28}"
 # NOTE: PRISM_DISABLE_SPINE_TOOLS is intentionally NOT set here — SPINE tool-calling
 # stays enabled (this is the tools-on arm of the A/B).
 

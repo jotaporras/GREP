@@ -4,8 +4,8 @@
 #SBATCH --time=24:00:00
 #SBATCH --partition=dgx-b200
 #SBATCH --gpus=1
-#SBATCH --cpus-per-task=14
-#SBATCH --mem=256G
+#SBATCH --cpus-per-task=28
+#SBATCH --mem=224G
 #
 # e14 — the e13f_alpha00_binary recipe (pure learned sim on legal edges, mask_alpha=0.0,
 # nav-GT Psi x decode_consistent, binary adjacency) run as a DIRECT Stage 1 -> Stage 3
@@ -103,7 +103,7 @@ export HF_HOME=${HF_HOME:-$ALELAB/hf_cache}
 export HF_DATASETS_CACHE="${TMPDIR:-/tmp}/hf_datasets_${SLURM_JOB_ID:-manual}"
 # SLURM 22.05+ stopped propagating --cpus-per-task to srun; pass it explicitly
 # to avoid "CPU binding outside of job step allocation" on dgx-b200 nodes.
-export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-14}"
+export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-28}"
 
 module load anaconda3
 source "$(conda info --base)/etc/profile.d/conda.sh"
