@@ -369,6 +369,79 @@ def test_forward_runs_differs_and_grad_flows():
     assert wrap._struct_bias is None
 
 
+# ---------------------------------------------------------------------------
+# Identity-RoPE on graph tokens (model.disable_graph_token_rope)
+# ---------------------------------------------------------------------------
+
+def _capture_position_ids(wrap):
+    """Record the position_ids the wrapper hands to the inner LLM (None if it passes none)."""
+    seen = {}
+    inner = wrap.llm.forward
+
+    def spy(*args, **kwargs):
+        seen["position_ids"] = kwargs.get("position_ids")
+        return inner(*args, **kwargs)
+
+    wrap.llm.forward = spy
+    return seen
+
+
+def test_identity_rope_zeroes_injected_spans_only():
+    """disable_graph_token_rope=True ⇒ the injected spans get position 0, everything
+    else keeps its arange index. Off (the default) ⇒ no position_ids at all, so the LLM
+    numbers the sequence itself."""
+    seq = 8
+    imap = [{0: [(1, 2)], 1: [(3, 5)]}]
+    g = _graph(2, edges=[(0, 1)])
+    input_ids = torch.randint(0, 64, (1, seq), device=DEVICE)
+
+    on = _wrap()
+    on._disable_graph_token_rope = True
+    seen_on = _capture_position_ids(on)
+    off = _wrap()
+    seen_off = _capture_position_ids(off)
+    with torch.no_grad():
+        on(input_ids=input_ids, graphs=[g], injection_maps=imap)
+        off(input_ids=input_ids, graphs=[g], injection_maps=imap)
+
+    assert seen_off["position_ids"] is None
+    pos = seen_on["position_ids"]
+    assert pos.shape == (1, seq)
+    assert pos[0].tolist() == [0, 0, 2, 0, 0, 5, 6, 7]
+
+
+def test_identity_rope_changes_logits_and_respects_caller_position_ids():
+    """The flag is a real architectural arm (logits move), and an explicit position_ids
+    from the caller wins — the wrapper must not overwrite it."""
+    seq = 8
+    imap = [{0: [(1, 2)], 1: [(3, 5)]}]
+    g = _graph(2, edges=[(0, 1)])
+    input_ids = torch.randint(0, 64, (1, seq), device=DEVICE)
+
+    on, off = _wrap(), _wrap()
+    on.load_state_dict(off.state_dict())      # same weights: only the flag differs
+    on._disable_graph_token_rope = True
+    with torch.no_grad():
+        a = on(input_ids=input_ids, graphs=[g], injection_maps=imap).logits
+        b = off(input_ids=input_ids, graphs=[g], injection_maps=imap).logits
+    assert not torch.allclose(a, b, atol=1e-5)
+
+    explicit = torch.arange(seq, device=DEVICE).unsqueeze(0)
+    seen = _capture_position_ids(on)
+    with torch.no_grad():
+        on(input_ids=input_ids, graphs=[g], injection_maps=imap, position_ids=explicit)
+    assert torch.equal(seen["position_ids"], explicit)
+
+
+def test_identity_rope_constructor_flag_reaches_the_attribute():
+    """The constructor arg is what architectures/loaders pass; it must set the attribute
+    inference.py duck-types on."""
+    llm = _tiny_llm()
+    wrap = LearnableGraphMaskLLM(llm, _StubPE(), disable_graph_token_rope=True)
+    assert wrap._disable_graph_token_rope is True
+    assert LearnableGraphMaskLLM(_tiny_llm(), _StubPE())._disable_graph_token_rope is False
+
+
 def test_gradient_debug_callback_handles_learnable_mask():
     """Regression for the on_train_begin AttributeError: GradientDebugCallback must not
     assume GraphAugmented's pe_proj/pe_gain. LearnableGraphMaskLLM has a GT `pe_model` but

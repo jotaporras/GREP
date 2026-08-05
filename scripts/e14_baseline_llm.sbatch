@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=28
 #SBATCH --mem=224G
 #
-# e14 BASELINE — the plain-LLM control for scripts/e14_stage1to3_binary.sbatch. Same base
+# e14 BASELINE — the plain-LLM control for scripts/e14_stage1to3_binary.sbatch — same base
 # model, same corpus, same prompt format, same optimizer settings, same eval set, same
 # SLURM resources; the ONLY intended difference is gnn.arch=llm, i.e. no graph channel at
 # all (no Psi, no attention mask, no PE). Checkpoints land in the same CHECKPOINT_DIR and
@@ -45,7 +45,8 @@
 #           only, and unlike e14 nothing supplies the edges. This is the number the graph
 #           channel has to beat.
 #   present — the informed BRACKET: edges written into the prompt text. Pair the two to
-#           bracket e14 the way experiments/e9_baseline_llm{,_no_edges}.yaml do.
+#           bracket e14 the way experiments/e9_baseline_llm.yaml and
+#           experiments/e9_baseline_llm_no_edges.yaml do.
 # Note the eval side follows automatically: train_v3 passes
 # include_edge_list=(text_edge_list=="present") to the EvalCallback.
 #

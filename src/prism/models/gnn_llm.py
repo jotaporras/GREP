@@ -465,6 +465,32 @@ def tok2node_vector(injection_map, seq_len, device) -> torch.Tensor:
     return tok2node
 
 
+def graph_token_position_ids(injection_maps, seq_len: int, device) -> torch.Tensor:
+    """``[B, seq_len]`` position_ids with the injected spans set to 0 (identity RoPE).
+
+    Non-graph tokens keep their natural ``arange`` index. Causality is unaffected (HF
+    derives the causal mask from cache_position, not position_ids). Shared by every
+    architecture that honours ``disable_graph_token_rope`` — the additive family
+    (:class:`GraphAugmentedLLM`) and the learned mask (:class:`LearnableGraphMaskLLM`) —
+    so there is ONE definition of which positions get identity RoPE.
+
+    The caller decides WHICH map to pass, and that choice is the arch's contract: both
+    callers pass the QUERY-role map, i.e. exactly the positions carrying the graph
+    channel under ``data.injection_scope``. A ``prompt_only`` run therefore matches
+    generation exactly; see :meth:`LearnableGraphMaskLLM.forward` for the
+    ``decode_consistent`` case.
+    """
+    B = len(injection_maps)
+    pos = torch.arange(seq_len, device=device).unsqueeze(0).repeat(B, 1)
+    for b in range(B):
+        for spans in injection_maps[b].values():
+            for start, end in spans:
+                end = min(end, seq_len)
+                if start < end:
+                    pos[b, start:end] = 0
+    return pos
+
+
 def wire_place_at_node_spans(dest, b: int, rows, injection_map, seq_len: int) -> None:
     """Accumulate per-node rows into ``dest[b]`` at each node's token spans, in place.
 
@@ -758,12 +784,16 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         psi_scale: ``"cosine"`` row-normalizes Ψ so sim ∈ [−1,1] (bounded mask); or
             ``"inv_sqrt_d"`` uses raw ``Ψ Ψᵀ / √D`` (attention-style scaling).
         eps: epsilon for the cosine normalization.
+        disable_graph_token_rope: identity-RoPE (position_id 0) on the injected spans —
+            the mask says *which* nodes may attend, this says the node tokens carry no
+            sequence position. Orthogonal to the bias: it changes q/k RoPE, not logits.
+            See :meth:`forward` for the train/decode contract.
     """
 
     def __init__(self, llm: nn.Module, pe_model: nn.Module, alpha: float = 0.7,
                  layer_scope: str = "dense", k_hops: int = 1, symmetrize: bool = True,
                  use_edges: bool = True, psi_scale: str = "cosine", eps: float = 1e-8,
-                 buggy_causal_fold: bool = False):
+                 buggy_causal_fold: bool = False, disable_graph_token_rope: bool = False):
         # Wrapper is not a registered HF architecture or MoE class; force "eager" so
         # PreTrainedModel doesn't reject SDPA/flash or expert-impl validation.
         config = copy.copy(llm.config)
@@ -799,6 +829,8 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         self._mask_use_edges = bool(use_edges)
         # A/B ablation knob (shared with GraphMaskLLM): reproduce the pre-fix mask leak.
         self._mask_buggy_fold = bool(buggy_causal_fold)
+        # Same attribute name GraphAugmentedLLM uses: inference.py duck-types on it.
+        self._disable_graph_token_rope: bool = bool(disable_graph_token_rope)
         if self._mask_psi_scale == "cosine" and not self._mask_use_edges:
             # Edgeless ⇒ adjacency is self-loops only; cosine self-similarity is the constant
             # 1, so every allowed entry is constant ⇒ the whole bias is constant ⇒ the GT gets
@@ -816,6 +848,19 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
     def structural_parameters(self) -> list[nn.Parameter]:
         """Graph-side parameters for the boosted-LR group: the standalone GT."""
         return list(self.pe_model.parameters())
+
+    def graph_token_position_ids(
+        self,
+        injection_maps: list[dict[int, list[tuple[int, int]]]],
+        seq_len: int,
+        device,
+    ) -> torch.Tensor:
+        """position_ids ([B, seq]) with graph-token spans set to 0 (identity RoPE).
+
+        Same delegate as :meth:`GraphAugmentedLLM.graph_token_position_ids`; kept as a
+        method so ``inference.py`` can call it on either architecture.
+        """
+        return graph_token_position_ids(injection_maps, seq_len, device)
 
     def _decoder_layers(self):
         """Return the LLM's decoder layer list (Gemma-4: ``llm.get_decoder().layers``)."""
@@ -956,6 +1001,26 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         key_injection_maps: list[dict[int, list[tuple[int, int]]]] | None = None,
         **kwargs,
     ):
+        """Arm the structural bias, then run the LLM.
+
+        ``_disable_graph_token_rope`` additionally zeroes the RoPE positions of the
+        QUERY-role spans (``injection_maps``) — the same rule
+        :class:`GraphAugmentedLLM` follows, so identity-RoPE always covers exactly the
+        positions that carry the graph channel under ``data.injection_scope``, and no
+        second definition of "graph token" exists. Consequences, worth knowing before
+        reading a result:
+
+        - ``prompt_only``: every zeroed position is a prompt position, and
+          ``inference.py`` passes the identical prompt map to ``generate`` ⇒ exact
+          train/decode parity.
+        - ``decode_consistent``: prompt spans as above; answer mentions are zeroed at
+          their single knowability position, which ``MaskDecodeInjector`` reproduces
+          step-by-step at decode ⇒ parity there too.
+        - ``full_sequence``: answer-side name spans are zeroed in training but get
+          natural positions at decode (HF advances position_ids per step and generated
+          tokens are not known in advance) — a train/decode mismatch that is inherent
+          to that scope, not to this flag.
+        """
         kwargs.pop("inputs_embeds", None)
         kwargs.pop("input_ids", None)
         # Arm the learned structural bias for the patched attention layers. No graph
@@ -966,6 +1031,12 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
                 key_injection_maps=key_injection_maps)
         else:
             self._struct_bias = None
+        # Identity-RoPE the injected spans when requested, unless the caller already
+        # supplied position_ids (mirrors GraphAugmentedLLM.forward).
+        if (self._disable_graph_token_rope and injection_maps is not None
+                and input_ids is not None and kwargs.get("position_ids") is None):
+            kwargs["position_ids"] = graph_token_position_ids(
+                injection_maps, input_ids.shape[1], input_ids.device)
         try:
             return self.llm(
                 input_ids=input_ids,
@@ -1210,19 +1281,12 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
     ) -> torch.Tensor:
         """position_ids ([B, seq]) with graph-token spans set to 0 (identity RoPE).
 
-        Non-graph tokens keep their natural ``arange`` index. Causality is unaffected
-        (HF derives the causal mask from cache_position, not position_ids). Returned
-        only when ``_disable_graph_token_rope`` is set; callers pass it to the LLM.
+        Thin delegate to the module-level :func:`graph_token_position_ids`; kept as a
+        method because ``inference.py`` calls it on the model (duck-typed across the
+        architectures that honour the flag). Used only when
+        ``_disable_graph_token_rope`` is set.
         """
-        B = len(injection_maps)
-        pos = torch.arange(seq_len, device=device).unsqueeze(0).repeat(B, 1)
-        for b in range(B):
-            for spans in injection_maps[b].values():
-                for start, end in spans:
-                    end = min(end, seq_len)
-                    if start < end:
-                        pos[b, start:end] = 0
-        return pos
+        return graph_token_position_ids(injection_maps, seq_len, device)
 
     def _augment_embeddings(
         self,
@@ -2591,3 +2655,13 @@ class MaskDecodeInjector:
         k_pos = (tok2node_k >= 0).nonzero(as_tuple=True)[0]
         row[k_pos] = self.node_values[q_node, tok2node_k[k_pos]]
         self.model._decode_bias_row = row.view(1, 1, 1, k_len)
+        # Identity-RoPE parity: under decode_consistent, training zeroes the position of
+        # exactly the query-tagged positions (decode_style_query_map), which are the ones
+        # tagged here — so zero this step's position_id too, or the same token would carry
+        # RoPE at decode and none in training. Only the CURRENT step's kwargs are
+        # rewritten; HF's own position_ids counter in model_kwargs is untouched, so
+        # subsequent steps keep advancing naturally (a zero written back there would
+        # restart the whole sequence's positions).
+        pos = kwargs.get("position_ids")
+        if getattr(self.model, "_disable_graph_token_rope", False) and pos is not None:
+            return args, {**kwargs, "position_ids": torch.zeros_like(pos)}

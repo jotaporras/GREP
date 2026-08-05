@@ -56,6 +56,31 @@ def _core_graph_model(model):
     return inner
 
 
+def _identity_rope_kwargs(graph_model, injection_map, seq_len, device) -> dict:
+    """``{"position_ids": ...}`` when the checkpoint trained with identity-RoPE, else ``{}``.
+
+    Duck-typed on ``_disable_graph_token_rope`` so the additive family and the learned
+    mask share one call site each. Only the PROMPT is covered: transformers advances
+    position_ids per decode step, so generated tokens get natural positions (the mask
+    family's ``MaskDecodeInjector`` re-zeroes the query-tagged steps, restoring parity
+    for ``decode_consistent``).
+
+    Fails loud if the last prompt position is zeroed: ``_update_model_kwargs_for_
+    generation`` derives every generated position as ``position_ids[..., -1:] + n``, so a
+    zeroed final prompt token would silently restart the whole rollout at position 1.
+    """
+    if not getattr(graph_model, "_disable_graph_token_rope", False):
+        return {}
+    position_ids = graph_model.graph_token_position_ids([injection_map], seq_len, device)
+    if seq_len > 1 and int(position_ids[0, -1]) == 0:
+        raise RuntimeError(
+            "identity-RoPE zeroed the FINAL prompt position: transformers derives each "
+            "generated position from the last one, so every generated token would be "
+            "numbered from 1. The prompt must not end inside a node mention "
+            f"(seq_len={seq_len}).")
+    return {"position_ids": position_ids}
+
+
 class InMemoryLLM(spine_models.InMemoryLLM):
     """SPINE-compatible LLM client for plain (non-graph-augmented) models.
 
@@ -269,6 +294,8 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
                     input_ids=input_ids, attention_mask=attention_mask,
                     max_new_tokens=max_new_tokens, **DECODE_KWARGS,
                     pad_token_id=self.tokenizer.eos_token_id,
+                    **_identity_rope_kwargs(graph_model, injection_map,
+                                            input_ids.shape[1], input_ids.device),
                 )
                 return outputs[:, input_ids.shape[-1]:]
             finally:
@@ -290,11 +317,9 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
         psi = graph_model.build_pe_signal(
             embeddings, [pyg_graph], [injection_map], permutation=self.permutation)
         graph_model._pe_signal = psi
-        gen_kwargs = {}
         # Identity-RoPE (position_id 0) for graph-token spans, matching training.
-        if getattr(graph_model, "_disable_graph_token_rope", False):
-            gen_kwargs["position_ids"] = graph_model.graph_token_position_ids(
-                [injection_map], embeddings.shape[1], embeddings.device)
+        gen_kwargs = _identity_rope_kwargs(
+            graph_model, injection_map, embeddings.shape[1], embeddings.device)
         try:
             return graph_model.llm.generate(
                 inputs_embeds=embeddings, attention_mask=attention_mask,

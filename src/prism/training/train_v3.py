@@ -255,6 +255,11 @@ def train_model(config: omegaconf.DictConfig):
             "architecture": config.gnn.arch,
             "base_model": config.model.path,
             "text_edge_list": config.data.text_edge_list,
+            # Cross-section (config.model), and LOAD-BEARING at reload: loaders pass it
+            # to every arch that honours it. It was previously absent from this dict, so
+            # `gnn_cfg.get("disable_graph_token_rope", False)` always won and a run
+            # trained with identity-RoPE was silently evaluated WITH normal RoPE.
+            "disable_graph_token_rope": config.model.disable_graph_token_rope,
             # Prompt-format provenance: whether the targets teach SPINE tool calling and
             # how many few-shot examples the prompts carried (eval must match).
             "spine_tools": config.data.spine_tools,

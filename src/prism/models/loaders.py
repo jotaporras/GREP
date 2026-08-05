@@ -338,6 +338,7 @@ def graph_augmented_llm_from_pretrained(
             use_edges=gnn_cfg.get("mask_use_edges", True),
             psi_scale=gnn_cfg.get("mask_psi_scale", "cosine"),
             buggy_causal_fold=gnn_cfg.get("mask_buggy_causal_fold", False),
+            disable_graph_token_rope=gnn_cfg.get("disable_graph_token_rope", False),
         )
         gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
         _load_psi_producer_state(model.pe_model, gnn_weights["pe_model"], path, gnn_cfg)

@@ -366,6 +366,84 @@ def test_learnable_mask_client_threads_the_permutation():
     assert model._struct_bias is None, "_struct_bias must be cleared after generate"
 
 
+def test_learnable_mask_identity_rope_reaches_generate_and_positions_advance():
+    """`disable_graph_token_rope` must survive the mask branch's generate call.
+
+    Two things only a REAL generate can settle, both transformers-version sensitive:
+    the prefill must receive the zeroed position_ids (not silently drop them, which
+    would evaluate an identity-RoPE checkpoint with normal RoPE), and the decode steps
+    must keep counting from the last prompt position rather than restarting at 0.
+    """
+    try:
+        tok = _tokenizer()
+        model = _learnable_mask_model(_tiny_gemma(tok.vocab_size))
+    except Exception as e:  # noqa: BLE001
+        return _skip(f"gemma4_unified/tokenizer unavailable: {e}")
+    model._disable_graph_token_rope = True
+    model.eval()
+    client = _make_client(GraphAugmentedInMemoryLLM, model, tok)
+    pyg = data_utils.scene_graph_dict_to_pyg(_SCENE)
+    # Ends OUTSIDE a mention, as a chat-templated prompt does (it closes with the model
+    # turn header); the shared `_prompt_ids` ends on a node name, which the guard rejects
+    # — see test_identity_rope_rejects_prompt_ending_in_a_mention.
+    enc = tok("Scene graph: field_1 house_1 robot at field_1. Plan:", return_tensors="pt")
+    input_ids, attn = enc["input_ids"], enc["attention_mask"]
+
+    seen = []
+    real_forward = model.llm.forward
+
+    def _spy(*a, **kw):
+        seen.append(kw.get("position_ids"))
+        return real_forward(*a, **kw)
+
+    model.llm.forward = _spy
+    try:
+        out = client._generate_tokens(input_ids, attn, [pyg], max_new_tokens=4)
+    finally:
+        del model.llm.forward
+
+    prefill = seen[0]
+    assert prefill is not None, "identity-RoPE position_ids never reached generate"
+    n = input_ids.shape[1]
+    assert prefill.shape == (1, n)
+    zeroed = (prefill[0] == 0).nonzero().flatten().tolist()
+    assert zeroed != [0], "no node span was zeroed — the prompt mentions no graph node"
+    # Decode steps continue from the prompt, so RoPE does not restart mid-rollout.
+    steps = [p for p in seen[1:] if p is not None]
+    assert steps, "decode steps received no position_ids"
+    assert int(steps[0][0, -1]) == n, (int(steps[0][0, -1]), n)
+    assert isinstance(out, torch.Tensor) and out.dtype == torch.long
+    assert model._struct_bias is None
+
+
+def test_identity_rope_rejects_prompt_ending_in_a_mention():
+    """The precondition behind the test above, asserted rather than assumed.
+
+    transformers numbers generated tokens from `position_ids[..., -1:]`, so a prompt
+    whose LAST token is inside a zeroed node span would restart the rollout at position
+    1 — every generated token silently mis-positioned. That must fail loudly, not
+    produce a plausible-looking rollout. (`_prompt_ids` ends on a node name, which is
+    exactly the offending shape.)
+    """
+    try:
+        tok = _tokenizer()
+        model = _learnable_mask_model(_tiny_gemma(tok.vocab_size))
+    except Exception as e:  # noqa: BLE001
+        return _skip(f"gemma4_unified/tokenizer unavailable: {e}")
+    model._disable_graph_token_rope = True
+    model.eval()
+    client = _make_client(GraphAugmentedInMemoryLLM, model, tok)
+    pyg = data_utils.scene_graph_dict_to_pyg(_SCENE)
+    input_ids, attn = _prompt_ids(tok)
+
+    try:
+        client._generate_tokens(input_ids, attn, [pyg], max_new_tokens=4)
+    except RuntimeError as e:
+        assert "FINAL prompt position" in str(e), e
+    else:
+        raise AssertionError("a prompt ending inside a node mention generated silently")
+
+
 def test_wire_decode_consistent_scope_is_rejected():
     """`injection_scope='decode_consistent'` has no rotation analogue (it needs the mask
     family's q/kv split). It must fail LOUDLY at the client rather than decode

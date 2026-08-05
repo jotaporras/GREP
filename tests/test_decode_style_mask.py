@@ -118,7 +118,8 @@ def test_forward_accepts_key_injection_maps():
 # MaskDecodeInjector must reproduce the teacher-forced asymmetric bias exactly,
 # and step-by-step cached decode must reproduce teacher-forced logits.
 # ---------------------------------------------------------------------------
-from prism.models.gnn_llm import MaskDecodeInjector, build_injection_map
+from prism.models.gnn_llm import (MaskDecodeInjector, LearnableGraphMaskLLM,
+                                  build_injection_map)
 from prism.models.gnn_llm import decode_style_query_map as dsqm
 
 # node0 = [10, 11], node1 = [12], node2 = [13, 14]; path graph 0-1-2.
@@ -138,10 +139,30 @@ PROMPT_AMB = [1, 20, 5, 20, 21, 6, 22, 7]      # nodeA@(1,2) nodeB@(3,5) nodeC@(
 ANSWER_AMB = [20, 9, 22, 4]                     # nodeA (resolves at 9), nodeC
 
 
-def _parity_fixture(seqs=None, prompt=None, answer=None):
+class _StubPE(torch.nn.Module):
+    """Per-node Psi from the node's own feature row — enough for LearnableGraphMaskLLM
+    to be constructible; the identity-RoPE tests read position_ids, not mask values."""
+
+    def __init__(self, d=4):
+        super().__init__()
+        self.lin = torch.nn.Linear(1, d)
+
+    def forward(self, g, permutation=None):
+        return self.lin(g.x.float() + 1.0)
+
+
+def _parity_fixture(seqs=None, prompt=None, answer=None, learnable=False,
+                    disable_graph_token_rope=False):
     seqs, prompt, answer = seqs or SEQS, prompt or PROMPT, answer or ANSWER
     n_nodes = len(seqs)
-    model = GraphMaskLLM(_tiny_llm(), k_hops=1, symmetrize=True).eval()
+    if learnable:
+        # The only arch that carries disable_graph_token_rope through its constructor.
+        model = LearnableGraphMaskLLM(
+            _tiny_llm(), _StubPE(), k_hops=1, symmetrize=True,
+            psi_scale="inv_sqrt_d",
+            disable_graph_token_rope=disable_graph_token_rope).eval()
+    else:
+        model = GraphMaskLLM(_tiny_llm(), k_hops=1, symmetrize=True).eval()
     g = _graph(n_nodes, [[i, i + 1] for i in range(n_nodes - 1)])
     full = prompt + answer
     full_map = build_injection_map(full, seqs, scope_start=0)
@@ -175,6 +196,47 @@ def _assert_rows_parity(seqs=None, prompt=None, answer=None):
 
 def test_decode_rows_match_teacher_forced_bias():
     _assert_rows_parity()
+
+
+def test_identity_rope_decode_zeroes_exactly_the_trained_positions():
+    """Identity-RoPE parity: with disable_graph_token_rope, training zeroes the RoPE
+    position of every QUERY-map span, so decode must zero the position of exactly the
+    same answer-side steps — no more (a stray zero corrupts the token's RoPE) and no
+    fewer (a missed one is a train/decode mismatch).
+
+    The step's kwargs are rewritten in place of the natural position_ids; HF's own
+    counter is untouched, which is what lets the following steps keep advancing.
+    """
+    model, g, full_map, q_map, prompt_map, seqs, prompt, answer = _parity_fixture(
+        learnable=True, disable_graph_token_rope=True)
+    injector = MaskDecodeInjector(model, g, prompt_map, len(prompt), seqs)
+
+    trained_zeroed = {p for spans in q_map.values() for s, e in spans
+                      for p in range(s, e) if p >= len(prompt)}
+    decode_zeroed = set()
+    for i, tok in enumerate(answer):
+        p = len(prompt) + i
+        natural = torch.tensor([[p]])
+        ret = injector.pre_hook(None, (), {"input_ids": torch.tensor([[tok]]),
+                                           "position_ids": natural})
+        if ret is not None and int(ret[1]["position_ids"][0, 0]) == 0:
+            decode_zeroed.add(p)
+        assert int(natural[0, 0]) == p, "the caller's position_ids tensor was mutated"
+
+    assert decode_zeroed, "no step was zeroed — the fixture exercises nothing"
+    assert decode_zeroed == trained_zeroed, (decode_zeroed, trained_zeroed)
+
+
+def test_identity_rope_off_leaves_decode_positions_untouched():
+    """Without the flag the hook must not touch position_ids (returning None = unchanged),
+    so existing decode_consistent checkpoints decode byte-identically."""
+    model, g, _, _, prompt_map, seqs, prompt, answer = _parity_fixture(learnable=True)
+    injector = MaskDecodeInjector(model, g, prompt_map, len(prompt), seqs)
+    for i, tok in enumerate(answer):
+        ret = injector.pre_hook(None, (), {
+            "input_ids": torch.tensor([[tok]]),
+            "position_ids": torch.tensor([[len(prompt) + i]])})
+        assert ret is None
 
 
 def test_decode_rows_match_teacher_forced_bias_ambiguous_names():

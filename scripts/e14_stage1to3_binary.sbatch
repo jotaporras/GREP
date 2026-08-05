@@ -45,21 +45,20 @@
 # and base_config.yaml still defaults train_files/val_files to it, so those two MUST be
 # passed explicitly or the run dies at dataset load.
 #
-# WARNING — DISABLE_GRAPH_TOKEN_ROPE (model.disable_graph_token_rope, default false) is
-# INERT for this arch. build_planner_model forwards it only to the three GraphAugmentedLLM
-# variants (architectures.py:49/74/98 — rpearl_llm / rpearl_gt_llm / gt_llm).
-# LearnableGraphMaskLLM, GraphMaskLLM and WireGraphLLM never receive it, so with
-# arch=learnable_graph_mask the node-name tokens keep their normal RoPE positions either
-# way — flipping the variable changes ONLY the value recorded in train_config.json. Do not
-# read a result here as "identity-RoPE on graph tokens" under any setting; that would
-# require threading the flag into LearnableGraphMaskLLM.forward (it builds no position_ids
-# today). The variable becomes load-bearing if the script is repointed at
-# gnn.arch=rpearl_llm / rpearl_gt_llm / gt_llm.
+# DISABLE_GRAPH_TOKEN_ROPE (model.disable_graph_token_rope, default false) is now LIVE for
+# this arch: build_planner_model forwards it to LearnableGraphMaskLLM, whose forward zeroes
+# the RoPE positions of the injected (query-role) spans. It is orthogonal to the mask — the
+# mask says which nodes may attend, this says node tokens carry no sequence position — so
+# true and false are two different models, not two labels for one.
+# Under data.injection_scope=decode_consistent (below) it covers the prompt spans plus the
+# single knowability position of each answer mention, and MaskDecodeInjector re-zeroes the
+# same positions at decode, so training and generation stay in agreement.
 #
-# NOTE the default is false, whereas earlier e14 runs hard-coded true. Nothing about the
-# computation changes, but train_config.json / the wandb config of new runs will disagree
-# with the old ones on this key. Pass DISABLE_GRAPH_TOKEN_ROPE=true to keep the old
-# recorded value.
+# NOTE the default is false, which is what earlier e14 runs actually COMPUTED (the flag
+# reached no code for this arch) even though they recorded true. Keeping false therefore
+# preserves comparability with those runs; DISABLE_GRAPH_TOKEN_ROPE=true is a NEW arm.
+# The value is now written into train_config.json, so eval rebuilds it correctly — before
+# this it was absent and loaders always defaulted to false at eval.
 #
 # The wandb names are overridable, in priority order:
 #   positional arg  >  same-named env var  >  built-in default.
@@ -112,9 +111,8 @@ TEST_GRAPHS=${TEST_GRAPHS:-$DATA_ROOT/test_graphs}
 # tool calls — switching the contract to an action list would ask the model for something
 # the data never demonstrates. Set DATA_ICL_EXAMPLES=0 to go back to zero-shot.
 DATA_ICL_EXAMPLES=${DATA_ICL_EXAMPLES:-2}
-# Identity-RoPE (position_id 0) on node-name tokens. See the WARNING above: inert under
-# arch=learnable_graph_mask, so this only sets what train_config.json records. Set true to
-# match what earlier e14 runs recorded.
+# Identity-RoPE (position_id 0) on the injected node-token spans — a real architectural
+# arm for this arch (see the note above), not just recorded metadata.
 DISABLE_GRAPH_TOKEN_ROPE=${DISABLE_GRAPH_TOKEN_ROPE:-false}
 
 # wandb names: positional arg > env var > default. RUN_NAME also drives the
