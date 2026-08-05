@@ -200,7 +200,7 @@ class GPTQueryClient:
         self,
         query: str,
         temperature: Optional[float] = 0.31,
-        max_tokens: Optional[int] = None,
+        max_tokens: Optional[int] = 10240,
         reasoning_effort: str = "low",
     ):
         return self.query_gpt_5(query, temperature, max_tokens, reasoning_effort)
@@ -209,13 +209,10 @@ class GPTQueryClient:
         self,
         query: str,
         temperature: Optional[float] = 0.31,
-        max_tokens: Optional[int] = None,
+        max_tokens: Optional[int] = 10240,
         reasoning_effort: str = "low",
     ) -> str:
 
-        # max_output_tokens caps reasoning + visible output together, exactly as
-        # max_new_tokens does for the local backend, so both honour the same
-        # config value. None leaves it to the model default (no cap).
         response = self.client.responses.create(
             model="gpt-5.1",
             input=[
@@ -223,7 +220,6 @@ class GPTQueryClient:
             ],
             text={"format": {"type": "text"}, "verbosity": "low"},
             reasoning={"effort": reasoning_effort, "summary": "auto"},
-            max_output_tokens=max_tokens,
         )
 
         return response.output_text
@@ -234,7 +230,6 @@ class GPTQueryClient:
         model: str = "gpt-5.1",
         reasoning_effort: str = "low",
         poll_interval: int = 60,
-        max_tokens: Optional[int] = None,
     ) -> List[str]:
         """Submit queries via the Batch API and return responses in order (~50% cheaper)."""
         requests_jsonl = "\n".join(
@@ -247,11 +242,6 @@ class GPTQueryClient:
                     "input": [{"role": "user", "content": [{"type": "input_text", "text": q}]}],
                     "text": {"format": {"type": "text"}, "verbosity": "low"},
                     "reasoning": {"effort": reasoning_effort, "summary": "auto"},
-                    **(
-                        {}
-                        if max_tokens is None
-                        else {"max_output_tokens": max_tokens}
-                    ),
                 },
             })
             for i, q in enumerate(queries)

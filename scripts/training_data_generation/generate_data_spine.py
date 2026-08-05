@@ -135,19 +135,6 @@ if __name__ == "__main__":
         help="Number of tasks to generate per graph in Phase 1.",
     )
     parser.add_argument(
-        "--max-gen-tokens",
-        type=int,
-        default=DataGenerator.max_gen_tokens,
-        help=(
-            "Phase-1 generation budget in tokens. Reasoning (the local backend's "
-            "<think> block / the OpenAI reasoning tokens) and the emitted JSON "
-            "SHARE this budget, so it is sized at 2x the measured output length: "
-            "184 tok/node at p95 over the populated n~100 graphs => ~20.2k tokens "
-            "for a 110-node graph. Too low and the model truncates mid-JSON, which "
-            "surfaces misleadingly as a json.loads parse error."
-        ),
-    )
-    parser.add_argument(
         "--max-graphs",
         type=int,
         default=None,
@@ -184,7 +171,6 @@ if __name__ == "__main__":
         task_proportions=args.task_proportions,
         complexity_proportions=args.complexity_proportions,
         seed=args.seed,
-        max_gen_tokens=args.max_gen_tokens,
     )
 
     if args.skip_populate:

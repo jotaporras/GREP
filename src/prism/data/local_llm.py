@@ -44,8 +44,7 @@ via ``apply_chat_template(..., enable_thinking=True)`` so the model reasons
 before answering; the reasoning is emitted in a ``<think>`` block that
 ``processor.parse_response`` strips, so the saved data stays clean JSON (Phase 1)
 and clean SPINE plans (Phase 2). NOTE: thinking consumes generation tokens, so
-the budgets account for the ``<think>`` block — Phase 1 uses
-:data:`DEFAULT_POPULATE_MAX_TOKENS` (2x the measured output length), Phase 2 is
+the budgets account for the ``<think>`` block — Phase 1 keeps 10240, Phase 2 is
 raised from 2048 to 4096. If a harder model still truncates before emitting
 ``answer(...)``, raise ``max_new_tokens`` further.
 
@@ -88,30 +87,6 @@ def _silence_hf_warnings() -> None:
 _silence_hf_warnings()
 
 DEFAULT_GEMMA_MODEL = "google/gemma-4-26B-A4B-it"
-
-# Phase-1 populate budget, MEASURED rather than guessed. Tokenising the 24
-# populated n~100 graphs in data/n_100/gen/nav_n100_gemma_data/populated_graphs
-# with the google/gemma-4-31B-it tokenizer gives 184 tok/node at both p95 and
-# max for the emitted {"graph", "tasks"} JSON, i.e. ~20.2k tokens for the
-# ~110-node regime. Doubled to 40960 so the ``<think>`` block, which shares this
-# same budget (enable_thinking=True), cannot starve the JSON — at 10240 it did
-# exactly that, and every truncation landed mid-``regions`` and surfaced as a
-# bogus json.loads error. Overridable per run via ``--max-gen-tokens``.
-DEFAULT_POPULATE_MAX_TOKENS = 40960
-
-
-def populate_max_tokens() -> int:
-    """Phase-1 generation budget: ``$PRISM_HF_POPULATE_MAX_NEW_TOKENS`` or
-    :data:`DEFAULT_POPULATE_MAX_TOKENS`.
-
-    The launch scripts already export this variable; until now nothing read it,
-    so the printed budget did not match the one actually used. Same env-override
-    idiom as ``PRISM_HF_MODEL`` in :func:`load_gemma`.
-    """
-    return int(
-        os.environ.get("PRISM_HF_POPULATE_MAX_NEW_TOKENS", DEFAULT_POPULATE_MAX_TOKENS)
-    )
-
 
 # model_id -> (model, processor). Module-level so populate (Phase 1) and SPINE
 # rollouts (Phase 2) share one loaded model within a process.
@@ -299,20 +274,15 @@ class LocalHFQueryClient:
     This is a pure backend swap: it accepts and honours the SAME call
     parameters the OpenAI client does, so every other knob in the data
     generator is unchanged. ``temperature`` and ``max_tokens`` map directly to
-    ``model.generate``; ``max_tokens=None`` (the default) falls back to
-    ``self.max_new_tokens``, which ``TaskGraphGen`` sets from config.
-    ``reasoning_effort`` has no
+    ``model.generate`` (the populate path uses the ``GPTQueryClient`` defaults
+    of ``temperature=0.31`` / ``max_tokens=10240``). ``reasoning_effort`` has no
     HF equivalent; thinking is enabled, and its ``<think>`` block is stripped by
     ``parse_response`` so the returned output is still a single well-formed JSON
     object (matching gpt-5.1 ``output_text``, whose reasoning never appears
     inline).
     """
 
-    def __init__(
-        self,
-        model_id: Optional[str] = None,
-        max_new_tokens: int = DEFAULT_POPULATE_MAX_TOKENS,
-    ):
+    def __init__(self, model_id: Optional[str] = None, max_new_tokens: int = 10240):
         self.model, self.processor = load_gemma(model_id)
         self.max_new_tokens = max_new_tokens
 
@@ -320,7 +290,7 @@ class LocalHFQueryClient:
         self,
         query: str,
         temperature: Optional[float] = 0.31,
-        max_tokens: Optional[int] = None,
+        max_tokens: Optional[int] = 10240,
         reasoning_effort: str = "low",
     ) -> str:
         return self.query_gpt_5(query, temperature, max_tokens, reasoning_effort)
@@ -329,7 +299,7 @@ class LocalHFQueryClient:
         self,
         query: str,
         temperature: Optional[float] = 0.31,
-        max_tokens: Optional[int] = None,
+        max_tokens: Optional[int] = 10240,
         reasoning_effort: str = "low",
     ) -> str:
         messages = [{"role": "user", "content": query}]
@@ -362,7 +332,6 @@ class LocalHFQueryClient:
         model: str = DEFAULT_GEMMA_MODEL,
         reasoning_effort: str = "low",
         poll_interval: int = 60,
-        max_tokens: Optional[int] = None,
     ) -> List[str]:
         """Sequential local fallback for the OpenAI Batch API.
 
@@ -371,10 +340,7 @@ class LocalHFQueryClient:
         only for signature compatibility with ``GPTQueryClient``.
         """
         return [
-            self.query_gpt_5(
-                q, max_tokens=max_tokens, reasoning_effort=reasoning_effort
-            )
-            for q in queries
+            self.query_gpt_5(q, reasoning_effort=reasoning_effort) for q in queries
         ]
 
 

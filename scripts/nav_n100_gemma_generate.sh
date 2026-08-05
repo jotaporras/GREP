@@ -67,12 +67,10 @@ export PRISM_LLM_BACKEND=hf
 export PRISM_HF_MODEL="${2:-${PRISM_HF_MODEL:-google/gemma-4-26B-A4B-it}}"
 # 4bit (NF4) fits a single 24GB GPU (~13GB for 26B-A4B); none=bf16 (~52GB).
 export PRISM_HF_QUANT="${PRISM_HF_QUANT:-4bit}"
-# Populate generation budget (ONE cap shared by the <think> block AND the JSON
-# graph). 10240 truncates a ~100-node graph mid-object ("Expecting ',' delimiter").
-# Sized at 2x the MEASURED output: 184 tok/node at p95 over the 24 populated
-# n~100 graphs (gemma-4-31B-it tokenizer) => ~20.2k for 110 nodes, doubled.
-# Consumed by prism.data.local_llm.populate_max_tokens(); override by pre-setting it.
-export PRISM_HF_POPULATE_MAX_NEW_TOKENS="${PRISM_HF_POPULATE_MAX_NEW_TOKENS:-40960}"
+# NOTE: the populate generation budget is NOT settable from here. It is the
+# LocalHFQueryClient(max_new_tokens=10240) default in prism.data.local_llm — one
+# cap shared by the <think> block AND the emitted JSON. Change it there, not via
+# an env var, so the value a run reports is the value it uses.
 
 # --- Quiet transformers / HuggingFace warnings, progress bars & banners ---
 export TRANSFORMERS_VERBOSITY=error
@@ -116,7 +114,6 @@ echo "    CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<all>} (require_single_gp
 echo "    PRISM_LLM_BACKEND=${PRISM_LLM_BACKEND}"
 echo "    PRISM_HF_MODEL=${PRISM_HF_MODEL}"
 echo "    PRISM_HF_QUANT=${PRISM_HF_QUANT}"
-echo "    PRISM_HF_POPULATE_MAX_NEW_TOKENS=${PRISM_HF_POPULATE_MAX_NEW_TOKENS}"
 echo "    N_GRAPHS=${N_GRAPHS} x N_TASKS=${N_TASKS} = $((N_GRAPHS * N_TASKS)) (graph,task) pairs"
 
 echo ""
