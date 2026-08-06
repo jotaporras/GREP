@@ -4,8 +4,8 @@
 #SBATCH --time=24:00:00
 #SBATCH --partition=dgx-b200
 #SBATCH --gpus=1
-#SBATCH --cpus-per-task=14
-#SBATCH --mem=256G
+#SBATCH --cpus-per-task=28
+#SBATCH --mem=224G
 #
 # SLURM wrapper for scripts/nav_n100_gemma_generate.sh with the vLLM backend
 # (GREP-T1 AC6/AC7): Phase-1 populate runs as ONE continuously-batched call and
