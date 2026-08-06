@@ -322,12 +322,121 @@ class DataGenerator:
                         "cublas", "out of memory", "cudnn")
         )
 
+    def _run_one_rollout(
+        self,
+        *,
+        idx: int,
+        task_idx: int,
+        task_entry: dict,
+        graph: dict,
+        log_dir: str,
+        spine_client,
+    ) -> bool:
+        """Run one SPINE rollout for (graph idx, task_idx) with the atomic
+        .partial-commit / *_failed.json-quarantine protocol. Returns True when a
+        sample file was produced (committed or previously valid). Raises on
+        fatal GPU errors so the caller can abort the run.
+
+        Thread-safe: every mutable object (GraphHandler, GraphSim, SPINE,
+        the .partial log) is task-local; `spine_client` must be thread-safe
+        when called with rollout_workers > 1 (the vLLM client is).
+        """
+        log_name = f"{log_dir}/sample_{idx:03d}_{task_idx:03d}.json"
+        # Recovery rerun: skip tasks whose rollout is already valid
+        # so only failed/corrupt/missing ones are regenerated.
+        if self._has_valid_rollout(log_name):
+            print(
+                f"Skipping sample_{idx:03d}_{task_idx:03d}: "
+                "valid rollout already exists"
+            )
+            return True
+        # Atomic-commit a rollout. SPINE rewrites its log file after
+        # EVERY planner turn, so a ^C between turns would otherwise leave
+        # a valid-looking but answer-less `sample_GGG_TTT.json` that
+        # `_has_valid_rollout` mistakes for complete and skips forever.
+        # Instead SPINE writes to a `.partial`, which we rename to the
+        # real name only once planning RETURNS. An interrupted task leaves
+        # only the `.partial` (ignored by resume, split, and aggregate)
+        # and is cleanly regenerated on the next run.
+        failed_name = log_name.replace(".json", "_failed.json")
+        tmp_log = f"{log_name}.partial"
+        if os.path.exists(tmp_log):
+            os.remove(tmp_log)  # drop any stale partial from a prior ^C
+        try:
+            task = task_entry["task"]
+            init_location = task_entry["init_node"]
+            # SPINE's GraphHandler loads from a path or dict; build an
+            # empty one (graph="") and populate it from the in-memory
+            # graph dict via reset() (same idiom as parse_response / the
+            # eval path) so GraphSim sees a populated graph at
+            # construction.
+            graph_handle = GraphHandler(graph="")
+            graph_handle.reset(graph, current_location=init_location)
+            graph_data_gen = graph_sim.GraphSim(graph_handle)
+            unknown_pct = self.unknown_pcts[task_idx % len(self.unknown_pcts)]
+            graph_data_gen.randomly_remove_nodes(pct=unknown_pct)
+            planner = SPINE(
+                graph=graph_data_gen.partial_graph,
+                log_name=tmp_log,
+                client=spine_client,
+            )
+            out = self.planning_sim.run_planning(
+                llm_planner=planner, task=task, graph_data_gen=graph_data_gen
+            )
+            # Commit: a rollout that reached an answer becomes the real
+            # sample (picked up by split_train_val); anything else is
+            # quarantined as *_failed.json (ignored by split, retried on a
+            # later run since `sample_GGG_TTT.json` stays absent).
+            os.replace(
+                tmp_log,
+                log_name if out.terminated_by == "answer" else failed_name,
+            )
+            return True
+        except Exception as ex:
+            # Quarantine whatever partial trace exists as *_failed.json.
+            if os.path.exists(tmp_log):
+                os.replace(tmp_log, failed_name)
+            # A GPU fault corrupts the CUDA context for every later task
+            # in this process; abort fast rather than quarantining all of
+            # them. Completed rollouts are already committed, so a re-run
+            # resumes (skips them via _has_valid_rollout) and retries the
+            # missing/failed ones.
+            if self._is_fatal_gpu_error(ex):
+                print(
+                    f"sample_{idx:03d}_{task_idx:03d}: fatal GPU error — "
+                    f"aborting so a re-run can resume: {ex}"
+                )
+                raise
+            # Any other single-task failure must not abort the run.
+            print(
+                f"Skipping sample_{idx:03d}_{task_idx:03d}: "
+                f"rollout failed — {type(ex).__name__}: {ex}"
+            )
+            return False
+
+    @staticmethod
+    def _make_spine_client():
+        """Pick the SPINE planner client from PRISM_LLM_BACKEND.
+
+        "vllm" -> thread-safe batched vLLM client; "hf"/"gemma"/"local" ->
+        eager HF Gemma client; anything else -> None so SPINE uses its own
+        default (OpenAI). Built once so the model is reused across all tasks.
+        """
+        from prism.data import vllm_llm
+
+        if vllm_llm.vllm_backend_enabled():
+            return vllm_llm.VLLMSpineClient()
+        if local_llm.hf_backend_enabled():
+            return local_llm.GemmaSpineClient()
+        return None
+
     def generate_example_plans(
         self,
         generated_data: List[str],
         log_dir: str,
+        rollout_workers: int = 1,
     ) -> None:
-        """_summary_
+        """Run SPINE rollouts for every (graph, task) pair.
 
         Parameters
         ----------
@@ -339,20 +448,30 @@ class DataGenerator:
         log_dir : str
             Path to log generated plans. Plans will be saved in the following structure
                 {log_dir}_sample_{graph_idx}_{task_idx}.json
+        rollout_workers : int
+            Number of rollouts to run concurrently. 1 (default) preserves the
+            historical sequential behavior. >1 requires a thread-safe planner
+            client (PRISM_LLM_BACKEND=vllm) — concurrent dialogues are then
+            micro-batched into shared vLLM generate calls.
         """
 
         Path(log_dir).mkdir(parents=True, exist_ok=True)
 
-        data_counter = 0
+        spine_client = self._make_spine_client()
+        from prism.data import vllm_llm
 
-        # When PRISM_LLM_BACKEND selects the local backend, drive the SPINE
-        # planner with a shared local Gemma client (same model instance as the
-        # populate phase). Otherwise leave client=None so SPINE uses its own
-        # default (OpenAI). Built once so the model is reused across all tasks.
-        spine_client = (
-            local_llm.GemmaSpineClient() if local_llm.hf_backend_enabled() else None
-        )
+        if rollout_workers > 1 and not isinstance(
+            spine_client, vllm_llm.VLLMSpineClient
+        ):
+            raise ValueError(
+                f"rollout_workers={rollout_workers} needs the thread-safe vLLM "
+                "planner client; set PRISM_LLM_BACKEND=vllm (got backend "
+                f"{os.environ.get('PRISM_LLM_BACKEND', 'openai')!r})."
+            )
 
+        # Flatten to one job per (graph, task); unreadable graphs are skipped
+        # here exactly as before.
+        jobs = []
         for idx, data_path in enumerate(generated_data):
             try:
                 with open(data_path) as f:
@@ -382,78 +501,40 @@ class DataGenerator:
             print(f"Generating example data for tasks: {tasks}")
 
             for task_idx, task_entry in enumerate(task_entries):
-                log_name = f"{log_dir}/sample_{idx:03d}_{task_idx:03d}.json"
-                # Recovery rerun: skip tasks whose rollout is already valid
-                # so only failed/corrupt/missing ones are regenerated.
-                if self._has_valid_rollout(log_name):
-                    print(
-                        f"Skipping sample_{idx:03d}_{task_idx:03d}: "
-                        "valid rollout already exists"
+                jobs.append(
+                    dict(
+                        idx=idx,
+                        task_idx=task_idx,
+                        task_entry=task_entry,
+                        graph=graph,
+                        log_dir=str(log_dir),
+                        spine_client=spine_client,
                     )
-                    data_counter += 1
-                    continue
-                # Atomic-commit a rollout. SPINE rewrites its log file after
-                # EVERY planner turn, so a ^C between turns would otherwise leave
-                # a valid-looking but answer-less `sample_GGG_TTT.json` that
-                # `_has_valid_rollout` mistakes for complete and skips forever.
-                # Instead SPINE writes to a `.partial`, which we rename to the
-                # real name only once planning RETURNS. An interrupted task leaves
-                # only the `.partial` (ignored by resume, split, and aggregate)
-                # and is cleanly regenerated on the next run.
-                failed_name = log_name.replace(".json", "_failed.json")
-                tmp_log = f"{log_name}.partial"
-                if os.path.exists(tmp_log):
-                    os.remove(tmp_log)  # drop any stale partial from a prior ^C
-                try:
-                    task = task_entry["task"]
-                    init_location = task_entry["init_node"]
-                    # SPINE's GraphHandler loads from a path or dict; build an
-                    # empty one (graph="") and populate it from the in-memory
-                    # graph dict via reset() (same idiom as parse_response / the
-                    # eval path) so GraphSim sees a populated graph at
-                    # construction.
-                    graph_handle = GraphHandler(graph="")
-                    graph_handle.reset(graph, current_location=init_location)
-                    graph_data_gen = graph_sim.GraphSim(graph_handle)
-                    unknown_pct = self.unknown_pcts[task_idx % len(self.unknown_pcts)]
-                    graph_data_gen.randomly_remove_nodes(pct=unknown_pct)
-                    planner = SPINE(
-                        graph=graph_data_gen.partial_graph,
-                        log_name=tmp_log,
-                        client=spine_client,
-                    )
-                    out = self.planning_sim.run_planning(
-                        llm_planner=planner, task=task, graph_data_gen=graph_data_gen
-                    )
-                    # Commit: a rollout that reached an answer becomes the real
-                    # sample (picked up by split_train_val); anything else is
-                    # quarantined as *_failed.json (ignored by split, retried on a
-                    # later run since `sample_GGG_TTT.json` stays absent).
-                    os.replace(
-                        tmp_log,
-                        log_name if out.terminated_by == "answer" else failed_name,
-                    )
-                    data_counter += 1
-                except Exception as ex:
-                    # Quarantine whatever partial trace exists as *_failed.json.
-                    if os.path.exists(tmp_log):
-                        os.replace(tmp_log, failed_name)
-                    # A GPU fault corrupts the CUDA context for every later task
-                    # in this process; abort fast rather than quarantining all of
-                    # them. Completed rollouts are already committed, so a re-run
-                    # resumes (skips them via _has_valid_rollout) and retries the
-                    # missing/failed ones.
-                    if self._is_fatal_gpu_error(ex):
-                        print(
-                            f"sample_{idx:03d}_{task_idx:03d}: fatal GPU error — "
-                            f"aborting so a re-run can resume: {ex}"
-                        )
-                        raise
-                    # Any other single-task failure must not abort the run.
-                    print(
-                        f"Skipping sample_{idx:03d}_{task_idx:03d}: "
-                        f"rollout failed — {type(ex).__name__}: {ex}"
-                    )
+                )
+
+        if rollout_workers <= 1:
+            for job in jobs:
+                self._run_one_rollout(**job)
+        else:
+            # N dialogues in flight; their planner turns are micro-batched by
+            # the vLLM client's generate gate. A fatal GPU error in any worker
+            # aborts the whole run (same contract as sequential mode): pending
+            # jobs are cancelled and the error is re-raised, so a re-run
+            # resumes from the committed rollouts.
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=rollout_workers) as pool:
+                futures = [pool.submit(self._run_one_rollout, **job) for job in jobs]
+                fatal = None
+                for fut in futures:
+                    try:
+                        fut.result()
+                    except Exception as ex:  # noqa: BLE001 — only fatal errors escape
+                        fatal = fatal or ex
+                        for pending in futures:
+                            pending.cancel()
+                if fatal is not None:
+                    raise fatal
 
         utils.aggregate(
             root_dir=log_dir,

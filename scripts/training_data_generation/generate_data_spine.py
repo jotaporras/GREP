@@ -71,6 +71,17 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--rollout-workers",
+        type=int,
+        default=1,
+        help=(
+            "Number of Phase-2 SPINE rollouts to run concurrently. 1 keeps the "
+            "historical sequential behavior; >1 requires PRISM_LLM_BACKEND=vllm "
+            "(concurrent dialogues are micro-batched into shared vLLM generate "
+            "calls)."
+        ),
+    )
+    parser.add_argument(
         "--skip-populate",
         action="store_true",
         help=(
@@ -216,7 +227,9 @@ if __name__ == "__main__":
 
     print("Generating plans for each graph and task.")
     data_generator.generate_example_plans(
-        generated_data=generated_graphs_dirs, log_dir=output_generated_plans_dir
+        generated_data=generated_graphs_dirs,
+        log_dir=output_generated_plans_dir,
+        rollout_workers=args.rollout_workers,
     )
 
     # for graph in graphs:

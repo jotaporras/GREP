@@ -5,7 +5,7 @@ from typing import List, Optional
 
 from spine.mapping.graph_util import GraphHandler
 
-from prism.data import local_llm, utils
+from prism.data import local_llm, utils, vllm_llm
 
 
 def _validate_tasks(json_content: dict) -> None:
@@ -365,10 +365,13 @@ Return ONLY valid JSON in the following format — no extra text, no reasoning, 
 class TaskGraphGen:
     def __init__(self, client=None):
         # Backend selected by PRISM_LLM_BACKEND (default "openai"). Set it to
-        # "hf" to populate graphs/tasks with a local Gemma 4 model instead of
-        # the OpenAI API. An explicit `client` always wins.
+        # "hf" to populate graphs/tasks with a local Gemma 4 model, or "vllm"
+        # to run the same model through a continuously-batched vLLM engine.
+        # An explicit `client` always wins.
         if client is not None:
             self.client = client
+        elif vllm_llm.vllm_backend_enabled():
+            self.client = vllm_llm.VLLMQueryClient()
         elif local_llm.hf_backend_enabled():
             self.client = local_llm.LocalHFQueryClient()
         else:
