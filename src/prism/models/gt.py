@@ -232,6 +232,13 @@ class GraphTransformer(nn.Module):
         k_gt (int): Hop radius for sparse attention neighborhoods.
         eps (float): Retained for config back-compat (unused).
         use_layer_norm (bool): Retained for config back-compat; norms are always LayerNorm.
+        pe_pool (str): WHERE the probe expectation E_q is taken.
+            ``"pe"`` (default): inside R-PEARL — Ψ = Φ(E_q[Φ(q; S, H)], G, T). The blocks
+            see the first moment only.
+            ``"gt"``: here, after the blocks — Ψ = E_q[Φ(Φ(q; S, H), G, T)]. The M probe
+            responses are pushed through the blocks as one block-diagonal M-copy graph
+            (probes independent, weights shared) and averaged last. Costs M× the block
+            activations and M× the k-hop sparsity pattern; see forward().
     """
 
     def __init__(self, num_layers: int, pe_hidden_channels: int,
@@ -243,11 +250,25 @@ class GraphTransformer(nn.Module):
                  fixed_seed_mode: bool = False, fixed_seed_value: int = 0,
                  pe_readout: str = "mean",
                  center_second_moment: bool = True,
-                 node_feature_dim: int = None):
+                 node_feature_dim: int = None,
+                 pe_pool: str = "pe"):
         super().__init__()
         if pe_readout not in ("mean", "second_moment"):
             raise ValueError(
                 f"pe_readout must be 'mean' or 'second_moment', got {pe_readout!r}"
+            )
+        if pe_pool not in ("pe", "gt"):
+            raise ValueError(f"pe_pool must be 'pe' or 'gt', got {pe_pool!r}")
+        if pe_pool == "gt" and pe_readout != "mean":
+            raise ValueError(
+                "pe_pool='gt' takes E_q outside the blocks and therefore requires the "
+                f"first-moment readout (pe_readout='mean'), got {pe_readout!r}: the "
+                "second moment C is itself a probe expectation and cannot be deferred."
+            )
+        if pe_pool == "gt" and node_feature_dim is not None:
+            raise ValueError(
+                "pe_pool='gt' needs a probe axis to defer E_q over; semantic node "
+                "features (node_feature_dim set) are deterministic. Use pe_pool='pe'."
             )
 
         self.k_hops = k_gt
@@ -259,6 +280,8 @@ class GraphTransformer(nn.Module):
         # (covariance C applied over the composite graph). See forward() for the
         # exact H0.
         self.pe_readout = pe_readout
+        # Where E_q is taken: "pe" (inside R-PEARL) or "gt" (after the blocks).
+        self.pe_pool = pe_pool
 
         # Set up R-PEARL Positional Encoder and Transformer Blocks.
         self.pe_model = RandomGNNPositionalEncodings(
@@ -340,11 +363,14 @@ class GraphTransformer(nn.Module):
         #                    composite graph (never formed). Tokens get the second
         #                    moment (the first collapses on the symmetric cycle);
         #                    scene rows keep their first-moment PE.
+        num_nodes = pe_data.x.size(0)
+        # pe_pool="gt" defers E_q: R-PEARL hands back the [M, N, d_model] probe stack
+        # Φ(q^(s); S, H) and the expectation is taken after the blocks (see below).
+        pe_kw = {} if self.pe_pool == "pe" else {"pool": False}
         if token_embeddings is None:
             # Legacy pure-PE-generator path (rpearl_gt_llm): first moment is the PE.
-            x = self.pe_model(pe_data)
+            x = self.pe_model(pe_data, **pe_kw)
         else:
-            num_nodes = pe_data.x.size(0)
             x_full = torch.zeros(num_nodes, self.d_model, device=device, dtype=torch.float32)
             rows = slice(0, token_embeddings.shape[0]) if is_token is None else is_token
             x_full[rows] = token_embeddings.to(device=device, dtype=torch.float32)
@@ -357,15 +383,27 @@ class GraphTransformer(nn.Module):
                 cx = self.pe_model.second_moment_apply(pe_data, seeded)  # C·seeded
                 x = seeded + cx.to(seeded.dtype)          # H0 = seeded + C·seeded
             else:
-                x = x_full + self.pe_model(pe_data)
+                # Broadcasts over the probe axis when pe_pool="gt" (x_full is [N, d]).
+                x = x_full + self.pe_model(pe_data, **pe_kw)
 
         # Precompute k-hop neighborhood diffusions.
         if permutation is not None:
-            khop_edge_index = self._expand_edge_index(edge_index, x.size(0))
+            khop_edge_index = self._expand_edge_index(edge_index, num_nodes)
         else:
             if not hasattr(data, '_khop_edge_index'):
-                data._khop_edge_index = self._expand_edge_index(edge_index, x.size(0))
+                data._khop_edge_index = self._expand_edge_index(edge_index, num_nodes)
             khop_edge_index = data._khop_edge_index
+
+        # pe_pool="gt": stack the M probe copies into ONE block-diagonal graph of M*N
+        # nodes (same offset trick as R-PEARL's batched GCN), so the blocks run once with
+        # shared weights and the probes stay exactly independent — no cross-probe edge is
+        # created. Peak cost is M× the [N, d_model] activations and M× nnz(A_k).
+        m_probes = x.shape[0] if x.dim() == 3 else None
+        if m_probes is not None:
+            x = x.reshape(m_probes * num_nodes, -1)
+            offsets = (torch.arange(m_probes, device=device) * num_nodes).view(-1, 1, 1)
+            khop_edge_index = ((khop_edge_index.unsqueeze(0) + offsets)
+                               .permute(1, 0, 2).reshape(2, -1))
 
         # In the fusion path, run the blocks in the LLM's low-precision dtype:
         # eval/generate has no autocast, so the dense [N, d_model] activations would
@@ -391,6 +429,12 @@ class GraphTransformer(nn.Module):
                     x = checkpoint(block, x, khop_edge_index, use_reentrant=False)
                 else:
                     x = block(x, khop_edge_index)
+            if m_probes is not None:
+                # E_q — the ONLY probe aggregation, taken here instead of inside R-PEARL:
+                # Ψ = E_q[Φ(Φ(q; S, H), G, T)]. Symmetric in the probe set, so Ψ stays a
+                # Monte-Carlo estimator. Averaged in fp32: a bf16 mean over M terms loses
+                # the precision the pe_pool="pe" path gets for free (it pools in fp32).
+                x = x.view(m_probes, num_nodes, -1).float().mean(dim=0).to(x.dtype)
             # Learnable output gate (no-op when token_embeddings is None).
             if token_embeddings is not None:
                 x = x * torch.tanh(self.output_gain).to(x.dtype)
@@ -787,6 +831,9 @@ def build_psi_producer(cfg, node_feature_dim: int = None) -> nn.Module:
             ``gt_num_layers``/``gt_heads``/``k_gt``/``d_model``/``dropout``/``eps``/
             ``use_layer_norm``/``pe_hidden_channels``/``pe_num_layers``/``num_samples``/
             ``k_pe``, plus the navigator switches ``pe_gt_from``/``semantic_gt_from``.
+            ``pe_pool`` is OPTIONAL and defaults to ``"pe"`` (E_q inside R-PEARL, the
+            behaviour every existing run and checkpoint was trained with); it is not in
+            base_config.yaml, so only a config that adds the key can select ``"gt"``.
         node_feature_dim: semantic input width for the standalone GT (``None`` = random
             probes). Ignored in two-stage mode: the notebook's PE GT is probe-based.
 
@@ -831,6 +878,7 @@ def build_psi_producer(cfg, node_feature_dim: int = None) -> nn.Module:
         eps=cfg["eps"],
         use_layer_norm=cfg["use_layer_norm"],
         node_feature_dim=None if navigator else node_feature_dim,
+        pe_pool=cfg.get("pe_pool", "pe"),
     )
     if not navigator:
         return pe_gt

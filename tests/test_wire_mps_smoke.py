@@ -581,7 +581,12 @@ def test_config_sides(label, over):
     freq_store = model._wire_omega if model._wire_vanilla else model._wire_sigma
     planes = {i: model.layer_omega(i).shape[0] for i in model.active_layer_indices()}
     frozen = [p.requires_grad for p in freq_store.values()]
-    in_group = {id(p) for p in model.structural_parameters()}
+    # The frequency table trains at the BASE LR, i.e. in base_lr_parameters() and NOT in
+    # the structural_lr_mult group (that multiplier damps the pretrained Ψ producer only).
+    in_group = {id(p) for p in model.base_lr_parameters()}
+    struct_group = {id(p) for p in model.structural_parameters()}
+    assert not any(id(p) in struct_group for p in freq_store.values()), \
+        "frequency table leaked into the structural (multiplier) LR group"
     sigma_in_group = [id(p) in in_group for p in freq_store.values()]
 
     with warnings.catch_warnings(record=True) as caught:

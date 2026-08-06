@@ -184,8 +184,22 @@ class RandomGNNPositionalEncodings(nn.Module):
         out = self.norm(out)
         return out * torch.tanh(self.output_gain).to(out.dtype)
 
-    def forward(self, data, permutation=None):
+    def forward(self, data, permutation=None, pool: bool = True):
+        """Ψ = E_q[Φ(q; S, H)] (``pool=True``), or the per-probe stack Φ(q^(s); S, H).
+
+        ``pool=False`` returns [M, N, d_model] with the readout (LayerNorm + tanh gate)
+        applied PER PROBE and the probe expectation NOT taken, so a caller can put E_q
+        outside a later stage: Ψ = E_q[Φ(Φ(q; S, H), G, T)] instead of
+        Ψ = Φ(E_q[Φ(q; S, H)], G, T). The aggregator the caller applies must be a
+        symmetric function of the probe set (E_q is), or Ψ stops being a Monte-Carlo
+        estimator of the expectation. See ``GraphTransformer(pe_pool='gt')``.
+        """
         if self.node_feature_dim is not None:
+            if not pool:
+                raise NotImplementedError(
+                    "pool=False is a random-probe path and is incompatible with semantic "
+                    "node features (node_feature_dim set): there is no probe axis to pool."
+                )
             return self._deterministic_forward(data, permutation=permutation)
         # Move input data to the model's device.
         try:
@@ -219,6 +233,7 @@ class RandomGNNPositionalEncodings(nn.Module):
         chunk = max(1, min(m, self.max_probe_rows // max(1, num_nodes),
                            self.max_gather_rows // max(1, num_edges)))
         pooled_sum = None
+        phi_chunks = []
         for start in range(0, m, chunk):
             Qc = Q[:, start:start + chunk]
             mc = Qc.shape[1]
@@ -228,18 +243,26 @@ class RandomGNNPositionalEncodings(nn.Module):
                 dummy = Qc.new_ones(1, requires_grad=True)
                 pooled = checkpoint(
                     lambda q, ei, d, dev, _mc=mc: self._batched_gcn_forward(
-                        q, ei, num_nodes, _mc, edge_weight=edge_weight, device=dev),
+                        q, ei, num_nodes, _mc, edge_weight=edge_weight, device=dev, pool=pool),
                     Qc, edge_index, dummy, device,
                     use_reentrant=False,
                 )
             else:
                 pooled = self._batched_gcn_forward(
-                    Qc, edge_index, num_nodes, mc, edge_weight=edge_weight, device=device)
+                    Qc, edge_index, num_nodes, mc, edge_weight=edge_weight, device=device,
+                    pool=pool)
+            if not pool:
+                # [mc, N, d_model]; concatenated below. Peak memory is O(M*N*d) — the
+                # chunk reduction that keeps it at O(N*d) only exists for pool=True.
+                phi_chunks.append(pooled)
+                continue
             # weight by mc; divide by m at end to recover global mean.
             contrib = pooled * mc
             pooled_sum = contrib if pooled_sum is None else pooled_sum + contrib
-        pooled_pe = pooled_sum / m
+        pooled_pe = pooled_sum / m if pool else torch.cat(phi_chunks, dim=0)
 
+        # LayerNorm is over d_model, so this is the same per-node readout in both
+        # branches — applied to Ψ when pooled, to every Φ_s when not.
         pooled_pe = self.norm(pooled_pe)
         return pooled_pe * torch.tanh(self.output_gain).to(pooled_pe.dtype)
 

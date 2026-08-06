@@ -216,11 +216,15 @@ def test_config_switch_matrix():
     for frz in (False, True):
         w = _wrap(freeze_sigma=frz)
         req = [p.requires_grad for p in w._wire_sigma.values()]
-        insp = {id(p) for p in w.structural_parameters()}
+        # σ belongs to the BASE-LR group, never to the structural_lr_mult group.
+        insp = {id(p) for p in w.base_lr_parameters()}
+        struct = {id(p) for p in w.structural_parameters()}
+        assert not any(id(p) in struct for p in w._wire_sigma.values()), \
+            "σ leaked into the structural (multiplier) LR group"
         in_group = [id(p) in insp for p in w._wire_sigma.values()]
         ok = all(r == (not frz) for r in req) and all(m == (not frz) for m in in_group)
-        rec(f"wire_freeze_sigma={frz}", "requires_grad and LR-group membership",
-            f"requires_grad={req[0]} in_structural_group={in_group[0]}",
+        rec(f"wire_freeze_sigma={frz}", "requires_grad and base-LR-group membership",
+            f"requires_grad={req[0]} in_base_lr_group={in_group[0]}",
             "PASS" if ok else "FAIL")
         assert ok
 
@@ -347,14 +351,19 @@ def test_public_methods_numeric():
         "PASS" if (not miss and allnum) else "FAIL")
     assert not miss and allnum
 
-    # structural_parameters
+    # structural_parameters (multiplier group) vs base_lr_parameters (base-LR group)
     sp = w.structural_parameters()
-    has_sig = any(id(p) in {id(x) for x in sp} for p in w._wire_sigma.values())
-    has_eps = any(id(getattr(w._wire_eps, str(i))) in {id(x) for x in sp} for i in idxs)
-    rec("structural_parameters", "includes pe_model+pe_gain+sigma, EXCLUDES eps",
-        f"n={len(sp)} sigma_in={has_sig} eps_in={has_eps}",
-        "PASS" if (has_sig and not has_eps) else "FAIL")
-    assert has_sig and not has_eps
+    blp = w.base_lr_parameters()
+    sp_ids, blp_ids = {id(x) for x in sp}, {id(x) for x in blp}
+    sig_struct = any(id(p) in sp_ids for p in w._wire_sigma.values())
+    sig_base = any(id(p) in blp_ids for p in w._wire_sigma.values())
+    has_eps = any(id(getattr(w._wire_eps, str(i))) in sp_ids | blp_ids for i in idxs)
+    ok = (not sig_struct) and sig_base and not has_eps
+    rec("structural_parameters", "pe_model+pe_gain only; sigma -> base_lr_parameters; eps in neither",
+        f"n_struct={len(sp)} n_base={len(blp)} sigma_in_struct={sig_struct} "
+        f"sigma_in_base={sig_base} eps_in_either={has_eps}",
+        "PASS" if ok else "FAIL")
+    assert ok
 
     # __getattr__ passthrough
     ok_attr = w.config is not None and hasattr(w, "generate")

@@ -770,9 +770,14 @@ def test_sigma_receives_gradient_and_eps_does_not():
         return _skip("gemma4 unavailable")
     torch.manual_seed(18)
     wrap = _wrap(llm, omega_learnable=True, pe_gain_init=1.0)
+    # σ trains at the BASE LR, deliberately outside structural_lr_mult: that multiplier
+    # damps a PRETRAINED Ψ producer, and σ has no pretrained state to protect.
     sp = {id(p) for p in wrap.structural_parameters()}
+    blp = {id(p) for p in wrap.base_lr_parameters()}
     for p in wrap._wire_sigma.values():
-        assert p.requires_grad and id(p) in sp, "learnable σ missing from the LR group"
+        assert p.requires_grad, "learnable σ is not trainable"
+        assert id(p) in blp, "learnable σ missing from the base-LR group"
+        assert id(p) not in sp, "σ leaked into the structural (multiplier) LR group"
 
     ids = torch.randint(0, 64, (1, 8))
     g = _tiny_graph(3)
@@ -1534,9 +1539,12 @@ def test_vanilla_omega_is_one_learnable_table_per_layer():
         "omega must be a LEARNABLE parameter in vanilla mode (3.3)"
     assert any(k.endswith(f"_wire_omega.{li}") for k in w.state_dict()), \
         "omega missing from state_dict"
-    # It is in the structural LR group, and the frozen-buffer eps is nowhere.
-    assert id(om) in {id(p) for p in w.structural_parameters()}, \
-        "learnable omega missing from the structural LR group"
+    # It trains at the BASE LR (outside structural_lr_mult, which exists to damp the
+    # pretrained Ψ producer), and the frozen-buffer eps is nowhere.
+    assert id(om) in {id(p) for p in w.base_lr_parameters()}, \
+        "learnable omega missing from the base-LR group"
+    assert id(om) not in {id(p) for p in w.structural_parameters()}, \
+        "omega leaked into the structural (multiplier) LR group"
     assert not any("_wire_eps" in k or "_wire_sigma" in k for k in w.state_dict()), \
         "vanilla mode still carries expectation-arm state in the checkpoint"
 

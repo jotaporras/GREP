@@ -340,6 +340,88 @@ def test_gt_grad_flow():
     assert any(x.abs().sum() > 0 for x in block_grads), "no grad reached the GT blocks"
 
 
+# --------------------------------------------------------------------------- #
+# pe_pool: WHERE E_q is taken
+#   "pe": Ψ = Φ(E_q[Φ(q; S, H)], G, T)      "gt": Ψ = E_q[Φ(Φ(q; S, H), G, T)]
+# --------------------------------------------------------------------------- #
+def test_rpearl_pool_false_returns_probe_stack():
+    """pool=False ⇒ [M, N, d]; with M=1 the probe axis is the only difference."""
+    m = _rpearl(num_samples=4, fixed_seed_mode=True).eval()
+    phi = m(_graph(n=6), pool=False)
+    assert phi.shape == (4, 6, 16) and torch.isfinite(phi).all()
+    # M=1: E_q over a single probe is the identity, so pooled == the lone slice.
+    m1 = _rpearl(num_samples=1, fixed_seed_mode=True).eval()
+    g = _graph(n=6)
+    assert torch.allclose(m1(g, pool=False)[0], m1(g), atol=1e-6)
+
+
+def test_rpearl_pool_false_rejected_for_semantic_features():
+    """No probe axis in the deterministic path ⇒ pool=False must fail loud."""
+    m = _rpearl(node_feature_dim=5).eval()
+    g = Data(x=torch.randn(6, 5), edge_index=_graph().edge_index, num_nodes=6)
+    try:
+        m(g, pool=False)
+    except NotImplementedError:
+        return
+    assert False, "expected NotImplementedError for pool=False with semantic features"
+
+
+def test_gt_pe_pool_gt_equals_mean_of_per_probe_blocks():
+    """Ψ = E_q[Blocks(Φ_s)] EXACTLY: the M-copy graph must be block-diagonal.
+
+    Oracle: run the blocks on each probe response separately and average. Any
+    cross-probe edge in the tiled edge_index would break this equality.
+    """
+    g = _gt(pe_pool="gt", fixed_seed_mode=True, num_samples=4).eval()
+    data = _graph(n=6)
+    with torch.no_grad():
+        out = g(data)
+        phi = g.pe_model(data, pool=False)                      # [M, N, d]
+        khop = g._expand_edge_index(data.edge_index, 6)
+        per_probe = []
+        for s in range(phi.shape[0]):
+            xs = phi[s]
+            for block in g.blocks:
+                xs = block(xs, khop)
+            per_probe.append(xs)
+        oracle = torch.stack(per_probe, dim=0).mean(dim=0)
+    assert out.shape == (6, 16) and torch.isfinite(out).all()
+    assert torch.allclose(out, oracle, atol=1e-4), (out - oracle).abs().max().item()
+
+
+def test_gt_pe_pool_gt_differs_from_pe_and_flows_grad():
+    """Same weights + same probes, different E_q placement ⇒ different Ψ; grads reach both."""
+    data = _graph(n=6)
+    a = _gt(pe_pool="pe", fixed_seed_mode=True, num_samples=4).eval()
+    b = _gt(pe_pool="gt", fixed_seed_mode=True, num_samples=4).eval()
+    b.load_state_dict(a.state_dict())                            # pe_pool holds no weights
+    with torch.no_grad():
+        ya, yb = a(data), b(data)
+    assert ya.shape == yb.shape
+    assert not torch.allclose(ya, yb, atol=1e-5), "E_q placement must change Ψ"
+
+    b.train()
+    b(data, token_embeddings=torch.randn(3, 16),
+      is_token=torch.tensor([1, 1, 1, 0, 0, 0], dtype=torch.bool)).sum().backward()
+    pe_grad = [p.grad for p in b.pe_model.parameters() if p.grad is not None]
+    blk_grad = [p.grad for p in b.blocks.parameters() if p.grad is not None]
+    assert any(x.abs().sum() > 0 for x in pe_grad), "no grad reached R-PEARL"
+    assert any(x.abs().sum() > 0 for x in blk_grad), "no grad reached the GT blocks"
+    assert all(torch.isfinite(x).all() for x in pe_grad + blk_grad)
+
+
+def test_gt_pe_pool_validation():
+    """pe_pool fails loud on an unknown value and on the two incompatible combinations."""
+    for kw in (dict(pe_pool="middle"),
+               dict(pe_pool="gt", pe_readout="second_moment"),
+               dict(pe_pool="gt", node_feature_dim=5)):
+        try:
+            _gt(**kw)
+        except ValueError:
+            continue
+        assert False, f"expected ValueError for {kw}"
+
+
 def test_gt_pe_readout_validation():
     """Invalid pe_readout fails loud (ValueError)."""
     try:
