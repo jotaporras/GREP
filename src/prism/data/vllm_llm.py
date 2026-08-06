@@ -163,7 +163,7 @@ def load_vllm(model_id: Optional[str] = None):
     if key not in _VLLM_CACHE:
         # Imported lazily so importing this module never forces a vLLM import
         # (the OpenAI and HF paths must keep working in envs without vLLM).
-        from transformers import AutoProcessor
+        from transformers import AutoProcessor, AutoTokenizer
         from vllm import LLM
 
         print(
@@ -171,10 +171,35 @@ def load_vllm(model_id: Optional[str] = None):
             f"quant={cfg['quantization'] or 'native'} "
             f"max_model_len={cfg['max_model_len']} seed={cfg['seed']}"
         )
-        processor = AutoProcessor.from_pretrained(model_id)
+        try:
+            processor = AutoProcessor.from_pretrained(model_id)
+        except ValueError:
+            # Text-only repos (e.g. google/gemma-4-E4B-it) ship a tokenizer but
+            # no processor class. The tokenizer also provides
+            # apply_chat_template; <think>-stripping then falls back to the
+            # regex in _parse_response since tokenizers lack parse_response.
+            processor = AutoTokenizer.from_pretrained(model_id)
         llm = LLM(model=model_id, **cfg)
         _VLLM_CACHE[key] = (llm, processor)
     return _VLLM_CACHE[key]
+
+
+def _parse_response(processor, text: str) -> str:
+    """Strip the ``<think>`` block from raw model text.
+
+    Uses ``processor.parse_response`` when available (AutoProcessor for the
+    full Gemma repos, HF-backend parity); otherwise (tokenizer-only repos)
+    removes any ``<think>...</think>`` span — or everything through a lone
+    closing tag — by regex.
+    """
+    parse = getattr(processor, "parse_response", None)
+    if parse is not None:
+        return local_llm._to_text(parse(text))
+    import re
+
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = re.sub(r"^.*?</think>", "", text, flags=re.DOTALL)
+    return text.strip()
 
 
 class VLLMQueryClient:
@@ -226,7 +251,7 @@ class VLLMQueryClient:
     def _finish(self, output) -> str:
         """Parse one vLLM RequestOutput into the JSON string the caller expects."""
         text = output.outputs[0].text
-        return local_llm._extract_json(self.processor.parse_response(text))
+        return local_llm._extract_json(_parse_response(self.processor, text))
 
     def query_gpt(
         self,
@@ -318,10 +343,7 @@ class VLLMSpineClient:
             )
             output = _gated_generate(self.llm, text, params)
             response = output.outputs[0].text
-            return (
-                local_llm._to_text(self.processor.parse_response(response)),
-                True,
-            )
+            return _parse_response(self.processor, response), True
         except Exception as ex:  # noqa: BLE001 — surface as a planner failure
             print(f"[vllm-spine] generation failed: {ex}")
             return "Error: local generation failed", False
