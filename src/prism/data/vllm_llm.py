@@ -184,17 +184,23 @@ def load_vllm(model_id: Optional[str] = None):
     return _VLLM_CACHE[key]
 
 
-def _parse_response(processor, text: str) -> str:
+def _parse_response(processor, text: str, prefix: str = "") -> str:
     """Strip the ``<think>`` block from raw model text.
 
     Uses ``processor.parse_response`` when available (AutoProcessor for the
     full Gemma repos, HF-backend parity); otherwise (tokenizer-only repos)
     removes any ``<think>...</think>`` span — or everything through a lone
-    closing tag — by regex.
+    closing tag — by regex. ``prefix`` is the rendered prompt that preceded
+    generation: transformers >= 5.14 requires it because chat templates may
+    pre-write part of the assistant turn (e.g. an opening ``<think>`` tag)
+    that the parser must see. Older parse_response signatures ignore it.
     """
     parse = getattr(processor, "parse_response", None)
     if parse is not None:
-        return local_llm._to_text(parse(text))
+        try:
+            return local_llm._to_text(parse(text, prefix=prefix))
+        except TypeError:  # transformers < 5.14: no prefix kwarg
+            return local_llm._to_text(parse(text))
     import re
 
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
@@ -251,7 +257,9 @@ class VLLMQueryClient:
     def _finish(self, output) -> str:
         """Parse one vLLM RequestOutput into the JSON string the caller expects."""
         text = output.outputs[0].text
-        return local_llm._extract_json(_parse_response(self.processor, text))
+        return local_llm._extract_json(
+            _parse_response(self.processor, text, prefix=output.prompt or "")
+        )
 
     def query_gpt(
         self,
@@ -343,7 +351,7 @@ class VLLMSpineClient:
             )
             output = _gated_generate(self.llm, text, params)
             response = output.outputs[0].text
-            return _parse_response(self.processor, response), True
+            return _parse_response(self.processor, response, prefix=text), True
         except Exception as ex:  # noqa: BLE001 — surface as a planner failure
             print(f"[vllm-spine] generation failed: {ex}")
             return "Error: local generation failed", False
