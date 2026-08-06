@@ -407,11 +407,12 @@ class DataGenerator:
                 try:
                     task = task_entry["task"]
                     init_location = task_entry["init_node"]
-                    # SPINE's GraphHandler loads from a path; build an empty one
-                    # and populate it from the in-memory graph dict via reset()
-                    # (same idiom as parse_response / the eval path) so GraphSim
-                    # sees a populated graph at construction.
-                    graph_handle = GraphHandler(graph_path="")
+                    # SPINE's GraphHandler loads from a path or dict; build an
+                    # empty one (graph="") and populate it from the in-memory
+                    # graph dict via reset() (same idiom as parse_response / the
+                    # eval path) so GraphSim sees a populated graph at
+                    # construction.
+                    graph_handle = GraphHandler(graph="")
                     graph_handle.reset(graph, current_location=init_location)
                     graph_data_gen = graph_sim.GraphSim(graph_handle)
                     unknown_pct = self.unknown_pcts[task_idx % len(self.unknown_pcts)]

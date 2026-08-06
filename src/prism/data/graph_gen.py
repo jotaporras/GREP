@@ -479,7 +479,7 @@ class TaskGraphGen:
         print(response)
         json_content = json.loads(response)
         json_content["description"] = description
-        graph_handle = GraphHandler(graph_path="")
+        graph_handle = GraphHandler(graph="")
         graph_handle.reset(
             json_content["graph"],
             current_location=json_content["graph"]["robot_location"],
@@ -510,6 +510,6 @@ if __name__ == "__main__":
 
     rnd_data = gen.get_tasks()
 
-    graph_handler = GraphHandler(graph_path="")
+    graph_handler = GraphHandler(graph="")
 
     whatdoihave = 0

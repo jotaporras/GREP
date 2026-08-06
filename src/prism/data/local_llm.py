@@ -44,9 +44,11 @@ via ``apply_chat_template(..., enable_thinking=True)`` so the model reasons
 before answering; the reasoning is emitted in a ``<think>`` block that
 ``processor.parse_response`` strips, so the saved data stays clean JSON (Phase 1)
 and clean SPINE plans (Phase 2). NOTE: thinking consumes generation tokens, so
-the budgets account for the ``<think>`` block — Phase 1 keeps 10240, Phase 2 is
-raised from 2048 to 4096. If a harder model still truncates before emitting
-``answer(...)``, raise ``max_new_tokens`` further.
+the budgets account for the ``<think>`` block — Phase 1 uses 20480 (10240 was
+enough for ~30-node graphs but truncated every ~100-node populate JSON
+mid-document once thinking took its share), Phase 2 is raised from 2048 to
+4096. If a harder model still truncates before emitting ``answer(...)``, raise
+``max_new_tokens`` further.
 
 Runtime deps (install on the GPU node):
     pip install -U transformers torch accelerate
@@ -274,15 +276,17 @@ class LocalHFQueryClient:
     This is a pure backend swap: it accepts and honours the SAME call
     parameters the OpenAI client does, so every other knob in the data
     generator is unchanged. ``temperature`` and ``max_tokens`` map directly to
-    ``model.generate`` (the populate path uses the ``GPTQueryClient`` defaults
-    of ``temperature=0.31`` / ``max_tokens=10240``). ``reasoning_effort`` has no
+    ``model.generate`` (temperature matches the ``GPTQueryClient`` default of
+    0.31; ``max_tokens`` defaults to 20480 here — with thinking sharing the
+    cap, the OpenAI-side 10240 truncates ~100-node populate JSON).
+    ``reasoning_effort`` has no
     HF equivalent; thinking is enabled, and its ``<think>`` block is stripped by
     ``parse_response`` so the returned output is still a single well-formed JSON
     object (matching gpt-5.1 ``output_text``, whose reasoning never appears
     inline).
     """
 
-    def __init__(self, model_id: Optional[str] = None, max_new_tokens: int = 10240):
+    def __init__(self, model_id: Optional[str] = None, max_new_tokens: int = 20480):
         self.model, self.processor = load_gemma(model_id)
         self.max_new_tokens = max_new_tokens
 
@@ -290,7 +294,7 @@ class LocalHFQueryClient:
         self,
         query: str,
         temperature: Optional[float] = 0.31,
-        max_tokens: Optional[int] = 10240,
+        max_tokens: Optional[int] = 20480,
         reasoning_effort: str = "low",
     ) -> str:
         return self.query_gpt_5(query, temperature, max_tokens, reasoning_effort)
@@ -299,7 +303,7 @@ class LocalHFQueryClient:
         self,
         query: str,
         temperature: Optional[float] = 0.31,
-        max_tokens: Optional[int] = 10240,
+        max_tokens: Optional[int] = 20480,
         reasoning_effort: str = "low",
     ) -> str:
         messages = [{"role": "user", "content": query}]

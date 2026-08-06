@@ -56,8 +56,8 @@ Used to fill in placeholders in `~/.claude/skills/cluster-slurm/template.sbatch`
   Ensure SPINE is importable (editable install or `PYTHONPATH`).
 
 ## Build, Test, and Development Commands
-- `python -m pip install -r requirements.txt` installs the dependency set (`requirements.txt` is the source of truth).
-- `python -m pip install -e .` enables `prism.*` imports in scripts and notebooks.
+- `uv pip install -r requirements.txt` installs the dependency set (`requirements.txt` is the source of truth).
+- `uv pip install -e .` enables `prism.*` imports in scripts and notebooks.
 - `python scripts/training_data_generation/generate_data_spine.py --n-samples 10 --n-tasks 3 --name demo` creates SPINE training data; other generators share similar flags.
 - `python -m prism.training.train_v3 --config-name=<config> [key=value ...]` launches training (LoRA SFT) from a nested Hydra config under `experiments/`.
 - Evaluation runs as part of `train_v3` via the Hydra `eval.*` block: set `eval.post_train_graphs` to reload the saved checkpoint from disk and cross-evaluate the held-out set.
@@ -95,6 +95,8 @@ General principles for verification:
 ## Package Management
 - NEVER install, upgrade, or remove packages without explicitly telling the user first and getting approval.
 - The full working conda env is `GREP-PRISM-v3`. Always activate it before running Python.
+- Use `uv` for ALL installs (`uv pip install ...`), never bare pip. When targeting a conda env from outside it, pass `--python <env>/bin/python` explicitly.
+- Pin an upper bound when adding a package another library depends on (e.g. `transformers` declares `kernels>=0.12,<0.13`); check the dependent's `Requires-Dist` metadata first.
 
 ## Security & Configuration Tips
 - Keep API keys (OpenAI, Hugging Face, WANDB) and filesystem paths in environment variables or `.env`; never commit secrets.
