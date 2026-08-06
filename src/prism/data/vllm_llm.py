@@ -163,6 +163,12 @@ def load_vllm(model_id: Optional[str] = None):
     if key not in _VLLM_CACHE:
         # Imported lazily so importing this module never forces a vLLM import
         # (the OpenAI and HF paths must keep working in envs without vLLM).
+        # The datagen pipeline touches CUDA (torch import chains) before the
+        # engine starts; vLLM's default fork-ed TP workers then die with
+        # "CUDA error: initialization error". Spawned workers are immune.
+        # setdefault so an explicit caller override still wins.
+        os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
         from transformers import AutoProcessor, AutoTokenizer
         from vllm import LLM
 
