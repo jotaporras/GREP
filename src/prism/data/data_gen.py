@@ -216,9 +216,26 @@ class DataGenerator:
         reasoning_effort: str = "low",
         poll_interval: int = 60,
     ) -> None:
-        """Like populate_graphs_and_tasks but uses the OpenAI Batch API (~50% cheaper)."""
+        """Like populate_graphs_and_tasks but batches all prompts in one call.
+
+        With the OpenAI backend this is the Batch API (~50% cheaper); with the
+        vLLM backend it is one continuously-batched generate over the list.
+        Resumes like the sequential path: graphs whose ``data_gen_XXX.json`` is
+        already valid are skipped, so the auto-resume retry loop in the launch
+        scripts only pays for the missing graphs.
+        """
+        pending = []  # (original idx, base_graph)
+        for idx, g in enumerate(base_graphs):
+            if self._load_valid_populated(f"{log_dir}/data_gen_{idx:03d}.json"):
+                print(f"Skipping populate for graph {idx}: already valid")
+            else:
+                pending.append((idx, g))
+        if not pending:
+            print("Batch populate: nothing to do (all graphs already populated)")
+            return
+
         prompts = []
-        for g in base_graphs:
+        for _, g in pending:
             task_types = None
             if self.task_proportions is not None:
                 task_types = sample_task_types(
@@ -252,12 +269,23 @@ class DataGenerator:
             poll_interval=poll_interval,
         )
 
-        for idx, response in enumerate(responses):
-            rnd_data = self.context_gen.parse_response(response, n_tasks=n_tasks)
-            with open(f"{log_dir}/data_gen_{idx:03d}.json", "w") as f:
+        for (idx, _), response in zip(pending, responses):
+            # One malformed response must not discard the whole batch: skip the
+            # graph (no file written) so a re-run's resume regenerates only it.
+            try:
+                rnd_data = self.context_gen.parse_response(response, n_tasks=n_tasks)
+            except Exception as ex:
+                print(f"graph {idx}: batch populate response unparseable — {ex}")
+                continue
+            # Atomic writes, matching the sequential path.
+            out_path = f"{log_dir}/data_gen_{idx:03d}.json"
+            with open(f"{out_path}.tmp", "w") as f:
                 f.write(json.dumps(rnd_data, indent=2))
-            with open(f"{log_dir}/graph_gen_{idx:03d}.json", "w") as f:
+            os.replace(f"{out_path}.tmp", out_path)
+            graph_path = f"{log_dir}/graph_gen_{idx:03d}.json"
+            with open(f"{graph_path}.tmp", "w") as f:
                 f.write(json.dumps(rnd_data["graph"], indent=2))
+            os.replace(f"{graph_path}.tmp", graph_path)
 
     @staticmethod
     def _has_valid_rollout(path: str) -> bool:

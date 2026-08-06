@@ -61,10 +61,24 @@ else
   export PRISM_REQUIRE_SINGLE_GPU=1   # backstop assertion inside local_llm.py
 fi
 
-# --- Local Gemma backend selection (consumed by prism.data.local_llm) ---
+# --- Local backend selection (consumed by prism.data.local_llm / vllm_llm) ---
+# PRISM_LLM_BACKEND=hf (default): eager HF Transformers, sequential.
+# PRISM_LLM_BACKEND=vllm: continuously-batched vLLM engine — Phase 1 populates
+#   all graphs in ONE batched call (--batch) and Phase 2 runs ROLLOUT_WORKERS
+#   concurrent SPINE dialogues (--rollout-workers). vLLM knobs: PRISM_VLLM_TP,
+#   PRISM_VLLM_MAX_LEN, PRISM_VLLM_GPU_UTIL, PRISM_VLLM_QUANT (see vllm_llm.py);
+#   the model falls back to PRISM_HF_MODEL so the $2 slot works for both.
 # Model precedence: positional arg $2 > $PRISM_HF_MODEL > default 26B-A4B (MoE).
-export PRISM_LLM_BACKEND=hf
+export PRISM_LLM_BACKEND="${PRISM_LLM_BACKEND:-hf}"
 export PRISM_HF_MODEL="${2:-${PRISM_HF_MODEL:-google/gemma-4-26B-A4B-it}}"
+
+# vLLM-only pipeline flags: batched Phase-1 populate + concurrent Phase-2
+# rollouts. Empty (fully inert) on the hf/openai backends.
+BACKEND_ARGS=""
+if [[ "$PRISM_LLM_BACKEND" == "vllm" ]]; then
+  ROLLOUT_WORKERS="${ROLLOUT_WORKERS:-8}"
+  BACKEND_ARGS="--batch --rollout-workers ${ROLLOUT_WORKERS}"
+fi
 # 4bit (NF4) fits a single 24GB GPU (~13GB for 26B-A4B); none=bf16 (~52GB).
 export PRISM_HF_QUANT="${PRISM_HF_QUANT:-4bit}"
 # NOTE: the populate generation budget is NOT settable from here. It is the
@@ -114,11 +128,14 @@ seeds=( $(seq 101 $((100 + N_GRAPHS))) )
 
 mkdir -p "$SKEL_DIR"
 
-echo "=== Backend: local HF Transformers ==="
+echo "=== Backend: ${PRISM_LLM_BACKEND} ==="
 echo "    CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<all>} (require_single_gpu=${PRISM_REQUIRE_SINGLE_GPU})"
 echo "    PRISM_LLM_BACKEND=${PRISM_LLM_BACKEND}"
 echo "    PRISM_HF_MODEL=${PRISM_HF_MODEL}"
 echo "    PRISM_HF_QUANT=${PRISM_HF_QUANT}"
+if [[ "$PRISM_LLM_BACKEND" == "vllm" ]]; then
+  echo "    vLLM: TP=${PRISM_VLLM_TP:-1} max_len=${PRISM_VLLM_MAX_LEN:-16384} rollout_workers=${ROLLOUT_WORKERS} (batched populate)"
+fi
 echo "    N_GRAPHS=${N_GRAPHS} x N_TASKS=${N_TASKS} = $((N_GRAPHS * N_TASKS)) (graph,task) pairs"
 
 echo ""
@@ -197,7 +214,8 @@ while true; do
       --task-proportions $TASK_PROPORTIONS \
       --n-tasks "$N_TASKS" \
       --max-graphs "$N_GRAPHS" \
-      --seed "$GEN_SEED"; then
+      --seed "$GEN_SEED" \
+      $BACKEND_ARGS; then
     echo "Stage 2 completed on attempt ${attempt}/${MAX_ATTEMPTS}."
     break
   else
