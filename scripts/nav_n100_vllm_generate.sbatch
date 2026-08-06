@@ -42,6 +42,9 @@ source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "$ENV_NAME"
 
 export PRISM_LLM_BACKEND=vllm
+# B200 compute nodes cannot JIT-build flashinfer's sampling kernels at engine
+# warmup (write_ninja fails); vLLM's native torch sampler works fine.
+export VLLM_USE_FLASHINFER_SAMPLER=0
 export PRISM_VLLM_TP=1              # a single B200 holds the bf16 31B
 export DATA_ROOT="${ALELAB_DRIVE}/GREP-PRISM/data/n_100_vllm"
 export ROLLOUT_WORKERS="${ROLLOUT_WORKERS:-8}"
