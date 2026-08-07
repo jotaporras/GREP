@@ -49,6 +49,17 @@ gnn:
   # "random" = PEARL random probes; "word_embeddings" = mean node-name word-embedding
   # (deterministic). gt_llm REQUIRES word_embeddings.
   pe_node_features: random
+  # WHERE the probe expectation E_q is taken. Read ONLY by gt.build_psi_producer, i.e.
+  # by the Ψ-consuming archs (learnable_graph_mask / wire_llm); train_v3 rejects a
+  # non-default value on any other arch rather than ignoring it.
+  #   "pe" (DEFAULT, what every existing run and checkpoint was trained with):
+  #        inside R-PEARL — Ψ = Φ(E_q[Φ(q; S, H)], G, T); the GT blocks see the first
+  #        moment only.
+  #   "gt": after the blocks — Ψ = E_q[Φ(Φ(q; S, H), G, T)]. The M probe responses are
+  #        pushed through the blocks as one block-diagonal M-copy graph (probes stay
+  #        independent, weights shared) and averaged last. Costs M× the block
+  #        activations and M× nnz(A_k); requires pe_node_features=random.
+  pe_pool: pe
 
   # --- Graph Transformer (rpearl_gt_llm / gt_llm / learnable_graph_mask). Default = L2 baseline. ---
   # gt_llm depth/width sweeps (use with arch=gt_llm pe_node_features=word_embeddings):

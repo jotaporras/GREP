@@ -28,8 +28,10 @@ import yaml
 
 REPO = Path(__file__).resolve().parent.parent
 # The e14 suite plus e9_gnn_navigation, which is upstream of it: it produces the
-# path_navigator_gt.pt that e14_stage1to3_binary consumes as NAV_GT.
+# path_navigator_gt.pt that e14_stage1to3_binary consumes as NAV_GT; plus the e15 WIRE
+# suite, which shares the same entrypoints and the same failure modes.
 SCRIPTS = sorted((REPO / "scripts").glob("e14_*.sbatch")) + \
+    sorted((REPO / "scripts").glob("e15_*.sbatch")) + \
     sorted((REPO / "scripts").glob("e9_gnn_navigation.sbatch"))
 BASE_CONFIG = REPO / "experiments" / "base_config.yaml"
 
@@ -162,11 +164,13 @@ def test_cli_flags_are_accepted_by_the_entrypoint(script):
 
 @pytest.mark.parametrize("script", SCRIPTS, ids=lambda p: p.name)
 def test_icl_policy_is_explicit(script):
-    """ICL is ON for BOTH sides: eval prompts carry demos, training runs few-shot.
+    """The ICL policy is written out, and it is the one that suite runs under.
 
-    Both values are written out even where they match a config default, because leaving
-    one implicit means the policy changes silently if that default ever moves — and the
-    two sides must agree (base_config.yaml:207).
+    The VALUE is per-suite — e14 is few-shot on both sides, e15 mirrors the zero-shot
+    e9_ms_stage1 — so what is asserted globally is that the training-side value is
+    stated and reaches the entrypoint. Both sides are written out even where they match
+    a config default, because leaving one implicit means the policy changes silently if
+    that default ever moves — and the two must agree (base_config.yaml:207).
     """
     body = _text(script)
     is_eval = ARGPARSE_ENTRY["module"] in body
@@ -174,8 +178,11 @@ def test_icl_policy_is_explicit(script):
     if not (is_eval or is_train):
         pytest.skip("neither entrypoint; the ICL switches have no consumer here")
 
-    assert re.search(r"^DATA_ICL_EXAMPLES=\$\{DATA_ICL_EXAMPLES:-2\}$", body, re.M), \
-        f"{script.name}: training-side ICL must be set to 2 explicitly"
+    # e14 is the few-shot suite and stays pinned to 2; other suites must still declare
+    # their value rather than inherit it.
+    expected = "2" if script.name.startswith("e14_") else r"\d+"
+    assert re.search(rf"^DATA_ICL_EXAMPLES=\$\{{DATA_ICL_EXAMPLES:-{expected}\}}$", body, re.M), \
+        f"{script.name}: training-side ICL must be set explicitly (expected {expected})"
 
     if is_train:
         # The training job is the ONLY place data.icl_examples has a consumer, so here it

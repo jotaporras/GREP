@@ -287,6 +287,12 @@ def train_model(config: omegaconf.DictConfig):
             # would silently reload an old run as a different function.
             **({"pe_gt_from": config.gnn.pe_gt_from, "semantic_gt_from": config.gnn.semantic_gt_from}
                if config.gnn.arch in _PSI_PRODUCER_ARCHS and config.gnn.pe_gt_from else {}),
+            # Ψ-producer probe pooling (WHERE E_q is taken). LOAD-BEARING at reload and
+            # invisible in the weights: pe_pool="gt" is a DIFFERENT function of the SAME
+            # state_dict, so an eval rebuild falling back to gt.build_psi_producer's
+            # "pe" default would score a different model with a clean, silent load.
+            **({"pe_pool": config.gnn.pe_pool}
+               if config.gnn.arch in _PSI_PRODUCER_ARCHS else {}),
             # graph_mask_llm / learnable_graph_mask adjacency (A) + fold + scope rebuild params.
             **({k: config.gnn[k] for k in ("mask_k_hops", "mask_symmetrize", "mask_use_edges",
                                            "mask_buggy_causal_fold", "mask_layer_scope")}
@@ -549,6 +555,12 @@ def _validate_config(config: omegaconf.DictConfig) -> None:
             raise ValueError(
                 "arch='wire_llm' requires gnn.pe_node_features='random' "
                 f"(word-embedding feature prep is not wired). Got {config.gnn.pe_node_features!r}.")
+    if config.gnn.get("pe_pool", "pe") != "pe" and config.gnn.arch not in _PSI_PRODUCER_ARCHS:
+        raise ValueError(
+            f"gnn.pe_pool={config.gnn.pe_pool!r} is read ONLY by gt.build_psi_producer, "
+            f"i.e. by {_PSI_PRODUCER_ARCHS}; arch={config.gnn.arch!r} builds its GT "
+            "elsewhere and would silently ignore it (a run that looks configured for "
+            "Ψ = E_q[Φ(Φ(q; S, H), G, T)] but trains Ψ = Φ(E_q[Φ(q; S, H)], G, T)).")
     if config.gnn.pe_gt_from or config.gnn.semantic_gt_from:
         if config.gnn.arch not in _PSI_PRODUCER_ARCHS:
             raise ValueError(

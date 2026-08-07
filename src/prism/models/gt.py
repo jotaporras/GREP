@@ -832,8 +832,8 @@ def build_psi_producer(cfg, node_feature_dim: int = None) -> nn.Module:
             ``use_layer_norm``/``pe_hidden_channels``/``pe_num_layers``/``num_samples``/
             ``k_pe``, plus the navigator switches ``pe_gt_from``/``semantic_gt_from``.
             ``pe_pool`` is OPTIONAL and defaults to ``"pe"`` (E_q inside R-PEARL, the
-            behaviour every existing run and checkpoint was trained with); it is not in
-            base_config.yaml, so only a config that adds the key can select ``"gt"``.
+            behaviour every existing run and checkpoint was trained with); the fallback
+            keeps checkpoints written before the key existed reloading as themselves.
         node_feature_dim: semantic input width for the standalone GT (``None`` = random
             probes). Ignored in two-stage mode: the notebook's PE GT is probe-based.
 
