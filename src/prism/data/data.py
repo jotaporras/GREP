@@ -249,7 +249,13 @@ def preprocess_dataset(
         full_text = tokenizer.apply_chat_template(example["messages"], tokenize=False)
         # LAST marker = the query graph. The corpus is ICL-stripped so it is usually the
         # only one, but few-shot examples (icl_examples > 0) put their own graphs first.
-        m = list(re.finditer(r"[Ss]cene graph:", full_text))[-1]
+        markers = list(re.finditer(r"[Ss]cene graph:", full_text))
+        # Assistant reasoning can also say "... in the scene graph: 1. ..." — only a
+        # marker immediately followed by "{" is the actual serialized query graph.
+        m = next(
+            (mm for mm in reversed(markers) if re.match(r"\s*\{", full_text[mm.end():])),
+            markers[-1],
+        )
         start = full_text.index("{", m.end())
         tail = full_text[start:]
         try:
