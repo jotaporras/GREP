@@ -326,7 +326,7 @@ layer may be elsewhere, and the patch crashes. Fix in
      span-final position — mid-mention query assignment is the label, Leak A again).
      Existence proof of headroom: the leak-trained circuit under train_style scores
      0.865 acc / 0.52 nats on decisions — with-edges-level performance.
-     Design note: `GREP-PRISM/notebooks/e11_decode_time_injection_design.md`.
+     Design note: `GREP-PRISM/docs/e11_decode_time_injection_design.md`.
    - **Interleaved graph tokens** (additive revival, untested): give ψ its own
      *inserted* token positions adjacent to each mention instead of superposing onto
      name tokens — removes the §5.4 interference tax by construction; binding by
@@ -354,8 +354,8 @@ layer may be elsewhere, and the patch crashes. Fix in
 
 - Code: `6452f93` (diagnostic + `prompt_only` + tests), `732d480`
   (`exclude_supervised` + e12 chain), `c589b1e` (gate sweep).
-- Lab notes: `notebooks/2026-07-01 e11_injection_asymmetry.md`,
-  `notebooks/2026-07-02 e12_leakfree_multistage.md`.
+- Lab notes: `docs/2026-07-01 e11_injection_asymmetry.md`,
+  `docs/2026-07-02 e12_leakfree_multistage.md`.
 - W&B (alelab/GREP-PRISM): e11 arms `bznw3x9p`/`22lq43i6` vs paired
   `ror8gtet`/`tyvhwlmx`; e12 chain `0dq55cex` → `wh0537au`/`gvzylvay` vs paired
   `3bitwckz` → `kfuu2djo`/`6lefhd76`; diagnostics JSONs in each run dir

@@ -516,7 +516,7 @@ class NavigatorPE(nn.Module):
     """PE stage of the notebook navigator — the probe-PE Graph Transformer, NO AGT.
 
     Ψ = ``pe_gt(graph)``. This is the PE half of
-    notebooks/e9_gnn_navigation.ipynb's ``GNNShortestPathNavigator`` (its ``gnn``
+    notebooks/2026-06-28 e9_gnn_navigation.ipynb's ``GNNShortestPathNavigator`` (its ``gnn``
     submodule; checkpoint ``path_navigator_gt.pt``) with the autoregressive head
     deliberately absent: the AGT (``SemanticGraphTransformer`` + classifier +
     autoregressive ``generate``) lives in :class:`NavigatorGT`, which extends this class.
@@ -580,7 +580,7 @@ class TwoStagePE(NavigatorPE):
 
 class NavigatorGT(NavigatorPE):
     """Autoregressive shortest-path navigator — the notebook's ``GNNShortestPathNavigator``
-    (notebooks/e9_gnn_navigation.ipynb §3) rebuilt on this repo's GT blocks.
+    (notebooks/2026-06-28 e9_gnn_navigation.ipynb §3) rebuilt on this repo's GT blocks.
 
     Extends :class:`NavigatorPE` (the PE stage: ``pe_gt``, a probe-PE ``GraphTransformer``)
     with the AUTOREGRESSIVE head — the ``SemanticGraphTransformer`` ``semantic_gt`` (the

@@ -1,6 +1,6 @@
 """Build a stage-3 PE-init folder from the pretrained edge-detector GNN.
 
-The edge detector (notebooks/e9_gnn_navigation.ipynb) is saved as a *flat*
+The edge detector (notebooks/2026-06-28 e9_gnn_navigation.ipynb) is saved as a *flat*
 ``GraphTransformer.state_dict()`` (its MLP edge-classifier head is NOT in the
 file). ``trainer.init_pe_from`` does not consume that directly: it reads
 ``<dir>/gnn_weights.pt`` and expects a dict ``{"gt_model", "pe_proj", ...}``

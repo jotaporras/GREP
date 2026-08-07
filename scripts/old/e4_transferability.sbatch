@@ -12,7 +12,7 @@
 #
 # Each array task evaluates ONE (checkpoint, graph_size) cell across all three
 # permutation seeds, mirroring the E3 transferability study in
-# notebooks/e3_transferability_results.ipynb. The 15 tasks cover:
+# notebooks/2026-05-13 e3_transferability_results.ipynb. The 15 tasks cover:
 #     3 checkpoints × 5 graph sizes  (3 perm seeds run inside each task)
 #
 # Sizes 500 and 1000 dropped: GPT-5.5 silently truncates the populated graph

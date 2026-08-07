@@ -15,7 +15,7 @@
 #        python scripts/dev_e10_build_pretrained_pe_planner.py \
 #          --gnn-checkpoint <edge_detector_gt_final.pt> \
 #          --model-path "$MODEL_PATH" --out-dir "$PE_INIT_DIR"
-#      (edge_detector_gt_final.pt comes from notebooks/e9_gnn_navigation.ipynb,
+#      (edge_detector_gt_final.pt comes from notebooks/2026-06-28 e9_gnn_navigation.ipynb,
 #      or rsync the cluster's pe_init_edge_detector_gt/ folder down.)
 #   2. LoRA warm-start is OPTIONAL locally: the stage-1 adapter is cluster-only,
 #      so by default this trains LoRA FROM SCRATCH (the GT is still warm-started).
@@ -81,7 +81,7 @@ if [ ! -f "$PE_INIT_DIR/gnn_weights.pt" ]; then
     echo "    python scripts/dev_e10_build_pretrained_pe_planner.py \\" >&2
     echo "      --gnn-checkpoint <edge_detector_gt_final.pt> \\" >&2
     echo "      --model-path \"$MODEL_PATH\" --out-dir \"$PE_INIT_DIR\"" >&2
-    echo "  (edge_detector_gt_final.pt: notebooks/e9_gnn_navigation.ipynb, or rsync" >&2
+    echo "  (edge_detector_gt_final.pt: notebooks/2026-06-28 e9_gnn_navigation.ipynb, or rsync" >&2
     echo "   the cluster's pe_init_edge_detector_gt/ folder into $PE_INIT_DIR)" >&2
     exit 1
 fi

@@ -1,6 +1,6 @@
 """Tests for the navigator Ψ producer (``gt.NavigatorPE`` / ``gt.build_psi_producer``).
 
-The notebook (``notebooks/e9_gnn_navigation.ipynb``) trains a shortest-path navigator whose
+The notebook (``notebooks/2026-06-28 e9_gnn_navigation.ipynb``) trains a shortest-path navigator whose
 two halves — a probe-PE ``GraphTransformer`` (``path_navigator_gt.pt``) and a
 ``SemanticGraphTransformer`` head (``path_navigator_agt.pt``) — are reused here as the Ψ
 producer of the two Ψ-consuming architectures: ``learnable_graph_mask`` (Ψ Ψᵀ attention

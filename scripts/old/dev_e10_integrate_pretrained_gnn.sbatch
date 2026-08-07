@@ -8,7 +8,7 @@
 #SBATCH --mem=256G
 
 # Dev e10: stage-3-style joint (PE + LoRA) finetune initialised from a pretrained
-# edge-detector GNN. The GNN was trained in notebooks/e9_gnn_navigation.ipynb to
+# edge-detector GNN. The GNN was trained in notebooks/2026-06-28 e9_gnn_navigation.ipynb to
 # classify edge existence; here its GraphTransformer replaces the from-scratch /
 # stage-2 PE.
 #

@@ -11,7 +11,7 @@
 # from the pretrained edge-detector GraphTransformer. The mask is
 #     M = alpha*A + (1-alpha)*scaled(Psi Psi^T),   Psi = GraphTransformer(graph)
 # and here that GraphTransformer's weights are initialised from the edge detector
-# (notebooks/e9_gnn_navigation.ipynb) instead of from scratch. Structurally this is
+# (notebooks/2026-06-28 e9_gnn_navigation.ipynb) instead of from scratch. Structurally this is
 # the learnable_graph_mask sibling of scripts/dev_e10_integrate_pretrained_gnn.sbatch
 # (which warm-starts the ADDITIVE rpearl_gt_llm planner from the same detector).
 #

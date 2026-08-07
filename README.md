@@ -65,15 +65,27 @@ python -m prism.eval.scalability_evaluation --checkpoint <run_dir> \
 ## Layout
 
 ```
-src/prism/        the package: models/ (architectures), data/ (prompting +
-                  collators + generation), training/ (train_v3 entrypoint),
-                  eval/ (grading, metrics, checkpoint reload)
-experiments/      Hydra configs (base_config.yaml = the documented schema;
-                  old/ = frozen legacy series)
-scripts/          current launchers + diagnostics (old/ = frozen legacy)
+src/prism/        the installable package
+  models/           architectures: LLM wrappers, graph encoders, injection
+  data/             prompting, collators, dataset + generation plumbing
+  training/         Hydra-driven training entrypoints and callbacks
+  eval/             grading, metrics, checkpoint reload, diagnostics
+experiments/      Hydra configs; the base config carries the documented
+                  schema, experiment files override deltas, old/ is frozen
+scripts/          runnable launchers (SLURM sbatch + CLI): data generation,
+                  training arms, diagnostics, analysis; old/ is frozen
 data/             navigation corpora and held-out eval graphs
-docs/             internal documentation (metrics catalog, ...)
-notebooks/        lab notes for the experiment series
+docs/             prose documentation: per-experiment lab notes (dated,
+                  named by experiment series) and reference material such as
+                  the metrics catalog
+notebooks/        exploratory + results analysis notebooks, prefixed with
+                  their creation date
+tests/            pytest suite
+outputs/          local run artifacts (not tracked; cluster runs write
+                  under $ALELAB_DRIVE instead)
 ```
+
+Experiment series are numbered `eN`; a series' decision log and results live
+in `docs/` and its launchers in `scripts/`, sharing the `eN` prefix.
 
 Built on PRISM-style planner training and the SPINE task setting.
