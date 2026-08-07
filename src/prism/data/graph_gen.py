@@ -1,11 +1,20 @@
 import json
 import os
+import re
 import sys
 from typing import List, Optional
 
-from spine.mapping.graph_util import GraphHandler
-
 from prism.data import local_llm, utils, vllm_llm
+
+FILL_TOKEN = "__FILL__"
+
+# Skeleton names the LLM must replace (region_1, object_12, ...).
+PLACEHOLDER_NAME = re.compile(r"^(region|object)_\d+$")
+
+# `type_N` node ids as they appear inside task answers/criteria (hub_1,
+# cell_block_3, ...). Used to catch tasks that reference a node the rename map
+# never produced.
+NODE_TOKEN = re.compile(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)*_\d+\b")
 
 
 def _validate_tasks(json_content: dict) -> None:
@@ -37,6 +46,154 @@ def _validate_tasks(json_content: dict) -> None:
                 )
     except Exception as e:  # never let validation break generation
         print(f"[graph-gen] task validation skipped ({type(e).__name__}: {e})")
+
+
+def _base_nodes(base_graph: dict) -> List[dict]:
+    return base_graph["graph"]["objects"] + base_graph["graph"]["regions"]
+
+
+def _graph_node_names(graph: dict) -> set:
+    return {n["name"] for n in graph["objects"] + graph["regions"]}
+
+
+def validate_rename_map(rename: dict, base_graph: dict) -> None:
+    """Reject a rename map that would not survive mechanical application.
+
+    The map is the ONLY thing the LLM says about topology, so every failure
+    mode of the old free-form contract (dangling edges, dropped nodes, renamed
+    coordinates) reduces to a defect in this dict. Raises ``ValueError`` so the
+    caller's retry loop regenerates the graph.
+    """
+    if not isinstance(rename, dict):
+        raise ValueError(f"rename map must be a dict, got {type(rename).__name__}")
+
+    expected = {node["name"] for node in _base_nodes(base_graph)}
+    got = set(rename)
+    missing = expected - got
+    extra = got - expected
+    if missing or extra:
+        raise ValueError(
+            f"rename map does not cover the base nodes: "
+            f"{len(missing)} missing {sorted(missing)[:8]}, "
+            f"{len(extra)} unknown {sorted(extra)[:8]}"
+        )
+
+    bad_type = {k for k, v in rename.items() if not isinstance(v, str) or not v.strip()}
+    if bad_type:
+        raise ValueError(
+            f"rename map has empty/non-string names for {sorted(bad_type)[:8]}"
+        )
+
+    seen: dict = {}
+    collisions = []
+    for old, new in rename.items():
+        if new in seen:
+            collisions.append(f"{seen[new]!r} and {old!r} -> {new!r}")
+        seen[new] = old
+    if collisions:
+        raise ValueError(f"rename map is not injective: {collisions[:8]}")
+
+    leftover = sorted(v for v in rename.values() if PLACEHOLDER_NAME.match(v))
+    if leftover:
+        raise ValueError(f"rename map keeps skeleton placeholder names: {leftover[:8]}")
+
+
+def validate_descriptions(descriptions: dict, base_graph: dict) -> None:
+    """Descriptions may only be supplied for nodes marked ``__FILL__``."""
+    if not isinstance(descriptions, dict):
+        raise ValueError(
+            f"descriptions must be a dict, got {type(descriptions).__name__}"
+        )
+
+    expected = {
+        node["name"] for node in _base_nodes(base_graph)
+        if node["description"] == FILL_TOKEN
+    }
+    got = set(descriptions)
+    missing = expected - got
+    extra = got - expected
+    if missing or extra:
+        raise ValueError(
+            f"descriptions must cover exactly the {len(expected)} __FILL__ nodes: "
+            f"missing {sorted(missing)[:8]}, unknown {sorted(extra)[:8]}"
+        )
+
+    bad = {
+        k for k, v in descriptions.items() if not isinstance(v, str) or not v.strip()
+    }
+    if bad:
+        raise ValueError(f"descriptions are empty/non-string for {sorted(bad)[:8]}")
+
+
+def apply_rename(base_graph: dict, rename: dict, descriptions: dict) -> dict:
+    """Build the populated graph from the base graph and a validated map.
+
+    Coordinates, connections and node counts are copied from the base graph, so
+    the LLM cannot perturb them; only names and ``__FILL__`` descriptions come
+    from the model.
+    """
+    def renamed_node(node: dict) -> dict:
+        out = dict(node)
+        out["name"] = rename[node["name"]]
+        if node["description"] == FILL_TOKEN:
+            out["description"] = descriptions[node["name"]]
+        return out
+
+    graph = base_graph["graph"]
+    return {
+        "objects": [renamed_node(n) for n in graph["objects"]],
+        "regions": [renamed_node(n) for n in graph["regions"]],
+        "object_connections": [
+            [rename[a], rename[b]] for a, b in graph["object_connections"]
+        ],
+        "region_connections": [
+            [rename[a], rename[b]] for a, b in graph["region_connections"]
+        ],
+        "robot_location": rename[graph["robot_location"]],
+    }
+
+
+def assert_graph_refs_resolve(graph: dict) -> None:
+    """Final backstop: every connection endpoint names an existing node."""
+    names = _graph_node_names(graph)
+    for key in ("object_connections", "region_connections"):
+        for edge in graph[key]:
+            assert len(edge) == 2, (
+                f"{key} entry {edge} has {len(edge)} endpoints, want 2"
+            )
+            for endpoint in edge:
+                assert endpoint in names, f"{key} references unknown node {endpoint!r}"
+    assert graph["robot_location"] in names, (
+        f"robot_location {graph['robot_location']!r} is not a node"
+    )
+
+
+def validate_task_refs(tasks: List[dict], graph: dict) -> None:
+    """Every node a task names must exist in the renamed graph.
+
+    ``init_node`` is loaded straight into ``GraphHandler.reset`` at rollout
+    time, and the deterministic grader resolves the goal/waypoints out of
+    ``acceptance_criterion``, so a hallucinated id there yields an ungradeable
+    task rather than a loud failure.
+    """
+    names = _graph_node_names(graph)
+    region_names = {n["name"] for n in graph["regions"]}
+
+    for i, task in enumerate(tasks):
+        if task["init_node"] not in region_names:
+            raise ValueError(
+                f"task {i}: init_node {task['init_node']!r} is not a region"
+            )
+        # Answer regexes carry escapes (\b...\b); drop them so the escape letter
+        # is not read as part of the following node id.
+        text = re.sub(
+            r"\\.", " ", f"{task['answer']} {task['acceptance_criterion']}"
+        )
+        unknown = set(NODE_TOKEN.findall(text)) - names
+        if unknown:
+            raise ValueError(
+                f"task {i} references nodes that are not in the graph: {sorted(unknown)}"
+            )
 
 
 UPDATED_QUERY = r"""
@@ -106,65 +263,40 @@ For example,
 }
 }
 
-After populating, the same graph might look like this (note: coordinates are unchanged, names are realistic, `__FILL__` is replaced, `""` is untouched, and `_metadata` is removed):
+You do NOT rewrite this graph. You return a rename map, the descriptions to fill in, and the tasks. The graph itself — coordinates, connections, node counts, robot_location — is rebuilt mechanically by applying your rename map to the base graph, so you cannot change the topology and must not try.
+
+For the base graph above, your entire output would be:
 
 {
-"graph": {
-  "objects":
-  [
-      {"name": "shed_1", "coords": [78, 9], "description": "rusted"},
-      {"name": "gate_1", "coords": [52, -56], "description": ""}
-  ],
-  "regions": [
-      {"name": "ground_1", "coords": [0, 0], "description": ""},
-      {"name": "road_1", "coords": [5.7, -8.3], "description": ""},
-      {"name": "road_2", "coords": [19.3, -6.5], "description": ""},
-      {"name": "trail_1", "coords": [35.7, -12.1], "description": ""},
-      {"name": "highway_1", "coords": [52.7, -20], "description": ""},
-      {"name": "highway_2", "coords": [57.2, -31.6], "description": ""},
-      {"name": "bridge_1", "coords": [54.3, -46.7], "description": ""},
-      {"name": "intersection_1", "coords": [52.4, -56.5], "description": ""},
-      {"name": "driveway_1", "coords": [78.4, 9.1], "description": ""}
-  ],
-  "object_connections": [
-      ["shed_1", "driveway_1"],
-      ["gate_1", "intersection_1"]
-  ],
-  "region_connections":[
-      ["ground_1", "road_1"],
-      ["road_1", "road_2"],
-      ["road_2", "trail_1"],
-      ["trail_1", "highway_1"],
-      ["highway_1", "highway_2"],
-      ["highway_2", "bridge_1"],
-      ["bridge_1", "intersection_1"],
-      ["intersection_1", "driveway_1"]
-  ],
-  "robot_location": "ground_1"
-},
-"tasks": [...]
+  "rename": {
+      "object_0": "shed_1",
+      "object_1": "gate_1",
+      "region_0": "ground_1",
+      "region_1": "road_1",
+      "region_2": "road_2",
+      "region_3": "trail_1",
+      "region_4": "highway_1",
+      "region_5": "highway_2",
+      "region_6": "bridge_1",
+      "region_7": "intersection_1",
+      "region_8": "driveway_1"
+  },
+  "descriptions": {
+      "object_0": "rusted"
+  },
+  "tasks": [...]
 }
+
+Applying that map yields `["shed_1", "driveway_1"]` from `["object_0", "region_8"]`, `robot_location: "ground_1"` from `"region_0"`, and every coordinate untouched.
 
 You must populate the base graph using the following steps:
 
-### CRITICAL GRAPH INVARIANTS (MUST NOT BE VIOLATED)
+### CRITICAL OUTPUT INVARIANTS (MUST NOT BE VIOLATED)
 
-You are given a base graph. You MUST preserve the following exactly:
-
-- DO NOT modify any coordinates under any circumstance.
-- DO NOT reorder or alter coordinate values.
-- DO NOT add, remove, or perturb coordinates.
-- The "coords" field for every region and object must remain EXACTLY as provided.
-- DO NOT add or remove nodes. The number of regions and objects must match the input exactly.
-- DO NOT change the graph topology. All connections (both object_connections and region_connections) must remain exactly as given, only with names updated to reflect renames.
-
-The ONLY allowed modifications are:
-- renaming nodes (name field)
-- filling descriptions (only replacing "__FILL__" — never modifying "")
-- generating tasks
-- updating robot_location to its renamed value
-
-If any coordinate, connection, or node count changes, the output is INVALID.
+- The "rename" map must contain EXACTLY one entry per node in the base graph — every region AND every object, keyed by its ORIGINAL name. No missing keys, no invented keys.
+- Every new name must be unique: two original nodes may never map to the same new name.
+- No new name may look like a skeleton placeholder (`region_4`, `object_7`).
+- DO NOT output "objects", "regions", "object_connections", "region_connections", "robot_location", "coords", or "_metadata". Any of those in your output is INVALID.
 
 ### Step 1: Choose theme
 
@@ -188,7 +320,7 @@ Examples of community → type mappings:
 - Community 1 (5 nodes) → `road_1`, `road_2`, `road_3`, `highway_1`, `intersection_1`
 - Community 2 (5 nodes) → `trail_1`, `trail_2`, `path_1`, `path_2`, `bridge_1`
 
-Choose types that make sense for the theme. Types used across different communities should be distinct where possible. Maintain a rename map: `{"region_1": "field_1", "region_2": "meadow_1", ...}`.
+Choose types that make sense for the theme. Types used across different communities should be distinct where possible. Record each choice in the `rename` map: `{"region_1": "field_1", "region_2": "meadow_1", ...}`.
 
 ### Step 3: Rename objects
 
@@ -202,22 +334,20 @@ Examples: `pickup_truck_1`, `cabin_1`, `shed_1`, `light_pole_1`, `sail_boat_1`, 
 
 ### Step 4: Fill descriptions (STRICT)
 
-Each node has a "description" field that is either:
-- "__FILL__" → MUST be replaced with a short attribute string
-- "" (empty string) → MUST remain EXACTLY "" (do not modify)
+The `descriptions` map holds one entry for each node whose base-graph description is `"__FILL__"`, keyed by its ORIGINAL name:
+
+`"descriptions": {"object_3": "rusted", "object_9": "locked"}`
 
 Rules:
-- DO NOT add descriptions to entries with "".
-- DO NOT change "" to any other value.
-- DO NOT remove descriptions that already exist.
-- ONLY replace "__FILL__".
+- Include EVERY node marked `"__FILL__"` and NOTHING else. Nodes whose description is `""` keep it and must NOT appear in the map.
+- If no node is marked `"__FILL__"`, return `"descriptions": {}`.
 
 Allowed description values are short attributes such as:
 "damaged", "not damaged", "locked", "empty", "operational", "rusted", "overgrown", "flooded", "collapsed", "active"
 
-If you modify an empty string "", the output is INVALID.
-
 ### Step 5: Planning
+
+Every node id you write in a task — in `init_node`, in `answer`, in `acceptance_criterion` — must be a NEW name from your `rename` map, never a base-graph name like `region_4`. Read the topology (`region_connections`, `object_connections`) off the BASE graph and translate each node through your map as you write. A task naming a node that is not a value in the map is INVALID.
 
 Generate EXACTLY n_tasks tasks (specified in `_metadata`). The tasks should present interesting planning scenarios that assess the ability of the planner to do one of the following:
 
@@ -284,15 +414,15 @@ For example, if the graph contains a `fuel_depot_1` region holding a `fuel_tank_
 
 {
   "task": "Reach the area holding the fuel tank from the starting area and report the connecting edges and the route.",
-  "answer": "(?i)\bclearing_1\b.*\bfuel_depot_1\b",
+  "answer": "(?i)\\bclearing_1\\b.*\\bfuel_depot_1\\b",
   "init_node": "clearing_1",
-  "acceptance_criterion": "A correct answer reaches fuel_depot_1 (which contains fuel_tank_1) via comm_bunker_1, stating the edge fuel_depot_1 <=> fuel_tank_1 and a route clearing_1 -> comm_bunker_1 -> fuel_depot_1."
+  "acceptance_criterion": "A correct answer gives a valid route from clearing_1 to fuel_depot_1 (which contains fuel_tank_1), stating the edge fuel_depot_1 <=> fuel_tank_1."
 }
 
 **Answer regex rules (a coarse parallel check — grading is deterministic over the graph):**
 The deterministic grader reads the goal region, any waypoints, the avoided areas, and the containment edge(s) directly from the `acceptance_criterion` (and this `answer`), then validates the planner's stated edges and route against the NetworkX graph. The regex is a secondary signal — keep it SIMPLE and node-naming, never a bare polarity.
 
-- Wrap every node name in `\b` word boundaries: `(?i)\bfuel_depot_1\b`, never bare `fuel_depot_1` (which also matches `fuel_depot_10`).
+- Wrap every node name in `\b` word boundaries: `(?i)\bfuel_depot_1\b`, never bare `fuel_depot_1` (which also matches `fuel_depot_10`). In the JSON output the backslash must itself be escaped — write `\\b`, since a bare `\b` in a JSON string is the backspace character and silently breaks the regex.
 - NEVER use a bare yes/no regex for Positionality, Reachability, or Navigability — those tasks are graded on edges and paths, not polarity.
 - Positionality — match the answer (destination) region name: `(?i)\bfuel_depot_1\b`.
 - Reachability/Navigability — match only the route's FIRST and LAST hop (start region then destination), in order: `(?i)\bcrew_quarters_1\b.*\bcoolant_station_1\b`. If the task names a required waypoint, include it: `(?i)\bcrew_quarters_1\b.*\bpower_conduit_1\b.*\bcoolant_station_1\b`. Never encode the full path in the regex — the full walk is checked deterministically against the graph.
@@ -320,43 +450,29 @@ Examples of good acceptance criteria:
 - Each task must be solvable from the graph alone.
 - Mix the three allowed types (Positionality, Reachability, Navigability). Do not generate all tasks of the same type, and never generate an Existence (yes/no) task.
 
-### Step 6: Update robot location
-
-After renaming all regions, update the `robot_location` field to use the new renamed region name. For example, if `region_0` was renamed to `clearing_1`, then `robot_location` must become `"clearing_1"`.
-
-### Step 7: Remove metadata
-
-Remove the `_metadata` field completely from the output. It is only used as input guidance and must not appear in the final JSON.
-
-### Step 8: Validation (REQUIRED)
+### Step 6: Validation (REQUIRED)
 
 Before producing your final output, verify ALL of the following. If any condition fails, fix it before outputting.
 
-1. ALL coordinates are EXACTLY unchanged from the input
-2. NO "" descriptions were modified (they must still be "")
-3. NO "__FILL__" placeholders remain — all must be replaced
-4. All node names are globally unique (across both regions and objects)
-5. Each type prefix (e.g., `field` in `field_1`) appears at most THREE times in the entire graph
-6. All connections reference valid, renamed node names
-7. No original placeholder names (like `region_0`, `object_0`) remain
-8. The number of tasks equals exactly n_tasks from `_metadata`
-9. `robot_location` references a valid renamed region
-10. All `init_node` values in tasks reference valid renamed regions
-11. Every task has a non-empty `acceptance_criterion` that names the answer entity by its node name
-12. Every `answer` regex uses `\b` word boundaries, rejects the opposite-polarity answer for yes/no tasks, and for Navigability tasks matches only the first and last hop (start and destination regions, plus any required waypoint), never a full path
+1. `rename` has exactly one key per base-graph node — count the regions and objects in the input and count your keys; they must match
+2. Every key in `rename` is spelled exactly as in the base graph, and no key is invented
+3. All new names are globally unique (across both regions and objects); no two keys share a value
+4. Each type prefix (e.g., `field` in `field_1`) appears at most THREE times across all new names
+5. No new name is a skeleton placeholder like `region_0` or `object_0`
+6. `descriptions` covers exactly the `"__FILL__"` nodes — no more, no fewer
+7. The number of tasks equals exactly n_tasks from `_metadata`
+8. Every `init_node` is a new name that you mapped from a REGION (not an object)
+9. Every node id inside `answer` and `acceptance_criterion` is a value of your `rename` map
+10. Every task has a non-empty `acceptance_criterion` that names the answer entity by its node name
+11. Every `answer` regex uses `\b` word boundaries and, for Navigability tasks, matches only the first and last hop (start and destination regions, plus any required waypoint), never a full path
 
 ### Output format
 
 Return ONLY valid JSON in the following format — no extra text, no reasoning, no commentary:
 
 {
-  "graph": {
-    "objects": [...],
-    "regions": [...],
-    "object_connections": [...],
-    "region_connections": [...],
-    "robot_location": "..."
-  },
+  "rename": {"<original name>": "<new name>", ...},
+  "descriptions": {"<original name of a __FILL__ node>": "<short attribute>", ...},
   "tasks": [...]
 }
 
@@ -468,34 +584,47 @@ class TaskGraphGen:
             reasoning_effort=reasoning_effort,
         )
 
-        return self.parse_response(response, description=description, n_tasks=n_tasks)
+        return self.parse_response(
+            response, base_graph, description=description, n_tasks=n_tasks
+        )
 
     def parse_response(
-        self, response: str, description: str = "", n_tasks: Optional[int] = None
+        self,
+        response: str,
+        base_graph: str,
+        description: str = "",
+        n_tasks: Optional[int] = None,
     ) -> dict:
-        """Validate and parse a raw GPT response string into a task dict.
+        """Rebuild the populated graph from a raw LLM response and the skeleton.
+
+        The response carries only a rename map, the ``__FILL__`` descriptions
+        and the tasks; the graph is reconstructed from ``base_graph`` so
+        topology and coordinates are the skeleton's by construction. Anything
+        the model got wrong about the map raises ``ValueError`` for the
+        caller's retry loop.
 
         When ``n_tasks`` is given, the parsed ``tasks`` list is hard-capped to
         that many entries — the LLM does not reliably honour the requested
         count, so this guarantees at most ``n_tasks`` tasks per graph.
         """
         print(response)
-        json_content = json.loads(response)
-        json_content["description"] = description
-        graph_handle = GraphHandler(graph="")
-        graph_handle.reset(
-            json_content["graph"],
-            current_location=json_content["graph"]["robot_location"],
-        )
+        base = json.loads(base_graph)
+        llm_content = json.loads(response)
 
-        # make sure GPT isn't hallucinating edges
-        for [source, end] in graph_handle.graph.edges:
-            assert source in graph_handle.graph.nodes, f"{source} not in graph"
-            assert end in graph_handle.graph.nodes, f"{end} not in graph"
+        validate_rename_map(llm_content["rename"], base)
+        validate_descriptions(llm_content["descriptions"], base)
+        graph = apply_rename(base, llm_content["rename"], llm_content["descriptions"])
+        assert_graph_refs_resolve(graph)
+
+        json_content = {
+            "graph": graph,
+            "tasks": llm_content["tasks"],
+            "description": description,
+        }
 
         # Enforce the requested task count: the model may over-produce (e.g. 21
         # when asked for 20), so truncate to exactly n_tasks.
-        if n_tasks is not None and isinstance(json_content.get("tasks"), list):
+        if n_tasks is not None:
             n_got = len(json_content["tasks"])
             if n_got != n_tasks:
                 print(
@@ -504,15 +633,6 @@ class TaskGraphGen:
                 )
             json_content["tasks"] = json_content["tasks"][:n_tasks]
 
+        validate_task_refs(json_content["tasks"], graph)
         _validate_tasks(json_content)
         return json_content
-
-
-if __name__ == "__main__":
-    gen = TaskGraphGen()
-
-    rnd_data = gen.get_tasks()
-
-    graph_handler = GraphHandler(graph="")
-
-    whatdoihave = 0

@@ -37,7 +37,7 @@ def main():
 
     generator = DataGenerator(graph_unknown=[0])
     with tempfile.TemporaryDirectory() as tmpdir:
-        generator.populate_graphs_and_tasks([str(base_graph)], log_dir=tmpdir)
+        generator.populate_graphs_and_tasks([json.dumps(base_graph)], log_dir=tmpdir)
         shutil.copy(Path(tmpdir) / "data_gen_000.json", args.output)
 
     print(f"Populated: {args.skeleton} -> {args.output}")

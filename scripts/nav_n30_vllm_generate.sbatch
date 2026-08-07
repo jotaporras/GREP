@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=nav-n60-gemma31b-vllm
+#SBATCH --job-name=nav-n30-gemma31b-vllm
 #SBATCH --output=/vast/projects/aribeiro/alelab/jporras/GREP-PRISM/slurm-%x-%j.out
 #SBATCH --time=24:00:00
 #SBATCH --partition=dgx-b200
@@ -7,12 +7,12 @@
 #SBATCH --cpus-per-task=28
 #SBATCH --mem=224G
 #
-# N~60 variant of nav_n100_vllm_generate.sbatch (same pipeline, smaller graphs):
-# 6 communities x 8 nodes = 48 regions x 1.3 ~= 62 nodes.
-# Data root: $ALELAB_DRIVE/GREP-PRISM/data/n_60_vllm_v2 (v2 = rename-map
-# populate contract; graphs from the old whole-graph contract live in n_60_vllm)
+# N~30 variant of nav_n100_vllm_generate.sbatch (same pipeline, smaller graphs):
+# 3 communities x 8 nodes = 24 regions x 1.3 ~= 31 nodes.
+# Data root: $ALELAB_DRIVE/GREP-PRISM/data/n_30_vllm_v2 (v2 = rename-map
+# populate contract; graphs from the old whole-graph contract live in n_*_vllm)
 #
-# Submit:  sbatch scripts/nav_n60_vllm_generate.sbatch
+# Submit:  sbatch scripts/nav_n30_vllm_generate.sbatch
 
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/..}"
@@ -30,11 +30,11 @@ export PRISM_LLM_BACKEND=vllm
 export VLLM_USE_FLASHINFER_SAMPLER=0
 export PRISM_VLLM_MAX_LEN=32768
 export PRISM_VLLM_TP=1
-export DATA_ROOT="${ALELAB_DRIVE}/GREP-PRISM/data/n_60_vllm_v2"
+export DATA_ROOT="${ALELAB_DRIVE}/GREP-PRISM/data/n_30_vllm_v2"
 export ROLLOUT_WORKERS="${ROLLOUT_WORKERS:-8}"
-export GRAPH_COMMUNITIES=6
+export GRAPH_COMMUNITIES=3
 export GRAPH_NODES_PER_COMMUNITY=8
-export GRAPH_LABEL=60
+export GRAPH_LABEL=30
 
 mkdir -p "$DATA_ROOT"
 

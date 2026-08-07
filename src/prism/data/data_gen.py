@@ -269,11 +269,13 @@ class DataGenerator:
             poll_interval=poll_interval,
         )
 
-        for (idx, _), response in zip(pending, responses):
+        for (idx, base_graph), response in zip(pending, responses):
             # One malformed response must not discard the whole batch: skip the
             # graph (no file written) so a re-run's resume regenerates only it.
             try:
-                rnd_data = self.context_gen.parse_response(response, n_tasks=n_tasks)
+                rnd_data = self.context_gen.parse_response(
+                    response, base_graph, n_tasks=n_tasks
+                )
             except Exception as ex:
                 print(f"graph {idx}: batch populate response unparseable — {ex}")
                 continue

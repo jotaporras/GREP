@@ -197,7 +197,9 @@ if __name__ == "__main__":
         for graph_path in graph_paths:
             print(graph_path)
             with open(graph_path) as f:
-                graphs.append(str(json.load(f)))
+                # json.dumps, not str(): parse_response reads the skeleton back
+                # to rebuild the graph from the LLM's rename map.
+                graphs.append(json.dumps(json.load(f)))
 
         populated_graphs_dir = Path(output_dir) / "populated_graphs"
         populated_graphs_dir.mkdir(exist_ok=True)
