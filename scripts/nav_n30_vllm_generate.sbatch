@@ -17,7 +17,10 @@
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/..}"
 
-: "${ALELAB_DRIVE:?ALELAB_DRIVE must be set (shared drive root)}"
+# Shared drive root. Default matches ~/.bashrc on betty (and the #SBATCH --output
+# path above); scripted submissions (ssh betty 'bash -lc "sbatch ..."') never see
+# the .bashrc export because of its non-interactive guard.
+export ALELAB_DRIVE="${ALELAB_DRIVE:-/vast/projects/aribeiro/alelab/jporras}"
 
 ENV_NAME=${ENV_NAME:-/vast/projects/aribeiro/alelab/jporras/envs/GREP-PRISM-vllm}
 export HF_HOME=${HF_HOME:-/vast/projects/aribeiro/alelab/jporras/hf_cache}
