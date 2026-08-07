@@ -97,10 +97,8 @@ export BITSANDBYTES_NOWELCOME=1
 # the EXISTING data/n_100 tree in place (skeletons under training/, populated graphs and
 # rollouts under gen/) with nothing to move afterwards. Overridable for a side-by-side
 # run: DATA_ROOT=data/n_100_v2 bash scripts/nav_n100_gemma_generate.sh
+# SKEL_DIR/RUN_DIR are derived from GRAPH_LABEL below.
 DATA_ROOT="${DATA_ROOT:-data/n_100}"
-SKEL_DIR="${DATA_ROOT}/training/nav_n100_skeletons"
-RUN_DIR="${DATA_ROOT}/gen/nav_n100_gemma_data"
-SPLIT_DIR="${RUN_DIR}/split"
 
 INTRA_PROB=0.6
 INTER_PROB=0.05
@@ -120,6 +118,12 @@ GEN_SEED=42
 NC="${GRAPH_COMMUNITIES:-7}"
 NPC="${GRAPH_NODES_PER_COMMUNITY:-11}"
 GRAPH_LABEL="${GRAPH_LABEL:-100}"
+
+# Output dirs carry the graph size so an N~30/N~60 run never lands in a
+# nav_n100_* directory.
+SKEL_DIR="${DATA_ROOT}/training/nav_n${GRAPH_LABEL}_skeletons"
+RUN_DIR="${DATA_ROOT}/gen/nav_n${GRAPH_LABEL}_gemma_data"
+SPLIT_DIR="${RUN_DIR}/split"
 
 # Number of graphs (skeletons). Each graph yields up to N_TASKS rollouts, and
 # the train/val split keeps ~80% for training, so training examples are roughly
@@ -164,7 +168,7 @@ print("preflight OK: get_tasks accepts task_complexities + reasoning_effort")
 PY
 
 echo ""
-echo "=== Stage 1: Generate skeletons (${#seeds[@]} seeds x 1 config = ${#seeds[@]} skeletons, ~100 nodes each) ==="
+echo "=== Stage 1: Generate skeletons (${#seeds[@]} seeds x 1 config = ${#seeds[@]} skeletons, N~${GRAPH_LABEL} each) ==="
 
 # Reuse-existing guard: if ALL N skeletons already exist AND at least one graph
 # has already been populated, an interrupted run is in progress — keep what is
