@@ -249,15 +249,21 @@ class VLLMQueryClient:
         ``temperature=0.0``). ``skip_special_tokens=False`` is REQUIRED: the
         ``<think>`` delimiters must survive detokenization for
         ``parse_response`` to find and strip the reasoning block.
+
+        The per-request seed is set ONLY when PRISM_VLLM_SEED is explicitly
+        exported. A fixed default seed would make retries pointless: a graph
+        whose populate response was malformed JSON would re-sample the exact
+        same malformed output on every resume.
         """
         from vllm import SamplingParams
 
         sample = temperature is not None and temperature > 0
+        seed_env = os.environ.get("PRISM_VLLM_SEED")
         return SamplingParams(
             temperature=temperature if sample else 0.0,
             max_tokens=max_tokens or self.max_new_tokens,
             skip_special_tokens=False,
-            seed=int(os.environ.get("PRISM_VLLM_SEED", "0")),
+            seed=int(seed_env) if seed_env is not None else None,
         )
 
     def _finish(self, output) -> str:

@@ -114,8 +114,12 @@ GEN_SEED=42
 
 # Single ~100-node config (7 communities x 11 nodes = 77 regions; +~30% objects).
 # Total nodes = n_regions x (1 + object_rate) = 77 x 1.3 ~= 100.
-NC=7
-NPC=11
+# Overridable for other graph sizes (e.g. N~60: GRAPH_COMMUNITIES=6
+# GRAPH_NODES_PER_COMMUNITY=8 -> 48 regions x 1.3 ~= 62 nodes). GRAPH_LABEL
+# names the skeleton files (eval_graph_unique_<label>_seedNNN.json).
+NC="${GRAPH_COMMUNITIES:-7}"
+NPC="${GRAPH_NODES_PER_COMMUNITY:-11}"
+GRAPH_LABEL="${GRAPH_LABEL:-100}"
 
 # Number of graphs (skeletons). Each graph yields up to N_TASKS rollouts, and
 # the train/val split keeps ~80% for training, so training examples are roughly
@@ -168,7 +172,7 @@ echo "=== Stage 1: Generate skeletons (${#seeds[@]} seeds x 1 config = ${#seeds[
 # against the exact skeletons it started from.
 all_skeletons_exist=true
 for SEED in "${seeds[@]}"; do
-  if [ ! -f "${SKEL_DIR}/eval_graph_unique_100_seed${SEED}.json" ]; then
+  if [ ! -f "${SKEL_DIR}/eval_graph_unique_${GRAPH_LABEL}_seed${SEED}.json" ]; then
     all_skeletons_exist=false
     break
   fi
@@ -181,7 +185,7 @@ if [ "$all_skeletons_exist" = true ] && [ "$populated_count" -gt 0 ]; then
   echo "Skipping skeleton generation (use --fresh by clearing those dirs to regenerate)."
 else
   for SEED in "${seeds[@]}"; do
-    echo "--- N~100 (${NC} communities x ${NPC} nodes/community) seed=${SEED} ---"
+    echo "--- N~${GRAPH_LABEL} (${NC} communities x ${NPC} nodes/community) seed=${SEED} ---"
     python scripts/generate_eval_graphs.py \
       --n-communities "$NC" \
       --nodes-per-community "$NPC" \
@@ -191,7 +195,7 @@ else
       --description-prob "$DESC_PROB" \
       --n-tasks "$N_TASKS" \
       --seed "$SEED" \
-      --output "${SKEL_DIR}/eval_graph_unique_100_seed${SEED}.json"
+      --output "${SKEL_DIR}/eval_graph_unique_${GRAPH_LABEL}_seed${SEED}.json"
   done
 fi
 

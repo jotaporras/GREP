@@ -4,8 +4,8 @@
 #SBATCH --time=24:00:00
 #SBATCH --partition=dgx-b200
 #SBATCH --gpus=1
-#SBATCH --cpus-per-task=14
-#SBATCH --mem=256G
+#SBATCH --cpus-per-task=28
+#SBATCH --mem=224G
 #
 # SLURM wrapper for scripts/nav_n100_gemma_generate.sh with the vLLM backend
 # (GREP-T1 AC6/AC7): Phase-1 populate runs as ONE continuously-batched call and
@@ -42,6 +42,12 @@ source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "$ENV_NAME"
 
 export PRISM_LLM_BACKEND=vllm
+# B200 compute nodes cannot JIT-build flashinfer's sampling kernels at engine
+# warmup (write_ninja fails); vLLM's native torch sampler works fine.
+export VLLM_USE_FLASHINFER_SAMPLER=0
+# ~100-node populate prompts + the 20480-token generation budget (thinking +
+# JSON) exceed the 16384 default context window — outputs truncate mid-JSON.
+export PRISM_VLLM_MAX_LEN=32768
 export PRISM_VLLM_TP=1              # a single B200 holds the bf16 31B
 export DATA_ROOT="${ALELAB_DRIVE}/GREP-PRISM/data/n_100_vllm"
 export ROLLOUT_WORKERS="${ROLLOUT_WORKERS:-8}"

@@ -217,7 +217,7 @@ data:
   # geometry graphs this nearly severs the long inter-community edges. "binary": no
   # edge_weight attached — GNNs see the plain SBM adjacency. Applies to train collator
   # AND all eval graph parsing; recorded in train_config.json.
-  edge_weights: gaussian
+  edge_weights: binary
   # Which token positions carry the graph channel (PE / structural mask) during TRAINING:
   # "full_sequence" (historical) also injects node mentions inside the assistant answer —
   # the predicted positions carry the ground-truth node's channel, which generation never
