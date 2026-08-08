@@ -232,8 +232,9 @@ figures (n30 0.071, n60 0.043) are artifacts; do not compare against them.
 
 Practical implication: more/more-diverse n60 training graphs plus stronger
 regularization should help the transfer half, but won't close the gap alone
-because the fit itself is short — the v3 corpus experiment (below/next doc)
-tests exactly how far the data lever goes.
+because the fit itself is short — the v3 corpus experiment tests exactly how
+far the data lever goes:
+[2026-08-08 e14_scaling_v3_n60_widened_corpus.md](2026-08-08%20e14_scaling_v3_n60_widened_corpus.md).
 
 ## 5. Metric caveats (eval definition, not run faults)
 
