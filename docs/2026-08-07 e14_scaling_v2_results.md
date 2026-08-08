@@ -1,7 +1,7 @@
 ---
 tags: [experiment, e14, scaling, graph-injection, vllm-data]
 date: 2026-08-07
-status: partial (5/6 runs final; n60 edges-in-prompt bracket died on a GPU infra flake 46s in, resubmit pending)
+status: partial (5/6 runs final; n60 edges-in-prompt rerunning as job 7438021; train-graph probes 7438024/7438025 running)
 related: ["2026-07-21 e13_nav_pe_setup"]
 wandb: alelab/GREP-PRISM (tag e14_scaling)
 ---
@@ -75,7 +75,69 @@ Gen acc = `eval/accuracy` over the full 70-rollout test split (7 held-out graphs
   header caveat); that asymmetry favors GT and it still trails the text
   bracket.
 
-## 4. Metric caveats (eval definition, not run faults)
+## 4. Failure-mode analysis (added 2026-08-08, from the epoch-3 `eval_logs` JSONs)
+
+Per-sample classification of every wrong answer, validated against the true
+test graphs (scratchpad `analyze_failures.py` / `analyze_invalid_edges.py` /
+`analyze_sibling_confusion.py`).
+
+**Where the errors are.** Failures are almost entirely *invalid edges* — the
+plan is well-formatted, every node name exists (node hallucination is not the
+problem on v2 data), but 1–2 transitions in the path don't exist in the graph:
+
+| run | invalid edges | wrong endpoints | other |
+|---|---|---|---|
+| n30 GT (21 fails) | 16 | 5 | 0 |
+| n60 GT (62 fails) | 46 | 15 | 1 eval crash |
+| n60 floor (68 fails) | 57 | 11 | 0 |
+
+**The phantom edges are local, and they repeat.** Nearly all invalid predicted
+edges connect nodes at true distance 2–3 (n30 GT: 19/24 at d=2; never random
+long-range jumps), and the same phantom edge recurs across tasks —
+`atrium_1→lab_2` appears in 8 of the n30 GT failures, `command_deck_2→command_deck_1`
+in 5 of the n60 GT ones. These are consistent wrong beliefs about adjacency,
+not sampling noise: the channel conveys coarse proximity but the model commits
+to specific nonexistent shortcuts.
+
+**n30 GT's 0.700 is concentrated, not diffuse.** Per-graph accuracy:
+`data_gen_011` **0.1**, `data_gen_020` 0.5, the other five graphs 0.8–0.9.
+Without graph 011 the run scores ~0.86. In 011, 13/24 phantom-edge instances
+are *sibling swaps*: predicted `a→lab_2` where `lab_1` (same base name,
+different suffix) really is adjacent to `a`. So the common n30 GT error is
+suffix confusion between duplicate-base-name nodes plus d=2 hop-skipping,
+concentrated in whichever test graph has confusable duplicates near the routes.
+
+**n60 GT's 0.114 is diffuse.** Every test graph scores 0.0–0.2. Success by
+true optimal hop count (BFS start→goal): 1-hop 4/8, 2-hop 2/29, 3-hop 2/30.
+At n30 the same curve is 0.92 / 0.58 / 0.70. So at n60 the channel's per-edge
+adjacency fidelity drops to roughly a coin flip even for single-hop tasks, and
+multi-hop compounding does the rest. Sibling swaps are only ~1/3 of n60
+phantom edges — the signal is broadly blurred, not just suffix-confused.
+(Context: on the old v1 data, GT scored 0.267 at n60 and 0.057 at n100 — the
+size collapse predates the datagen fix and is monotone in graph size.)
+
+**n60 floor fails differently**: it invents a generic hub topology
+(`bridge→comm_hub` etc., the same made-up edges across every task) — pure
+prior, as expected with no connectivity given.
+
+**First-guess hypotheses.** n60 collapse: the graph-channel injection has a
+fixed representational budget per node, and at 60+ nodes the binary-adjacency
+signal blurs below the threshold the LLM needs to commit to exact edges —
+consistent with errors staying local (d=2–3) and with the monotone v1 size
+trend. n30 residual: not a corpus problem (v2 is clean) but channel
+resolution on confusable node pairs — duplicate base names one hop apart get
+near-identical injected representations and the model swaps suffixes.
+
+**Overnight causal probe (running).** Jobs 7438024/7438025 re-evaluate the two
+GT checkpoints on 7 *train* graphs each
+(`results/e14v2_traingraph_probe/{n60,n30}_gt_on_train/`, via
+`e14_transferability.sbatch`). If n60 GT also fails on graphs it trained on,
+the channel representation itself can't carry n60 adjacency (capacity story);
+if train graphs are fine, it's generalization to unseen graphs' injections.
+Same read for n30: if `data_gen_011`-style sibling swaps don't appear on train
+graphs, the confusion is specific to unseen-graph encodings.
+
+## 5. Metric caveats (eval definition, not run faults)
 
 - `eval/accuracy` == `eval/valid_path_rate` bit-identically in 4/5 finished
   runs — accuracy appears to be counted as "produced a valid path." In
@@ -85,7 +147,7 @@ Gen acc = `eval/accuracy` over the full 70-rollout test split (7 held-out graphs
 - `eval/path_optimality_rate` > 1.0 everywhere (1.09–1.52), i.e. produced
   paths run longer than optimal; the name suggests a ratio ≤ 1.
 
-## 5. Ops log
+## 6. Ops log
 
 - Submitted 2026-08-07 ~18:46 (original four) and ~19:53 (edges brackets),
   betty dgx-b200. Monitored by the Opus monitor-job pipeline; **zero
@@ -99,9 +161,12 @@ Gen acc = `eval/accuracy` over the full 70-rollout test split (7 held-out graphs
   patched server-side to group `e14_scaling` mid-run; the patch survived
   `finish()` on all four (verified). The edges runs were tagged correctly at
   submission. Standing rule: every e14 run groups under `e14_scaling`.
-- Checkpoints expected under `$PROJ/outputs/e14_stage1to3/<RUN_NAME>` —
-  **not yet verified on disk** (a Kerberos outage on the submitting laptop
-  blocked ssh for the back half of the campaign; wandb `finished` is the only
-  completion evidence so far).
+- 2026-08-08: 7437560 resubmitted as **7438021** (running on dgx006, verified
+  `tag=e14_scaling` / `text_edge_list: present` in the log header). All five
+  finished runs verified on disk: sacct COMPLETED, checkpoints under
+  `$PROJ/outputs/e14_stage1to3/<RUN_NAME>_<wandb_id>` (note the wandb-id
+  suffix — the bare `<RUN_NAME>` path in the sbatch does not exist), each with
+  `checkpoint-390`, `adapter_model.safetensors`, `eval_logs/`; GT runs also
+  carry `gnn_weights.pt`.
 - A macOS KCM quirk to remember: the TGT can show valid in `klist` while
   GSSAPI fails with `no credential for <UUID>`; a fresh `kinit` clears it.
