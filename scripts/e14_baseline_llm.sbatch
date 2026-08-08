@@ -86,6 +86,10 @@ TEXT_EDGE_LIST=${TEXT_EDGE_LIST:-none}
 # call goto/map_region while spine_tools stays at its default "none", left as a decision
 # rather than flipped, so the baseline's prompt format matches e14's exactly).
 DATA_ICL_EXAMPLES=${DATA_ICL_EXAMPLES:-2}
+# Post-training save->load round-trip: reload the just-saved checkpoint from disk
+# and re-eval it on these graphs (train_v3.py:394), so a broken reload path fails
+# the job instead of surfacing weeks later. Set POST_TRAIN_GRAPHS=null to skip.
+POST_TRAIN_GRAPHS=${POST_TRAIN_GRAPHS:-$TEST_GRAPHS}
 
 # wandb names: positional arg > env var > default. RUN_NAME also drives the
 # checkpoint subdir (trainer.save_name) so the on-disk run stays identifiable.
@@ -123,6 +127,7 @@ srun python -m prism.training.train_v3 \
     trainer.checkpoint_dir="$CHECKPOINT_DIR" \
     trainer.save_name="$RUN_NAME" \
     wandb.run_name="$RUN_NAME" wandb.tag="$TAG" \
-    eval.data="$TEST_GRAPHS" eval.num_graphs=-1
+    eval.data="$TEST_GRAPHS" eval.num_graphs=-1 \
+    eval.post_train_graphs="$POST_TRAIN_GRAPHS"
 
 echo "[$(date --iso-8601=seconds)] $RUN_NAME DONE"

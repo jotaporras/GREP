@@ -111,6 +111,11 @@ TEST_GRAPHS=${TEST_GRAPHS:-$DATA_ROOT/test_graphs}
 # tool calls — switching the contract to an action list would ask the model for something
 # the data never demonstrates. Set DATA_ICL_EXAMPLES=0 to go back to zero-shot.
 DATA_ICL_EXAMPLES=${DATA_ICL_EXAMPLES:-2}
+# Post-training save->load round-trip: reload the just-saved checkpoint from disk
+# and re-eval it on these graphs (train_v3.py:394), so a broken reload path fails
+# the job instead of surfacing weeks later in a transferability eval. Meaningful
+# for 4-bit runs since the loaders fix b378e5a. Set POST_TRAIN_GRAPHS=null to skip.
+POST_TRAIN_GRAPHS=${POST_TRAIN_GRAPHS:-$TEST_GRAPHS}
 # Identity-RoPE (position_id 0) on the injected node-token spans — a real architectural
 # arm for this arch (see the note above), not just recorded metadata.
 DISABLE_GRAPH_TOKEN_ROPE=${DISABLE_GRAPH_TOKEN_ROPE:-false}
@@ -163,6 +168,7 @@ srun python -m prism.training.train_v3 \
     trainer.checkpoint_dir="$CHECKPOINT_DIR" \
     trainer.save_name="$RUN_NAME" \
     wandb.run_name="$RUN_NAME" wandb.tag="$TAG" \
-    eval.data="$TEST_GRAPHS" eval.num_graphs=-1
+    eval.data="$TEST_GRAPHS" eval.num_graphs=-1 \
+    eval.post_train_graphs="$POST_TRAIN_GRAPHS"
 
 echo "[$(date --iso-8601=seconds)] $RUN_NAME DONE"
