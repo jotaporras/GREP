@@ -160,11 +160,26 @@ produces that direction. The suspect is the reload eval path itself
 - train_v3 has a designed save→load round-trip check
   (`eval.post_train_graphs`) but it was not enabled in the e14 runs, so the
   reload boundary was never exercised.
-- **Control job 7439074** (same reload protocol, same n30 GT checkpoint, its
-  own TEST graphs) has run; results pending SSH access. ~0.70 ⇒ reload fine
-  and the train-graph result is real; ~0.07 ⇒ reload path broken, and every
-  conclusion drawn through it (both probes, the e14_p152 and e13f
-  transferability ~0.0s) is void.
+- **Control job 7439074 verdict: reload path BROKEN.** Same reload protocol,
+  same n30 GT checkpoint, its own TEST graphs: **0.057** (4/70) where the
+  in-training eval scored 0.700. Every conclusion drawn through the reload
+  path (both probes, the e14_p152 and e13f transferability ~0.0s) is void.
+- **Prime suspect confirmed active in the logs**: PEFT warns
+  `Merge lora module to 4-bit linear may get different generations due to
+  rounding errors` (`peft/tuners/lora/bnb.py:397`) during every reload —
+  `loaders.py` merges the LoRA into the nf4-quantized base
+  (dequantize→merge→requantize). LoRA deltas are small relative to the nf4
+  quantization step, so requantization can round the fine-tune away, leaving
+  ~base Gemma + mask — exactly the floor-level behavior measured. Training
+  never merges (adapter rides bf16 on the 4-bit base), so in-training eval
+  is unaffected.
+- **Discriminator job 7439306** (one-off, not in repo): identical eval
+  without `--four-bit`, so the merge happens losslessly in bf16. ~0.70 would
+  confirm merge-into-4bit as the bug; the fix would then be either eval in
+  bf16 or keep the adapter unmerged at reload (the latter reproduces
+  training numerics exactly).
+- The original probe question (capacity vs generalization at n60) remains
+  open until the reload path is fixed and the probes rerun.
 
 ## 5. Metric caveats (eval definition, not run faults)
 
