@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from pathlib import Path
 from typing import List, Optional, Union
 
@@ -520,7 +521,13 @@ class DataGenerator:
         # Flatten to one job per (graph, task); unreadable graphs are skipped
         # here exactly as before.
         jobs = []
-        for idx, data_path in enumerate(generated_data):
+        for pos, data_path in enumerate(generated_data):
+            # Sample ids must carry the data_gen file's OWN index, not the list
+            # position: with any gap in the file sequence (a populate-rejected
+            # graph) positional ids shift, mis-grouping every later graph's
+            # rollouts in the split and breaking resume across re-runs.
+            id_match = re.search(r"data_gen_(\d+)", Path(data_path).name)
+            idx = int(id_match.group(1)) if id_match else pos
             try:
                 with open(data_path) as f:
                     data = json.load(f)
