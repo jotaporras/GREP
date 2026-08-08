@@ -203,7 +203,12 @@ def graph_augmented_llm_from_pretrained(
             k = re.sub(r'\.lora_([AB])\.weight', r'.lora_\1.default.weight', k)
             remapped[k] = v
         peft_model.load_state_dict(remapped, strict=False)
-        llm = peft_model.merge_and_unload()
+        # 4-bit: merging requantizes base+delta to the nf4 grid, rounding the LoRA
+        # away (erased the e14 fine-tunes: 0.700 -> 0.057). Keep the adapter
+        # attached — llm's module tree already carries the loaded LoRA layers —
+        # matching training, which never merges.
+        if not load_in_4bit:
+            llm = peft_model.merge_and_unload()
 
     tokenizer = AutoTokenizer.from_pretrained(path)
 
