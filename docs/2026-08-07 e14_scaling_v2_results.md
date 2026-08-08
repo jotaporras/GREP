@@ -1,7 +1,7 @@
 ---
 tags: [experiment, e14, scaling, graph-injection, vllm-data]
 date: 2026-08-07
-status: complete (6/6 runs final; 7438021 checkpoint verification + train-graph probes 7438024/7438025 pending)
+status: complete (6/6 training runs final + reload-path bug found/fixed + train/test probe matrix done; last cell 7439499 pending)
 related: ["2026-07-21 e13_nav_pe_setup"]
 wandb: alelab/GREP-PRISM (tag e14_scaling)
 ---
@@ -192,10 +192,35 @@ produces that direction. The suspect is the reload eval path itself
   attached on 4-bit reload instead of `merge_and_unload` — matching both
   training (which never merges) and the plain-LLM loader path (which never
   merged either, which is why baseline reloads were unaffected).
-- **Rerunning with the fix**: 7439396 (validation: n30 GT on test graphs,
-  fixed 4-bit path, expect ~0.70) gates 7439398/7439399 (the n30/n60
-  train-graph probes, outputs `*_on_train_fixed/`). Those finally answer the
-  capacity-vs-generalization question the original probes were built for.
+- **Rerun with the fix — gate passed, probes valid.** 7439396 (n30 GT on
+  test graphs, fixed 4-bit path) scored **0.729** — between in-training
+  0.700 and bf16 0.757, ~13× the broken path — so the fix is confirmed and
+  the probe2 numbers below are trustworthy.
+
+**The capacity-vs-generalization answer: both, and the split is the finding.**
+
+| | train graphs | test graphs | gap |
+|---|---|---|---|
+| n30 GT | **0.857** (7439398) | 0.729 (7439396) | 0.128 |
+| n60 GT | **0.429** (7439399) | 0.114 (in-training) | 0.315 |
+
+The n60 collapse to 0.114 is a compound of two failures:
+
+1. **Fitting deficit** — n60 reaches only 0.429 on graphs it *trained on*
+   vs n30's 0.857 on the same footing. Not a hard capacity wall (0.429 is
+   far above chance and its own test score), but the channel does not fit
+   n60 comfortably even in-distribution-and-in-sample.
+2. **Transfer gap** — n60 loses 0.315 train→test, ~2.5× n30's 0.128 loss.
+   What it does learn generalizes much worse at the larger size.
+
+Practical implication: more/more-diverse n60 training graphs plus stronger
+regularization should help the transfer half, but won't close the gap alone
+because the fit itself is short. Caveat: the n60 test column above is the
+in-training EvalCallback number; the same-path version (fixed-4bit reload
+eval on n60 test graphs, job 7439499) closes that last comparison cell —
+the gate showed the two paths agree within ~0.03 at n30. The superseded
+broken-path probe figures (n30 0.071, n60 0.043) are artifacts; do not
+compare against them.
 
 ## 5. Metric caveats (eval definition, not run faults)
 
