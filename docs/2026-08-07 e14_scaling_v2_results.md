@@ -1,7 +1,7 @@
 ---
 tags: [experiment, e14, scaling, graph-injection, vllm-data]
 date: 2026-08-07
-status: partial (5/6 runs final; n60 edges-in-prompt rerunning as job 7438021; train-graph probes 7438024/7438025 running)
+status: complete (6/6 runs final; 7438021 checkpoint verification + train-graph probes 7438024/7438025 pending)
 related: ["2026-07-21 e13_nav_pe_setup"]
 wandb: alelab/GREP-PRISM (tag e14_scaling)
 ---
@@ -12,12 +12,13 @@ wandb: alelab/GREP-PRISM (tag e14_scaling)
 > On the freshly regenerated v2 corpora (rename-map populate contract, zero
 > hallucinated node refs), the learned graph channel is a large real gain over
 > the no-connectivity floor at both sizes (n30: 0.157 → **0.700**; n60:
-> 0.029 → **0.114**). But at n30 the trivial bracket — writing the edge list
-> into the prompt text — scores **0.986** with 0.005 hallucination, decisively
-> above the graph channel. Any claim that the learned channel is the effective
-> way to supply connectivity has to contend with that run. Whether the text
-> bracket degrades at n60 is exactly the run that flaked; rerun before drawing
-> the scaling conclusion.
+> 0.029 → **0.114**). But the trivial bracket — writing the edge list into the
+> prompt text — beats it at **both** sizes and the gap widens sharply with
+> scale: 0.986 vs 0.700 at n30 (1.4×), **0.943 vs 0.114 at n60 (8.2×)**. The
+> graph channel collapses with graph size while text edges barely move
+> (0.986 → 0.943). As it stands, the scaling result points against the learned
+> channel: its gain over the floor is mostly "has connectivity at all," and it
+> stops being a usable vehicle for connectivity by n60.
 
 ## 1. Setup
 
@@ -52,7 +53,11 @@ only possible source would be the (absent) edge list.
 | n30 | edges | 7437559 | `e14v2_n30_baseline_edges` [krktnvkr](https://wandb.ai/alelab/GREP-PRISM/runs/krktnvkr) | **0.986** | 0.005 | 0.067 | 0.975 |
 | n60 | floor | 7437501 | `e14v2_n60_baseline` [32na8lx2](https://wandb.ai/alelab/GREP-PRISM/runs/32na8lx2) | 0.029 | 0.570 | 0.092 | 0.966 |
 | n60 | GT | 7437503 | `e14v2_n60_gt` [q91esr6a](https://wandb.ai/alelab/GREP-PRISM/runs/q91esr6a) | **0.114** | 0.222 | 0.082 | 0.970 |
-| n60 | edges | 7437560 | `e14v2_n60_baseline_edges` [4ybimax8](https://wandb.ai/alelab/GREP-PRISM/runs/4ybimax8) | — FAILED 46s | — | — | — |
+| n60 | edges | 7438021 | `e14v2_n60_baseline_edges` [iq8bo4sa](https://wandb.ai/alelab/GREP-PRISM/runs/iq8bo4sa) | **0.943** | 0.015 | 0.079 | 0.972 |
+
+(7437560/[4ybimax8](https://wandb.ai/alelab/GREP-PRISM/runs/4ybimax8) was the
+first attempt at the n60 edges arm — died at 46s on a dgx024 CUDA flake;
+7438021 is its identical resubmit.)
 
 Gen acc = `eval/accuracy` over the full 70-rollout test split (7 held-out graphs).
 
@@ -62,15 +67,19 @@ Gen acc = `eval/accuracy` over the full 70-rollout test split (7 held-out graphs
   hallucination cut 0.54 → 0.09 (n30) and 0.57 → 0.22 (n60). SFT alone
   (floor arms hit 0.97 token accuracy) does not solve routing; connectivity
   does.
-- **But text edges work better, at least at n30.** 0.986 (69/70) vs 0.700,
-  hallucination 0.005 vs 0.089 — and the edges arm was already at 0.986 at
-  epoch 0.92, so it converges there rather than getting lucky. The honest
-  decomposition of the GT arm's gain over the floor is mostly "has
-  connectivity at all," not "the learned channel is the right vehicle."
-- **Everything is much harder at n60** (floor 0.029 ≈ chance, GT 0.114).
-  The open question is whether prompt-text edges also collapse with graph
-  size — 48 regions of edge list is a long prompt — or stay near ceiling.
-  That is the flaked run; do not write the scaling story without it.
+- **But text edges work better at both sizes, and the gap explodes with
+  scale.** n30: 0.986 (69/70) vs 0.700, hallucination 0.005 vs 0.089 — and
+  the edges arm was already at 0.986 at epoch 0.92, so it converges there
+  rather than getting lucky. n60: **0.943 (66/70) vs 0.114**, hallucination
+  0.015 vs 0.222. Going n30 → n60 the channel loses 84% of its accuracy while
+  the text bracket loses 4%. A ~48-region edge list in the prompt is
+  evidently still fully usable by the LLM; the learned channel is the thing
+  that doesn't scale. The honest decomposition of the GT arm's gain over the
+  floor is mostly "has connectivity at all," not "the learned channel is the
+  right vehicle."
+- **Everything is much harder at n60 without usable connectivity** (floor
+  0.029 ≈ chance, GT 0.114) — but 0.943 shows the tasks themselves are not
+  the bottleneck; the connectivity representation is.
 - Note the GT arms carry Stage-1 SFT epochs the baselines don't (sbatch
   header caveat); that asymmetry favors GT and it still trails the text
   bracket.
@@ -161,8 +170,11 @@ graphs, the confusion is specific to unseen-graph encodings.
   patched server-side to group `e14_scaling` mid-run; the patch survived
   `finish()` on all four (verified). The edges runs were tagged correctly at
   submission. Standing rule: every e14 run groups under `e14_scaling`.
-- 2026-08-08: 7437560 resubmitted as **7438021** (running on dgx006, verified
-  `tag=e14_scaling` / `text_edge_list: present` in the log header). All five
+- 2026-08-08: 7437560 resubmitted as **7438021** (dgx006, verified
+  `tag=e14_scaling` / `text_edge_list: present` in the log header); completed
+  in 2h50m, metrics above from wandb — on-disk checkpoint check pending the
+  next SSH window (the laptop's KCM credential breaks recurrently; outage
+  timeline in the monitor's `ssh-outage-log.md`). All five
   finished runs verified on disk: sacct COMPLETED, checkpoints under
   `$PROJ/outputs/e14_stage1to3/<RUN_NAME>_<wandb_id>` (note the wandb-id
   suffix — the bare `<RUN_NAME>` path in the sbatch does not exist), each with
