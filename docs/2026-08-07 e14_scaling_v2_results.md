@@ -173,13 +173,29 @@ produces that direction. The suspect is the reload eval path itself
   ~base Gemma + mask — exactly the floor-level behavior measured. Training
   never merges (adapter rides bf16 on the 4-bit base), so in-training eval
   is unaffected.
-- **Discriminator job 7439306** (one-off, not in repo): identical eval
-  without `--four-bit`, so the merge happens losslessly in bf16. ~0.70 would
-  confirm merge-into-4bit as the bug; the fix would then be either eval in
-  bf16 or keep the adapter unmerged at reload (the latter reproduces
-  training numerics exactly).
-- The original probe question (capacity vs generalization at n60) remains
-  open until the reload path is fixed and the probes rerun.
+- **Discriminator job 7439306 confirmed it**: identical eval without
+  `--four-bit` (lossless bf16 merge) scored **0.757** (53/70) vs 0.057 —
+  full recovery on every graph, slightly above the in-training 0.700. Also
+  26:40 vs 44:25 elapsed: the 4-bit reload wasn't even faster on a B200.
+
+  | graph | in-training | reload+4bit | reload+bf16 |
+  |---|---|---|---|
+  | 005 | 0.9 | 0.0 | 0.9 |
+  | 011 | 0.1 | 0.0 | 0.3 |
+  | 012 | 0.9 | 0.1 | 0.9 |
+  | 016 | 0.9 | 0.1 | 0.8 |
+  | 020 | 0.5 | 0.0 | 0.7 |
+  | 026 | 0.8 | 0.0 | 0.9 |
+  | 027 | 0.8 | 0.2 | 0.8 |
+
+- **Fix applied** (commit `b378e5a`): `loaders.py` keeps the LoRA adapter
+  attached on 4-bit reload instead of `merge_and_unload` — matching both
+  training (which never merges) and the plain-LLM loader path (which never
+  merged either, which is why baseline reloads were unaffected).
+- **Rerunning with the fix**: 7439396 (validation: n30 GT on test graphs,
+  fixed 4-bit path, expect ~0.70) gates 7439398/7439399 (the n30/n60
+  train-graph probes, outputs `*_on_train_fixed/`). Those finally answer the
+  capacity-vs-generalization question the original probes were built for.
 
 ## 5. Metric caveats (eval definition, not run faults)
 
