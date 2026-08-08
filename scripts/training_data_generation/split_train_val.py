@@ -120,6 +120,12 @@ def main() -> None:
                          "validation. The actual number of val graphs is "
                          "chosen so the val rollout count is closest to this.")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--val-ids", nargs="+", default=None, metavar="GGG",
+                    help="Explicit graph ids (e.g. 052 053) to hold out as "
+                         "val/test instead of the seeded random split. Use to "
+                         "pin a frozen test set. Ids need not have rollouts; "
+                         "their populated graphs are still copied to "
+                         "test_graphs/.")
     args = ap.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -141,32 +147,44 @@ def main() -> None:
     if len(graph_ids) < 2:
         raise SystemExit(f"Only {len(graph_ids)} graph(s) after cleaning; need >= 2 to split.")
 
-    rng = random.Random(args.seed)
-    shuffled = graph_ids[:]
-    rng.shuffle(shuffled)
+    if args.val_ids is not None:
+        val_ids = sorted(args.val_ids)
+        no_rollouts = [g for g in val_ids if g not in groups]
+        if no_rollouts:
+            print(f"  WARN: explicit val id(s) without clean rollouts: {no_rollouts}")
+        train_ids = sorted(g for g in graph_ids if g not in set(val_ids))
+        if not train_ids:
+            raise SystemExit("Explicit --val-ids left no train graphs.")
+        print(f"Clean: {len(graph_ids)} graphs, {total_rollouts} rollouts.")
+        print(f"Explicit val ids → {len(train_ids)} train graphs / "
+              f"{len(val_ids)} val graphs")
+    else:
+        rng = random.Random(args.seed)
+        shuffled = graph_ids[:]
+        rng.shuffle(shuffled)
 
-    # Choose n_val graphs so the val rollout count is closest to val_frac of total.
-    target_val = args.val_frac * total_rollouts
-    cum = 0
-    best_n, best_diff = 1, float("inf")
-    for i, gid in enumerate(shuffled, start=1):
-        cum += len(groups[gid])
-        if i == len(shuffled):
-            break  # keep at least one train graph
-        diff = abs(cum - target_val)
-        if diff < best_diff:
-            best_diff, best_n = diff, i
-    n_val = best_n
+        # Choose n_val graphs so the val rollout count is closest to val_frac of total.
+        target_val = args.val_frac * total_rollouts
+        cum = 0
+        best_n, best_diff = 1, float("inf")
+        for i, gid in enumerate(shuffled, start=1):
+            cum += len(groups[gid])
+            if i == len(shuffled):
+                break  # keep at least one train graph
+            diff = abs(cum - target_val)
+            if diff < best_diff:
+                best_diff, best_n = diff, i
+        n_val = best_n
 
-    val_ids = sorted(shuffled[:n_val])
-    train_ids = sorted(shuffled[n_val:])
+        val_ids = sorted(shuffled[:n_val])
+        train_ids = sorted(shuffled[n_val:])
 
-    print(f"Clean: {len(graph_ids)} graphs, {total_rollouts} rollouts.")
-    print(f"Target val_frac={args.val_frac:.0%} → "
-          f"{len(train_ids)} train graphs / {len(val_ids)} val graphs")
+        print(f"Clean: {len(graph_ids)} graphs, {total_rollouts} rollouts.")
+        print(f"Target val_frac={args.val_frac:.0%} → "
+              f"{len(train_ids)} train graphs / {len(val_ids)} val graphs")
 
     train_samples = [p for gid in train_ids for p in groups[gid]]
-    val_samples = [p for gid in val_ids for p in groups[gid]]
+    val_samples = [p for gid in val_ids for p in groups.get(gid, [])]
 
     n_train = write_split(
         args.output_dir / "formatted_all_new__train.json", train_samples)
@@ -189,6 +207,7 @@ def main() -> None:
 
     manifest = {
         "seed": args.seed,
+        "explicit_val_ids": args.val_ids is not None,
         "val_frac_target": args.val_frac,
         "val_frac_actual": actual_frac,
         "plans_dir": str(args.plans_dir),

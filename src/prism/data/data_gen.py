@@ -87,13 +87,54 @@ class DataGenerator:
         task_proportions: Optional[List[float]] = None,
         complexity_proportions: Optional[List[float]] = None,
         seed: Optional[int] = None,
+        n_longhop_tasks: int = 0,
     ):
         self.unknown_pcts = graph_unknown
         self.task_proportions = task_proportions
         self.complexity_proportions = complexity_proportions
+        self.n_longhop_tasks = n_longhop_tasks
         self.rng = np.random.default_rng(seed)
         self.context_gen = graph_gen.TaskGraphGen()
         self.planning_sim = planning_sim.PlanningSim()
+
+    def _sample_task_labels(self, base_graph: str, n_tasks: int):
+        """Per-graph (task_types, task_complexities, longhop_constraints).
+
+        The last ``n_longhop_tasks`` slots are forced to Navigability and bound
+        to endpoint pairs sampled on the skeleton's region graph, so the hop
+        length of those tasks is fixed before the LLM ever sees the prompt.
+        """
+        n_recipe = n_tasks - self.n_longhop_tasks
+        task_types = None
+        if self.task_proportions is not None:
+            task_types = sample_task_types(
+                n_tasks=n_recipe, proportions=self.task_proportions, rng=self.rng
+            ) + [3] * self.n_longhop_tasks
+        complexity_props = (
+            self.complexity_proportions
+            if self.complexity_proportions is not None
+            else DEFAULT_COMPLEXITY_PROPORTIONS
+        )
+        task_complexities = sample_task_complexities(
+            n_tasks=n_tasks, proportions=complexity_props, rng=self.rng
+        )
+        longhop = None
+        if self.n_longhop_tasks:
+            longhop = graph_gen.sample_longhop_constraints(
+                json.loads(base_graph)["graph"], self.n_longhop_tasks, self.rng
+            )
+        return task_types, task_complexities, longhop
+
+    @staticmethod
+    def _record_longhop(log_dir, idx: int, longhop: Optional[list]) -> None:
+        """Sidecar manifest of sampled endpoints, so the delivered hop-length
+        mix can be verified without re-deriving goals from acceptance criteria."""
+        if not longhop:
+            return
+        path = Path(log_dir) / "longhop_manifest.json"
+        manifest = json.loads(path.read_text()) if path.exists() else {}
+        manifest[f"data_gen_{idx:03d}"] = longhop
+        path.write_text(json.dumps(manifest, indent=2))
 
     def populate_graphs_and_tasks(
         self,
@@ -134,23 +175,8 @@ class DataGenerator:
             for _ in range(self.n_graph_gen_attempts):
                 try:
                     # error handling in case data generation fails
-                    task_types = None
-                    if self.task_proportions is not None:
-                        task_types = sample_task_types(
-                            n_tasks=n_tasks,
-                            proportions=self.task_proportions,
-                            rng=self.rng,
-                        )
-
-                    complexity_props = (
-                        self.complexity_proportions
-                        if self.complexity_proportions is not None
-                        else DEFAULT_COMPLEXITY_PROPORTIONS
-                    )
-                    task_complexities = sample_task_complexities(
-                        n_tasks=n_tasks,
-                        proportions=complexity_props,
-                        rng=self.rng,
+                    task_types, task_complexities, longhop = (
+                        self._sample_task_labels(base_graph, n_tasks)
                     )
 
                     rnd_data = self.context_gen.get_tasks(
@@ -159,6 +185,7 @@ class DataGenerator:
                         previous_tasks=previous_tasks,
                         task_types=task_types,
                         task_complexities=task_complexities,
+                        longhop_constraints=longhop,
                         reasoning_effort=reasoning_effort,
                     )
 
@@ -199,6 +226,7 @@ class DataGenerator:
             with open(tmp_path, "w") as f:
                 f.write(json.dumps(rnd_data, indent=2))
             os.replace(tmp_path, out_path)
+            self._record_longhop(log_dir, idx, longhop)
 
             # save graphs separately for Graph handler
             graph_path = f"{log_dir}/graph_gen_{idx:03d}.json"
@@ -235,31 +263,19 @@ class DataGenerator:
             return
 
         prompts = []
+        longhops = []
         for _, g in pending:
-            task_types = None
-            if self.task_proportions is not None:
-                task_types = sample_task_types(
-                    n_tasks=n_tasks,
-                    proportions=self.task_proportions,
-                    rng=self.rng,
-                )
-
-            complexity_props = (
-                self.complexity_proportions
-                if self.complexity_proportions is not None
-                else DEFAULT_COMPLEXITY_PROPORTIONS
+            task_types, task_complexities, longhop = (
+                self._sample_task_labels(g, n_tasks)
             )
-            task_complexities = sample_task_complexities(
-                n_tasks=n_tasks,
-                proportions=complexity_props,
-                rng=self.rng,
-            )
+            longhops.append(longhop)
             prompts.append(
                 self.context_gen.build_prompt(
                     base_graph=g,
                     n_tasks=n_tasks,
                     task_types=task_types,
                     task_complexities=task_complexities,
+                    longhop_constraints=longhop,
                 )
             )
         responses = self.context_gen.client.batch_query_gpt_5(
@@ -269,12 +285,13 @@ class DataGenerator:
             poll_interval=poll_interval,
         )
 
-        for (idx, base_graph), response in zip(pending, responses):
+        for (idx, base_graph), response, longhop in zip(pending, responses, longhops):
             # One malformed response must not discard the whole batch: skip the
             # graph (no file written) so a re-run's resume regenerates only it.
             try:
                 rnd_data = self.context_gen.parse_response(
-                    response, base_graph, n_tasks=n_tasks
+                    response, base_graph, n_tasks=n_tasks,
+                    longhop_constraints=longhop,
                 )
             except Exception as ex:
                 print(f"graph {idx}: batch populate response unparseable — {ex}")
@@ -284,6 +301,7 @@ class DataGenerator:
             with open(f"{out_path}.tmp", "w") as f:
                 f.write(json.dumps(rnd_data, indent=2))
             os.replace(f"{out_path}.tmp", out_path)
+            self._record_longhop(log_dir, idx, longhop)
             graph_path = f"{log_dir}/graph_gen_{idx:03d}.json"
             with open(f"{graph_path}.tmp", "w") as f:
                 f.write(json.dumps(rnd_data["graph"], indent=2))

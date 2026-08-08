@@ -196,6 +196,76 @@ def validate_task_refs(tasks: List[dict], graph: dict) -> None:
             )
 
 
+def sample_longhop_constraints(
+    graph: dict, n: int, rng, min_hops: int = 3
+) -> List[dict]:
+    """Sample ``n`` (init, goal) region pairs whose shortest-path length is
+    uniform over [min_hops, diameter] of the region graph.
+
+    ``graph`` is the inner graph dict (regions + region_connections). Works on
+    a skeleton and a populated graph alike: the rename map cannot alter
+    topology, so a distance computed on the skeleton is exact after renaming.
+    """
+    adj: dict = {node["name"]: set() for node in graph["regions"]}
+    for a, b in graph["region_connections"]:
+        adj[a].add(b)
+        adj[b].add(a)
+
+    dist = {}
+    for src in adj:
+        seen = {src: 0}
+        frontier, d = [src], 0
+        while frontier:
+            d += 1
+            nxt = []
+            for u in frontier:
+                for v in adj[u]:
+                    if v not in seen:
+                        seen[v] = d
+                        nxt.append(v)
+            frontier = nxt
+        for tgt, hops in seen.items():
+            if hops:
+                dist[(src, tgt)] = hops
+
+    diameter = max(dist.values())
+    lo = min(min_hops, diameter)
+    out = []
+    for _ in range(n):
+        hops = int(rng.integers(lo, diameter + 1))
+        pairs = sorted(k for k, v in dist.items() if v == hops)
+        init, goal = pairs[int(rng.integers(len(pairs)))]
+        out.append({"init": init, "goal": goal, "hops": hops})
+    return out
+
+
+def validate_longhop_tasks(tasks: List[dict], constraints: List[dict]) -> None:
+    """The last ``len(constraints)`` tasks must honour their fixed endpoints.
+
+    ``constraints`` carry FINAL (renamed) node ids. init_node must match
+    exactly, and the goal must be named in both the acceptance_criterion and
+    the answer regex so the deterministic grader resolves the intended
+    destination — otherwise the sampled hop length silently drifts.
+    """
+    n = len(constraints)
+    if len(tasks) < n:
+        raise ValueError(
+            f"expected >= {n} tasks to satisfy long-hop constraints, got {len(tasks)}"
+        )
+    for i, (task, c) in enumerate(zip(tasks[-n:], constraints)):
+        label = f"long-hop task {len(tasks) - n + i}"
+        if task["init_node"] != c["init"]:
+            raise ValueError(
+                f"{label}: init_node {task['init_node']!r} != required {c['init']!r}"
+            )
+        for field in ("acceptance_criterion", "answer"):
+            text = re.sub(r"\\.", " ", task[field])
+            if c["goal"] not in NODE_TOKEN.findall(text):
+                raise ValueError(
+                    f"{label}: {field} does not name the required goal {c['goal']!r}"
+                )
+
+
 UPDATED_QUERY = r"""
 You are generating data for training an LLM-based planner, like the SPINE paper from Ravichandran et al.
 
@@ -501,6 +571,7 @@ class TaskGraphGen:
         previous_tasks: Optional[str] = "",
         task_types: Optional[List[int]] = None,
         task_complexities: Optional[List[int]] = None,
+        longhop_constraints: Optional[List[dict]] = None,
     ):
         query = (
             UPDATED_QUERY
@@ -530,6 +601,32 @@ class TaskGraphGen:
                 "corresponding complexity above."
             )
 
+        if longhop_constraints:
+            n_lh = len(longhop_constraints)
+            query += (
+                "\n\nLong-hop routing constraints (OVERRIDE the type/complexity "
+                "lists for these tasks)\n"
+                f"The FINAL {n_lh} of the {n_tasks} tasks are Navigability tasks "
+                "with FIXED endpoints, chosen so the optimal route is long:\n"
+            )
+            for k, c in enumerate(longhop_constraints):
+                query += (
+                    f"- Task {n_tasks - n_lh + k + 1}: the robot starts at base-graph "
+                    f"node \"{c['init']}\" — set \"init_node\" to the NEW name your "
+                    f"rename map gives that region. The destination is base-graph "
+                    f"node \"{c['goal']}\" (optimal route: {c['hops']} hops).\n"
+                )
+            query += (
+                "For each constrained task: phrase the destination semantically "
+                "(by a contained object, its description, or its name theme) "
+                "rather than by node id; if sibling nodes share the destination's "
+                "name prefix and nothing disambiguates it, you MAY name the "
+                "destination id in the task text. The acceptance_criterion and "
+                "answer regex must name the start and destination by their NEW "
+                "node ids, as usual. Do not add waypoint or avoid constraints to "
+                "these tasks."
+            )
+
         if previous_tasks != "":
             query += f"\nPrevious tasks are: {previous_tasks}\nTry not to duplicate"
 
@@ -546,6 +643,7 @@ class TaskGraphGen:
         previous_tasks: str = "",
         task_types: Optional[List[int]] = None,
         task_complexities: Optional[List[int]] = None,
+        longhop_constraints: Optional[List[dict]] = None,
         reasoning_effort: str = "low",
     ) -> List[str]:
         """Get GPT generated tasks for putting planner data
@@ -580,12 +678,14 @@ class TaskGraphGen:
                 previous_tasks=previous_tasks,
                 task_types=task_types,
                 task_complexities=task_complexities,
+                longhop_constraints=longhop_constraints,
             ),
             reasoning_effort=reasoning_effort,
         )
 
         return self.parse_response(
-            response, base_graph, description=description, n_tasks=n_tasks
+            response, base_graph, description=description, n_tasks=n_tasks,
+            longhop_constraints=longhop_constraints,
         )
 
     def parse_response(
@@ -594,6 +694,7 @@ class TaskGraphGen:
         base_graph: str,
         description: str = "",
         n_tasks: Optional[int] = None,
+        longhop_constraints: Optional[List[dict]] = None,
     ) -> dict:
         """Rebuild the populated graph from a raw LLM response and the skeleton.
 
@@ -634,5 +735,18 @@ class TaskGraphGen:
             json_content["tasks"] = json_content["tasks"][:n_tasks]
 
         validate_task_refs(json_content["tasks"], graph)
+        if longhop_constraints:
+            rename = llm_content["rename"]
+            validate_longhop_tasks(
+                json_content["tasks"],
+                [
+                    {
+                        "init": rename[c["init"]],
+                        "goal": rename[c["goal"]],
+                        "hops": c["hops"],
+                    }
+                    for c in longhop_constraints
+                ],
+            )
         _validate_tasks(json_content)
         return json_content

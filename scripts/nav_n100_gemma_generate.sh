@@ -104,7 +104,10 @@ INTRA_PROB=0.6
 INTER_PROB=0.05
 OBJECT_RATE=0.3
 DESC_PROB=0.05
-N_TASKS=10
+# Tasks per graph; N_LONGHOP reserves the LAST k of them as fixed-endpoint
+# long-hop Navigability tasks (see generate_data_spine.py --n-longhop-tasks).
+N_TASKS="${N_TASKS:-10}"
+N_LONGHOP="${N_LONGHOP:-0}"
 
 # 100% navigation (EXIST POS REACH NAV). GEN_SEED makes task-type sampling reproducible.
 TASK_PROPORTIONS="0 0 0 1"
@@ -131,8 +134,15 @@ SPLIT_DIR="${RUN_DIR}/split"
 # Default 36 (x10 tasks = 360 pairs) clears the >=180 training-example target
 # with headroom even at a ~65% rollout success rate. Override as the 3rd arg.
 N_GRAPHS="${3:-36}"
-# Distinct per-graph seeds (101..), embedded in skeleton filenames for provenance.
-seeds=( $(seq 101 $((100 + N_GRAPHS))) )
+# Phase-2/split can cover MORE graphs than the skeletons generated here (e.g.
+# pre-seeded frozen test graphs appended to populated_graphs/ at higher
+# indices). Default: just the N_GRAPHS from this run.
+MAX_GRAPHS="${MAX_GRAPHS:-$N_GRAPHS}"
+# Distinct per-graph seeds (SEED_START..), embedded in skeleton filenames for
+# provenance. Override SEED_START to guarantee fresh topologies vs. a prior
+# corpus (reusing a range would duplicate its skeletons under new names).
+SEED_START="${SEED_START:-101}"
+seeds=( $(seq "$SEED_START" $((SEED_START - 1 + N_GRAPHS))) )
 
 mkdir -p "$SKEL_DIR"
 
@@ -221,7 +231,8 @@ while true; do
       --name "$RUN_DIR" \
       --task-proportions $TASK_PROPORTIONS \
       --n-tasks "$N_TASKS" \
-      --max-graphs "$N_GRAPHS" \
+      --n-longhop-tasks "$N_LONGHOP" \
+      --max-graphs "$MAX_GRAPHS" \
       --seed "$GEN_SEED" \
       $BACKEND_ARGS; then
     echo "Stage 2 completed on attempt ${attempt}/${MAX_ATTEMPTS}."
@@ -241,10 +252,18 @@ done
 
 echo ""
 echo "=== Stage 3: Train/val split ==="
+# VAL_IDS (space-separated graph ids, e.g. "052 053") pins an explicit test
+# set instead of the seeded random holdout.
+SPLIT_EXTRA=()
+if [ -n "${VAL_IDS:-}" ]; then
+  # shellcheck disable=SC2206
+  SPLIT_EXTRA=(--val-ids $VAL_IDS)
+fi
 python scripts/training_data_generation/split_train_val.py \
   --plans-dir "${RUN_DIR}/generated_plans" \
   --graphs-dir "${RUN_DIR}/populated_graphs" \
-  --output-dir "$SPLIT_DIR"
+  --output-dir "$SPLIT_DIR" \
+  ${SPLIT_EXTRA[@]+"${SPLIT_EXTRA[@]}"}
 
 echo ""
 echo "=== Stage 4: Leak check (must print CLEAN twice) ==="

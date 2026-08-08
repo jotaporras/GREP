@@ -146,6 +146,19 @@ if __name__ == "__main__":
         help="Number of tasks to generate per graph in Phase 1.",
     )
     parser.add_argument(
+        "--n-longhop-tasks",
+        type=int,
+        default=0,
+        help=(
+            "Reserve the LAST N of --n-tasks per graph as long-hop Navigability "
+            "tasks with fixed (init, goal) region pairs sampled uniformly over "
+            "shortest-path lengths [3, graph diameter]. Endpoints are chosen in "
+            "Python on the skeleton (topology survives the rename untouched) and "
+            "enforced against the LLM's output, and recorded in "
+            "populated_graphs/longhop_manifest.json."
+        ),
+    )
+    parser.add_argument(
         "--max-graphs",
         type=int,
         default=None,
@@ -182,6 +195,7 @@ if __name__ == "__main__":
         task_proportions=args.task_proportions,
         complexity_proportions=args.complexity_proportions,
         seed=args.seed,
+        n_longhop_tasks=args.n_longhop_tasks,
     )
 
     if args.skip_populate:
