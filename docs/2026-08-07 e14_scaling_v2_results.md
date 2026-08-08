@@ -137,14 +137,34 @@ trend. n30 residual: not a corpus problem (v2 is clean) but channel
 resolution on confusable node pairs — duplicate base names one hop apart get
 near-identical injected representations and the model swaps suffixes.
 
-**Overnight causal probe (running).** Jobs 7438024/7438025 re-evaluate the two
-GT checkpoints on 7 *train* graphs each
-(`results/e14v2_traingraph_probe/{n60,n30}_gt_on_train/`, via
-`e14_transferability.sbatch`). If n60 GT also fails on graphs it trained on,
-the channel representation itself can't carry n60 adjacency (capacity story);
-if train graphs are fine, it's generalization to unseen graphs' injections.
-Same read for n30: if `data_gen_011`-style sibling swaps don't appear on train
-graphs, the confusion is specific to unseen-graph encodings.
+**Overnight causal probe — result invalidated the probe, not the model.**
+Jobs 7438024/7438025 re-evaluated the two GT checkpoints on 7 *train* graphs
+each via `e14_transferability.sbatch` (the standalone reload path). Both came
+back at floor: n30 GT **0.071**, n60 GT 0.043, hallucination ~0.46–0.54. A
+checkpoint scoring 0.700 on held-out test graphs in-training cannot honestly
+score 0.071 on its own training graphs — no capacity or generalization story
+produces that direction. The suspect is the reload eval path itself
+(`scalability_evaluation` → `graph_augmented_llm_from_pretrained`):
+
+- Prior evidence it's been broken a while: `results/e14_transferability_p152`
+  scored **0.0** on the same distribution where that checkpoint's in-training
+  eval scored ~0.65+, and every e13f transferability result is ~0.0 too.
+- Ruled out so far: resolved policies are correct (binary /
+  decode_consistent / edge list none); Psi producer load is fail-loud and
+  passed; the LoRA adapter's 820 remapped keys all exist in the rebuilt PEFT
+  model (verified against an empty-weights rebuild), so the adapter is not
+  silently dropped.
+- Remaining suspects: LoRA `merge_and_unload` into the 4-bit-quantized base
+  (dequantize→merge→requantize is lossy; training keeps the adapter
+  unmerged), or a train/eval mismatch in how the mask/injection is rebuilt.
+- train_v3 has a designed save→load round-trip check
+  (`eval.post_train_graphs`) but it was not enabled in the e14 runs, so the
+  reload boundary was never exercised.
+- **Control job 7439074** (same reload protocol, same n30 GT checkpoint, its
+  own TEST graphs) has run; results pending SSH access. ~0.70 ⇒ reload fine
+  and the train-graph result is real; ~0.07 ⇒ reload path broken, and every
+  conclusion drawn through it (both probes, the e14_p152 and e13f
+  transferability ~0.0s) is void.
 
 ## 5. Metric caveats (eval definition, not run faults)
 
