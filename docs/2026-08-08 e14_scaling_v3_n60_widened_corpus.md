@@ -1,7 +1,7 @@
 ---
 experiment: e14 v3 — n60 widened corpus (2x graphs + long-hop tasks)
 date: 2026-08-08
-status: training complete + round-trip checks passed; train-graph probe 7451959 pending
+status: complete (2 training runs + round-trip checks + train/test probe 2x2 done)
 wandb_tag: e14_scaling
 ---
 
@@ -95,9 +95,10 @@ transferability eval.
 
 **TL;DR: doubling the corpus lifted the GT arm ~3.4× (0.114 → 0.393) on a
 harder eval set — and 4× on the identical legacy-10 subset (0.114 → 0.457) —
-but the gap to edges-in-prompt (0.952) persists at ~2.4×. The data lever
-works; it does not close the gap. The long-hop tasks split the arms
-completely: edges ~13–14/14, GT 1–5/14.**
+with retention rising 47% → 70% (fixed-path 2×2), so the gain is genuine
+transfer, not memorization. But the gap to edges-in-prompt (0.952) persists
+at ~2.4×: the data lever works and does not close the gap. The long-hop
+tasks split the arms completely: edges ~13–14/14, GT 1–5/14.**
 
 ### Headline (84 samples = 7 frozen graphs × 12 tasks)
 
@@ -141,17 +142,26 @@ channel largely fails them. Small n — treat as directional. The GT
 in-training vs reload disagreement concentrates here (the legacy-10 rows
 agree exactly), which is what moved the 84-sample totals 0.393 → 0.440.
 
-### Transfer gap (fixed-path 2×2, v3 GT)
+### Transfer gap (fixed-path 2×2, v3 GT) — ANSWERED
 
 | | train graphs | test graphs | retention |
 |---|---|---|---|
 | v2 GT | 0.429 | 0.200 | 47% |
-| v3 GT | _7451959 pending_ | 0.440 (round-trip, same fixed path) | _pending_ |
+| v3 GT | **0.631** (7451959, 53/84) | 0.440 (round-trip, same fixed path) | **70%** |
 
-The v3 test cell (0.440) already exceeds v2's *train* cell (0.429). The
-pending probe on 7 v3 train graphs (data_gen_000–006 subset) decides the
-story: retention well above 47% → the widening closed transfer; train cell
-also jumping with retention ~flat → the gain was fit, not transfer.
+**Both halves moved, and transfer moved more.** Train +47% relative
+(0.429→0.631), test +120% relative (0.200→0.441), retention 47%→70%. The
+corpus widening bought genuine generalization, not just memorization — the
+"transfer" outcome of the two pre-registered readings. Caveats: retention
+is still below n30's 85% (gap narrowed, not closed), and 0.631 on the
+model's *own training graphs* is still a real fitting deficit vs the edges
+arm's 0.952 on *test*. The channel improves on both axes with more data
+but catches the text bracket on neither.
+
+Per-graph train accuracy spreads 0.417–0.917 (data_gen_000 0.917, 001
+0.417, 002 0.667, 003 0.583, 004 0.417, 005 0.833, 006 0.583) — some
+graphs remain much harder for the channel; a failure-mode pass over the
+weak ones (001, 004) is the natural next diagnostic.
 
 ### Bookkeeping
 
