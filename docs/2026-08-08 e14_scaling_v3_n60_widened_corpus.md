@@ -163,6 +163,15 @@ Per-graph train accuracy spreads 0.417–0.917 (data_gen_000 0.917, 001
 graphs remain much harder for the channel; a failure-mode pass over the
 weak ones (001, 004) is the natural next diagnostic.
 
+### Follow-up in flight: 6-epoch GT rerun (submitted 08-09)
+
+GT was still climbing at the 3-epoch cutoff (0.286 → 0.357 → 0.393, no
+plateau). Job **7459421** (`e14v3_n60_gt_6ep`, TAG=e14_scaling) reruns the
+identical recipe with `EPOCHS=6` (env override added in `668586a`) — same
+v3 split, same suite9_p152 navigator, round-trip check on. Question: does
+GT keep climbing past 0.393 in epochs 4–6, or was 3 epochs near the
+asymptote? Results to be appended here.
+
 ### Bookkeeping
 
 - Training: 5h27m (edges) / 3h50m (GT), both COMPLETED 0:0, TAG
