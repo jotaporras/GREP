@@ -1,7 +1,7 @@
 ---
 experiment: e14 v3 — n60 widened corpus (2x graphs + long-hop tasks)
 date: 2026-08-08
-status: training in flight (7439955 edges / 7439956 gt, queued ~07:10 08-09; corpus complete + gated)
+status: training complete + round-trip checks passed; train-graph probe 7451959 pending
 wandb_tag: e14_scaling
 ---
 
@@ -93,5 +93,73 @@ transferability eval.
 
 ## Results
 
-_(pending — jobs queued behind dgx-b200 congestion, est. start 07:10 08-09,
-results ~midday 08-09)_
+**TL;DR: doubling the corpus lifted the GT arm ~3.4× (0.114 → 0.393) on a
+harder eval set — and 4× on the identical legacy-10 subset (0.114 → 0.457) —
+but the gap to edges-in-prompt (0.952) persists at ~2.4×. The data lever
+works; it does not close the gap. The long-hop tasks split the arms
+completely: edges ~13–14/14, GT 1–5/14.**
+
+### Headline (84 samples = 7 frozen graphs × 12 tasks)
+
+| arm | job / run | epochs 1→2→3 (in-training) | round-trip reload | Δ | halluc |
+|---|---|---|---|---|---|
+| edges (`present`) | 7439955 [zqvzaab6](https://wandb.ai/alelab/GREP-PRISM/runs/zqvzaab6) | 0.726 → 0.881 → **0.952** | 0.929 | −0.024 | 0.011 |
+| GT (graph channel) | 7439956 [kma1nipe](https://wandb.ai/alelab/GREP-PRISM/runs/kma1nipe) | 0.286 → 0.357 → **0.393** | 0.440 | +0.048 | 0.084 |
+
+- **Round-trip save→load check passed on both** (first time it ever ran;
+  enabled by `e2a169a`). Deltas are small and *bidirectional* (−0.024 /
+  +0.048), so the reload path is faithful, not systematically flattering —
+  this retires the "reload reads higher" prior from the v2 probes as
+  sampling noise on 84-sample evals.
+- Checkpoints verified: `gnn_weights.pt` present on GT (2.2G), absent on
+  the `arch=llm` edges arm (1.9G), as required.
+- GT kept improving every epoch (v2 was flat from epoch 1) — the doubled
+  corpus gave the graph channel something to learn from.
+
+### Legacy-10 subset (identical graphs + tasks as v2 → direct comparison)
+
+| arm | v2 final (in-training) | v3 in-training | v3 reload |
+|---|---|---|---|
+| edges | 0.943 | **0.957** (67/70) | 0.914 |
+| GT | 0.114 | **0.457** (32/70) | 0.457 |
+
+GT's legacy-10 score is identical on both eval paths (32/70 exactly), so
+the 4× improvement over v2 is solid, not path-dependent. Edges was already
+at ceiling. Per-graph GT (in-training): 052 2/10, 053 7/10, 054 3/10,
+055 4/10, 056 6/10, 057 4/10, 058 6/10 — more diffuse than v2's
+collapse-everywhere 0.0–0.2.
+
+### Long-hop subset (14 samples: 2 per graph, hops 3–5)
+
+| arm | in-training | reload |
+|---|---|---|
+| edges | 13/14 | 14/14 |
+| GT | 1/14 | 5/14 |
+
+With edges in the prompt the long-hop tasks are nearly free; the graph
+channel largely fails them. Small n — treat as directional. The GT
+in-training vs reload disagreement concentrates here (the legacy-10 rows
+agree exactly), which is what moved the 84-sample totals 0.393 → 0.440.
+
+### Transfer gap (fixed-path 2×2, v3 GT)
+
+| | train graphs | test graphs | retention |
+|---|---|---|---|
+| v2 GT | 0.429 | 0.200 | 47% |
+| v3 GT | _7451959 pending_ | 0.440 (round-trip, same fixed path) | _pending_ |
+
+The v3 test cell (0.440) already exceeds v2's *train* cell (0.429). The
+pending probe on 7 v3 train graphs (data_gen_000–006 subset) decides the
+story: retention well above 47% → the widening closed transfer; train cell
+also jumping with retention ~flat → the gain was fit, not transfer.
+
+### Bookkeeping
+
+- Training: 5h27m (edges) / 3h50m (GT), both COMPLETED 0:0, TAG
+  `e14_scaling`, 936 steps (3 × 312 — ~2.4× v2's step count, matching the
+  corpus growth 260 → ~570 conversations).
+- Edges runs slower per step than GT (longer prompts carry the edge list) —
+  it started 19 min earlier and finished ~1.5h later.
+- Campaign totals across datagen + training: 0 debugger escalations; 2
+  substantive bugs found and fixed before they could distort results
+  (merge-into-nf4 reload, positional sample naming).
