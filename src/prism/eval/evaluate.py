@@ -17,6 +17,7 @@ Public surface:
 """
 from __future__ import annotations
 
+import gc
 import json
 import os
 import re
@@ -408,6 +409,20 @@ def eval_model_single_graph(
                 "traceback": tb_str,
                 "path_metrics": None,
             })
+
+            # The exception's __traceback__ chain pins every frame's locals — for
+            # a CUDA OOM raised inside run_planning that keeps the failed
+            # forward's tensors (KV cache, attention buffers) alive in reference
+            # cycles refcounting can't clear, so each caught crash permanently
+            # shrank free GPU memory and cascaded later samples into OOM
+            # (observed: ~20 GiB of genuinely-allocated growth per caught OOM,
+            # free memory 23.1 -> 3.4 GiB within one 84-sample eval).
+            e.__traceback__ = None
+            planning_result = None
+            planner_response = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         print("\n=====\n")
 
