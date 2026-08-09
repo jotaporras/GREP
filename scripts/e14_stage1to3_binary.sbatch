@@ -119,6 +119,7 @@ POST_TRAIN_GRAPHS=${POST_TRAIN_GRAPHS:-$TEST_GRAPHS}
 # Identity-RoPE (position_id 0) on the injected node-token spans — a real architectural
 # arm for this arch (see the note above), not just recorded metadata.
 DISABLE_GRAPH_TOKEN_ROPE=${DISABLE_GRAPH_TOKEN_ROPE:-false}
+EPOCHS=${EPOCHS:-3}
 
 # wandb names: positional arg > env var > default. RUN_NAME also drives the
 # checkpoint subdir (trainer.save_name) so the on-disk run stays identifiable.
@@ -163,7 +164,7 @@ srun python -m prism.training.train_v3 \
     data.icl_examples="$DATA_ICL_EXAMPLES" \
     trainer.init_lora_from="$STAGE1_LORA" \
     trainer.freeze_lora=false trainer.freeze_pe=false \
-    trainer.learning_rate=0.00025 trainer.epochs=3 \
+    trainer.learning_rate=0.00025 trainer.epochs="$EPOCHS" \
     +trainer.sft.save_total_limit=1 \
     trainer.checkpoint_dir="$CHECKPOINT_DIR" \
     trainer.save_name="$RUN_NAME" \
