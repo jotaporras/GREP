@@ -166,11 +166,23 @@ weak ones (001, 004) is the natural next diagnostic.
 ### Follow-up in flight: 6-epoch GT rerun (submitted 08-09)
 
 GT was still climbing at the 3-epoch cutoff (0.286 → 0.357 → 0.393, no
-plateau). Job **7459421** (`e14v3_n60_gt_6ep`, TAG=e14_scaling) reruns the
-identical recipe with `EPOCHS=6` (env override added in `668586a`) — same
-v3 split, same suite9_p152 navigator, round-trip check on. Question: does
-GT keep climbing past 0.393 in epochs 4–6, or was 3 epochs near the
-asymptote? Results to be appended here.
+plateau). Rerun of the identical recipe with `EPOCHS=6` (env override
+added in `668586a`) — same v3 split, same suite9_p152 navigator,
+round-trip check on. Question: does GT keep climbing past 0.393 in epochs
+4–6, or was 3 epochs near the asymptote? Results to be appended here.
+
+- **7459421** (run 84bouc2f): killed ~2h in. Its epoch-1 eval hit 2
+  CUDA-OOM crashes on long-sequence samples (49/58 GiB allocation attempts;
+  "reserved but unallocated" grew 1.7 → 45.7 GiB between them = allocator
+  **fragmentation**, not a leak) and ran ~2h vs the usual ~30–40 min.
+  Crashed samples count as *incorrect* (evaluate.py:389), and both
+  comparison runs had zero crashes, so a full run would have carried a
+  growing handicap in exactly the late epochs under test — and projected
+  ~15h instead of ~8h.
+- **7462298**: resubmit with `PYTORCH_ALLOC_CONF=expandable_segments:True`
+  (+ legacy `PYTORCH_CUDA_ALLOC_CONF` alias), otherwise identical. Success
+  criteria vs the theory: zero eval OOMs and eval durations back to
+  ~30–40 min.
 
 ### Bookkeeping
 
