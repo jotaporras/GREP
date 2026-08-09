@@ -180,9 +180,26 @@ round-trip check on. Question: does GT keep climbing past 0.393 in epochs
   growing handicap in exactly the late epochs under test — and projected
   ~15h instead of ~8h.
 - **7462298**: resubmit with `PYTORCH_ALLOC_CONF=expandable_segments:True`
-  (+ legacy `PYTORCH_CUDA_ALLOC_CONF` alias), otherwise identical. Success
-  criteria vs the theory: zero eval OOMs and eval durations back to
-  ~30–40 min.
+  (+ legacy `PYTORCH_CUDA_ALLOC_CONF` alias), otherwise identical. Died in
+  90s on dgx024 ("CUDA device busy/unavailable" — that node's second such
+  failure this campaign; excluded from later hops).
+- **7462389** (run ksbxgm4e): the allocator flag *worked* — stranded
+  memory 45.7 GiB → 331 MiB — but OOMs persisted, and with fragmentation
+  gone the trend became legible: **genuinely-allocated memory grew ~20 GiB
+  per caught OOM** (free 23.1 → 3.4 GiB within one eval). Root cause found
+  in `evaluate.py`'s per-sample crash handler: the exception's
+  `__traceback__` chain pins the failed forward's KV cache/attention
+  buffers in reference cycles, so each caught OOM permanently leaked its
+  own attempt and cascaded later samples into OOM. Killed before it could
+  produce six garbage eval points (crashes count as *incorrect*).
+- **Fix `5b95231`** (3rd substantive bug of the campaign): the handler now
+  clears `e.__traceback__`/locals, `gc.collect()`s, and empties the CUDA
+  cache after recording the crash. Note the leak was latent in *every*
+  prior eval — harmless there only because zero samples crashed.
+- **7464551**: resubmit with the fix + allocator flags + `--exclude=dgx024`.
+  Expectation: ≤1–2 isolated OOM-scored samples per eval at worst (the
+  60–72 GiB single-allocation samples may legitimately fail), no cascade,
+  eval durations back near ~35 min once memory pressure is gone.
 
 ### Bookkeeping
 
