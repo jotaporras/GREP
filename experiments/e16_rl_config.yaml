@@ -38,6 +38,13 @@ trainer:
       cost_optimality: 0.3
       format_ok: 0.2
       keyword: 0.5
+    # GPU for the POLICY model. The in-process vLLM engine always takes cuda:0
+    # of the visible set, so two-GPU hosts (plaza) set 1; single-GPU hosts 0.
+    policy_device: 0
+    # Free-form vLLM engine kwargs for the rollout engine (build_graph_llm
+    # passthrough) — e.g. quantization/load_format bitsandbytes for in-flight
+    # nf4 on 48 GB cards, max_model_len, gpu_memory_utilization.
+    engine: {}
     # Free-form GRPOConfig passthrough, merged LAST (mirrors trainer.sft):
     # any GRPOConfig field is settable here without a schema change.
     grpo: {}

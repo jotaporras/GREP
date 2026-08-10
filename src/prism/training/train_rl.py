@@ -43,13 +43,18 @@ def train_rl(config: omegaconf.DictConfig) -> None:
     output_dir = train_v3._construct_output_dir(config, run_id)
     print(f"[train_rl] output dir: {output_dir}")
 
+    # The in-process vLLM worker pins itself to cuda:0 of the visible set, so
+    # on a two-GPU host the policy lives on the OTHER device (plaza: engine on
+    # 0, trainer on 1). Single-GPU hosts share device 0.
+    policy_device = int(rl_cfg.get("policy_device", 0))
+
     init_checkpoint = rl_cfg.get("init_checkpoint")
     if init_checkpoint:
         from prism.eval import checkpoint as ckpt_mod
 
         policy = vg_engine.checkpoint_engine_policy(init_checkpoint)
         model, tokenizer, is_gnn = ckpt_mod.load_checkpoint(
-            init_checkpoint, four_bit=config.trainer.bit4, device=0)
+            init_checkpoint, four_bit=config.trainer.bit4, device=policy_device)
         if not is_gnn:
             raise ValueError(
                 f"{init_checkpoint} is a plain-LLM checkpoint; the graph RL "
@@ -64,7 +69,7 @@ def train_rl(config: omegaconf.DictConfig) -> None:
                 load_in_4bit=True, bnb_4bit_use_double_quant=True,
                 bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.bfloat16)
         llm = AutoModelForCausalLM.from_pretrained(
-            config.model.path, torch_dtype="auto", device_map={"": 0},
+            config.model.path, torch_dtype="auto", device_map={"": policy_device},
             quantization_config=bnb)
         tokenizer = AutoTokenizer.from_pretrained(config.model.path)
         train_v3._ensure_pad_tokens(tokenizer, llm)
