@@ -114,9 +114,11 @@ same ordering holds (edges 96.4% vs GT 47.6% here, against 98.6% vs 71.4% at
 n30), but a rollout audit shows those runs are effectively SINGLE-SHOT
 (307/308 samples used one planner call; the tool calls returned nothing), so
 they are a prompt-format ablation and say nothing about interactive planning.
-They do expose a GT-specific output-contract defect (missing keywords, and
-`goto` emitted on only 17/82 samples at n60 vs 100% for edges) plus a
-graph-size-independent OOM signature.**
+They do sharpen the GT failure decomposition (at n60, 21/84 samples route to
+the wrong destination and another 21 route over nonexistent edges — target
+selection degrades with scale, not just edge fidelity), and expose an
+output-contract drift (`goto` emitted on 17/82 samples vs 100% for edges) plus
+a graph-size-independent OOM signature.**
 
 ### Headline (84 samples = 7 frozen graphs × 12 tasks)
 
@@ -324,12 +326,26 @@ genuine behavioural signal even though the calls are inert: both edges arms
 emit `goto` on 100% of samples (70/70, 84/84), while the GT arms emit it on
 42/68 at n30 and only **17/82 at n60**. The graph-channel arm drifts away
 from the documented output contract as graphs grow — the same direction as
-its keyword-rate collapse below, and plausibly the same underlying failure.
-- **The keyword defect is worse at n60**: 61/84 for GT (27% of samples fail to
-emit the expected keyword) against a perfect 84/84 for edges. Combined with
-n30's 62/70, this is a consistent, size-scaling failure of the graph-channel
-arm to produce well-formed tool-mode output — a defect separate from
-routing accuracy, and plausibly a bigger lever on the score than the crashes.
+its keyword-rate shortfall below.
+- **The keyword column is NOT a formatting metric** (an earlier draft of this
+section said it was — see the definition in the v2 doc's section 6).
+`plan_keyword` is a regex hit of the task's own `answer` pattern against the
+plan text, i.e. *"did the plan name the right destination, in the right
+order?"* — a necessary-but-not-sufficient condition, so an upper bound on
+accuracy rather than an independent axis. Decomposed, the n60 GT arm fails in
+two roughly equal ways, and only the second is a routing problem:
+
+| arm | right endpoint AND valid route | right endpoint, invalid route | wrong endpoint | crash |
+| --- | --- | --- | --- | --- |
+| n60 edges | 81 | 3 | 0 | 0 |
+| n60 GT 6ep | 40 | **21** | **21** | 2 |
+
+  Against n30 GT (50 / 12 / 6), the qualitatively new failure at n60 is the
+  **wrong-endpoint** column: 6 → 21 samples where the model does not identify
+  the correct destination at all, on top of the phantom-edge failures growing
+  12 → 21. Both edges arms name the right endpoint on 100% of samples at both
+  sizes. So scaling hurts the graph channel's *target selection*, not just its
+  edge fidelity — a distinction the raw keyword rate hides.
 - **Crash handicap**: 2 OOM-crashed samples scored incorrect ⇒ adjusted
 40/82 = **48.8%**; honest range 47.6–48.8%. Neither adjustment changes the
 picture.

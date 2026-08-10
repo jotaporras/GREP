@@ -1,6 +1,7 @@
 ---
 
 ## tags: [experiment, e14, scaling, graph-injection, vllm-data]
+
 date: 2026-08-07
 status: complete (6/6 training runs final + reload-path bug found/fixed + same-path train/test probe matrix complete incl. 7439499 + SPINE tools-enabled eval on the n30 arms)
 related: ["2026-07-21 e13_nav_pe_setup"]
@@ -268,10 +269,12 @@ Same checkpoints, same 7 held-out graphs, same scoring; only the prompt policy
 and the simulator differ. (The n60 arms were run against the *v3* corpus
 checkpoints — results in the v3 doc.)
 
-| job | arm | run | Acc(obj) | correct | eval errors | formatted | keyword |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 7475035 | edges | `e14v2_n30_baseline_edges` [krktnvkr](https://wandb.ai/alelab/GREP-PRISM/runs/krktnvkr) | **98.6%** | 69/70 | 0 | 70/70 | 70/70 |
-| 7475036 | GT | `e14v2_n30_gt` [8g2o6yzd](https://wandb.ai/alelab/GREP-PRISM/runs/8g2o6yzd) | **71.4%** | 50/70 | 2 | 68/70 | 62/70 |
+
+| job     | arm   | run                                                                                     | Acc(obj)  | correct | eval errors | formatted | keyword |
+| ------- | ----- | --------------------------------------------------------------------------------------- | --------- | ------- | ----------- | --------- | ------- |
+| 7475035 | edges | `e14v2_n30_baseline_edges` [krktnvkr](https://wandb.ai/alelab/GREP-PRISM/runs/krktnvkr) | **98.6%** | 69/70   | 0           | 70/70     | 70/70   |
+| 7475036 | GT    | `e14v2_n30_gt` [8g2o6yzd](https://wandb.ai/alelab/GREP-PRISM/runs/8g2o6yzd)             | **71.4%** | 50/70   | 2           | 68/70     | 62/70   |
+
 
 Both COMPLETED 0:0. Outputs under
 `$PROJ/outputs/e14_transferability/<run>_spine/` (7 per-graph JSONs each).
@@ -302,20 +305,41 @@ Both COMPLETED 0:0. Outputs under
 **Reading (as a prompt-format ablation).**
 
 - **Adding the tool documentation to the prompt costs nothing at n30.** Each
-  arm lands within ~1.5 points of its own tools-off number (edges 0.986 →
-  0.986; GT 0.700 → 0.714). The longer, tool-documented prompt does not
-  destabilise either arm — which is a real (if narrow) robustness result.
+arm lands within ~1.5 points of its own tools-off number (edges 0.986 →
+0.986; GT 0.700 → 0.714). The longer, tool-documented prompt does not
+destabilise either arm — which is a real (if narrow) robustness result.
 - **The edges-over-GT gap is unchanged**: 27 points here, 28.6 without tools.
-  Consistent with the two conditions eliciting near-identical behaviour.
-- **The GT arm has a separate output-quality defect.** Its keyword rate is
-  62/70 while edges is a perfect 70/70 — roughly 11% of GT samples fail to
-  emit the expected answer keyword at all. That is distinct from its 2 eval
-  crashes, and it may be a larger lever on the GT score than the crashes are.
+Consistent with the two conditions eliciting near-identical behaviour.
+**What "keyword" means** (it is *not* a formatting metric — an earlier draft of
+this section mis-described it). `plan_keyword` is
+`re.search(answer_key, plan_text, IGNORECASE)` (`evaluate.py:721`), where
+`answer_key` is the task's own `answer` field from the data_gen file: a regex
+naming the expected endpoints in order, e.g. `(?i)\bhub_1\b.*\blab_1\b`. So the
+keyword rate answers **"did the plan name the right destination, in the right
+order?"** Every task in these evals is `structured`, so the headline `correct`
+is the *stronger* deterministic NetworkX check
+(`path_validator.validate_structured`): does the stated route actually traverse
+edges that exist? Keyword is therefore necessary-but-not-sufficient — an
+**upper bound** on accuracy, not an independent axis.
+
+Decomposing each arm with that in mind:
+
+| arm | right endpoint AND valid route | right endpoint, invalid route | wrong endpoint | crash |
+| --- | --- | --- | --- | --- |
+| n30 edges | 69 | 1 | 0 | 0 |
+| n30 GT | 50 | **12** | **6** | 2 |
+
+- **The GT arm's keyword shortfall is not an output-format defect** — it is 6
+samples that routed to the wrong place entirely. Its bigger loss is the middle
+column: **12 samples name the correct destination but get there over edges that
+do not exist** — exactly the phantom-edge failure mode catalogued in section 4,
+now confirmed under tools-on prompts as well. The edges arm names the right
+endpoint on every sample and only once fails to find a real route.
 - **Crash handicap.** The 2 OOM-crashed samples are scored incorrect, so the
-  handicap-adjusted GT figure is 50/68 = **73.5%**; the honest range is
-  71.4–73.5%. The edges arm crashed zero times, so this comparison is not
-  symmetric — see the v3 doc for the localisation of those OOMs to the graph
-  channel.
+handicap-adjusted GT figure is 50/68 = **73.5%**; the honest range is
+71.4–73.5%. The edges arm crashed zero times, so this comparison is not
+symmetric — see the v3 doc for the localisation of those OOMs to the graph
+channel.
 
 **Script fix required first** (`fcbdd5b`): the SPINE sbatch hardcoded
 `--text-edge-list none`, which would have evaluated the edges arm without the
