@@ -85,7 +85,6 @@ class GraphGRPOTrainer(GRPOTrainer):
             for row in self.train_dataset
         }
         self._transport_cache: dict[str, tuple] = {}
-        self._batch_transports: list[torch.Tensor] | None = None
         self._last_synced_step = -1
         # LoRA hot-swap state (see _sync_policy_to_engine).
         self._lora_version = 0
@@ -158,8 +157,6 @@ class GraphGRPOTrainer(GRPOTrainer):
             [next(iter(lp.values())).logprob for lp in out.logprobs]
             for o in outputs for out in o.outputs
         ]
-        # Consumed by the loss-side forward (row-aligned with this batch).
-        self._batch_transports = transports
         return prompt_ids, completion_ids, logprobs, {}
 
     # ----------------------------------------------------------- loss side
@@ -175,19 +172,36 @@ class GraphGRPOTrainer(GRPOTrainer):
             psi[b, start:start + n] = transport[:, :hidden].to(input_ids.device)
         return psi
 
+    def _transports_for_rows(self, input_ids, attention_mask, logits_to_keep):
+        """Per-row transports recovered from the rows THEMSELVES: the prompt
+        segment (everything left of the completion window, minus left-padding)
+        keys into the Ψ cache. Order/slicing independent — trl calls the logps
+        function both on the full generation batch and on grad-accum
+        micro-batch slices, so positional alignment is not a contract."""
+        by_pids = {tuple(pids): t for pids, t in self._transport_cache.values()}
+        prompt_cols = input_ids.shape[1] - int(logits_to_keep or 0)
+        transports = []
+        for b in range(input_ids.shape[0]):
+            mask = attention_mask[b, :prompt_cols].bool()
+            toks = tuple(input_ids[b, :prompt_cols][mask].tolist())
+            t = by_pids.get(toks)
+            if t is None:
+                raise ValueError(
+                    "loss-side row's prompt tokens not found in the Ψ cache — "
+                    "the generate/loss tokenization contract changed.")
+            transports.append(t)
+        return transports
+
     def _get_per_token_logps_and_entropies(self, model, input_ids, attention_mask,
                                            logits_to_keep, batch_size=None,
                                            **kwargs):
-        transports = self._batch_transports
-        if transports is None:
+        if not self._transport_cache:
             return super()._get_per_token_logps_and_entropies(
                 model, input_ids, attention_mask, logits_to_keep,
                 batch_size=batch_size, **kwargs)
+        transports = self._transports_for_rows(
+            input_ids, attention_mask, logits_to_keep)
         B = input_ids.shape[0]
-        if len(transports) != B:
-            raise ValueError(
-                f"Ψ/batch misalignment: {len(transports)} cached transports for a "
-                f"batch of {B} rows — the generate/loss batching contract changed.")
         chunk = batch_size or B
         if chunk < B and getattr(self._core.llm, "is_gradient_checkpointing", False):
             raise ValueError(
