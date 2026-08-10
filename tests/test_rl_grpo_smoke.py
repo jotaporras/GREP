@@ -87,9 +87,10 @@ def test_grpo_two_steps(tmp_path):
     graph_model = build_hf_graph_model(hf_llm).train()
     # The trainer syncs the policy as a LoRARequest — engine must accept it.
     # max_lora_rank must be one of vLLM's allowed sizes (8 is the floor that
-    # covers the r=4 adapter).
+    # covers the r=4 adapter); LoRA Triton kernels are fp16/bf16-only, so this
+    # smoke runs the engine at bf16 (parity tests keep float32, no LoRA).
     rollout_llm, wrapper = spin_engine(model_dir, enable_lora=True,
-                                       max_lora_rank=8)
+                                       max_lora_rank=8, dtype="bfloat16")
 
     args = GRPOConfig(
         output_dir=str(tmp_path / "out"),

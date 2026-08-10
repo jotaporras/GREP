@@ -67,13 +67,13 @@ def build_hf_graph_model(llm, disable_graph_token_rope=False, seed: int = 0):
 
 
 def spin_engine(model_dir, *, identity_rope=False, pe_inject_value=True,
-                **extra):
+                dtype="float32", **extra):
     from prism.models.vllm_graph.engine import build_graph_llm
     return build_graph_llm(
         str(model_dir),
         identity_rope=identity_rope,
         pe_inject_value=pe_inject_value,
-        dtype="float32",
+        dtype=dtype,
         max_model_len=512,
         gpu_memory_utilization=0.15,  # CPU backend: fraction of RAM to reserve
         max_num_seqs=8,              # keep the profiling pass tiny
