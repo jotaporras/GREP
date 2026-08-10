@@ -1,7 +1,7 @@
 ---
 experiment: e14 v3 — n60 widened corpus (2x graphs + long-hop tasks)
 date: 2026-08-08
-status: complete (2 training runs + round-trip checks + train/test probe 2x2 done)
+status: complete (2 training runs + round-trip checks + train/test probe 2x2 + 6-epoch GT extension done)
 wandb_tag: e14_scaling
 ---
 
@@ -98,7 +98,10 @@ harder eval set — and 4× on the identical legacy-10 subset (0.114 → 0.457) 
 with retention rising 47% → 70% (fixed-path 2×2), so the gain is genuine
 transfer, not memorization. But the gap to edges-in-prompt (0.952) persists
 at ~2.4×: the data lever works and does not close the gap. The long-hop
-tasks split the arms completely: edges ~13–14/14, GT 1–5/14.**
+tasks split the arms completely: edges ~13–14/14, GT 1–5/14.
+Post-hoc 6-epoch extension: GT keeps climbing past the 3-epoch cutoff and
+plateaus at ~0.56 (epochs 5 = 6 exactly), narrowing the edges gap to
+~1.7× — see the follow-up section.**
 
 ### Headline (84 samples = 7 frozen graphs × 12 tasks)
 
@@ -200,6 +203,49 @@ round-trip check on. Question: does GT keep climbing past 0.393 in epochs
   Expectation: ≤1–2 isolated OOM-scored samples per eval at worst (the
   60–72 GiB single-allocation samples may legitimately fail), no cascade,
   eval durations back near ~35 min once memory pressure is gone.
+
+### 6-epoch results (7464551, run [n6dz4zlq](https://wandb.ai/alelab/GREP-PRISM/runs/n6dz4zlq)) — COMPLETED 0:0, 10h45m
+
+**Answer: GT climbs well past the 3-epoch 0.393 and plateaus at ~0.56 —
+epochs 5 and 6 are identical (47/84), the plateau signature this run was
+built to detect. Best estimate of this arm's ceiling on the v3 corpus:
+~0.56, vs edges 0.952 (~1.7× gap, down from ~2.4× at 3 epochs).**
+
+| epoch | acc (84) | crashes | crash-adj | legacy-10 | long-hop |
+|---|---|---|---|---|---|
+| 1 | 0.321 | 3 | 0.333 | 22/70 | 5/14 |
+| 2 | 0.512 | 2 | 0.524 | 36/70 | 7/14 |
+| 3 | 0.464 | 0 | 0.464 | 35/70 | 4/14 |
+| 4 | 0.369 | 1 | 0.374 | 29/70 | 2/14 |
+| 5 | 0.560 | 2 | 0.573 | 40/70 | 7/14 |
+| 6 | **0.560** | 0 | 0.560 | **40/70 = 0.571** | **7/14** |
+
+Post-train round-trip: **0.500** (42/84, 2 crashes; Δ −0.060 vs
+in-training). The delta is *negative* where all earlier round-trips were
+positive (+0.048/+0.029/+0.086) — confirming reload deltas are
+bidirectional sampling noise, not a systematic reload bias.
+
+Subset movement vs the 3-epoch run: legacy-10 0.457 → **0.571** (v2 was
+0.114), and long-hop finally moved, 1/14 → **7/14** — the graph channel
+learned some multi-hop routing given enough passes, though edges' 13–14/14
+remains far ahead.
+
+**How to read it (caveats that matter):**
+- **Quote the plateau, never a single epoch.** Adjacent swings reach 0.19
+  (0.46 → 0.37 → 0.56), beyond the ±0.11 that 84-sample noise explains;
+  the epoch-4 dip is inside the run's own volatility, not a regression.
+- **The trajectory is not reproducible epoch-by-epoch.** This run's
+  epoch 2 (0.512) reads +0.155 above kma1nipe's (0.357) — beyond 2 SE, and
+  the crash handicap biases *downward*, so it can't explain it. Genuine
+  run-to-run training variance; some of the 6-epoch gain over 0.393 is
+  that variance, but the epoch-5/6 plateau sits ~3 SE above it.
+- **Crashes are OOM-scored samples counted as incorrect** (~0.02/point
+  understatement, crash-adj column corrects the denominator). 10 total:
+  3/2/0/1/2/0 across epochs + 2 in the round-trip — flat, not compounding,
+  confirming the `5b95231` leak fix held for the whole run.
+
+Checkpoint: `outputs/e14_stage1to3/e14v3_n60_gt_6ep_n6dz4zlq` (2.2 GB,
+`gnn_weights.pt` present, `checkpoint-1872` = 6 × 312 steps).
 
 ### Bookkeeping
 
