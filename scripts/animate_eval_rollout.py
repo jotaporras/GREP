@@ -129,10 +129,12 @@ def build_neon_base(graph_dict: dict, min_sep: float = 52.0) -> tuple:
         })
 
     edges = []
-    for i, (src, dst) in enumerate(graph_dict.get("region_connections", [])):
+    # (src, dst, *_) — LLM-generated graphs occasionally emit a malformed 3-node
+    # connection (e.g. data_gen_016 in n_100_vllm); keep the first two endpoints.
+    for i, (src, dst, *_) in enumerate(graph_dict.get("region_connections", [])):
         edges.append({"id": f"r{i}", "from": src, "to": dst,
                       "color": {"color": "rgba(120,130,180,0.10)"}, "width": 0.6})
-    for i, (src, dst) in enumerate(graph_dict.get("object_connections", [])):
+    for i, (src, dst, *_) in enumerate(graph_dict.get("object_connections", [])):
         edges.append({"id": f"o{i}", "from": src, "to": dst,
                       "color": {"color": "rgba(150,110,170,0.10)"}, "width": 0.6,
                       "dashes": True})
@@ -147,8 +149,8 @@ _METRIC_BLOCKLIST = {"hallucination_rate", "parsed_nodes", "goal"}
 def build_adjacency(graph_dict: dict) -> set:
     """Undirected edge set for classifying a hop as real vs. hallucinated."""
     adj = set()
-    for src, dst in (graph_dict.get("region_connections", []) +
-                     graph_dict.get("object_connections", [])):
+    for src, dst, *_ in (graph_dict.get("region_connections", []) +
+                         graph_dict.get("object_connections", [])):
         adj.add((src, dst))
         adj.add((dst, src))
     return adj
@@ -161,8 +163,8 @@ def _weighted_adjacency(graph_dict: dict, coord: dict) -> dict:
     Dijkstra search below optimises travelled distance rather than hop count.
     """
     adjw: dict = {}
-    for u, v in (graph_dict.get("region_connections", []) +
-                 graph_dict.get("object_connections", [])):
+    for u, v, *_ in (graph_dict.get("region_connections", []) +
+                     graph_dict.get("object_connections", [])):
         if u in coord and v in coord:
             w = _cartesian(coord[u], coord[v])
             adjw.setdefault(u, []).append((v, w))
