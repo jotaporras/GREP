@@ -66,7 +66,8 @@ def build_hf_graph_model(llm, disable_graph_token_rope=False, seed: int = 0):
     ).eval()  # eval semantics: dropout off, as in the eval/rollout path
 
 
-def spin_engine(model_dir, *, identity_rope=False, pe_inject_value=True):
+def spin_engine(model_dir, *, identity_rope=False, pe_inject_value=True,
+                **extra):
     from prism.models.vllm_graph.engine import build_graph_llm
     return build_graph_llm(
         str(model_dir),
@@ -76,4 +77,5 @@ def spin_engine(model_dir, *, identity_rope=False, pe_inject_value=True):
         max_model_len=512,
         gpu_memory_utilization=0.15,  # CPU backend: fraction of RAM to reserve
         max_num_seqs=8,              # keep the profiling pass tiny
+        **extra,
     )

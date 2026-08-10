@@ -101,6 +101,11 @@ def train_rl(config: omegaconf.DictConfig) -> None:
     # kwarg is CLI-settable — e.g. quantization=bitsandbytes +
     # load_format=bitsandbytes for in-flight nf4 on 48 GB cards.
     engine_kwargs = _freeform(rl_cfg.get("engine"))
+    # The trainer syncs the policy as a LoRARequest (see GraphGRPOTrainer.
+    # _sync_policy_to_engine) — the engine must accept adapters of the
+    # policy's rank.
+    engine_kwargs.setdefault("enable_lora", True)
+    engine_kwargs.setdefault("max_lora_rank", int(config.lora.r))
     rollout_llm, rollout_wrapper = vg_engine.build_graph_llm(
         serving,
         identity_rope=policy["identity_rope"],

@@ -14,10 +14,12 @@ two seams, keeping trl's loss/advantage machinery intact:
    queries attend Ψ-carrying prompt keys; completion keys carry no Ψ) — the
    training-consistent forward, which the vLLM cache reproduces exactly.
 
-Weight sync: the engine serves base/merged weights; after each optimizer step
-the LoRA-targeted projections are re-merged (W0 + scaling·B·A) and pushed into
-the engine via ``load_weights`` (device-to-device on colocated GPUs). Payload
-and cadence are the first knobs in the compute-optimization plan.
+Weight sync: the engine serves the FIXED base weights (bf16 merged dir, or
+in-flight nf4 on 48 GB cards); after each optimizer step the current PEFT
+adapter is saved and re-attached as a fresh ``LoRARequest`` (id bump — vLLM
+caches adapters by id). The adapter IS the entire trainable state (Ψ tower
+frozen), so the sync payload is ~the adapter file. Cadence is the first knob
+in the compute-optimization plan.
 
 v1 restrictions (fail loud): additive archs only, ``disable_graph_token_rope``
 unsupported (trl's forward passes no position_ids), Ψ tower FROZEN (enables the
@@ -26,7 +28,9 @@ per-prompt Ψ cache and LoRA-only sync; unfreezing is v2), ``beta`` must be 0
 """
 from __future__ import annotations
 
+import os
 import re
+import tempfile
 from ast import literal_eval
 
 import torch
@@ -77,6 +81,10 @@ class GraphGRPOTrainer(GRPOTrainer):
         self._transport_cache: dict[str, tuple] = {}
         self._batch_transports: list[torch.Tensor] | None = None
         self._last_synced_step = -1
+        # LoRA hot-swap state (see _sync_policy_to_engine).
+        self._lora_version = 0
+        self._lora_request = None
+        self._lora_sync_root = tempfile.mkdtemp(prefix="grpo_lora_sync_")
 
     # ------------------------------------------------------------------ Ψ
 
@@ -133,7 +141,9 @@ class GraphGRPOTrainer(GRPOTrainer):
                 "multi_modal_data": {"image": {"graph_embeds": transport.unsqueeze(0)}},
             })
             transports.append(transport)
-        outputs = self.rollout_llm.generate(reqs, sampling_params, use_tqdm=False)
+        outputs = self.rollout_llm.generate(
+            reqs, sampling_params, use_tqdm=False,
+            lora_request=self._lora_request)
 
         prompt_ids = [list(o.prompt_token_ids) for o in outputs]
         completion_ids = [list(out.token_ids) for o in outputs for out in o.outputs]
@@ -199,27 +209,39 @@ class GraphGRPOTrainer(GRPOTrainer):
     # ---------------------------------------------------------- weight sync
 
     def _sync_policy_to_engine(self) -> None:
-        """Push LoRA-merged projections into the rollout engine.
+        """LoRA-only hot-swap: save the current adapter and bump the LoRA id.
 
-        For every LoRA layer: ``W = W0 + scaling·B·A``, named as the HF
-        checkpoint would name it (the wrapper's WeightsMapper and vLLM's
-        stacked-qkv mapping do the rest)."""
-        from peft.tuners.lora import LoraLayer
+        The engine serves the FIXED base weights (bf16 merged dir, or in-flight
+        nf4 — the same base the nf4 policy trains over); the policy delta rides
+        as a ``LoRARequest`` on every rollout. Merging into the engine's base
+        is impossible under bnb (packed params) and wasteful otherwise — the
+        adapter payload is the entire trainable state precisely because the Ψ
+        tower is frozen (v1 contract, enforced in ``__init__``)."""
+        import shutil
 
-        updates = []
-        for name, module in self.model.named_modules():
-            if not isinstance(module, LoraLayer) or "default" not in module.lora_A:
-                continue
-            delta = (module.lora_B["default"].weight
-                     @ module.lora_A["default"].weight) * module.scaling["default"]
-            merged = (module.base_layer.weight.data.float() + delta.float())
-            # PEFT/base prefixes down to the inner llm's checkpoint name:
-            # base_model.model.llm.model.layers.N...q_proj -> model.layers.N...q_proj
-            clean = re.sub(r"^(base_model\.model\.)?(llm\.)?", "", name)
-            updates.append((clean + ".weight",
-                            merged.to(dtype=torch.bfloat16)))
-        if updates:
-            self.rollout_wrapper.load_weights(iter(updates))
+        peft_model = getattr(self.model, "llm", self.model)
+        if not hasattr(peft_model, "save_pretrained"):
+            raise RuntimeError(
+                "policy carries no PEFT adapter to sync — LoRA-only RL is the "
+                "v1 contract (full-weight sync has no engine-side path).")
+        version = self._lora_version + 1
+        adapter_dir = os.path.join(self._lora_sync_root, f"v{version}")
+        os.makedirs(adapter_dir, exist_ok=True)
+        peft_model.save_pretrained(adapter_dir)
+        # PEFT nests per-adapter subdirs only in multi-adapter setups; vLLM
+        # wants the dir that directly holds adapter_config.json.
+        if not os.path.exists(os.path.join(adapter_dir, "adapter_config.json")):
+            sub = os.path.join(adapter_dir, "default")
+            if os.path.exists(os.path.join(sub, "adapter_config.json")):
+                adapter_dir = sub
+            else:
+                raise RuntimeError(f"no adapter_config.json under {adapter_dir}")
+        from vllm.lora.request import LoRARequest
+        self._lora_request = LoRARequest(f"policy-v{version}", version, adapter_dir)
+        prev = os.path.join(self._lora_sync_root, f"v{self._lora_version}")
+        self._lora_version = version
+        if os.path.isdir(prev):
+            shutil.rmtree(prev)
 
     # ---------------------------------------------------------------- save
 

@@ -85,7 +85,9 @@ def test_grpo_two_steps(tmp_path):
     hf_llm = save_fixture_dir(model_dir)
     tokenizer = load_tokenizer()
     graph_model = build_hf_graph_model(hf_llm).train()
-    rollout_llm, wrapper = spin_engine(model_dir)
+    # The trainer syncs the policy as a LoRARequest — engine must accept it.
+    rollout_llm, wrapper = spin_engine(model_dir, enable_lora=True,
+                                       max_lora_rank=4)
 
     args = GRPOConfig(
         output_dir=str(tmp_path / "out"),
@@ -121,6 +123,8 @@ def test_grpo_two_steps(tmp_path):
     assert result.training_loss == result.training_loss  # not NaN
     assert trainer._transport_cache, "Ψ cache never populated — rollouts bypassed Ψ"
     assert wrapper.dbg["attn_hit"] > 0, "engine attention never consumed Ψ"
+    assert trainer._lora_request is not None, "policy LoRA never synced to engine"
+    assert trainer._lora_version >= 1
 
     out = tmp_path / "run_dir"
     trainer.save_model(str(out))
