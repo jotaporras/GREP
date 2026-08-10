@@ -219,11 +219,21 @@ class GraphGRPOTrainer(GRPOTrainer):
         tower is frozen (v1 contract, enforced in ``__init__``)."""
         import shutil
 
-        peft_model = getattr(self.model, "llm", self.model)
-        if not hasattr(peft_model, "save_pretrained"):
-            raise RuntimeError(
-                "policy carries no PEFT adapter to sync — LoRA-only RL is the "
-                "v1 contract (full-weight sync has no engine-side path).")
+        from peft import PeftModel
+
+        # trl's peft_config path wraps the WHOLE policy (PeftModel(graph
+        # model)); the from-checkpoint path keeps the adapter on the inner
+        # ``.llm``. getattr on a PeftModel delegates into the base model, so
+        # resolve by isinstance, never by attribute fallback.
+        if isinstance(self.model, PeftModel):
+            peft_model = self.model
+        else:
+            inner = getattr(self.model, "llm", None)
+            if not isinstance(inner, PeftModel):
+                raise RuntimeError(
+                    "policy carries no PEFT adapter to sync — LoRA-only RL is "
+                    "the v1 contract (full-weight sync has no engine-side path).")
+            peft_model = inner
         version = self._lora_version + 1
         adapter_dir = os.path.join(self._lora_sync_root, f"v{version}")
         os.makedirs(adapter_dir, exist_ok=True)
