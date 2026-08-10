@@ -18,7 +18,6 @@ Engine sizing knobs follow the ``PRISM_VLLM_*`` env convention from
 """
 from __future__ import annotations
 
-import json
 import os
 
 import torch
@@ -81,25 +80,26 @@ def build_graph_llm(
 
 
 def checkpoint_engine_policy(checkpoint_dir: str) -> dict:
-    """Engine policy read from a run dir's ``train_config.json`` — fails loud.
+    """Engine policy read from the checkpoint's recorded config — fails loud.
 
     Returns ``{"identity_rope": bool, "pe_inject_value": bool, "base_model": str,
     "architecture": str}`` after asserting the arch is in the additive family.
+    Reads through ``loaders.load_gnn_config`` so legacy flat ``gnn_config.json``
+    checkpoints resolve identically to the HF eval path.
     """
-    with open(os.path.join(checkpoint_dir, "train_config.json")) as f:
-        cfg = json.load(f)
-    arch = cfg.get("architecture") or cfg.get("gnn", {}).get("arch")
+    from prism.models import loaders
+
+    cfg = loaders.load_gnn_config(checkpoint_dir)
+    arch = cfg.get("architecture", "rpearl_llm")
     if arch not in ADDITIVE_ARCHS:
         raise ValueError(
             f"architecture {arch!r} is not vLLM-servable: only the additive Ψ family "
             f"{sorted(ADDITIVE_ARCHS)} is supported (mask archs need the HF backend — "
             "their decode-time MaskDecodeInjector has no vLLM analog)."
         )
-    gnn = cfg.get("gnn", {})
     return {
-        "identity_rope": bool(cfg.get("disable_graph_token_rope",
-                                      gnn.get("disable_graph_token_rope", False))),
-        "pe_inject_value": bool(gnn.get("pe_inject_value", True)),
+        "identity_rope": bool(cfg.get("disable_graph_token_rope", False)),
+        "pe_inject_value": bool(cfg.get("pe_inject_value", True)),
         "base_model": cfg.get("base_model"),
         "architecture": arch,
     }
@@ -113,3 +113,60 @@ def generate_with_psi(llm, prompt_ids: list[int], psi_transport: torch.Tensor,
         "multi_modal_data": {"image": {"graph_embeds": psi_transport.unsqueeze(0)}},
     }
     return llm.generate([req], sampling_params)[0]
+
+
+def build_plain_llm(model_path: str, *, dtype: str = "auto",
+                    max_model_len: int | None = None,
+                    gpu_memory_utilization: float | None = None, seed: int = 0,
+                    **extra_engine_kwargs):
+    """Stock vLLM engine for plain-LLM checkpoints (no graph channel, no
+    registration, prefix caching allowed)."""
+    from vllm import LLM
+
+    return LLM(
+        model=model_path,
+        dtype=dtype,
+        disable_log_stats=True,
+        seed=seed,
+        max_model_len=_engine_env("PRISM_VLLM_MAX_LEN", max_model_len or 16384, int),
+        gpu_memory_utilization=_engine_env(
+            "PRISM_VLLM_GPU_UTIL", gpu_memory_utilization or 0.90, float),
+        **extra_engine_kwargs,
+    )
+
+
+def materialize_serving_dir(checkpoint_dir: str, is_gnn: bool,
+                            out_dir: str | None = None) -> str:
+    """HF-format weights vLLM can serve for this checkpoint.
+
+    No adapter → the base model itself (nothing to materialize). With an
+    adapter → merge it into the bf16 base ONCE and cache under
+    ``<checkpoint>/vllm_bf16/``. Merging at bf16 is exact (unlike merge-into-nf4
+    — see ``loaders.graph_augmented_llm_from_pretrained`` — which rounds the
+    adapter away); it needs the full model in memory, so this runs on the
+    cluster, not a laptop.
+    """
+    from prism.models import loaders
+
+    if not os.path.exists(os.path.join(checkpoint_dir, "adapter_config.json")):
+        if is_gnn:
+            return loaders.load_gnn_config(checkpoint_dir)["base_model"]
+        return checkpoint_dir
+
+    out = out_dir or os.path.join(checkpoint_dir, "vllm_bf16")
+    if os.path.exists(os.path.join(out, "config.json")):
+        return out
+
+    if is_gnn:
+        # bf16 path merges the adapter (merge_and_unload) before returning.
+        model, tokenizer = loaders.graph_augmented_llm_from_pretrained(
+            checkpoint_dir, load_in_4bit=False, device=-1)
+        llm = model.llm
+    else:
+        model, tokenizer = loaders.from_pretrained(
+            checkpoint_dir, load_in_4bit=False, device=-1)
+        # Plain loader keeps the adapter attached; serving needs merged weights.
+        llm = model.merge_and_unload() if hasattr(model, "merge_and_unload") else model
+    llm.save_pretrained(out, safe_serialization=True)
+    tokenizer.save_pretrained(out)
+    return out

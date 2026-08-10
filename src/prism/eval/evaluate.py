@@ -227,10 +227,16 @@ def eval_model_single_graph(
     permutation,
     edge_weights: str = "gaussian",
     injection_scope: str = "full_sequence",
+    client=None,
 ) -> Tuple[float, List[Dict]]:
     """Run the planning-simulation loop over `eval_samples` (all same underlying graph).
 
     For multi-graph evaluation use `eval_model_multiple_graphs`.
+
+    ``client``: a pre-built SPINE LLM client (e.g. the vLLM-backed clients in
+    ``vllm_graph.spine_client``). When given, ``model`` is not consulted for
+    generation and the HF client construction below is skipped — the caller
+    owns backend choice; prompts, simulator, and scoring are unchanged.
 
     ``edge_weights`` ("gaussian" | "binary") sets the GNN edge weighting for the
     parsed scene graphs and MUST match the train-time ``data.edge_weights`` policy;
@@ -257,26 +263,31 @@ def eval_model_single_graph(
     include_tools = not _spine_tools_disabled()
     icl_examples = _compact_icl_examples(use_icl)
 
-    is_gnn = _is_graph_augmented(model)
-    if is_gnn:
-        client = inference.GraphAugmentedInMemoryLLM(
-            model=model,
-            tokenizer=tokenizer,
-            include_edges=include_edge_list,
-            include_tools=include_tools,
-            icl_examples=icl_examples,
-            permutation=permutation,
-            edge_weights=edge_weights,
-            injection_scope=injection_scope,
-        )
+    if client is not None:
+        # Graph-vs-plain still drives the permutation branch below; a provided
+        # client declares it by type.
+        is_gnn = isinstance(client, inference.GraphAugmentedInMemoryLLM)
     else:
-        client = inference.InMemoryLLM(
-            model=model,
-            tokenizer=tokenizer,
-            include_edges=include_edge_list,
-            include_tools=include_tools,
-            icl_examples=icl_examples,
-        )
+        is_gnn = _is_graph_augmented(model)
+        if is_gnn:
+            client = inference.GraphAugmentedInMemoryLLM(
+                model=model,
+                tokenizer=tokenizer,
+                include_edges=include_edge_list,
+                include_tools=include_tools,
+                icl_examples=icl_examples,
+                permutation=permutation,
+                edge_weights=edge_weights,
+                injection_scope=injection_scope,
+            )
+        else:
+            client = inference.InMemoryLLM(
+                model=model,
+                tokenizer=tokenizer,
+                include_edges=include_edge_list,
+                include_tools=include_tools,
+                icl_examples=icl_examples,
+            )
 
 
     llm_planner = spine.SPINE(
@@ -446,11 +457,13 @@ def eval_model_multiple_graphs(
     on_graph_done: Optional[Callable[[str, GraphEvalResultSummary], None]],
     edge_weights: str = "gaussian",
     injection_scope: str = "full_sequence",
+    client=None,
 ) -> Dict[str, GraphEvalResultSummary]:
     """Evaluate one model over many graphs; returns per-graph GraphEvalResultSummary dicts.
 
     `graph_samples` maps graph names to their eval-sample lists. All policy args
-    forwarded as-is to `eval_model_single_graph`.
+    (including a pre-built ``client``, see `eval_model_single_graph`) forwarded
+    as-is to `eval_model_single_graph`.
     """
     results: Dict[str, GraphEvalResultSummary] = {}
     for name, samples in graph_samples.items():
@@ -468,6 +481,7 @@ def eval_model_multiple_graphs(
             permutation=permutation,
             edge_weights=edge_weights,
             injection_scope=injection_scope,
+            client=client,
         )
         elapsed = time.time() - t0
 

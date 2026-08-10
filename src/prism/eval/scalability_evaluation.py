@@ -107,6 +107,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "Default: false — the deployed setting, matching the zero-shot "
                         "prompts the checkpoints were trained on (data.icl_examples=0). "
                         "true also moves the scene graph out of the system message.")
+    p.add_argument("--backend", choices=["hf", "vllm"],
+                   default=os.environ.get("PRISM_EVAL_BACKEND", "hf"),
+                   help="Generation backend. hf (default): the historical "
+                        "transformers path — zero behavior change. vllm: serve the "
+                        "checkpoint through the vLLM engine (graph checkpoints via "
+                        "the vllm_graph Psi plugin, additive archs only; plain LLMs "
+                        "via a stock engine). Prompts, simulator, and scoring are "
+                        "identical — only generation moves. Note the additive-arch "
+                        "decode semantics differ by construction: vLLM's cache "
+                        "persists Psi (training-consistent), HF's cached decode "
+                        "attends Psi-free keys. Env mirror: PRISM_EVAL_BACKEND.")
     return p.parse_args(argv)
 
 
@@ -264,6 +275,11 @@ def main(argv: list[str] | None = None) -> None:
 
     samples_by_graph, graph_file_by_name = data.load_samples_by_graph(args.graphs)
 
+    if is_navigator and args.backend == "vllm":
+        raise ValueError(
+            "--backend vllm is meaningless for the navigator (no LLM generates); "
+            "drop the flag rather than have it silently ignored.")
+
     if is_navigator:
         # NavigatorGT: no LLM checkpoint. The route is generated from explicit start/goal
         # nodes; text_edge_list / injection_scope are LLM-only and unused here.
@@ -282,10 +298,34 @@ def main(argv: list[str] | None = None) -> None:
         edge_weights = _resolve_edge_weights(checkpoint)
         injection_scope = _resolve_injection_scope(checkpoint)
         print(f"Loading checkpoint: {checkpoint}")
-        model, tokenizer, _ = _load_checkpoint(checkpoint, four_bit=args.four_bit, device=args.device)
+        if args.backend == "vllm":
+            from transformers import AutoTokenizer
+
+            from prism.models.vllm_graph import engine as vg_engine
+
+            tokenizer = AutoTokenizer.from_pretrained(checkpoint)
+            model = None
+            serving = vg_engine.materialize_serving_dir(checkpoint, is_gnn)
+            print(f"  vllm serving weights: {serving}")
+            if is_gnn:
+                from prism.models.vllm_graph import psi_producer as vg_psi
+
+                policy = vg_engine.checkpoint_engine_policy(checkpoint)
+                vllm_engine, _ = vg_engine.build_graph_llm(
+                    serving,
+                    identity_rope=policy["identity_rope"],
+                    pe_inject_value=policy["pe_inject_value"],
+                )
+                producer = vg_psi.load_psi_producer(checkpoint)
+            else:
+                vllm_engine = vg_engine.build_plain_llm(serving)
+                producer = None
+        else:
+            model, tokenizer, _ = _load_checkpoint(checkpoint, four_bit=args.four_bit, device=args.device)
         architecture = "graph-augmented" if is_gnn else "llm"
     print(f"  architecture: {architecture}  |  text_edge_list={text_edge_list}  |  "
-          f"edge_weights={edge_weights}  |  injection_scope={injection_scope}  |  4bit={args.four_bit}")
+          f"edge_weights={edge_weights}  |  injection_scope={injection_scope}  |  "
+          f"4bit={args.four_bit}  |  backend={args.backend}")
     print(f"  {len(samples_by_graph)} graph file(s)\n")
 
     use_icl = args.use_icl == "true"
@@ -313,6 +353,28 @@ def main(argv: list[str] | None = None) -> None:
             out_dir = base_output
         os.makedirs(out_dir, exist_ok=True)
 
+        # vLLM backend: pre-built client (the engine is shared across
+        # permutations; the client is a thin per-permutation shell because
+        # Psi construction consumes the permutation).
+        client = None
+        if not is_navigator and args.backend == "vllm":
+            from prism.models.vllm_graph import spine_client as vg_client
+
+            include_tools = not evaluate._spine_tools_disabled()
+            icl_examples = evaluate._compact_icl_examples(use_icl)
+            if is_gnn:
+                client = vg_client.VLLMGraphInMemoryLLM(
+                    producer, tokenizer, vllm_engine,
+                    include_edges=(text_edge_list == "present"),
+                    include_tools=include_tools, icl_examples=icl_examples,
+                    permutation=permutation, edge_weights=edge_weights,
+                    injection_scope=injection_scope)
+            else:
+                client = vg_client.VLLMInMemoryLLM(
+                    vllm_engine, tokenizer,
+                    include_edges=(text_edge_list == "present"),
+                    include_tools=include_tools, icl_examples=icl_examples)
+
         progress = _make_progress_printer(samples_by_graph)
         results = evaluate.eval_model_multiple_graphs(
             model,
@@ -324,6 +386,7 @@ def main(argv: list[str] | None = None) -> None:
             on_graph_done=progress,
             edge_weights=edge_weights,
             injection_scope=injection_scope,
+            client=client,
         )
 
         if has_seeds:

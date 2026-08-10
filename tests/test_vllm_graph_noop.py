@@ -34,7 +34,12 @@ def engine_setup(tmp_path_factory):
     llm, wrapper = spin_engine(model_dir)
     tokenizer = load_tokenizer()
     prompt_ids = tokenizer(PROMPT, add_special_tokens=False)["input_ids"]
-    return llm, wrapper, hf_llm, tokenizer, prompt_ids
+    yield llm, wrapper, hf_llm, tokenizer, prompt_ids
+    # Each CPU engine reserves GiBs of host RAM at startup; a leftover engine
+    # starves the next module's ("Available memory ... less than desired").
+    import gc
+    del llm, wrapper
+    gc.collect()
 
 
 def _gen(llm, prompt_ids, transport=None, max_tokens=32):

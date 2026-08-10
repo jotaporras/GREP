@@ -164,6 +164,78 @@ def _load_psi_producer_state(pe_model, state: dict, path: str, gnn_cfg: dict) ->
             "pe_num_layers/num_samples/k_pe) the same shapes as the trained run.")
 
 
+def additive_model_from_config(llm, gnn_cfg: dict, path: str) -> gnn_llm.GraphAugmentedLLM:
+    """Rebuild an additive-family ``GraphAugmentedLLM`` (Ψ tower + weights) around ``llm``.
+
+    Extracted from :func:`graph_augmented_llm_from_pretrained` so the vLLM
+    Ψ producer (``vllm_graph.psi_producer``) rebuilds the SAME tower from the
+    SAME recorded config — ``llm`` there is an embeddings-only shim, here the
+    full base model. Covers ``rpearl_gt_llm`` / ``gt_llm`` and the default
+    R-PEARL branch; mask/WIRE archs are not additive and stay in the caller.
+    """
+    architecture = gnn_cfg.get("architecture", "rpearl_llm")
+    pe_node_features = gnn_cfg.get("pe_node_features", "random")
+    node_feature_dim = (llm.config.get_text_config().hidden_size
+                        if pe_node_features == "word_embeddings" else None)
+
+    if architecture == "rpearl_gt_llm":
+        pe_model = gt_module.GraphTransformer(
+            num_layers=gnn_cfg["gt_num_layers"],
+            pe_hidden_channels=gnn_cfg["pe_hidden_channels"],
+            pe_num_layers=gnn_cfg["pe_num_layers"],
+            d_model=gnn_cfg["d_model"],
+            heads=gnn_cfg["gt_heads"],
+            num_samples=gnn_cfg["num_samples"],
+            dropout=gnn_cfg["dropout"],
+            k_pe=gnn_cfg["k_pe"],
+            k_gt=gnn_cfg["k_gt"],
+            eps=gnn_cfg["eps"],
+            use_layer_norm=gnn_cfg["use_layer_norm"],
+            node_feature_dim=node_feature_dim,
+        )
+        weights_key = "gt_model"
+    elif architecture == "gt_llm":
+        # Pure GT over semantic node features; key 'pe_model' holds the SemanticGraphTransformer.
+        pe_model = gt_module.SemanticGraphTransformer(
+            node_feature_dim=llm.config.get_text_config().hidden_size,
+            d_model=gnn_cfg["d_model"],
+            num_layers=gnn_cfg["gt_num_layers"],
+            heads=gnn_cfg["gt_heads"],
+            dropout=gnn_cfg["dropout"],
+            k_gt=gnn_cfg["k_gt"],
+        )
+        weights_key = "pe_model"
+        pe_node_features = gnn_cfg.get("pe_node_features", "word_embeddings")
+    else:
+        pe_model = r_pearl.RandomGNNPositionalEncodings(
+            pe_hidden_channels=gnn_cfg["pe_hidden_channels"],
+            pe_num_layers=gnn_cfg["pe_num_layers"],
+            d_model=gnn_cfg["d_model"],
+            num_samples=gnn_cfg["num_samples"],
+            dropout=gnn_cfg["dropout"],
+            k=gnn_cfg["k_pe"],
+            eps=gnn_cfg["eps"],
+            use_layer_norm=gnn_cfg["use_layer_norm"],
+            node_feature_dim=node_feature_dim,
+        )
+        weights_key = "pe_model"
+
+    model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=gnn_cfg["d_model"],
+                                      eps=gnn_cfg["eps"],
+                                      pe_gain_init=gnn_cfg.get("pe_gain_init", 1.0),
+                                      disable_graph_token_rope=gnn_cfg.get("disable_graph_token_rope", False),
+                                      use_pe_norm=gnn_cfg.get("use_pe_norm", False),
+                                      pe_node_features=pe_node_features)
+    gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
+    model.pe_model.load_state_dict(gnn_weights[weights_key], strict=False)
+    model.pe_proj.load_state_dict(gnn_weights["pe_proj"])
+    if "pe_gain" in gnn_weights:
+        model.pe_gain.data.copy_(gnn_weights["pe_gain"])
+    if model.pe_norm is not None and "pe_norm" in gnn_weights:
+        model.pe_norm.load_state_dict(gnn_weights["pe_norm"])
+    return model
+
+
 def graph_augmented_llm_from_pretrained(
     path: str,
     load_in_4bit: bool = False,
@@ -219,57 +291,8 @@ def graph_augmented_llm_from_pretrained(
     node_feature_dim = (llm.config.get_text_config().hidden_size
                         if pe_node_features == "word_embeddings" else None)
 
-    if architecture == "rpearl_gt_llm":
-        pe_model = gt_module.GraphTransformer(
-            num_layers=gnn_cfg["gt_num_layers"],
-            pe_hidden_channels=gnn_cfg["pe_hidden_channels"],
-            pe_num_layers=gnn_cfg["pe_num_layers"],
-            d_model=gnn_cfg["d_model"],
-            heads=gnn_cfg["gt_heads"],
-            num_samples=gnn_cfg["num_samples"],
-            dropout=gnn_cfg["dropout"],
-            k_pe=gnn_cfg["k_pe"],
-            k_gt=gnn_cfg["k_gt"],
-            eps=gnn_cfg["eps"],
-            use_layer_norm=gnn_cfg["use_layer_norm"],
-            node_feature_dim=node_feature_dim,
-        )
-        model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=gnn_cfg["d_model"],
-                                          eps=gnn_cfg["eps"],
-                                          pe_gain_init=gnn_cfg.get("pe_gain_init", 1.0),
-                                          disable_graph_token_rope=gnn_cfg.get("disable_graph_token_rope", False),
-                                          use_pe_norm=gnn_cfg.get("use_pe_norm", False),
-                                          pe_node_features=pe_node_features)
-        gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
-        model.pe_model.load_state_dict(gnn_weights["gt_model"], strict=False)
-        model.pe_proj.load_state_dict(gnn_weights["pe_proj"])
-        if "pe_gain" in gnn_weights:
-            model.pe_gain.data.copy_(gnn_weights["pe_gain"])
-        if model.pe_norm is not None and "pe_norm" in gnn_weights:
-            model.pe_norm.load_state_dict(gnn_weights["pe_norm"])
-    elif architecture == "gt_llm":
-        # Pure GT over semantic node features; key 'pe_model' holds the SemanticGraphTransformer.
-        pe_model = gt_module.SemanticGraphTransformer(
-            node_feature_dim=llm.config.get_text_config().hidden_size,
-            d_model=gnn_cfg["d_model"],
-            num_layers=gnn_cfg["gt_num_layers"],
-            heads=gnn_cfg["gt_heads"],
-            dropout=gnn_cfg["dropout"],
-            k_gt=gnn_cfg["k_gt"],
-        )
-        model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=gnn_cfg["d_model"],
-                                          eps=gnn_cfg["eps"],
-                                          pe_gain_init=gnn_cfg.get("pe_gain_init", 1.0),
-                                          disable_graph_token_rope=gnn_cfg.get("disable_graph_token_rope", False),
-                                          use_pe_norm=gnn_cfg.get("use_pe_norm", False),
-                                          pe_node_features=gnn_cfg.get("pe_node_features", "word_embeddings"))
-        gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
-        model.pe_model.load_state_dict(gnn_weights["pe_model"], strict=False)
-        model.pe_proj.load_state_dict(gnn_weights["pe_proj"])
-        if "pe_gain" in gnn_weights:
-            model.pe_gain.data.copy_(gnn_weights["pe_gain"])
-        if model.pe_norm is not None and "pe_norm" in gnn_weights:
-            model.pe_norm.load_state_dict(gnn_weights["pe_norm"])
+    if architecture in ("rpearl_gt_llm", "gt_llm"):
+        model = additive_model_from_config(llm, gnn_cfg, path)
     elif architecture == "wire_llm":
         # WIRE rotary injection: rebuild the Psi producer + the per-layer omega tables.
         # omega is loaded STRICTLY (not regenerated from the seed) so a checkpoint can
@@ -352,30 +375,7 @@ def graph_augmented_llm_from_pretrained(
             f"architecture {architecture!r} was removed from the codebase (legacy "
             "e7/e10 experiments); check out an older commit to reload this checkpoint.")
     else:
-        pe_model = r_pearl.RandomGNNPositionalEncodings(
-            pe_hidden_channels=gnn_cfg["pe_hidden_channels"],
-            pe_num_layers=gnn_cfg["pe_num_layers"],
-            d_model=gnn_cfg["d_model"],
-            num_samples=gnn_cfg["num_samples"],
-            dropout=gnn_cfg["dropout"],
-            k=gnn_cfg["k_pe"],
-            eps=gnn_cfg["eps"],
-            use_layer_norm=gnn_cfg["use_layer_norm"],
-            node_feature_dim=node_feature_dim,
-        )
-        model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=gnn_cfg["d_model"],
-                                          eps=gnn_cfg["eps"],
-                                          pe_gain_init=gnn_cfg.get("pe_gain_init", 1.0),
-                                          disable_graph_token_rope=gnn_cfg.get("disable_graph_token_rope", False),
-                                          use_pe_norm=gnn_cfg.get("use_pe_norm", False),
-                                          pe_node_features=pe_node_features)
-        gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
-        model.pe_model.load_state_dict(gnn_weights["pe_model"], strict=False)
-        model.pe_proj.load_state_dict(gnn_weights["pe_proj"])
-        if "pe_gain" in gnn_weights:
-            model.pe_gain.data.copy_(gnn_weights["pe_gain"])
-        if model.pe_norm is not None and "pe_norm" in gnn_weights:
-            model.pe_norm.load_state_dict(gnn_weights["pe_norm"])
+        model = additive_model_from_config(llm, gnn_cfg, path)
 
     model.eval()
     return model, tokenizer

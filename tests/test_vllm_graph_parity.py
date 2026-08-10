@@ -50,7 +50,12 @@ def base_setup(tmp_path_factory, tokenizer):
     hf_llm = save_fixture_dir(model_dir)
     llm, wrapper = spin_engine(model_dir)
     prompt_ids = tokenizer(PROMPT, add_special_tokens=False)["input_ids"]
-    return hf_llm, llm, wrapper, prompt_ids
+    yield hf_llm, llm, wrapper, prompt_ids
+    # Each CPU engine reserves GiBs of host RAM at startup; a leftover engine
+    # starves the next module's ("Available memory ... less than desired").
+    import gc
+    del llm, wrapper
+    gc.collect()
 
 
 def hf_generate_train_consistent(graph_model, prompt_ids, injection_map, psi_2d,
