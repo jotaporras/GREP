@@ -62,6 +62,12 @@ USE_ICL=${USE_ICL:-true}
 DATA_ICL_EXAMPLES=${DATA_ICL_EXAMPLES:-2}
 echo "  training policy (recorded, not consumed here): data.icl_examples=$DATA_ICL_EXAMPLES"
 
+# Textual edge list in the eval prompt. Edges-arm checkpoints were TRAINED with
+# the edge list present, so evaluating them with none breaks their input
+# contract — pass TEXT_EDGE_LIST=present for those. Default stays none (this
+# script's historical behavior, and the right mode for GT/floor arms).
+TEXT_EDGE_LIST=${TEXT_EDGE_LIST:-none}
+
 # Home dir sits near its quota; keep the HF hub cache (base gemma-4-31B-it
 # weights, loaded 4-bit) on shared vast — downloaded once, reused across jobs.
 export HF_HOME=${HF_HOME:-$ALELAB/hf_cache}
@@ -79,13 +85,14 @@ echo "[$(date --iso-8601=seconds)] e14 no-perm eval (SPINE tools ENABLED)"
 echo "  checkpoint: $CHECKPOINT"
 echo "  graphs:     $GRAPHS"
 echo "  output:     $OUTPUT/"
+echo "  text edges: $TEXT_EDGE_LIST"
 
 srun python -m prism.eval.scalability_evaluation \
     --checkpoint "$CHECKPOINT" \
     --graphs "$GRAPHS" \
     --output "$OUTPUT" \
     --four-bit \
-    --text-edge-list none \
+    --text-edge-list "$TEXT_EDGE_LIST" \
     --use-icl "$USE_ICL"
 
 echo "[$(date --iso-8601=seconds)] e14 no-perm eval (SPINE tools ENABLED) DONE"
