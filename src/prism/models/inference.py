@@ -36,24 +36,9 @@ MAX_NEW_TOKENS = 2048
 SPINE_TOKEN_MULTIPLIER = 4
 
 
-def _core_graph_model(model):
-    """Peel PEFT wrappers to reach the GraphAugmentedLLM / GraphMaskLLM core.
-
-    PEFT-wrapped models fail isinstance checks; unwrapping ensures the correct injection branch runs.
-    LoRA adapters remain live inside the graph model's .llm (PEFT patches it in place).
-    """
-    inner = model
-    for _ in range(5):
-        if isinstance(inner, (GraphAugmentedLLM, GraphMaskLLM, LearnableGraphMaskLLM,
-                              WireGraphLLM)):
-            return inner
-        nxt = getattr(inner, "base_model", None)
-        if nxt is None or nxt is inner:
-            nxt = getattr(inner, "model", None)
-        if nxt is None or nxt is inner:
-            break
-        inner = nxt
-    return inner
+# Moved to gnn_llm (spine-free) so the RL trainer can import it; kept under the
+# historical name for the existing call sites in this module and evaluate.py.
+from prism.models.gnn_llm import core_graph_model as _core_graph_model  # noqa: E402
 
 
 def _identity_rope_kwargs(graph_model, injection_map, seq_len, device) -> dict:

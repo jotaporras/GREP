@@ -1,0 +1,43 @@
+# e16 — GRPO RL training on the GT architecture with graph-conditioned vLLM
+# rollouts (train_rl.py). Inherits every base default; overrides below are the
+# RL-specific surface. The wandb tag is LOCKED as e16_rl_training — never drift.
+defaults:
+  - base_config
+  - _self_
+
+name: e16_rl
+
+wandb:
+  run_name: e16_rl_gt
+  tag: e16_rl_training
+
+trainer:
+  checkpoint_dir: outputs/e16_rl_training
+  learning_rate: 1e-5           # RL steps are far noisier than SFT; start low
+  epochs: 1
+  max_steps: 300                # PoC-sized; betty runs override
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 4
+
+  rl:
+    # SFT run dir to resume the policy from (additive arch). null = from scratch
+    # (base LLM + fresh LoRA + gnn.pe_gt_from navigator carry, as in e14).
+    init_checkpoint: null
+    # Dir (or glob) of data_gen_*.json graph/task files — the RL prompt source.
+    data_files: data/n_30/gen/nav100_n30_gemma_data/split/train_graphs
+    num_generations: 8          # GRPO group size
+    max_completion_length: 2048 # matches eval MAX_NEW_TOKENS (tool-free)
+    temperature: 0.9
+    sync_every: 1               # optimizer steps between engine weight syncs
+    # Shaped-reward composition (see training/rewards.py); raw components are
+    # logged separately regardless.
+    reward_weights:
+      full_path_valid: 1.0
+      edge_validity_rate: 0.3
+      nodes_exist_rate: 0.2
+      cost_optimality: 0.3
+      format_ok: 0.2
+      keyword: 0.5
+    # Free-form GRPOConfig passthrough, merged LAST (mirrors trainer.sft):
+    # any GRPOConfig field is settable here without a schema change.
+    grpo: {}

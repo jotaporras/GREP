@@ -1315,7 +1315,16 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         injection_maps: list[dict[int, list[tuple[int, int]]]] | None = None,
         **kwargs,
     ):
-        embeddings = self._augment_embeddings(input_ids, graphs, injection_maps)
+        if graphs is None and self._pe_signal is not None:
+            # Externally-armed Ψ (the RL loss path, trainers_rl): the caller
+            # built the signal from per-prompt transports and armed it directly;
+            # plain token embeddings, no rebuild. A graphs-less forward with NO
+            # armed signal still fails loud below — this is not a fallback.
+            embeddings = (
+                self.llm.get_input_embeddings()(input_ids).clone().to(input_ids.device)
+            )
+        else:
+            embeddings = self._augment_embeddings(input_ids, graphs, injection_maps)
 
         kwargs.pop("inputs_embeds", None)
         kwargs.pop("input_ids", None)
@@ -2345,6 +2354,28 @@ class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         finally:
             self._wire_signal = None
             self._wire_decode_cos_sin.clear()
+
+
+def core_graph_model(model):
+    """Peel PEFT wrappers to reach the GraphAugmentedLLM / GraphMaskLLM core.
+
+    PEFT-wrapped models fail isinstance checks; unwrapping ensures the correct injection branch runs.
+    LoRA adapters remain live inside the graph model's .llm (PEFT patches it in place).
+    (Moved here from ``inference.py`` — which re-exports it — so spine-free
+    callers like the RL trainer can import it without the SPINE package.)
+    """
+    inner = model
+    for _ in range(5):
+        if isinstance(inner, (GraphAugmentedLLM, GraphMaskLLM, LearnableGraphMaskLLM,
+                              WireGraphLLM)):
+            return inner
+        nxt = getattr(inner, "base_model", None)
+        if nxt is None or nxt is inner:
+            nxt = getattr(inner, "model", None)
+        if nxt is None or nxt is inner:
+            break
+        inner = nxt
+    return inner
 
 
 def find_last_graph_scope(input_ids_b, tokenizer) -> int:

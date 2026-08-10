@@ -74,6 +74,6 @@ def spin_engine(model_dir, *, identity_rope=False, pe_inject_value=True):
         pe_inject_value=pe_inject_value,
         dtype="float32",
         max_model_len=512,
-        gpu_memory_utilization=0.2,  # CPU backend: fraction of RAM to reserve
+        gpu_memory_utilization=0.15,  # CPU backend: fraction of RAM to reserve
         max_num_seqs=8,              # keep the profiling pass tiny
     )
