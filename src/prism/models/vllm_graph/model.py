@@ -45,7 +45,22 @@ GRAPH_ARCH_NAME = "GraphGemma4ForCausalLM"
     dummy_inputs=GraphDummyInputsBuilder,
 )
 class GraphGemma4ForCausalLM(nn.Module, SupportsMultiModal):
-    hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"": "language_model."})
+    # Composes the stock class's HF-repo mapping (google/gemma-4-* repos nest
+    # text weights under ``model.language_model.``; the stock mapper folds that
+    # to ``model.``) with this wrapper's ``language_model.`` nesting. Rules
+    # apply SEQUENTIALLY to the mutated key, so no ``""`` catch-all: after rule
+    # 1 rewrites, the key no longer startswith ``model.`` and rule 2 is inert.
+    # The bitsandbytes loader keys its quantization targets off THIS mapper
+    # (loader-side bookkeeping), so it must produce final names on its own —
+    # merely composing with the inner class's load-time mapping is not enough.
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_substr=dict(_StockGemma4.hf_to_vllm_mapper.orig_to_new_substr),
+        orig_to_new_prefix={
+            "model.language_model.": "language_model.model.",  # HF hub layout
+            "model.": "language_model.model.",  # merged/fixture layout
+            "lm_head.": "language_model.lm_head.",
+        },
+    )
     # The bitsandbytes loader (and LoRA) resolve fused-projection layout from
     # the top-level model class — mirror the wrapped stock class exactly.
     packed_modules_mapping = _StockGemma4.packed_modules_mapping
