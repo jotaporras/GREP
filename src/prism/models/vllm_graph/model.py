@@ -20,7 +20,7 @@ from torch import nn
 from vllm import ModelRegistry
 from vllm.config import VllmConfig
 from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM as _StockGemma4
-from vllm.model_executor.models.interfaces import SupportsMultiModal
+from vllm.model_executor.models.interfaces import SupportsLoRA, SupportsMultiModal
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -44,7 +44,7 @@ GRAPH_ARCH_NAME = "GraphGemma4ForCausalLM"
     info=GraphProcessingInfo,
     dummy_inputs=GraphDummyInputsBuilder,
 )
-class GraphGemma4ForCausalLM(nn.Module, SupportsMultiModal):
+class GraphGemma4ForCausalLM(nn.Module, SupportsMultiModal, SupportsLoRA):
     # Composes the stock class's HF-repo mapping (google/gemma-4-* repos nest
     # text weights under ``model.language_model.``; the stock mapper folds that
     # to ``model.``) with this wrapper's ``language_model.`` nesting. Rules
