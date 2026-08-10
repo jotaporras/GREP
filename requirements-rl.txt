@@ -1,0 +1,38 @@
+# e16 RL / vLLM rollout environment (GREP-PRISM-rl). Deviates from
+# requirements.txt on the torch family: vllm 0.26 hard-requires torch 2.11,
+# while the SFT env pins <2.11 — keep the two envs separate.
+#
+# CUDA variant matters. The PyPI vllm 0.26.0 wheel is a cu130 build; on hosts
+# whose driver tops out at CUDA 12.x (plaza A6000s: 12.8, betty: check
+# nvidia-smi) install the +cu129 release asset instead — CUDA 12 minor-version
+# compatibility covers it:
+#   uv pip install "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.26.0/vllm-0.26.0+cu129-cp38-abi3-manylinux_2_28_x86_64.whl" --no-deps
+# and take torch/torchvision/torchaudio from the matching cu index:
+#   uv pip install --index-url https://download.pytorch.org/whl/cu128 \
+#     "torch==2.11.0+cu128" "torchvision==0.26.0+cu128" "torchaudio==2.11.0+cu128"
+torch>=2.11.0,<2.12.0
+torchvision>=0.26.0,<0.27.0
+torch-geometric>=2.7.0
+vllm>=0.26.0,<0.27.0
+# transformers 5.15 introduced per-layer-config strictness
+# (AmbiguousGlobalPerLayerAttributeError) that breaks vllm 0.26's global
+# config.num_key_value_heads read on Gemma-4. Cap until vllm catches up.
+transformers>=5.12,<5.15
+peft>=0.18.0,<0.19.0
+trl>=0.27.0,<0.28.0
+datasets
+accelerate
+safetensors
+sentencepiece
+tokenizers
+numpy
+matplotlib
+tqdm
+wandb
+openai
+bitsandbytes
+tiktoken
+scipy
+dotenv
+hydra-core
+omegaconf
