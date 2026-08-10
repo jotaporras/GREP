@@ -1,0 +1,115 @@
+"""Engine construction for graph-conditioned vLLM rollouts and eval.
+
+``build_graph_llm`` spins up a ``vllm.LLM`` serving the wrapper model
+(:mod:`prism.models.vllm_graph.model`) with the engine constraints the Ψ
+transport requires:
+
+- ``enforce_eager=True`` — the attention patch is Python state; CUDA graphs /
+  torch.compile would capture stale Ψ.
+- ``enable_prefix_caching=False`` — Ψ varies per request but is invisible to
+  the prefix-cache key, so cached prefixes would silently reuse another
+  request's injected state.
+- ``enable_mm_embeds=True`` — the transport is a precomputed tensor, not media.
+- ``VLLM_ENABLE_V1_MULTIPROCESSING=0`` — runtime model registration must be
+  visible to the model runner (single-process engine).
+
+Engine sizing knobs follow the ``PRISM_VLLM_*`` env convention from
+``prism.data.vllm_llm._engine_config``.
+"""
+from __future__ import annotations
+
+import json
+import os
+
+import torch
+
+# Archs whose graph channel is the additive Ψ path (GraphAugmentedLLM family).
+# Mask archs (graph_mask_llm / learnable_graph_mask) inject decode-time mask
+# rows (MaskDecodeInjector) that have no vLLM analog — HF backend only.
+ADDITIVE_ARCHS = {"gt_llm", "rpearl_gt_llm", "rpearl_llm"}
+
+
+def _engine_env(name: str, default, cast):
+    raw = os.environ.get(name)
+    return default if raw is None else cast(raw)
+
+
+def build_graph_llm(
+    model_path: str,
+    *,
+    identity_rope: bool = False,
+    pe_inject_value: bool = True,
+    dtype: str = "auto",
+    max_model_len: int | None = None,
+    gpu_memory_utilization: float | None = None,
+    seed: int = 0,
+    **extra_engine_kwargs,
+):
+    """Construct the graph-conditioned engine over HF-format weights at ``model_path``.
+
+    ``model_path`` must hold full model weights (base model, or an SFT
+    checkpoint whose LoRA has been merged at bf16 — never merge into nf4, see
+    ``loaders.graph_augmented_llm_from_pretrained``). Returns ``(llm, wrapper)``
+    where ``wrapper`` is the in-process model instance carrying the ``dbg``
+    counters.
+    """
+    os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+
+    from vllm import LLM
+
+    from prism.models.vllm_graph.model import GRAPH_ARCH_NAME, register_graph_gemma4
+
+    register_graph_gemma4()
+    llm = LLM(
+        model=model_path,
+        hf_overrides={"architectures": [GRAPH_ARCH_NAME]},
+        dtype=dtype,
+        enforce_eager=True,
+        enable_mm_embeds=True,
+        enable_prefix_caching=False,
+        disable_log_stats=True,
+        seed=seed,
+        max_model_len=_engine_env("PRISM_VLLM_MAX_LEN", max_model_len or 16384, int),
+        gpu_memory_utilization=_engine_env(
+            "PRISM_VLLM_GPU_UTIL", gpu_memory_utilization or 0.90, float),
+        **extra_engine_kwargs,
+    )
+    wrapper = llm.llm_engine.model_executor.driver_worker.worker.model_runner.model
+    wrapper._identity_rope = identity_rope
+    wrapper._pe_inject_value = pe_inject_value
+    return llm, wrapper
+
+
+def checkpoint_engine_policy(checkpoint_dir: str) -> dict:
+    """Engine policy read from a run dir's ``train_config.json`` — fails loud.
+
+    Returns ``{"identity_rope": bool, "pe_inject_value": bool, "base_model": str,
+    "architecture": str}`` after asserting the arch is in the additive family.
+    """
+    with open(os.path.join(checkpoint_dir, "train_config.json")) as f:
+        cfg = json.load(f)
+    arch = cfg.get("architecture") or cfg.get("gnn", {}).get("arch")
+    if arch not in ADDITIVE_ARCHS:
+        raise ValueError(
+            f"architecture {arch!r} is not vLLM-servable: only the additive Ψ family "
+            f"{sorted(ADDITIVE_ARCHS)} is supported (mask archs need the HF backend — "
+            "their decode-time MaskDecodeInjector has no vLLM analog)."
+        )
+    gnn = cfg.get("gnn", {})
+    return {
+        "identity_rope": bool(cfg.get("disable_graph_token_rope",
+                                      gnn.get("disable_graph_token_rope", False))),
+        "pe_inject_value": bool(gnn.get("pe_inject_value", True)),
+        "base_model": cfg.get("base_model"),
+        "architecture": arch,
+    }
+
+
+def generate_with_psi(llm, prompt_ids: list[int], psi_transport: torch.Tensor,
+                      sampling_params):
+    """One graph-conditioned generation. ``psi_transport`` is [seq, hidden+1]."""
+    req = {
+        "prompt_token_ids": prompt_ids,
+        "multi_modal_data": {"image": {"graph_embeds": psi_transport.unsqueeze(0)}},
+    }
+    return llm.generate([req], sampling_params)[0]
