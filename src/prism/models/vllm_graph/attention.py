@@ -31,8 +31,6 @@ computation.
 """
 from __future__ import annotations
 
-import torch.nn.functional as F
-
 
 def install_psi_injection(wrapper) -> None:
     """Replace each ``Gemma4Attention.forward`` with the Ψ-aware equivalent.
@@ -45,10 +43,10 @@ def install_psi_injection(wrapper) -> None:
     layers = wrapper.language_model.model.layers
     for layer in layers:
         attn = layer.self_attn
-        # Ψ=0 at non-graph tokens, so W·Ψ=0 only if the projection is bias-free
-        # (same contract as GraphAugmentedLLM._install_pe_injection). F.linear
-        # below is weight-only, but a biased base model would still mean the HF
-        # and vLLM models disagree — fail loud instead of silently diverging.
+        # Ψ=0 at non-graph tokens, so proj(Ψ)=0 only if the projection is
+        # bias-free (same contract as GraphAugmentedLLM._install_pe_injection);
+        # a biased base model would mean the HF and vLLM models disagree —
+        # fail loud instead of silently diverging.
         if attn.qkv_proj.bias is not None:
             raise ValueError(
                 f"{type(attn).__name__}.qkv_proj has a bias; prism Ψ-injection assumes "
@@ -80,8 +78,12 @@ def _make_forward(wrapper, attn):
         pos = positions
         if inject:
             wrapper.dbg["attn_hit"] += 1
-            w = attn.qkv_proj.weight
-            qkv_psi = F.linear(psi.to(dtype=w.dtype, device=w.device), w)
+            # Through the MODULE, not F.linear on .weight: under bnb the raw
+            # weight is a packed uint8 blob, and under a LoRARequest the module
+            # carries the adapter — both mirror the HF path, where Ψ passes the
+            # (PEFT-adapted, quant-aware) q/k/v projections themselves.
+            qkv_psi, _ = attn.qkv_proj(
+                psi.to(dtype=hidden_states.dtype, device=hidden_states.device))
             q_psi, k_psi, v_psi = qkv_psi.split(
                 [attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
             if wrapper._identity_rope:
