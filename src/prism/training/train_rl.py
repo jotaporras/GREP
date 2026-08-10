@@ -100,7 +100,7 @@ def train_rl(config: omegaconf.DictConfig) -> None:
     # Free-form engine passthrough (mirrors trainer.rl.grpo): any vLLM engine
     # kwarg is CLI-settable — e.g. quantization=bitsandbytes +
     # load_format=bitsandbytes for in-flight nf4 on 48 GB cards.
-    engine_kwargs = omegaconf.OmegaConf.to_container(rl_cfg.get("engine") or {})
+    engine_kwargs = _freeform(rl_cfg.get("engine"))
     rollout_llm, rollout_wrapper = vg_engine.build_graph_llm(
         serving,
         identity_rope=policy["identity_rope"],
@@ -137,7 +137,7 @@ def train_rl(config: omegaconf.DictConfig) -> None:
     )
     # Free-form passthrough merged LAST (mirrors trainer.sft): any GRPOConfig
     # field is CLI-settable without a schema change.
-    grpo_kwargs.update(omegaconf.OmegaConf.to_container(rl_cfg.get("grpo") or {}))
+    grpo_kwargs.update(_freeform(rl_cfg.get("grpo")))
     args = GRPOConfig(**grpo_kwargs)
 
     trainer = GraphGRPOTrainer(
@@ -156,6 +156,15 @@ def train_rl(config: omegaconf.DictConfig) -> None:
     trainer.save_model(output_dir)
     tokenizer.save_pretrained(output_dir)
     print(f"[train_rl] saved: {output_dir}")
+
+
+def _freeform(v) -> dict:
+    """Free-form config dict → plain dict (an EMPTY DictConfig is falsy, so
+    ``v or {}`` would hand ``to_container`` a plain dict and raise)."""
+    if v is None:
+        return {}
+    return omegaconf.OmegaConf.to_container(v) if isinstance(
+        v, omegaconf.DictConfig) else dict(v)
 
 
 def _gnn_config_from_checkpoint(path: str) -> dict:
