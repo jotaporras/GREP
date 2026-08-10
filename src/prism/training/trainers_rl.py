@@ -29,9 +29,7 @@ per-prompt Ψ cache and LoRA-only sync; unfreezing is v2), ``beta`` must be 0
 from __future__ import annotations
 
 import os
-import re
 import tempfile
-from ast import literal_eval
 
 import torch
 
@@ -78,6 +76,14 @@ class GraphGRPOTrainer(GRPOTrainer):
         self.sync_every = sync_every
         self._core = core
         self._edge_weights = gnn_config.get("edge_weights", "binary")
+        # Ψ source per prompt: the dataset's scene_graph_dict, keyed by the
+        # VERBATIM prompt text (prompts are deterministic and unique per
+        # (graph, task)). Parsing the graph back out of the prompt is not a
+        # fallback — edgeless templates never serialize it.
+        self._scene_by_prompt = {
+            row["prompt"]: row["scene_graph_dict"]
+            for row in self.train_dataset
+        }
         self._transport_cache: dict[str, tuple] = {}
         self._batch_transports: list[torch.Tensor] | None = None
         self._last_synced_step = -1
@@ -96,14 +102,15 @@ class GraphGRPOTrainer(GRPOTrainer):
             return hit
         prompt_ids = self.processing_class(
             prompt, add_special_tokens=False)["input_ids"]
-        matches = re.findall(r"[Ss]cene graph: ?(.*})", prompt, re.DOTALL)
-        if not matches:
+        scene = self._scene_by_prompt.get(prompt)
+        if scene is None:
             raise ValueError(
-                "RL prompt carries no parseable scene graph — Ψ cannot be built. "
-                "rl_dataset embeds 'Scene graph:{...}' in every prompt; a prompt "
-                "without one is a data bug, not a fallback case.")
+                "rollout prompt not found in the RL dataset — Ψ is built from "
+                "the dataset's scene_graph_dict, so prompts must reach the "
+                "engine verbatim. A miss is a data/collation bug, not a "
+                "fallback case.")
         pyg_graph = data_utils.scene_graph_dict_to_pyg(
-            literal_eval(matches[-1]), edge_weights=self._edge_weights)
+            scene, edge_weights=self._edge_weights)
         transport, _ = build_psi_transport(
             self._core, self.processing_class, prompt_ids, pyg_graph)
         self._transport_cache[prompt] = (prompt_ids, transport)
