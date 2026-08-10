@@ -110,9 +110,13 @@ tasks split the arms completely: edges ~13–14/14, GT 1–5/14.
 Post-hoc 6-epoch extension: GT keeps climbing past the 3-epoch cutoff and
 plateaus at ~0.56 (epochs 5 = 6 exactly), narrowing the edges gap to
 ~1.7× — see the follow-up section. Post-hoc SPINE (tools-enabled) eval: the
-ordering and the widening survive tool access (edges 96.4% vs GT 47.6% here,
-against 98.6% vs 71.4% at n30), and it exposes a GT-specific keyword-formatting
-defect plus a graph-size-independent OOM signature.**
+same ordering holds (edges 96.4% vs GT 47.6% here, against 98.6% vs 71.4% at
+n30), but a rollout audit shows those runs are effectively SINGLE-SHOT
+(307/308 samples used one planner call; the tool calls returned nothing), so
+they are a prompt-format ablation and say nothing about interactive planning.
+They do expose a GT-specific output-contract defect (missing keywords, and
+`goto` emitted on only 17/82 samples at n60 vs 100% for edges) plus a
+graph-size-independent OOM signature.**
 
 ### Headline (84 samples = 7 frozen graphs × 12 tasks)
 
