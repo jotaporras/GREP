@@ -227,6 +227,19 @@ class GraphGRPOTrainer(GRPOTrainer):
                 if outs_ents and outs_ents[0] is not None else None)
         return logps, ents
 
+    def compute_loss(self, model, inputs, return_outputs=False,
+                     num_items_in_batch=None):
+        """On split-GPU hosts the policy lives on ``policy_device`` while
+        accelerate keeps ``args.device`` at cuda:0 (the engine's GPU);
+        transformers 5.14 asserts the loss lands on ``args.device``. Moving the
+        scalar is free — autograd follows it back across devices."""
+        out = super().compute_loss(model, inputs, return_outputs=return_outputs,
+                                   num_items_in_batch=num_items_in_batch)
+        if return_outputs:
+            loss, extras = out
+            return loss.to(self.args.device), extras
+        return out.to(self.args.device)
+
     # ---------------------------------------------------------- weight sync
 
     def _sync_policy_to_engine(self) -> None:
