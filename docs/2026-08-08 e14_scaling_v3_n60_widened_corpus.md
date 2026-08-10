@@ -1,7 +1,7 @@
 ---
 experiment: e14 v3 — n60 widened corpus (2x graphs + long-hop tasks)
 date: 2026-08-08
-status: complete (2 training runs + round-trip checks + train/test probe 2x2 + 6-epoch GT extension done)
+status: complete (2 training runs + round-trip checks + train/test probe 2x2 + 6-epoch GT extension + SPINE tools-enabled eval done)
 wandb_tag: e14_scaling
 ---
 
@@ -101,7 +101,10 @@ at ~2.4×: the data lever works and does not close the gap. The long-hop
 tasks split the arms completely: edges ~13–14/14, GT 1–5/14.
 Post-hoc 6-epoch extension: GT keeps climbing past the 3-epoch cutoff and
 plateaus at ~0.56 (epochs 5 = 6 exactly), narrowing the edges gap to
-~1.7× — see the follow-up section.**
+~1.7× — see the follow-up section. Post-hoc SPINE (tools-enabled) eval: the
+ordering and the widening survive tool access (edges 96.4% vs GT 47.6% here,
+against 98.6% vs 71.4% at n30), and it exposes a GT-specific keyword-formatting
+defect plus a graph-size-independent OOM signature.**
 
 ### Headline (84 samples = 7 frozen graphs × 12 tasks)
 
@@ -246,6 +249,59 @@ remains far ahead.
 
 Checkpoint: `outputs/e14_stage1to3/e14v3_n60_gt_6ep_n6dz4zlq` (2.2 GB,
 `gnn_weights.pt` present, `checkpoint-1872` = 6 × 312 steps).
+
+### SPINE tools-enabled eval (added 2026-08-10)
+
+Everything above was measured with SPINE tool-calling **disabled**
+(`PRISM_DISABLE_SPINE_TOOLS=1`) — the model writes a route directly, nothing
+executes. These runs are the tools-**enabled** counterpart
+(`scripts/e14_transferability_spine.sbatch`): the model may call the SPINE API
+actions against a live simulator while planning. Same checkpoints, same 7
+frozen v3 test graphs, same scoring. The n30 v2 arms were run in the same
+batch — see section 6 of the
+[v2 doc](2026-08-07%20e14_scaling_v2_results.md).
+
+| job | arm | run | Acc(obj) | correct | eval errors | formatted | keyword |
+|---|---|---|---|---|---|---|---|
+| 7475037 | edges | 7439955 [zqvzaab6](https://wandb.ai/alelab/GREP-PRISM/runs/zqvzaab6) | **96.4%** | 81/84 | 0 | 84/84 | 84/84 |
+| 7475039 | GT 6-epoch | 7464551 [n6dz4zlq](https://wandb.ai/alelab/GREP-PRISM/runs/n6dz4zlq) | **47.6%** | 40/84 | 2 | 82/84 | 61/84 |
+
+Both COMPLETED 0:0; outputs under
+`$PROJ/outputs/e14_transferability/<run>_spine/`.
+
+**Reading.**
+
+- **Tools do not rescue the graph channel.** The edges arm holds its ceiling
+  (0.952 → 96.4%, +1.2 points) while the GT arm drops from its 0.560 plateau
+  to 47.6% (−8.4 points). At n30 the same comparison was flat-to-positive for
+  both arms, so this is the first sign that tool mode costs the graph channel
+  something specifically at n60.
+- **The gap widens with scale under tools, exactly as it does without them:**
+  27 points at n30 (98.6 vs 71.4), **49 points at n60** (96.4 vs 47.6). The
+  tools-off numbers show the same ordering and the same widening, so tool
+  access is not a confound in the campaign's central result.
+- **The keyword defect is worse at n60**: 61/84 for GT (27% of samples fail to
+  emit the expected keyword) against a perfect 84/84 for edges. Combined with
+  n30's 62/70, this is a consistent, size-scaling failure of the graph-channel
+  arm to produce well-formed tool-mode output — a defect separate from
+  routing accuracy, and plausibly a bigger lever on the score than the crashes.
+- **Crash handicap**: 2 OOM-crashed samples scored incorrect ⇒ adjusted
+  40/82 = **48.8%**; honest range 47.6–48.8%. Neither adjustment changes the
+  picture.
+
+**The eval OOMs are localised to the graph channel, and they are not a
+sequence-length problem.** Across the four-job batch the split is perfect —
+0 crashes on both edges arms, 2 on each GT arm — and the confound runs
+*backwards*: the edges arms carry the **longer** prompts (+800–930 tokens at
+n30, +1650–1990 at n60, the edge list itself) yet never fail. The failing
+allocations sit in a **62–70 GiB band regardless of graph size** (n30 GT:
+64.20 / 68.04 GiB; n60 GT: 62.33 / 70.37 GiB), with fragmentation flat at
+133–182 MiB. A tensor whose size barely moves when the graph doubles is a
+fixed-shape *padded* buffer in the injection/attention path, not something
+scaling with the input — so the lever is that padding/max dimension (or
+chunking that one attention computation), **not** the generic eval-side
+sequence-length cap considered earlier. Both failures were near-misses (short
+by 5.6 GiB and 0.81 GiB), so a modest reduction would likely eliminate them.
 
 ### Bookkeeping
 
