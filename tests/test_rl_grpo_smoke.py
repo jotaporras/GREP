@@ -86,8 +86,10 @@ def test_grpo_two_steps(tmp_path):
     tokenizer = load_tokenizer()
     graph_model = build_hf_graph_model(hf_llm).train()
     # The trainer syncs the policy as a LoRARequest — engine must accept it.
+    # max_lora_rank must be one of vLLM's allowed sizes (8 is the floor that
+    # covers the r=4 adapter).
     rollout_llm, wrapper = spin_engine(model_dir, enable_lora=True,
-                                       max_lora_rank=4)
+                                       max_lora_rank=8)
 
     args = GRPOConfig(
         output_dir=str(tmp_path / "out"),
