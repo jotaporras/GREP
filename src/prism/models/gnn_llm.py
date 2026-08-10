@@ -1313,8 +1313,14 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         labels: torch.Tensor | None = None,
         graphs: Batch | None = None,
         injection_maps: list[dict[int, list[tuple[int, int]]]] | None = None,
+        logits_to_keep: int | torch.Tensor | None = None,
         **kwargs,
     ):
+        # ``logits_to_keep`` is EXPLICIT (not folded into **kwargs) because trl
+        # inspects the forward signature and silently drops the arg when it
+        # isn't named — full-vocab full-sequence logits OOM a 262k-vocab model.
+        if logits_to_keep is not None:
+            kwargs["logits_to_keep"] = logits_to_keep
         if graphs is None and self._pe_signal is not None:
             # Externally-armed Ψ (the RL loss path, trainers_rl): the caller
             # built the signal from per-prompt transports and armed it directly;
