@@ -19,6 +19,7 @@ from torch import nn
 
 from vllm import ModelRegistry
 from vllm.config import VllmConfig
+from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM as _StockGemma4
 from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -45,6 +46,9 @@ GRAPH_ARCH_NAME = "GraphGemma4ForCausalLM"
 )
 class GraphGemma4ForCausalLM(nn.Module, SupportsMultiModal):
     hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"": "language_model."})
+    # The bitsandbytes loader (and LoRA) resolve fused-projection layout from
+    # the top-level model class — mirror the wrapped stock class exactly.
+    packed_modules_mapping = _StockGemma4.packed_modules_mapping
 
     @classmethod
     def get_placeholder_str(cls, modality, i):

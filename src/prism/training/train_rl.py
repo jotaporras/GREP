@@ -92,10 +92,15 @@ def train_rl(config: omegaconf.DictConfig) -> None:
     # the process) — the plaza two-GPU topology is settled at PoC time.
     serving = (vg_engine.materialize_serving_dir(init_checkpoint, is_gnn=True)
                if init_checkpoint else config.model.path)
+    # Free-form engine passthrough (mirrors trainer.rl.grpo): any vLLM engine
+    # kwarg is CLI-settable — e.g. quantization=bitsandbytes +
+    # load_format=bitsandbytes for in-flight nf4 on 48 GB cards.
+    engine_kwargs = omegaconf.OmegaConf.to_container(rl_cfg.get("engine") or {})
     rollout_llm, rollout_wrapper = vg_engine.build_graph_llm(
         serving,
         identity_rope=policy["identity_rope"],
-        pe_inject_value=policy["pe_inject_value"])
+        pe_inject_value=policy["pe_inject_value"],
+        **engine_kwargs)
 
     core = inference._core_graph_model(model)
     include_edges = gnn_config.get("text_edge_list") == "present"
