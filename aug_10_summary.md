@@ -226,9 +226,26 @@ verified from the output JSONs that each arm ran under its correct condition.
 | 7475037 | n60 edges baseline (zqvzaab6) | **96.4%** (81/84) | 0 | 84/84 | 84/84 |
 | 7475039 | n60 GT 6-epoch (n6dz4zlq) | **47.6%** (40/84) | 2 | 82/84 | 61/84 |
 
+**IMPORTANT — audit finding (added after the first version of this summary):
+these runs are effectively SINGLE-SHOT and did not test interactive planning.**
+The rollout JSONs were pulled to `results/e14_spine_2026-08-10/` and inspected:
+**307 of 308 samples used exactly one planner call.** The models emit
+`[goto(X), answer(route)]` as a single response — the answer is written before
+any tool result exists — and `goto` is a pure location update that reveals
+nothing by design (only `map_region` / `explore_region` / `inspect` return
+information). So the executed call returns no updates, the planning loop
+terminates on the `answer` in that same response, and the graded output is one
+greedy generation, exactly as in the tools-off eval. Exactly one sample in the
+batch (n30 edges, `data_gen_011` idx 4) called `inspect`, got real feedback,
+and produced a genuine second turn. Treat this batch as a **prompt-format
+ablation** (does adding the SPINE tool documentation change accuracy?), not as
+evidence about whether tool use would help the graph channel. The likely reason
+the models never explore: the prompt already contains the complete scene graph,
+so there is nothing to discover.
+
 How to read this:
 
-- **Tools are roughly neutral.** Each arm lands near its own tools-off number
+- **The tool-documented prompt is close to free.** Each arm lands near its own tools-off number
   (n30 edges 0.986→98.6%, n60 edges 0.952→96.4%, n30 GT 0.700→71.4%,
   n60 GT 0.560→47.6%). Tools neither rescue the graph channel nor break the
   baselines. The n60 GT drop (~8 points) is the largest movement.

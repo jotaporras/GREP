@@ -276,15 +276,37 @@ checkpoints — results in the v3 doc.)
 Both COMPLETED 0:0. Outputs under
 `$PROJ/outputs/e14_transferability/<run>_spine/` (7 per-graph JSONs each).
 
-**Reading.**
+> [!warning] What this actually measured — read before quoting these numbers
+> **These runs are effectively single-shot; the environment was never
+> meaningfully consulted.** Rollout audit over the whole 4-job batch (308
+> samples, JSONs pulled to `results/e14_spine_2026-08-10/`): **307 of 308
+> samples used exactly ONE planner call.** The models emit
+> `[goto(X), answer(route)]` as a *single* response — the answer is written
+> before any tool result exists — and `GraphSim.take_action` treats `goto` as a
+> pure location update that reveals nothing (only `map_region`,
+> `explore_region` and `inspect` return information, `graph_sim.py:135-155`).
+> So the executed tool call returns no updates, the loop terminates on the
+> `answer` in that same response (`planning_sim.py:101-113`), and the graded
+> output is one greedy generation — exactly as in the tools-off eval.
+> Exactly **one** sample in the batch (n30 edges, `data_gen_011` idx 4) called
+> `inspect`, received real feedback (`update_robot_location(greenhouse_1)`,
+> `seed_pod_1: damaged`) and produced a genuine second turn.
+>
+> Therefore this batch is a **prompt-format ablation** — does adding the SPINE
+> tool documentation to the prompt move accuracy? — and **not** a test of
+> interactive planning. Any claim about whether tool *use* would help the graph
+> channel is unsupported by these runs. The likely reason the models never
+> explore: the eval prompt already contains the complete scene graph, so there
+> is nothing to discover; tools can only pay off on partial maps.
 
-- **Tools are essentially neutral at n30.** Each arm lands within ~1.5 points
-  of its own tools-off number (edges 0.986 → 0.986; GT 0.700 → 0.714). Turning
-  the tool loop on neither rescues the graph channel nor destabilises the
-  text-edges baseline, so the two prompt regimes can be read as one story.
-- **The edges-over-GT gap survives tools**: 27 points here, against 28.6
-  without tools. Nothing about tool access substitutes for having the edge
-  list in the prompt.
+**Reading (as a prompt-format ablation).**
+
+- **Adding the tool documentation to the prompt costs nothing at n30.** Each
+  arm lands within ~1.5 points of its own tools-off number (edges 0.986 →
+  0.986; GT 0.700 → 0.714). The longer, tool-documented prompt does not
+  destabilise either arm — which is a real (if narrow) robustness result.
+- **The edges-over-GT gap is unchanged**: 27 points here, 28.6 without tools.
+  Consistent with the two conditions eliciting near-identical behaviour.
 - **The GT arm has a separate output-quality defect.** Its keyword rate is
   62/70 while edges is a perfect 70/70 — roughly 11% of GT samples fail to
   emit the expected answer keyword at all. That is distinct from its 2 eval
