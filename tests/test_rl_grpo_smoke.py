@@ -129,6 +129,26 @@ def test_grpo_two_steps(tmp_path):
     assert trainer._lora_request is not None, "policy LoRA never synced to engine"
     assert trainer._lora_version >= 1
 
+    # v2: the Ψ tower must TRAIN. Random-init rewards are ~constant so the
+    # 2-step loss can be ~0 — assert the gradient PATH instead of weight
+    # movement: requires_grad on, tower in the optimizer, and the loss-side
+    # live Ψ rebuild backpropagates into the tower.
+    structural = trainer._core.structural_parameters()
+    assert structural and all(p.requires_grad for p in structural), \
+        "Ψ tower frozen — v2 requires unfrozen PE weights"
+    opt_params = {id(p) for g in trainer.optimizer.param_groups for p in g["params"]}
+    assert all(id(p) in opt_params for p in structural), \
+        "Ψ tower params missing from the optimizer"
+    row = _dataset()[0]
+    entry = trainer._transport_for_prompt(row["prompt"])
+    ids = torch.tensor([entry[0]])
+    live_psi = trainer._live_psi_for_rows(ids, torch.ones_like(ids), [entry])
+    trainer.optimizer.zero_grad(set_to_none=True)
+    live_psi.sum().backward()
+    grads = [p.grad for p in structural if p.grad is not None]
+    assert grads and any(g.abs().sum() > 0 for g in grads), \
+        "loss-side Ψ does not backpropagate into the tower"
+
     out = tmp_path / "run_dir"
     trainer.save_model(str(out))
     cfg = loaders.load_gnn_config(str(out))

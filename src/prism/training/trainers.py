@@ -103,6 +103,61 @@ GraphTokenAccuracyMixin = evaluate.GraphTokenAccuracyMixin
 from prism.training.run_dir import save_run_dir  # noqa: F401 — shared run-dir contract
 
 
+def create_two_group_optimizer(trainer, structural):
+    """Two learning-rate groups on ``trainer``: ``structural`` params at
+    ``structural_lr_mult`` × base LR, everything else trainable at base LR.
+
+    Shared by the SFT and GRPO trainers (each passes its own model's
+    ``structural_parameters()`` — the GRPO trainer's policy is PEFT-wrapped, so
+    it resolves them on the unwrapped core). Returns ``None`` when the stock
+    optimizer applies (multiplier 1.0, parameter-free arch, or an optimizer
+    already exists), so callers fall through to ``super().create_optimizer()``.
+    """
+    mult = float(trainer.gnn_config.get("structural_lr_mult", 1.0))
+    opt_model = trainer.model
+    if trainer.optimizer is not None or mult == 1.0 or not structural:
+        return None
+
+    structural_ids = {id(p) for p in structural}
+
+    decay_names = set(trainer.get_decay_parameter_names(opt_model))
+    base_lr = trainer.args.learning_rate
+    groups = []
+    # Structural at boosted LR, LLM/LoRA at base LR; each split into decay / no-decay.
+    for is_struct, lr in ((True, base_lr * mult), (False, base_lr)):
+        named = [
+            (n, p)
+            for n, p in opt_model.named_parameters()
+            if p.requires_grad and (id(p) in structural_ids) == is_struct
+        ]
+        decay = [p for n, p in named if n in decay_names]
+        no_decay = [p for n, p in named if n not in decay_names]
+        if decay:
+            groups.append(
+                {"params": decay, "lr": lr, "weight_decay": trainer.args.weight_decay}
+            )
+        if no_decay:
+            groups.append({"params": no_decay, "lr": lr, "weight_decay": 0.0})
+
+    try:
+        optimizer_cls, optimizer_kwargs = trainer.get_optimizer_cls_and_kwargs(
+            trainer.args, opt_model
+        )
+    except TypeError:
+        optimizer_cls, optimizer_kwargs = trainer.get_optimizer_cls_and_kwargs(
+            trainer.args
+        )
+    optimizer_kwargs.pop("params", None)
+    optimizer_kwargs.pop("lr", None)
+    trainer.optimizer = optimizer_cls(groups, lr=base_lr, **optimizer_kwargs)
+    n_struct = sum(p.numel() for p in structural if p.requires_grad)
+    print(
+        f"[train] structural LR group: {mult}x base = {base_lr * mult:.2e} "
+        f"({n_struct / 1e6:.2f}M params); LLM/LoRA at base LR {base_lr:.2e}"
+    )
+    return trainer.optimizer
+
+
 class GraphSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
     def __init__(
         self,
@@ -155,51 +210,8 @@ class GraphSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
         ``structural_lr_mult`` × base LR; LLM/LoRA at base LR. Falls back to the
         stock optimizer when the multiplier is 1.0.
         """
-        mult = float(self.gnn_config.get("structural_lr_mult", 1.0))
-        opt_model = self.model
-        structural = self.model.structural_parameters()
-        # No multiplier, or a parameter-free arch (empty structural set) → stock optimizer.
-        if self.optimizer is not None or mult == 1.0 or not structural:
-            return super().create_optimizer()
-
-        structural_ids = {id(p) for p in structural}
-
-        decay_names = set(self.get_decay_parameter_names(opt_model))
-        base_lr = self.args.learning_rate
-        groups = []
-        # Structural at boosted LR, LLM/LoRA at base LR; each split into decay / no-decay.
-        for is_struct, lr in ((True, base_lr * mult), (False, base_lr)):
-            named = [
-                (n, p)
-                for n, p in opt_model.named_parameters()
-                if p.requires_grad and (id(p) in structural_ids) == is_struct
-            ]
-            decay = [p for n, p in named if n in decay_names]
-            no_decay = [p for n, p in named if n not in decay_names]
-            if decay:
-                groups.append(
-                    {"params": decay, "lr": lr, "weight_decay": self.args.weight_decay}
-                )
-            if no_decay:
-                groups.append({"params": no_decay, "lr": lr, "weight_decay": 0.0})
-
-        try:
-            optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(
-                self.args, opt_model
-            )
-        except TypeError:
-            optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(
-                self.args
-            )
-        optimizer_kwargs.pop("params", None)
-        optimizer_kwargs.pop("lr", None)
-        self.optimizer = optimizer_cls(groups, lr=base_lr, **optimizer_kwargs)
-        n_struct = sum(p.numel() for p in structural if p.requires_grad)
-        print(
-            f"[train] structural LR group: {mult}x base = {base_lr * mult:.2e} "
-            f"({n_struct / 1e6:.2f}M params); LLM/LoRA at base LR {base_lr:.2e}"
-        )
-        return self.optimizer
+        opt = create_two_group_optimizer(self, self.model.structural_parameters())
+        return opt if opt is not None else super().create_optimizer()
 
     def training_step(self, model, inputs, num_items_in_batch=None, **kwargs):
         loss = super().training_step(

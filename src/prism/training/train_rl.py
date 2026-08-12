@@ -139,6 +139,10 @@ def train_rl(config: omegaconf.DictConfig) -> None:
         max_prompt_length=None,
         temperature=rl_cfg.temperature,
         logging_steps=1,
+        # Reentrant checkpointing silently drops gradients to the armed Ψ
+        # tensor (captured state, not a checkpoint input) — the tower would
+        # never learn. The trainer fails loud on the reentrant setting.
+        gradient_checkpointing_kwargs={"use_reentrant": False},
     )
     # Free-form passthrough merged LAST (mirrors trainer.sft): any GRPOConfig
     # field is CLI-settable without a schema change.
