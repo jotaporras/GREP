@@ -141,7 +141,8 @@ def test_grpo_two_steps(tmp_path):
         "Ψ tower params missing from the optimizer"
     row = _dataset()[0]
     entry = trainer._transport_for_prompt(row["prompt"])
-    ids = torch.tensor([entry[0]])
+    dev = trainer._core.llm.get_input_embeddings().weight.device
+    ids = torch.tensor([entry[0]], device=dev)
     live_psi = trainer._live_psi_for_rows(ids, torch.ones_like(ids), [entry])
     trainer.optimizer.zero_grad(set_to_none=True)
     live_psi.sum().backward()
