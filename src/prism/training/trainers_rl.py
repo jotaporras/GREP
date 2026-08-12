@@ -74,14 +74,17 @@ class GraphGRPOTrainer(GRPOTrainer):
             raise ValueError(
                 "use_vllm must be False: this trainer owns its engine "
                 "(trl's colocate engine cannot serve the registered graph model).")
-        if args.gradient_checkpointing and (
-                args.gradient_checkpointing_kwargs or {}).get("use_reentrant", True):
-            raise ValueError(
-                "gradient checkpointing needs use_reentrant=False: the armed Ψ "
-                "tensor is captured state, not a checkpoint input, and the "
-                "reentrant recompute silently drops its gradients — the tower "
-                "would never learn. Set gradient_checkpointing_kwargs="
-                "{'use_reentrant': False}.")
+        if args.gradient_checkpointing:
+            # Reentrant recompute drops gradients to the armed Ψ tensor
+            # (captured state, not a checkpoint input) — the tower would never
+            # learn. Default to non-reentrant; refuse an explicit True.
+            gc_kwargs = dict(args.gradient_checkpointing_kwargs or {})
+            if gc_kwargs.get("use_reentrant") is True:
+                raise ValueError(
+                    "use_reentrant=True gradient checkpointing silently drops "
+                    "the Ψ tower's gradients; use use_reentrant=False.")
+            gc_kwargs["use_reentrant"] = False
+            args.gradient_checkpointing_kwargs = gc_kwargs
 
         super().__init__(model, args=args, **kwargs)
         # PEFT froze every non-LoRA parameter when trl wrapped the policy;
@@ -285,10 +288,24 @@ class GraphGRPOTrainer(GRPOTrainer):
         (the engine's GPU); transformers 5.14 raises on the mismatch. Moving
         the detached scalar is free and side-effect-less."""
         loss = super().training_step(model, inputs, num_items_in_batch)
+        # Grads are live here (backward ran in super, optimizer.step has not) —
+        # capture the tower's grad norm so wandb SHOWS the PE weights learning.
+        sq = 0.0
+        for p in self._core.structural_parameters():
+            if p.grad is not None:
+                sq += float(p.grad.detach().float().pow(2).sum())
+        self._tower_grad_norm = sq ** 0.5
         tr_loss = getattr(self, "_tr_loss", None)
         if tr_loss is not None and loss.device != tr_loss.device:
             loss = loss.to(tr_loss.device)
         return loss
+
+    def log(self, logs: dict, *args, **kwargs):
+        if getattr(self, "_tower_grad_norm", None) is not None:
+            logs["tower_grad_norm"] = self._tower_grad_norm
+        logs["pe_gain_tanh"] = float(
+            torch.tanh(self._core.pe_gain.detach()).float().mean())
+        super().log(logs, *args, **kwargs)
 
     # ---------------------------------------------------------- weight sync
 

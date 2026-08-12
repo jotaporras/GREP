@@ -161,6 +161,13 @@ def train_rl(config: omegaconf.DictConfig) -> None:
         processing_class=tokenizer,
         peft_config=peft_config,
     )
+    # The e16 research question is BEFORE-vs-AFTER RL, all else equal: save the
+    # untrained policy (same tower init, zero-init LoRA) as a sibling run dir so
+    # both ends evaluate through the identical checkpoint/eval path.
+    init_dir = os.path.join(output_dir, "init")
+    trainer.save_model(init_dir)
+    tokenizer.save_pretrained(init_dir)
+    print(f"[train_rl] init checkpoint saved: {init_dir}")
     trainer.train()
     trainer.save_model(output_dir)
     tokenizer.save_pretrained(output_dir)
