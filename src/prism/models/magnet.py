@@ -6,7 +6,6 @@ Copyright (c) PyG Team) and implements the operator introduced in Zhang et
 al., "MagNet: A Neural Network for Directed Graphs", NeurIPS 2021
 (arXiv:2102.11391).
 """
-
 import math
 from typing import Optional
 
@@ -21,18 +20,22 @@ from torch_geometric.utils import coalesce, remove_self_loops
 from torch_geometric.utils.num_nodes import maybe_num_nodes
 
 
-def crelu(x: Tensor) -> Tensor:
-    r"""Applies the complex rectified linear unit function of the `"MagNet: A
-    Neural Network for Directed Graphs"
-    <https://arxiv.org/abs/2102.11391>`_ paper element-wise.
+def modrelu(x: Tensor, bias: Tensor, eps: float = 1e-12) -> Tensor:
+    r"""Applies the modReLU function of the `"Unitary Evolution Recurrent
+    Neural Networks" <https://arxiv.org/abs/1511.06464>`_ paper element-wise.
 
     .. math::
-        \sigma(z) = \begin{cases}
-            z, & \text{if } \arg(z) \in [- \pi / 2, \pi / 2] \\
-            0, & \text{otherwise}
-        \end{cases}
+        \sigma(z) = \mathrm{ReLU}(|z| + b) \frac{z}{|z|}
+
+    In contrast to :math:`\mathbb{C}\mathrm{ReLU}`, the phase of :math:`z` is
+    left untouched, so that :math:`\sigma` commutes with the gauge
+    :math:`z \mapsto e^{i \gamma} z` and gates the magnitude alone. The
+    learnable bias :math:`b` is the radius of the deadzone; at :math:`b = 0`
+    the function is the identity.
     """
-    return x * (x.real >= 0)
+    magnitude = (x.real.square() + x.imag.square() + eps).sqrt()
+    b = -nn.functional.softplus(bias)
+    return x * (magnitude + b).relu() / magnitude
 
 
 def clin(lin: Linear, x: Tensor) -> Tensor:
@@ -232,7 +235,7 @@ class MagNet(nn.Module):
     r"""The magnetic graph neural network from the `"MagNet: A Neural Network
     for Directed Graphs" <https://arxiv.org/abs/2102.11391>`_ paper, stacking
     :class:`MagChebConv` layers interleaved with the complex non-linearity
-    :func:`crelu`
+    :func:`modrelu`
 
     .. math::
         \mathbf{X}^{(\ell)} = \sigma \Big( \mathbf{Y}^{(\ell - 1)}
@@ -248,7 +251,8 @@ class MagNet(nn.Module):
 
     For :math:`r = 0` the phase matrix vanishes and the model reduces to
     :class:`~torch_geometric.nn.conv.ChebConv` on the symmetrized graph. Each
-    layer holds its own charge, so :obj:`learn_r` fits :math:`L` of them.
+    layer holds its own charge, so :obj:`learn_r` fits :math:`L` of them, and
+    its own modReLU bias, initialized to zero.
 
     Args:
         in_channels (int): Size of each input sample.
@@ -301,6 +305,9 @@ class MagNet(nn.Module):
         ])
         self.norms = nn.ModuleList(
             [nn.LayerNorm(hidden_channels) for _ in range(num_layers - 2)])
+        self.biases = nn.ParameterList(
+            [nn.Parameter(torch.full((hidden_channels,), -4.6))  # softplus(-4.6) ≈ 0.01
+             for _ in range(num_layers - 1)])
         self.unwind = nn.Linear(2 * hidden_channels, hidden_channels)
         self.dropout = nn.Dropout(dropout)
         self.skip_connection = skip_connection
@@ -326,7 +333,7 @@ class MagNet(nn.Module):
             x = conv(x_prev, edge_index, edge_weight, batch)
             if i < len(self.norms):
                 x = torch.complex(self.norms[i](x.real), self.norms[i](x.imag))
-            x = crelu(x) * self.dropout(torch.ones_like(x.real))
+            x = modrelu(x, self.biases[i]) * self.dropout(torch.ones_like(x.real))
             if self.skip_connection and i > 0:
                 x = x + x_prev
             x_prev = x
