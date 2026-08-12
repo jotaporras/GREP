@@ -192,6 +192,7 @@ def additive_model_from_config(llm, gnn_cfg: dict, path: str) -> gnn_llm.GraphAu
             eps=gnn_cfg["eps"],
             use_layer_norm=gnn_cfg["use_layer_norm"],
             node_feature_dim=node_feature_dim,
+            directed=gnn_cfg.get("directed", False),
         )
         weights_key = "gt_model"
     elif architecture == "gt_llm":
@@ -217,6 +218,7 @@ def additive_model_from_config(llm, gnn_cfg: dict, path: str) -> gnn_llm.GraphAu
             eps=gnn_cfg["eps"],
             use_layer_norm=gnn_cfg["use_layer_norm"],
             node_feature_dim=node_feature_dim,
+            directed=gnn_cfg.get("directed", False),
         )
         weights_key = "pe_model"
 

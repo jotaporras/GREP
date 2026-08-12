@@ -5,7 +5,7 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 from torch_geometric.data import Data
 
-from prism.models import gcn
+from prism.models import gcn, magnet
 
 
 class RandomGNNPositionalEncodings(nn.Module):
@@ -30,6 +30,11 @@ class RandomGNNPositionalEncodings(nn.Module):
             with ``fixed_seed_value`` on every forward so the probes — and hence
             Ψ — are identical across runs.
         fixed_seed_value (int): Seed used when ``fixed_seed_mode`` is True.
+        directed (bool): Probe backbone. False (default) = ``gcn.GCN`` (TAGConv,
+            undirected). True = ``magnet.MagNet``, the magnetic-Laplacian backbone
+            that keeps edge direction as a phase; it symmetrizes A and encodes the
+            asymmetry in Θ = 2πr·sgn(A − Aᵀ), so it is a no-op on graphs whose
+            ``edge_index`` already carries both directions.
     """
 
     def __init__(self,
@@ -48,6 +53,7 @@ class RandomGNNPositionalEncodings(nn.Module):
         max_gather_rows: int = 2_000_000,
         center_second_moment: bool = True,
         node_feature_dim: int = None,
+        directed: bool = False,
     ):
         super().__init__()
         if probe_distribution not in ("gaussian", "rademacher"):
@@ -64,7 +70,10 @@ class RandomGNNPositionalEncodings(nn.Module):
         # When set → deterministic GCN over caller-supplied ``data.x``; no probes.
         self.node_feature_dim = node_feature_dim
         in_channels = 1 if node_feature_dim is None else node_feature_dim
-        self.pe_gcn = gcn.GCN(
+        # Same (in, hidden, layers, skip, dropout, k) contract and the same
+        # Data -> [N, hidden] forward, so the backbone swap is local to this line.
+        self.directed = directed
+        self.pe_gcn = (magnet.MagNet if directed else gcn.GCN)(
             in_channels, pe_hidden_channels, pe_num_layers,
             skip_connection=True, dropout=dropout, k=k
         )

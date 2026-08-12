@@ -239,6 +239,8 @@ class GraphTransformer(nn.Module):
             responses are pushed through the blocks as one block-diagonal M-copy graph
             (probes independent, weights shared) and averaged last. Costs M× the block
             activations and M× the k-hop sparsity pattern; see forward().
+        directed (bool): Forwarded to the R-PEARL probe backbone (MagNet when True);
+            see :class:`RandomGNNPositionalEncodings`. The GT blocks are unaffected.
     """
 
     def __init__(self, num_layers: int, pe_hidden_channels: int,
@@ -251,7 +253,8 @@ class GraphTransformer(nn.Module):
                  pe_readout: str = "mean",
                  center_second_moment: bool = True,
                  node_feature_dim: int = None,
-                 pe_pool: str = "pe"):
+                 pe_pool: str = "pe",
+                 directed: bool = False):
         super().__init__()
         if pe_readout not in ("mean", "second_moment"):
             raise ValueError(
@@ -292,6 +295,7 @@ class GraphTransformer(nn.Module):
             fixed_seed_mode=fixed_seed_mode, fixed_seed_value=fixed_seed_value,
             center_second_moment=center_second_moment,
             node_feature_dim=node_feature_dim,
+            directed=directed,
         )
         # Final block is norm-free (normalize=False) so its output magnitude
         # survives for the output gate; earlier blocks keep LayerNorm.
@@ -831,9 +835,10 @@ def build_psi_producer(cfg, node_feature_dim: int = None) -> nn.Module:
             ``gt_num_layers``/``gt_heads``/``k_gt``/``d_model``/``dropout``/``eps``/
             ``use_layer_norm``/``pe_hidden_channels``/``pe_num_layers``/``num_samples``/
             ``k_pe``, plus the navigator switches ``pe_gt_from``/``semantic_gt_from``.
-            ``pe_pool`` is OPTIONAL and defaults to ``"pe"`` (E_q inside R-PEARL, the
-            behaviour every existing run and checkpoint was trained with); the fallback
-            keeps checkpoints written before the key existed reloading as themselves.
+            ``pe_pool`` and ``directed`` are OPTIONAL, defaulting to ``"pe"`` (E_q
+            inside R-PEARL) and ``False`` (undirected GCN backbone) — the behaviour
+            every existing run and checkpoint was trained with; the fallbacks keep
+            checkpoints written before those keys existed reloading as themselves.
         node_feature_dim: semantic input width for the standalone GT (``None`` = random
             probes). Ignored in two-stage mode: the notebook's PE GT is probe-based.
 
@@ -879,6 +884,7 @@ def build_psi_producer(cfg, node_feature_dim: int = None) -> nn.Module:
         use_layer_norm=cfg["use_layer_norm"],
         node_feature_dim=None if navigator else node_feature_dim,
         pe_pool=cfg.get("pe_pool", "pe"),
+        directed=cfg.get("directed", False),
     )
     if not navigator:
         return pe_gt

@@ -250,6 +250,10 @@ def train_model(config: omegaconf.DictConfig):
         _direct = (
             "pe_hidden_channels", "pe_num_layers", "d_model", "num_samples", "dropout",
             "k_pe", "use_layer_norm", "eps", "pe_gain_init", "use_pe_norm", "pe_node_features",
+            # LOAD-BEARING at reload: selects the MagNet probe backbone, whose weights
+            # are a different state_dict shape than the GCN one — a missing key would
+            # fail the rebuild loudly rather than silently, but record it anyway.
+            "directed",
         )
         gnn_config = {
             "architecture": config.gnn.arch,

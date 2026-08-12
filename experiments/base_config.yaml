@@ -49,6 +49,12 @@ gnn:
   # "random" = PEARL random probes; "word_embeddings" = mean node-name word-embedding
   # (deterministic). gt_llm REQUIRES word_embeddings.
   pe_node_features: random
+  # Probe backbone: false (DEFAULT, every run so far) = TAGConv GCN, undirected.
+  # true = MagNet (models/magnet.py) — magnetic Laplacian, direction kept as a phase.
+  # Only bites on an asymmetric edge_index; the SPINE scene graphs are undirected
+  # (from_networkx emits both directions), so there Theta = 0 and it is a backbone
+  # A/B, not a directionality one.
+  directed: false
   # WHERE the probe expectation E_q is taken. Read ONLY by gt.build_psi_producer, i.e.
   # by the Ψ-consuming archs (learnable_graph_mask / wire_llm); train_v3 rejects a
   # non-default value on any other arch rather than ignoring it.
