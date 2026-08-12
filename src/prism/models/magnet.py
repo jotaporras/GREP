@@ -1,3 +1,12 @@
+r"""Magnetic Chebyshev convolution for directed graphs.
+
+:class:`MagChebConv` is adapted from
+:class:`torch_geometric.nn.conv.ChebConv` (PyTorch Geometric, MIT License,
+Copyright (c) PyG Team) and implements the operator introduced in Zhang et
+al., "MagNet: A Neural Network for Directed Graphs", NeurIPS 2021
+(arXiv:2102.11391).
+"""
+
 import math
 from typing import Optional
 
@@ -99,7 +108,9 @@ class MagChebConv(ChebConv):
             (default: :obj:`"binary"`):
 
             1. :obj:`"binary"`: :math:`\mathbf{\Theta}^{(r)} = 2 \pi r \,
-            \mathrm{sgn}(\mathbf{A} - \mathbf{A}^{\top})`
+            \mathrm{sgn}(\mathbf{A} - \mathbf{A}^{\top})`, taken after
+            parallel edges are summed, so that a repeated edge does not
+            widen the phase.
 
             2. :obj:`"weight"`: :math:`\mathbf{\Theta}^{(r)} = 2 \pi r
             (\mathbf{A} - \mathbf{A}^{\top})`
@@ -171,7 +182,8 @@ class MagChebConv(ChebConv):
 
         edge_index, edge_weight = gcn_norm(edge_index, edge_attr[:, 0] / 2,
                                            num_nodes, add_self_loops=False)
-        theta = (2 * math.pi) * self.r * edge_attr[:, 1]
+        asym = edge_attr[:, 1].sign() if self.phase == 'binary' else edge_attr[:, 1]
+        theta = (2 * math.pi) * self.r * asym
 
         return edge_index, torch.complex(edge_weight * theta.cos(),
                                          edge_weight * theta.sin())
@@ -230,8 +242,9 @@ class MagNet(nn.Module):
     of the final representation before applying a linear transformation
 
     .. math::
-        \mathbf{X}^{\prime} = \mathbf{W} \left[ \mathrm{Re}\Big(\mathbf{X}^{(L)}
-        \Big) \, \Vert \, \mathrm{Im}\Big(\mathbf{X}^{(L)}\Big) \right]
+        \mathbf{X}^{\prime} = \mathbf{W} \left[
+        \mathrm{Re}\Big(\mathbf{X}^{(L)}\Big) \, \Vert \,
+        \mathrm{Im}\Big(\mathbf{X}^{(L)}\Big) \right]
 
     For :math:`r = 0` the phase matrix vanishes and the model reduces to
     :class:`~torch_geometric.nn.conv.ChebConv` on the symmetrized graph. Each
