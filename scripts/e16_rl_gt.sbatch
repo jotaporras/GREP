@@ -4,8 +4,10 @@
 #SBATCH --time=24:00:00
 #SBATCH --partition=dgx-b200
 #SBATCH --gpus=2
-#SBATCH --cpus-per-task=32
-#SBATCH --mem=256G
+# betty's SLURM cli_filter (2026-08-03) enforces EXACTLY 28 CPUs and 224 GB
+# per GPU on dgx-b200 — 2 GPUs therefore require 56 CPUs / 448 GB.
+#SBATCH --cpus-per-task=56
+#SBATCH --mem=448G
 #
 # e16 — GRPO RL training of the ADDITIVE GT architecture (gt_llm) with
 # graph-conditioned vLLM rollouts, v2 semantics: the Ψ tower is UNFROZEN and
