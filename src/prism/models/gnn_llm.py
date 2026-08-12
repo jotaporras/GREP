@@ -1236,7 +1236,10 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         psi = torch.zeros(B, seq_len, hidden, device=embeddings.device, dtype=embeddings.dtype)
         for b in range(B):
             g = graphs[b]
-            if self._pe_node_features == "word_embeddings":
+            # gt.GraphTransformer(fuse_node_features=True) reads data.x too — it fuses
+            # X with the random-probe PE (Φ(X + P; T)) rather than replacing it.
+            if (self._pe_node_features == "word_embeddings"
+                    or getattr(self.pe_model, "fuse_node_features", False)):
                 # Per-node feature = mean word-embedding over mention spans. Fail loud if any node has no span.
                 N = g.num_nodes
                 feats = torch.zeros(N, hidden, device=embeddings.device, dtype=torch.float32)
@@ -1251,7 +1254,8 @@ class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
                 if missing:
                     names = getattr(g, "node_names", None)
                     raise ValueError(
-                        "pe_node_features='word_embeddings' requires every graph node to be "
+                        "pe_node_features='word_embeddings' / fuse_node_features "
+                        "requires every graph node to be "
                         f"mentioned in the prompt, but these have no span: "
                         f"{[(i, names[i] if names else '?') for i in missing]}"
                     )

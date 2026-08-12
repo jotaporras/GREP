@@ -49,6 +49,12 @@ gnn:
   # "random" = PEARL random probes; "word_embeddings" = mean node-name word-embedding
   # (deterministic). gt_llm REQUIRES word_embeddings.
   pe_node_features: random
+  # rpearl_gt_llm only. false (DEFAULT) = the GT sees the PE alone. true = the GT blocks
+  # see Phi(X + P; T): node features X (mean node-name word-embedding, same source as
+  # gt_llm) are projected and ADDED to the probe PE P = E_q[Phi(q; S, H)]. Unlike
+  # pe_node_features=word_embeddings this KEEPS the random probes — the features are
+  # fused in the GT, not swapped into R-PEARL. Leave pe_node_features=random with it.
+  fuse_node_features: false
   # Probe backbone: false (DEFAULT, every run so far) = TAGConv GCN, undirected.
   # true = MagNet (models/magnet.py) — magnetic Laplacian, direction kept as a phase.
   # Only bites on an asymmetric edge_index; the SPINE scene graphs are undirected

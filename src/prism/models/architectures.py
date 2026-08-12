@@ -56,6 +56,8 @@ def build_planner_model(gnn, llm, tokenizer, *, disable_graph_token_rope=False,
             model.llm.requires_grad_(False)
     elif gnn.arch == "rpearl_gt_llm":
         # Full Graph Transformer: R-PEARL inside Sparse Attention blocks.
+        # fuse_node_features keeps the random probes AND reads data.x: Φ(X + P; T).
+        _fuse_x = gnn.get("fuse_node_features", False)
         pe_model = gt_module.GraphTransformer(
             num_layers=gnn.gt_num_layers,
             pe_hidden_channels=gnn.pe_hidden_channels,
@@ -68,7 +70,8 @@ def build_planner_model(gnn, llm, tokenizer, *, disable_graph_token_rope=False,
             k_gt=gnn.k_gt,
             eps=gnn.eps,
             use_layer_norm=gnn.use_layer_norm,
-            node_feature_dim=_node_feature_dim,
+            node_feature_dim=_text_hidden if _fuse_x else _node_feature_dim,
+            fuse_node_features=_fuse_x,
             directed=gnn.get("directed", False),
         )
         model = gnn_llm.GraphAugmentedLLM(llm, pe_model, d_model=gnn.d_model,

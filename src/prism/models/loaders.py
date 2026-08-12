@@ -179,6 +179,7 @@ def additive_model_from_config(llm, gnn_cfg: dict, path: str) -> gnn_llm.GraphAu
                         if pe_node_features == "word_embeddings" else None)
 
     if architecture == "rpearl_gt_llm":
+        fuse_x = gnn_cfg.get("fuse_node_features", False)
         pe_model = gt_module.GraphTransformer(
             num_layers=gnn_cfg["gt_num_layers"],
             pe_hidden_channels=gnn_cfg["pe_hidden_channels"],
@@ -191,7 +192,9 @@ def additive_model_from_config(llm, gnn_cfg: dict, path: str) -> gnn_llm.GraphAu
             k_gt=gnn_cfg["k_gt"],
             eps=gnn_cfg["eps"],
             use_layer_norm=gnn_cfg["use_layer_norm"],
-            node_feature_dim=node_feature_dim,
+            node_feature_dim=(llm.config.get_text_config().hidden_size if fuse_x
+                              else node_feature_dim),
+            fuse_node_features=fuse_x,
             directed=gnn_cfg.get("directed", False),
         )
         weights_key = "gt_model"

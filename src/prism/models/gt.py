@@ -239,6 +239,12 @@ class GraphTransformer(nn.Module):
             responses are pushed through the blocks as one block-diagonal M-copy graph
             (probes independent, weights shared) and averaged last. Costs M× the block
             activations and M× the k-hop sparsity pattern; see forward().
+        fuse_node_features (bool): When True the blocks compute Φ(X + P; T): semantic
+            node features X = ``Linear(data.x)`` are ADDED to the probe PE
+            P = E_q[Φ(q; S, H)]. R-PEARL keeps its RANDOM-probe path, so
+            ``node_feature_dim`` here is the ``data.x`` width, NOT a switch to the
+            deterministic encoder (that is ``node_feature_dim`` with this False).
+            Requires ``node_feature_dim``.
         directed (bool): Forwarded to the R-PEARL probe backbone (MagNet when True);
             see :class:`RandomGNNPositionalEncodings`. The GT blocks are unaffected.
     """
@@ -254,6 +260,7 @@ class GraphTransformer(nn.Module):
                  center_second_moment: bool = True,
                  node_feature_dim: int = None,
                  pe_pool: str = "pe",
+                 fuse_node_features: bool = False,
                  directed: bool = False):
         super().__init__()
         if pe_readout not in ("mean", "second_moment"):
@@ -273,8 +280,14 @@ class GraphTransformer(nn.Module):
                 "pe_pool='gt' needs a probe axis to defer E_q over; semantic node "
                 "features (node_feature_dim set) are deterministic. Use pe_pool='pe'."
             )
+        if fuse_node_features and node_feature_dim is None:
+            raise ValueError(
+                "fuse_node_features=True computes Φ(X + P; T) and needs node_feature_dim "
+                "— the width of data.x it projects to d_model."
+            )
 
         self.k_hops = k_gt
+        self.fuse_node_features = fuse_node_features
         self.heads = heads
         self.num_layers = num_layers
         self.d_model = d_model
@@ -294,9 +307,12 @@ class GraphTransformer(nn.Module):
             max_gather_rows=max_gather_rows,
             fixed_seed_mode=fixed_seed_mode, fixed_seed_value=fixed_seed_value,
             center_second_moment=center_second_moment,
-            node_feature_dim=node_feature_dim,
+            # When fusing, X is added HERE (self.input_proj) instead of being consumed
+            # by R-PEARL, so the probe path stays live and P = E_q[Φ(q; S, H)].
+            node_feature_dim=None if fuse_node_features else node_feature_dim,
             directed=directed,
         )
+        self.input_proj = nn.Linear(node_feature_dim, d_model) if fuse_node_features else None
         # Final block is norm-free (normalize=False) so its output magnitude
         # survives for the output gate; earlier blocks keep LayerNorm.
         self.blocks = nn.ModuleList([
@@ -374,6 +390,10 @@ class GraphTransformer(nn.Module):
         if token_embeddings is None:
             # Legacy pure-PE-generator path (rpearl_gt_llm): first moment is the PE.
             x = self.pe_model(pe_data, **pe_kw)
+            if self.fuse_node_features:
+                # Φ(X + P; T): semantic features X = input_proj(data.x) added to the
+                # probe PE P before the blocks. Both fp32 on this path.
+                x = self.input_proj(pe_data.x.float()) + x
         else:
             x_full = torch.zeros(num_nodes, self.d_model, device=device, dtype=torch.float32)
             rows = slice(0, token_embeddings.shape[0]) if is_token is None else is_token

@@ -254,6 +254,9 @@ def train_model(config: omegaconf.DictConfig):
             # are a different state_dict shape than the GCN one — a missing key would
             # fail the rebuild loudly rather than silently, but record it anyway.
             "directed",
+            # LOAD-BEARING at reload: selects the GT's input_proj (Φ(X + P; T)). The
+            # pe_model load is strict=False, so a missing key would silently drop it.
+            "fuse_node_features",
         )
         gnn_config = {
             "architecture": config.gnn.arch,

@@ -448,6 +448,33 @@ def test_expand_edge_index_khop():
     assert torch.equal(got, ref), f"\n{got.int()}\nvs\n{ref.int()}"
 
 
+def test_gt_fuse_node_features():
+    """fuse_node_features ⇒ Φ(X + P; T): data.x is read AND the probes stay random."""
+    n, f = 6, 4
+    e = [(i, (i + 1) % n) for i in range(n)]
+    ei = torch.tensor(e + [(b, a) for a, b in e], dtype=torch.long).t().contiguous()
+    g = lambda x: Data(x=x, edge_index=ei, num_nodes=n)
+    x1, x2 = torch.zeros(n, f), torch.randn(n, f)
+
+    m = _gt(node_feature_dim=f, fuse_node_features=True,
+            fixed_seed_mode=True, fixed_seed_value=3).eval()
+    # X enters through the GT's own projection; R-PEARL keeps the random-probe path.
+    assert m.pe_model.node_feature_dim is None
+    assert m.input_proj.in_features == f
+    a, b = m(g(x1)), m(g(x2))
+    assert a.shape == (n, 16) and torch.isfinite(a).all()
+    assert not torch.allclose(a, b), "data.x must move the output when fusing"
+
+    off = _gt(fixed_seed_mode=True, fixed_seed_value=3).eval()
+    assert torch.allclose(off(g(x1)), off(g(x2))), "without the flag data.x is ignored"
+
+    try:
+        _gt(fuse_node_features=True)
+    except ValueError:
+        return
+    assert False, "fuse_node_features without node_feature_dim must fail loud"
+
+
 def test_sparse_attention_parity_dense_oracle():
     """_SafeBatchedSparseAttn == dense masked-softmax attention over A's pattern.
 
