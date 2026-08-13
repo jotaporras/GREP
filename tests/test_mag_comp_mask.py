@@ -1,0 +1,318 @@
+"""Smoke tests for the magnetic-composite attention mask (``gnn.mask_composite``).
+
+``MagCompGraphLLM`` adds ONE additive pre-softmax bias over the scene-graph scope::
+
+    Phi'(q) = T(Phi(q; L_bar^(r), H))     GT blocks applied PER PROBE, inside E_q
+    Psi     = E_q[Phi']
+    C       = E_q[Phi' Phi'^T] - Psi Psi^T
+    A       = sm[ (Q x_n)^T (K x_m) / sqrt(d_h) + beta * C_tok[n, m] + M_causal ]
+
+The five properties asserted here are the ones a silent misconfiguration would break
+without changing a shape:
+
+1. ``C_tok`` is symmetric PSD (it is a centered Gram matrix; a sign slip or an
+   un-centered second moment loses that).
+2. ``beta_init = 0`` reproduces the base LLM's logits EXACTLY — the arm's cold start.
+3. The composite ``edge_index`` carries the four edge classes with the right
+   directedness and node counts (the crosslink direction is an architecture invariant:
+   scene -> token, never the reverse, or ``Theta^(r)`` cancels on those edges).
+4. ``pe_pool='gt'`` CHANGES ``C_tok`` versus ``pe_pool='pe'`` — proof that T runs inside
+   the probe loop rather than being applied to Psi (T is nonlinear, so the two differ).
+5. ``beta`` has gradient at 0 while ``C`` does not (the documented one-step stall), so
+   the channel provably opens.
+
+Runs on CPU: the GT blocks go through ``torch.sparse.sampled_addmm``, which has no MPS
+kernel, and the models here are tiny by construction (c <= 24, M <= 6).
+"""
+import sys
+
+sys.path.insert(0, "src")
+
+import pytest
+import torch
+from torch_geometric.data import Data
+
+from prism.models.gnn_llm import MagCompGraphLLM, build_composite_graph
+from prism.models.gt import GraphTransformer
+
+DEVICE = torch.device("cpu")
+CYCLE = 24          # small stand-in for the config's mask_cycle_size = 8192
+SCOPE_START = 4     # tokens [0, 4) are "system prompt": no bias at all
+
+
+class _Tokenizer:
+    """Minimal stand-in for the pieces ``find_last_graph_scope`` touches.
+
+    It decodes token id ``t`` to ``"<t>"`` except the marker id, which decodes to the
+    literal block signature — so the scope starts at whatever position the marker sits at.
+    """
+
+    MARKER = 999
+
+    def batch_decode(self, seqs, **kwargs):
+        return ["scene graph: •" if s[0] == self.MARKER else f"<{s[0]}>" for s in seqs]
+
+
+def _ids(seq_len=CYCLE + SCOPE_START):
+    """Token ids whose last ``scene graph: •`` marker sits at ``SCOPE_START``."""
+    ids = list(range(1, seq_len + 1))
+    ids[SCOPE_START] = _Tokenizer.MARKER
+    return torch.tensor([ids], dtype=torch.long)
+
+
+def _scene():
+    """Park - Office - House - Hankee, undirected (both directions in edge_index)."""
+    edges = [(0, 1), (1, 0), (1, 2), (2, 1), (2, 3), (3, 2)]
+    g = Data(x=torch.zeros(4, 1), edge_index=torch.tensor(edges).t().contiguous(),
+             num_nodes=4)
+    g.node_names = ["Park", "Office", "House", "Hankee"]
+    return g
+
+
+def _injection_map():
+    """The doc's sample mentions, in FULL-sequence coordinates (scope_start = 4).
+
+    Hankee -> 4 sub-tokens, Park -> 3, Office -> 3, House -> none (uncrosslinked, which
+    is exactly the case the anchor exists to keep connected).
+    """
+    return {3: [(6, 10)], 0: [(12, 15)], 1: [(18, 21)]}
+
+
+def _gt(pe_pool="gt", d_model=8, m=6, seed=0):
+    torch.manual_seed(seed)
+    return GraphTransformer(
+        num_layers=2, pe_hidden_channels=8, pe_num_layers=2, d_model=d_model,
+        heads=2, num_samples=m, dropout=0.0, k_pe=3, k_gt=2,
+        directed=True, learn_r=True, pe_pool=pe_pool,
+        fixed_seed_mode=True, fixed_seed_value=0, center_second_moment=True,
+    ).to(DEVICE)
+
+
+def _llm(hidden=32):
+    from transformers import LlamaConfig, LlamaForCausalLM
+    torch.manual_seed(0)
+    cfg = LlamaConfig(vocab_size=_Tokenizer.MARKER + 1, hidden_size=hidden,
+                      intermediate_size=64, num_hidden_layers=2, num_attention_heads=4,
+                      num_key_value_heads=2, max_position_embeddings=128,
+                      attn_implementation="eager")
+    return LlamaForCausalLM(cfg).to(DEVICE)
+
+
+def _model(beta_init=0.0, pe_pool="gt", **kw):
+    return MagCompGraphLLM(
+        _llm(), _gt(pe_pool=pe_pool), tokenizer=_Tokenizer(), cycle_size=CYCLE,
+        beta_init=beta_init, layer_scope="all", **kw).to(DEVICE)
+
+
+def _composite(**kw):
+    return build_composite_graph(
+        _scene(), _ids()[0].tolist(), _injection_map(), scope_start=SCOPE_START,
+        context_window=CYCLE, device=DEVICE,
+        crosslink_mention_to_node=False, crosslink_bidirectional=True, **kw)
+
+
+# --------------------------------------------------------------- the composite graph
+def test_four_edge_classes_directedness_and_counts():
+    """Cycle DIRECTED, scene UNDIRECTED, crosslinks scene->token ONLY, anchor = 2 edges."""
+    g = _composite()
+    n_scene, c = 4, CYCLE
+    assert g.num_nodes == c + n_scene + 1          # + the anchor
+    assert int(g.is_token.sum()) == c
+
+    ei = {(int(u), int(v)) for u, v in g.edge_index.t()}
+    mentions = {3: [2, 3, 4, 5], 0: [8, 9, 10], 1: [14, 15, 16]}   # window coordinates
+
+    # 1. token cycle: i -> i+1 mod c present, the reverse absent (a symmetric cycle
+    #    cancels sgn(A - A^T) and the rows stop carrying position).
+    for i in range(c):
+        assert (i, (i + 1) % c) in ei
+        assert ((i + 1) % c, i) not in ei
+
+    # 2. scene: both directions, shifted by +c.
+    for u, v in ((0, 1), (1, 2), (2, 3)):
+        assert (c + u, c + v) in ei and (c + v, c + u) in ei
+
+    # 3. crosslinks: scene node -> token, arrowheads on the cycle, every sub-token.
+    for j, toks in mentions.items():
+        for t in toks:
+            assert (c + j, t) in ei, f"missing crosslink scene {j} -> token {t}"
+            assert (t, c + j) not in ei, f"crosslink {j} <- {t} must not exist"
+
+    # 4. anchor: exactly BOS -> a and a -> scene node 0, never fanned.
+    a = c + n_scene
+    assert {(u, v) for u, v in ei if u == a or v == a} == {(0, a), (a, c)}
+
+    # The class counts add up to the whole edge set, so nothing else was emitted.
+    assert g.edge_index.shape[1] == c + 6 + sum(len(t) for t in mentions.values()) + 2
+
+
+def test_anchor_can_be_ablated():
+    g = _composite(anchor=False)
+    assert g.num_nodes == CYCLE + 4
+    assert g.edge_index.max() < CYCLE + 4
+
+
+# ------------------------------------------------------------------------ C_tok
+def test_c_tok_symmetric_psd():
+    model = _model()
+    g = _composite()
+    with torch.no_grad():
+        c_tok = model.covariance_token_block(g, CYCLE)
+    assert c_tok.shape == (CYCLE, CYCLE)
+    assert torch.allclose(c_tok, c_tok.T, atol=1e-5), "C_tok is not symmetric"
+    lam = torch.linalg.eigvalsh(c_tok.double())
+    assert lam.min() > -1e-8 * max(1.0, float(lam.max())), f"C_tok not PSD: {lam.min()}"
+    assert float(c_tok.diagonal().sum()) > 0
+
+
+def test_pe_pool_gt_changes_c_tok():
+    """T inside E_q != T applied to Psi: the two poolings must give DIFFERENT C_tok.
+
+    Both models share the R-PEARL seed and ``fixed_seed_mode``, so the probe draw is
+    identical and the only difference is where the blocks run.
+    """
+    g = _composite()
+    with torch.no_grad():
+        gt_pool = _gt(pe_pool="gt", seed=3)
+        pe_pool = _gt(pe_pool="pe", seed=3)
+        pe_pool.load_state_dict(gt_pool.state_dict())   # same weights, different pooling
+        c_gt, _ = gt_pool.pe_model.covariance_token_block(g, CYCLE, pe_pool="gt", gt=gt_pool)
+        c_pe, _ = pe_pool.pe_model.covariance_token_block(g, CYCLE)
+    assert c_gt.shape == c_pe.shape
+    rel = (c_gt - c_pe).norm() / c_pe.norm().clamp_min(1e-12)
+    assert rel > 1e-3, f"pe_pool='gt' left C_tok unchanged (rel diff {rel:.2e})"
+
+
+def test_pe_pool_and_gt_argument_must_agree():
+    g = _composite()
+    gt = _gt()
+    with pytest.raises(ValueError, match="pe_pool"):
+        gt.pe_model.covariance_token_block(g, CYCLE, pe_pool="gt")     # no gt handed in
+    with pytest.raises(ValueError, match="pe_pool"):
+        gt.pe_model.covariance_token_block(g, CYCLE, pe_pool="pe", gt=gt)
+
+
+# ------------------------------------------------------------------------- the bias
+def test_beta_zero_reproduces_base_logits_exactly():
+    """beta = 0 => the bias is identically 0 => the base LLM, bit for bit."""
+    model = _model(beta_init=0.0)
+    ids = _ids().to(DEVICE)
+    kw = dict(graphs=[_scene()], injection_maps=[_injection_map()])
+    with torch.no_grad():
+        armed = model(input_ids=ids, **kw).logits
+        assert model._struct_bias is None            # disarmed in the finally
+        base = model.llm(input_ids=ids).logits
+    assert torch.equal(armed, base), (
+        f"beta=0 changed the logits (max |delta| = {(armed - base).abs().max():.3e})")
+
+
+def test_bias_is_zero_outside_the_scope_and_c_tok_inside():
+    """The system prompt gets NO bias; the scope block IS beta * C_tok; nothing is -inf."""
+    model = _model(beta_init=0.5)
+    ids = _ids().to(DEVICE)
+    with torch.no_grad():
+        bias = model.build_structural_mask(
+            ids.shape[1], [_scene()], [_injection_map()], DEVICE,
+            dtype=torch.float32, input_ids=ids)
+        c_tok = model.covariance_token_block(
+            model.composite_graph(_scene(), ids[0].tolist(), _injection_map(),
+                                  SCOPE_START, DEVICE), CYCLE)
+    assert torch.isfinite(bias).all(), "this arm never hard-blocks"
+    assert torch.equal(bias[0, 0, :SCOPE_START, :], torch.zeros(SCOPE_START, ids.shape[1]))
+    assert torch.equal(bias[0, 0, :, :SCOPE_START], torch.zeros(ids.shape[1], SCOPE_START))
+    assert torch.allclose(bias[0, 0, SCOPE_START:, SCOPE_START:], 0.5 * c_tok, atol=1e-6)
+
+
+def test_beta_has_gradient_at_zero_and_c_does_not():
+    """The documented one-step stall: dL/dbeta != 0 at beta = 0, dL/dC = 0."""
+    model = _model(beta_init=0.0)
+    ids = _ids().to(DEVICE)
+    out = model(input_ids=ids, labels=ids, graphs=[_scene()],
+                injection_maps=[_injection_map()])
+    out.loss.backward()
+    assert model.beta.grad is not None and float(model.beta.grad.abs()) > 0, (
+        "beta has no gradient at 0 — the graph channel could never open")
+    gt_grads = [p.grad for p in model.pe_model.parameters() if p.grad is not None]
+    assert all(float(g.abs().max()) == 0.0 for g in gt_grads), (
+        "the GT received gradient at beta=0; dL/dC = beta * dL/dbias should be exactly 0")
+
+
+# ---------------------------------------------------------------- the preconditions
+@pytest.mark.parametrize("kw, match", [
+    (dict(directed=False, learn_r=True, pe_pool="gt"), "DIRECTED"),
+    (dict(directed=True, learn_r=False, pe_pool="gt"), "LEARNABLE charge"),
+    (dict(directed=True, learn_r=True, pe_pool="pe"), "pe_pool"),
+])
+def test_producer_preconditions_fail_loud(kw, match):
+    torch.manual_seed(0)
+    gt = GraphTransformer(num_layers=2, pe_hidden_channels=8, pe_num_layers=2, d_model=8,
+                          heads=2, num_samples=4, dropout=0.0, k_pe=3, k_gt=2, **kw)
+    with pytest.raises(ValueError, match=match):
+        MagCompGraphLLM(_llm(), gt, tokenizer=_Tokenizer(), cycle_size=CYCLE)
+
+
+# --------------------------------------------------- the pretrained-MagGT channel
+def test_pretrained_pinned_charge_maggt_loads_and_r_cold_starts(tmp_path):
+    """``gnn.pe_gt_from`` accepts the notebook's PINNED-charge MagGT.
+
+    The resistance-regression stage trains with ``learn_r=False`` so its target is a fixed
+    function of the topology; its state dict therefore has no ``r_logit``. The loader must
+    tolerate exactly that gap (and nothing else), land every other tensor, and leave r at
+    THIS run's ``mask_magnet_r`` init.
+    """
+    from prism.models.loaders import load_navigator_pe_into
+
+    torch.manual_seed(7)
+    source = GraphTransformer(num_layers=2, pe_hidden_channels=8, pe_num_layers=2,
+                              d_model=8, heads=2, num_samples=4, dropout=0.0, k_pe=3,
+                              k_gt=2, directed=True, learn_r=False, pe_pool="gt")
+    src_state = source.state_dict()
+    assert not any(k.endswith(".r_logit") for k in src_state), "source must pin the charge"
+    path = tmp_path / "mag_gt.pt"
+    torch.save(src_state, path)
+
+    model = _model(pe_pool="gt")                       # learn_r=True, r = 0.126 default
+    r_before = float(model.pe_model.pe_model.pe_gcn.r.detach())
+    load_navigator_pe_into(model, str(path), None)
+
+    loaded = model.pe_model.state_dict()
+    for k, v in src_state.items():
+        assert torch.equal(loaded[k], v), f"{k} did not land"
+    assert float(model.pe_model.pe_model.pe_gcn.r.detach()) == pytest.approx(r_before)
+    assert model.pe_model.pe_model.pe_gcn.convs[0].r_logit.requires_grad
+
+
+def test_pretrained_load_still_rejects_a_real_mismatch(tmp_path):
+    """Only ``*.r_logit`` is forgiven — a genuine topology mismatch must still raise."""
+    from prism.models.loaders import load_navigator_pe_into
+
+    torch.manual_seed(7)
+    wrong = GraphTransformer(num_layers=1, pe_hidden_channels=8, pe_num_layers=2,
+                             d_model=8, heads=2, num_samples=4, dropout=0.0, k_pe=3,
+                             k_gt=2, directed=True, learn_r=False, pe_pool="gt")
+    path = tmp_path / "wrong.pt"
+    torch.save(wrong.state_dict(), path)
+    with pytest.raises(RuntimeError, match="did not match"):
+        load_navigator_pe_into(_model(), str(path), None)
+
+
+def test_save_run_dir_carries_beta(tmp_path):
+    """beta is the whole channel's gain; a run dir without it reloads as the base LLM."""
+    from prism.training.run_dir import save_run_dir
+
+    model = _model(beta_init=0.25)
+    save_run_dir(model, {"architecture": "learnable_graph_mask", "mask_composite": True},
+                 str(tmp_path))
+    weights = torch.load(tmp_path / "gnn_weights.pt", map_location="cpu")
+    assert "pe_model" in weights
+    assert float(weights["mask_beta"]) == pytest.approx(0.25)
+
+
+def test_left_padding_is_rejected():
+    model = _model()
+    ids = _ids().to(DEVICE)
+    mask = torch.ones_like(ids)
+    mask[0, 0] = 0                                   # left pad
+    with pytest.raises(ValueError, match="RIGHT padding"):
+        model.build_structural_mask(ids.shape[1], [_scene()], [_injection_map()], DEVICE,
+                                    input_ids=ids, attention_mask=mask)

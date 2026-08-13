@@ -48,6 +48,16 @@ _PSI_PRODUCER_ARCHS = ("learnable_graph_mask", "wire_llm")
 
 
 def train_model(config: omegaconf.DictConfig):
+    # Silence the AccumulateGrad stream-mismatch advisory. It is a performance note
+    # (redundant syncing, and CUDA-graph capture we never do), not a correctness one —
+    # accumulation still lands in the right param.grad. The cross-iteration node it
+    # reports comes from accelerate's multi-device dispatch under device_map="auto";
+    # our own retentions are dropped in CompositeWireGraphLLM._arm. getattr so a torch
+    # without the toggle still runs.
+    _silence = getattr(torch.autograd.graph,
+                       "set_warn_on_accumulate_grad_stream_mismatch", None)
+    if _silence is not None:
+        _silence(False)
     wandb_run_id = _setup_wandb(
         config.wandb.project, config.wandb.run_name, config.wandb.tag,
         report_to=config.trainer.report_to,
@@ -316,6 +326,18 @@ def train_model(config: omegaconf.DictConfig):
             # learnable_graph_mask extra params (read back by loaders for eval).
             **({k: config.gnn[k] for k in ("mask_alpha", "mask_psi_scale")}
                if config.gnn.arch == "learnable_graph_mask" else {}),
+            # mask_composite: the covariance arm is a DIFFERENT function of the same
+            # weights (beta * C_tok over the composite token block instead of the Psi
+            # Psi^T node-pair gate), so every switch its graph and its probe statistic
+            # depend on is recorded too. learn_r/directed/pe_pool ride the blocks above.
+            **({k: config.gnn[k] for k in (
+                "mask_composite", "mask_cycle_size", "mask_beta_init", "mask_magnet_r",
+                "mask_cycle_weight", "mask_cycle_causal", "mask_crosslink_weight",
+                "mask_anchor_enabled", "mask_anchor_weight", "learn_r", "hidden_norm",
+                "phase", "shift", "probe_distribution", "fixed_seed_mode",
+                "fixed_seed_value", "center_second_moment", "cache_pe")}
+               if config.gnn.arch == "learnable_graph_mask" and config.gnn.get("mask_composite")
+               else {}),
         }
         trainer = GraphSFTTrainer(
             model=model,
@@ -543,6 +565,25 @@ def _validate_config(config: omegaconf.DictConfig) -> None:
             raise ValueError(
                 "gnn.mask_psi_scale='cosine' with gnn.mask_use_edges=false is degenerate "
                 "(constant mask, zero GT gradient). Use mask_psi_scale='inv_sqrt_d' or keep edges.")
+        if config.gnn.get("mask_composite"):
+            # The three preconditions MagCompGraphLLM.__init__ asserts, checked at compose
+            # time so a mis-set value fails before the LLM is even loaded. pe_pool='gt' is
+            # what puts T inside E_q; directed/learn_r are what give the token cycle a phase.
+            for key, want in (("directed", True), ("learn_r", True), ("pe_pool", "gt")):
+                if config.gnn.get(key) != want:
+                    raise ValueError(
+                        f"gnn.mask_composite=true requires gnn.{key}={want!r}, got "
+                        f"{config.gnn.get(key)!r}: C = E_q[Φ'Φ'ᵀ] − ΨΨᵀ over "
+                        "Φ' = T(Φ(q; L̄^(r), H)) needs the magnetic backbone (directed), "
+                        "its charge as a free parameter (learn_r), and the blocks INSIDE "
+                        "the probe expectation (pe_pool='gt').")
+            if int(config.gnn.mask_cycle_size) < 2:
+                raise ValueError(
+                    f"gnn.mask_cycle_size must be >= 2, got {config.gnn.mask_cycle_size}")
+            if not 0.0 < float(config.gnn.mask_magnet_r) < 0.25:
+                raise ValueError(
+                    "gnn.mask_magnet_r must be in (0, 0.25) (sigmoid-reparameterized; the "
+                    f"endpoints have no logit), got {config.gnn.mask_magnet_r}")
     if config.gnn.arch == "wire_llm":
         if config.gnn.wire_layer_scope not in ("all", "dense", "dense_top_half", "dense_first"):
             raise ValueError(
@@ -594,6 +635,13 @@ def _validate_config(config: omegaconf.DictConfig) -> None:
             "injection_scope='decode_consistent' is only wired for the mask archs "
             "(graph_mask_llm / learnable_graph_mask) — the additive family needs the "
             f"q/kv split (design note §2.3, not built). Got {config.gnn.arch!r}.")
+    if config.data.injection_scope == "decode_consistent" and config.gnn.get("mask_composite"):
+        raise ValueError(
+            "injection_scope='decode_consistent' is not wired for gnn.mask_composite: "
+            "MaskDecodeInjector arms a per-NODE-PAIR bias row, and this arm's bias is "
+            "indexed by sequence POSITION in a composite graph that is fixed at prefill "
+            "(extending the cycle mid-rollout would change every token's C_tok row). Use "
+            "data.injection_scope='prompt_only'.")
     if (config.data.injection_scope == "decode_consistent"
             and config.gnn.mask_layer_scope == "all"):
         raise ValueError(

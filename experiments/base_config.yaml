@@ -136,6 +136,46 @@ gnn:
   mask_layer_scope: dense    # "all" = every layer | "dense" = all global layers | "dense_top_half" = deeper half of globals | "dense_first" = first global only
   mask_psi_scale: cosine     # "cosine" (row-normalized, sim in [-1,1]) | "inv_sqrt_d" (Gemma-style raw/sqrt(D))
 
+  # --- learnable_graph_mask, mask_composite arm (gnn_llm.MagCompGraphLLM) ---
+  # false (DEFAULT, every run so far) = the Psi Psi^T node-pair gate above.
+  # true = the bias is beta * C_tok, the token block of the probe COVARIANCE
+  #   C = E_q[Phi' Phi'^T] - Psi Psi^T over Phi' = T(Phi(q; L_bar^(r), H)) on the COMPOSITE
+  #   graph (directed token cycle + scene + scene->token crosslinks + anchor). Placed at
+  #   [start, end)^2 only: the system prompt and the ICL graphs get NO bias at all, and
+  #   nothing is hard-blocked. REQUIRES directed=true, learn_r=true and pe_pool=gt (all
+  #   three asserted in MagCompGraphLLM.__init__ and in _validate_config).
+  # mask_alpha / mask_psi_scale / mask_k_hops / mask_symmetrize / mask_use_edges are
+  # INERT under it — build_structural_mask is overridden wholesale.
+  mask_composite: false
+  mask_cycle_size: 8192      # cap on c, the token cycle length. COST scales as c^2.
+  mask_beta_init: 0.0        # beta at step 0. 0.0 = the base LLM's logits, exactly.
+  # Initial MagNet charge, written into the shared r_logit before any checkpoint load.
+  # Eigenvalues of L_bar^(r) collide on the length-c cycle iff dist(2rc, Z) = 0; at
+  # c = 8192 this r gives 2rc = 2064.384, a margin of 0.384. Changing mask_cycle_size
+  # moves the degeneracies — watch prism.eval.callbacks.ChargeDegeneracyCallback.
+  mask_magnet_r: 0.126
+  mask_cycle_weight: 1.0
+  mask_cycle_causal: false   # true transposes the cycle so a token reads its PREDECESSOR
+  mask_crosslink_weight: 0.1
+  mask_anchor_enabled: true  # false ablates the t_0 -> a -> v_0 bond (G may disconnect)
+  mask_anchor_weight: 10.0
+
+  # --- MagNet phase / shift and the R-PEARL probe statistic (Psi-producer archs) ---
+  # Read by gt.build_psi_producer; each default IS the module default, i.e. what every
+  # existing run and checkpoint was built with, so leaving them alone changes nothing.
+  phase: binary              # Theta^(r) = 2*pi*r*sgn(A - A^T) | "weight" (unnormalized)
+  shift: laplacian           # S = L_hat^(r) = -H_bar^(r) | "adjacency" (S = H_bar^(r))
+  probe_distribution: gaussian   # "gaussian" N(0,I) | "rademacher" (+/-1); both E[q]=0, unit 2nd moment
+  fixed_seed_mode: false     # true re-seeds the probes every forward, so Psi/C are reproducible
+  fixed_seed_value: 0
+  # Center E[Phi Phi^T] into the covariance C = E[Phi Phi^T] - Psi Psi^T. true removes the
+  # rank-1 Psi Psi^T bias that otherwise dominates, and makes C manifestly PSD.
+  center_second_moment: true
+  # Reuse the graph channel across consecutive forwards over the SAME graph object (Psi
+  # for the GT; C_tok for mask_composite). Fills only under no_grad — a cached tensor
+  # carries its autograd graph. false = recompute every forward.
+  cache_pe: false
+
   # --- wire_llm (WIRE: Psi enters as a ROTATION of q/k, not an added signal) ---
   # q_i -> R(theta_i) q_i, k_j -> R(theta_j) k_j with theta_n = omega_n . Psi_i, composed
   # on top of Gemma's own RoPE. Reuses the gt_*/pe_* GT above as the Psi producer.

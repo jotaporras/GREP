@@ -13,6 +13,7 @@ from prism.models.gnn_llm import (
     GraphAugmentedLLM,
     GraphMaskLLM,
     LearnableGraphMaskLLM,
+    MagCompGraphLLM,
     WireGraphLLM,
     build_injection_map,
     find_last_graph_scope,
@@ -263,7 +264,12 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
                 # the mask is computed on (it was silently ignored here before).
                 graph_model._struct_bias = graph_model.build_structural_mask(
                     input_ids.shape[1], [pyg_graph], [injection_map], input_ids.device,
-                    permutation=self.permutation)
+                    permutation=self.permutation,
+                    # MagCompGraphLLM's text layer IS the token sequence, so its bias
+                    # needs the ids; the Psi Psi^T mask is a function of the graph alone
+                    # and its signature has no room for them.
+                    **({"input_ids": input_ids, "attention_mask": attention_mask}
+                       if isinstance(graph_model, MagCompGraphLLM) else {}))
                 # decode_consistent checkpoints extend the channel to generated
                 # mentions: a forward pre-hook arms a per-step bias row (span-end
                 # assignment, design note §2.2). Other scopes keep the historical

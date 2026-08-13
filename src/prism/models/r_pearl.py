@@ -44,6 +44,10 @@ class RandomGNNPositionalEncodings(nn.Module):
             sigmoid-constrained to [0, 0.25]) instead of pinning it at 0.25. Adds
             ``pe_gcn.convs.*.r_logit`` to the state dict, so a checkpoint trained with
             it set must be rebuilt with it set.
+        phase (str): ``directed`` only — MagNet's phase matrix Θ^(r), ``"binary"``
+            (2πr·sgn(A − Aᵀ)) or ``"weight"``. See :class:`~prism.models.magnet.MagChebConv`.
+        shift (str): ``directed`` only — MagNet's shift operator, ``"laplacian"``
+            (L̂^(r) = −H̄^(r)) or ``"adjacency"``. Same reference.
     """
 
     def __init__(self,
@@ -65,6 +69,8 @@ class RandomGNNPositionalEncodings(nn.Module):
         directed: bool = False,
         learn_r: bool = True,
         hidden_norm: str = "none",
+        phase: str = "binary",
+        shift: str = "laplacian",
         readout_norm: str = "global_rms",
     ):
         super().__init__()
@@ -85,11 +91,13 @@ class RandomGNNPositionalEncodings(nn.Module):
         # Same (in, hidden, layers, skip, dropout, k) contract and the same
         # Data -> [N, hidden] forward, so the backbone swap is local to this line.
         self.directed = directed
-        # learn_r / hidden_norm are MagNet-only: TAGConv has no charge and no complex path.
+        # learn_r / hidden_norm / phase / shift are MagNet-only: TAGConv has no charge,
+        # no phase matrix and no complex path.
         self.pe_gcn = (magnet.MagNet if directed else gcn.GCN)(
             in_channels, pe_hidden_channels, pe_num_layers,
             skip_connection=True, dropout=dropout, k=k,
-            **({"learn_r": learn_r, "hidden_norm": hidden_norm} if directed else {})
+            **({"learn_r": learn_r, "hidden_norm": hidden_norm,
+                "phase": phase, "shift": shift} if directed else {})
         )
         self.output_projection = nn.Linear(pe_hidden_channels, d_model)
 
@@ -397,19 +405,52 @@ class RandomGNNPositionalEncodings(nn.Module):
         # Learnable tanh(g) output gate.
         return result * torch.tanh(self.output_gain).to(result.dtype)
 
-    def covariance_token_block(self, data, c):
-        """Sampled centered covariance ``C = E_q[ΦΦᵀ] − ΨΨᵀ`` and first-moment Gram
+    def covariance_token_block(self, data, c, pe_pool: str = "pe", gt=None):
+        """Sampled centered covariance ``C = E_q[Φ'Φ'ᵀ] − ΨΨᵀ`` and first-moment Gram
         ``Ψ̃ = ΨΨᵀ``, returned as the TOKEN blocks ``[c, c]`` (the matrices, not C·s).
 
         Probes run on the FULL composite graph (so token rows co-vary through the
         crosslinks/scene — non-mention tokens inherit scene context via diffusion).
         Same probe sampling / chunking / fixed-seed semantics as ``forward`` /
         ``second_moment_apply``; gradient flows to the GCN. Returns ``(C_tok, Psi_tok)``.
+
+        ``pe_pool`` says what Φ' IS, exactly as it does for
+        :class:`~prism.models.gt.GraphTransformer`:
+
+        - ``"pe"`` (default, every pre-existing caller): ``Φ' = Φ(q; S, H)``, the probe
+          response itself — C is read off the probe stack BEFORE any blocks.
+        - ``"gt"``: ``Φ' = T(Φ(q; S, H))``, i.e. ``gt``'s transformer blocks applied PER
+          PROBE, INSIDE the expectation, so both moments are taken over the block
+          outputs. T is nonlinear, so ``E_q[T(Φ)] ≠ T(E_q[Φ])``: this is NOT T applied
+          to Ψ, and that difference is the whole point of the option.
+
+        The outer product is ``Φ'Φ'ᵀ`` and not ``Φ'Φ'ᴴ`` because ``MagNet.unwind`` has
+        already split the complex representation into ``[Re ‖ Im]`` and returned a REAL
+        tensor. Moving T ahead of that unwind would make Φ' complex and the Hermitian
+        form the correct one — only ``Φ'Φ'ᴴ`` is invariant under the gauge z ↦ e^{iγ}z.
+
+        Args:
+            data: the composite-graph ``Data``, TOKEN rows first.
+            c: number of leading token rows the returned blocks cover.
+            pe_pool: ``"pe"`` or ``"gt"``, above.
+            gt: the ``GraphTransformer`` whose blocks form Φ' = T(Φ). Required by — and
+                only by — ``pe_pool="gt"``. Passed in rather than held as an attribute:
+                this module is that GT's own submodule, so storing it would close a
+                cycle in the module tree and duplicate every block in the state dict.
         """
         if self.node_feature_dim is not None:
             raise NotImplementedError(
                 "covariance_token_block is a random-probe readout and is incompatible "
                 "with semantic node features (node_feature_dim set)."
+            )
+        if pe_pool not in ("pe", "gt"):
+            raise ValueError(f"pe_pool must be 'pe' or 'gt', got {pe_pool!r}")
+        if (pe_pool == "gt") != (gt is not None):
+            raise ValueError(
+                f"pe_pool={pe_pool!r} was passed gt={type(gt).__name__ if gt is not None else None}: "
+                "'gt' needs the GraphTransformer whose blocks form Φ' = T(Φ), and 'pe' must "
+                "not be handed one — it would be ignored, and C would silently be the "
+                "PRE-block covariance under a config that says otherwise."
             )
         try:
             device = next(self.parameters()).device
@@ -435,6 +476,11 @@ class RandomGNNPositionalEncodings(nn.Module):
             Qc = Q[:, start:start + chunk]
             P = self._batched_gcn_forward(Qc, ei, N, Qc.shape[1],
                                           edge_weight=ew, device=device, pool=False)  # [mc,N,F]
+            if gt is not None:
+                # Φ' = T(Φ(q)) — the blocks run per probe, INSIDE E_q, over the whole
+                # composite (so the token rows keep reading the scene through the
+                # crosslinks); the token slice below is taken after, never before.
+                P = gt.apply_blocks(P, data)                        # [mc, N, F]
             Pt_chunks.append(P[:, :c, :])                           # token rows [mc, c, F]
         Pt = torch.cat(Pt_chunks, dim=0)                           # [m, c, F]
         psi = Pt.mean(dim=0)                                        # Ψ token rows [c, F]

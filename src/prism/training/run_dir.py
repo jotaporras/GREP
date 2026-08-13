@@ -43,8 +43,11 @@ def save_run_dir(model, gnn_config: dict, output_dir: str) -> None:
     elif gnn_config.get("architecture") == "learnable_graph_mask":
         # Save the standalone GraphTransformer (Psi producer); the mask + adjacency
         # rebuild from gnn_config and the LoRA adapter is saved by the trainer.
+        # mask_composite (MagCompGraphLLM) additionally carries `beta`, the ONE scalar
+        # scaling beta * C_tok — reloading without it evaluates the base LLM at 0.
         torch.save(
-            {"pe_model": model.pe_model.state_dict()},
+            {"pe_model": model.pe_model.state_dict(),
+             **({"mask_beta": model.beta.data} if hasattr(model, "beta") else {})},
             os.path.join(output_dir, "gnn_weights.pt"),
         )
     elif gnn_config.get("architecture") == "wire_llm":

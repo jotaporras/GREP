@@ -1,0 +1,128 @@
+# @package _global_
+# e17 — the LEARNABLE ATTENTION MASK over the MAGNETIC COMPOSITE graph.
+#
+#   python -m prism.training.train_v3 --config-name=e17_magnetic_composite_graphs
+#
+# The bias added to every in-scope attention logit is
+#
+#   Phi'(q) = T(Phi(q; L_bar^(r), H))     the GT blocks, applied PER PROBE, inside E_q
+#   Psi     = E_q[Phi']
+#   C       = E_q[Phi' Phi'^T] - Psi Psi^T
+#   A       = sm[ (Q x_n)^T (K x_m) / sqrt(d_h) + beta * C_tok[n, m] + M_causal ]
+#
+# with C_tok = C[:c, :c] the TOKEN block of the composite graph
+# (directed token cycle + undirected scene + DIRECTED scene->token crosslinks + anchor;
+# gnn_llm.build_composite_graph). beta is ONE learnable scalar starting at 0, so step 0
+# is the base LLM's logits exactly. RoPE is untouched — this arm composes with it (that
+# is what separates it from e17_composite_wire, which REPLACES RoPE).
+#
+# Everything before the last `scene graph:` block — system prompt, ICL graphs — gets NO
+# bias, and nothing anywhere is hard-blocked: the bias is additive and finite.
+#
+# The preconditions the arm cannot run without are asserted in BOTH
+# _validate_config (compose time) and MagCompGraphLLM.__init__ (construction):
+#   directed=true      the cycle's position lives in the magnetic phase alone
+#   learn_r=true       r is that phase budget
+#   pe_pool=gt         T inside E_q; under "pe" C would be the PRE-block covariance
+defaults:
+  - base_config
+  - _self_
+
+name: e17
+
+gnn:
+  arch: learnable_graph_mask
+  mask_composite: true
+
+  # --- The composite graph ---
+  # c = min(len(prompt), scope_start + mask_cycle_size) - scope_start, counted FROM the
+  # block so the graph block itself is never the part cut. This is a CAP: at
+  # data.max_seq_length=2048 below and scope_start ~ 249 the binding constraint is the
+  # sequence, so c ~ 1800 and the cap never engages. Raise max_seq_length before reading
+  # the cost of c = 8192 into a wall-clock.
+  # COST at the cap: the contraction forming C_tok is 2*M*c^2*D FLOP (4.4e13 at M=320,
+  # D=1024) and C_tok is c^2 fp32 = 268 MB. It scales as c^2, not c — this is the single
+  # most expensive number in the file.
+  mask_cycle_size: 8192
+  mask_cycle_weight: 1.0
+  mask_cycle_causal: false
+  mask_crosslink_weight: 0.1
+  # The anchor bond t_0 -> a -> v_0 (exactly two edges) is what makes G one component,
+  # and with it every magnetic effective resistance finite. Set false to ablate it.
+  mask_anchor_enabled: true
+  mask_anchor_weight: 10.0
+  # Crosslink DIRECTION is not a knob: scene node -> token, arrowheads on the cycle.
+  # Reversing or doubling it symmetrizes the pair and cancels Theta^(r) on exactly the
+  # edges that bind text to scene. Fixed in MagCompGraphLLM, asserted in the tests.
+
+  # --- The bias scale ---
+  # beta = 0 at step 0 => identical logits to the base LLM. Note the one-step stall this
+  # implies: dL/dC = beta * dL/dbias = 0 there, so beta moves first and the GT/MagNet
+  # train from step 2. Watch that beta actually leaves 0.
+  mask_beta_init: 0.0
+  mask_layer_scope: dense
+
+  # --- The magnetic probe backbone ---
+  # r is written into the shared r_logit at construction and trained from there.
+  # dist(2rc, Z) = dist(2064.384, Z) = 0.384 at c = 8192 — off the eigenvalue collision
+  # that would make the cycle's rows indistinguishable.
+  directed: true
+  learn_r: true
+  mask_magnet_r: 0.126
+  phase: binary
+  shift: laplacian
+  hidden_norm: none
+
+  # --- The probe statistic ---
+  # pe_pool=gt is load-bearing: it is what applies T per probe INSIDE E_q, so both
+  # moments are taken over the block outputs. center_second_moment=true makes C the
+  # centered covariance (manifestly PSD, no fp32 cancellation), and fixed_seed_mode
+  # makes the two moments share one probe draw exactly rather than in expectation.
+  pe_pool: gt
+  probe_distribution: gaussian
+  fixed_seed_mode: true
+  fixed_seed_value: 0
+  center_second_moment: true
+  # C_tok is a function of the composite TOPOLOGY alone, so prefill + any repeat forward
+  # over the same prompt pays for it once. Fills only under no_grad.
+  cache_pe: true
+
+  # --- Sizing (the notebook's create_gnn, e17 cell 41; also e13f's) ---
+  # base_config's smaller pe/gt block is a dev default and would train a different model.
+  d_model: 1024              # the GT's `dim`
+  pe_hidden_channels: 256
+  pe_num_layers: 5
+  k_pe: 3                    # MagChebConv filter size K
+  gt_num_layers: 3           # the GT's `num_layers`
+  gt_heads: 8
+  k_gt: 2
+  num_samples: 320           # the probe count M
+
+  # --- Pretrained MagGT channel ---
+  # A GT pretrained by the notebook's resistance-regression stage
+  # (2026-08-10 e17_magnet_composite_graphs.ipynb §3, which fits C's induced distances to
+  # alpha * R_eff of this same composite graph) is poured in here, straight into
+  # model.pe_model, by loaders.load_navigator_pe_into. That stage pins the charge
+  # (learn_r=false), so its state dict has no r_logit keys; the loader tolerates exactly
+  # that gap and cold-starts r at mask_magnet_r above. Any other key mismatch raises.
+  # trainer.init_pe_from is the other channel (a prior RUN's gnn_weights.pt).
+  pe_gt_from: null
+  semantic_gt_from: null
+
+data:
+  # prompt_only keeps the answer-side mentions OUT of the crosslinks, so the prefill
+  # C_tok carries no answer-derived topology. decode_consistent is REJECTED for this arm.
+  injection_scope: prompt_only
+  # binary is what the notebook assembles composite graphs under; base_config's gaussian
+  # affinity is a different scene layer.
+  edge_weights: binary
+  max_seq_length: 2048
+
+trainer:
+  bit4: true
+  checkpoint_dir: outputs/e17_magnetic_composite_graphs
+  save_name: e17_magnetic_composite_graphs
+
+wandb:
+  run_name: e17_magnetic_composite_graphs
+  tag: e17

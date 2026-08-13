@@ -135,8 +135,25 @@ def build_planner_model(gnn, llm, tokenizer, *, disable_graph_token_rope=False,
         # gt.build_psi_producer, the single site eval rebuilds from too. Weights are loaded
         # afterwards in train_v3 (load_navigator_pe_into).
         pe_model = gt_module.build_psi_producer(gnn, node_feature_dim=_node_feature_dim)
-        model = gnn_llm.LearnableGraphMaskLLM(
+        # mask_composite swaps the SCENE graph for the COMPOSITE one (token cycle + scene
+        # + scene->token crosslinks + anchor) and the bias for beta * C_tok, the probe
+        # COVARIANCE of the token block; the delivery mechanism (one additive pre-softmax
+        # [B,1,seq,seq]) is identical, so the two share this branch and every mask_* key
+        # the composite arm still reads. See MagCompGraphLLM.
+        _composite = bool(gnn.get("mask_composite", False))
+        _mask_cls = gnn_llm.MagCompGraphLLM if _composite else gnn_llm.LearnableGraphMaskLLM
+        model = _mask_cls(
             llm, pe_model, alpha=gnn.mask_alpha,
+            **({"tokenizer": tokenizer,
+                "cycle_size": gnn.get("mask_cycle_size", 8192),
+                "beta_init": gnn.get("mask_beta_init", 0.0),
+                "magnet_r": gnn.get("mask_magnet_r", 0.126),
+                "cycle_weight": gnn.get("mask_cycle_weight", 1.0),
+                "cycle_causal": gnn.get("mask_cycle_causal", False),
+                "crosslink_weight": gnn.get("mask_crosslink_weight", 0.1),
+                "anchor_enabled": gnn.get("mask_anchor_enabled", True),
+                "anchor_weight": gnn.get("mask_anchor_weight", 10.0),
+                "cache_pe": gnn.get("cache_pe", True)} if _composite else {}),
             layer_scope=gnn.mask_layer_scope,
             k_hops=gnn.mask_k_hops, symmetrize=gnn.mask_symmetrize,
             use_edges=gnn.mask_use_edges, psi_scale=gnn.mask_psi_scale,

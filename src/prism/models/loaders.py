@@ -375,9 +375,24 @@ def graph_augmented_llm_from_pretrained(
         # Psi = PE GT (a standalone GraphTransformer); a recorded semantic_gt_from selects
         # the legacy two-stage TwoStagePE so pre-split checkpoints reload as trained.
         pe_model = gt_module.build_psi_producer(gnn_cfg, node_feature_dim=node_feature_dim)
-        model = gnn_llm.LearnableGraphMaskLLM(
+        # Absent key = a run predating mask_composite, i.e. the Psi Psi^T mask. The two
+        # are different functions of the same state_dict (beta * C_tok over the composite
+        # token block), so this must be recorded, never defaulted true.
+        _composite = bool(gnn_cfg.get("mask_composite", False))
+        _mask_cls = gnn_llm.MagCompGraphLLM if _composite else gnn_llm.LearnableGraphMaskLLM
+        model = _mask_cls(
             llm, pe_model,
             alpha=gnn_cfg.get("mask_alpha", 0.7),
+            **({"tokenizer": tokenizer,
+                "cycle_size": gnn_cfg.get("mask_cycle_size", 8192),
+                "beta_init": gnn_cfg.get("mask_beta_init", 0.0),
+                "magnet_r": gnn_cfg.get("mask_magnet_r", 0.126),
+                "cycle_weight": gnn_cfg.get("mask_cycle_weight", 1.0),
+                "cycle_causal": gnn_cfg.get("mask_cycle_causal", False),
+                "crosslink_weight": gnn_cfg.get("mask_crosslink_weight", 0.1),
+                "anchor_enabled": gnn_cfg.get("mask_anchor_enabled", True),
+                "anchor_weight": gnn_cfg.get("mask_anchor_weight", 10.0),
+                "cache_pe": gnn_cfg.get("cache_pe", True)} if _composite else {}),
             layer_scope=gnn_cfg.get("mask_layer_scope", "dense"),
             k_hops=gnn_cfg.get("mask_k_hops", 1),
             symmetrize=gnn_cfg.get("mask_symmetrize", True),
@@ -388,6 +403,15 @@ def graph_augmented_llm_from_pretrained(
         )
         gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
         _load_psi_producer_state(model.pe_model, gnn_weights["pe_model"], path, gnn_cfg)
+        if _composite:
+            # beta is the whole graph channel's gain; a checkpoint without it would
+            # evaluate at beta_init (0 = the base LLM) and report a clean load.
+            if "mask_beta" not in gnn_weights:
+                raise KeyError(
+                    f"{os.path.join(path, 'gnn_weights.pt')} is missing 'mask_beta': the "
+                    "learned bias scale of a mask_composite run. Without it the rebuild "
+                    "would silently evaluate at mask_beta_init, i.e. the base LLM at 0.")
+            model.beta.data.copy_(gnn_weights["mask_beta"].to(model.beta.device))
     elif architecture in ("postfusion_graph_llm", "composite_graph_gt"):
         raise ValueError(
             f"architecture {architecture!r} was removed from the codebase (legacy "
@@ -408,9 +432,17 @@ def load_navigator_pe_into(model, pe_gt_from: str, semantic_gt_from: str) -> Non
     is honoured only for the legacy ``gt.TwoStagePE`` producer, which exists so pre-split
     checkpoints reload as the function they were trained as.
 
-    Architecture-agnostic: it only needs ``model.pe_model``, so it serves both Ψ-consuming
-    architectures — ``learnable_graph_mask`` (Ψ Ψᵀ attention bias) and ``wire_llm``
-    (Ψ as q/k rotation angles).
+    Architecture-agnostic: it only needs ``model.pe_model``, so it serves every Ψ-consuming
+    architecture — ``learnable_graph_mask`` (Ψ Ψᵀ attention bias, or ``β·C_tok`` over the
+    composite graph under ``mask_composite``) and ``wire_llm`` (Ψ as q/k rotation angles).
+    This is also the channel a PRETRAINED MagNet GT arrives through: the notebook's
+    resistance-regression stage (``2026-08-10 e17_magnet_composite_graphs.ipynb`` §3)
+    trains one with the charge PINNED (``learn_r=False``, so the target is a fixed
+    function of the topology) and saves ``gnn.state_dict()``. Its key set is then the
+    consumer's minus ``*.r_logit``, and exactly that difference is tolerated below — the
+    charge cold-starts at the consumer's own ``r`` init, which is the only sane value for
+    a parameter the source never had. Any OTHER missing/unexpected key is a genuine
+    topology mismatch and still raises.
     """
     pe = model.pe_model
     # The GT to fill is the wrapped `pe_gt` (NavigatorPE / TwoStagePE) or `pe_model` itself
@@ -421,6 +453,13 @@ def load_navigator_pe_into(model, pe_gt_from: str, semantic_gt_from: str) -> Non
     # mismatch fails loudly instead of silently loading a partially-random PE.
     missing, unexpected = target.load_state_dict(
         torch.load(pe_gt_from, map_location="cpu"), strict=False)
+    charge_only = [k for k in missing if k.endswith(".r_logit")]
+    missing = [k for k in missing if not k.endswith(".r_logit")]
+    if charge_only:
+        backbone = getattr(getattr(target, "pe_model", None), "pe_gcn", None)
+        print(f"[navigator] {pe_gt_from} pins the MagNet charge ({len(charge_only)} "
+              f"r_logit keys absent); r cold-starts at this run's init "
+              f"r={float(torch.as_tensor(backbone.r).detach()):.6f}")
     if missing or unexpected:
         raise RuntimeError(
             f"PE GT load from {pe_gt_from} did not match the {type(target).__name__} "

@@ -256,6 +256,10 @@ class GraphTransformer(nn.Module):
             layer; ``directed`` only. See :class:`RandomGNNPositionalEncodings`.
         hidden_norm (str): Forwarded to the same backbone — MagNet's inter-layer
             normalization, ``"none"`` (default) or ``"global_rms"``; ``directed`` only.
+        phase (str): Forwarded to the same backbone — MagNet's phase matrix Θ^(r),
+            ``"binary"`` (default) or ``"weight"``; ``directed`` only.
+        shift (str): Forwarded to the same backbone — MagNet's shift operator,
+            ``"laplacian"`` (default) or ``"adjacency"``; ``directed`` only.
         cache_pe (bool): Reuse Ψ across consecutive forwards over the SAME ``Data``
             object; see :meth:`_probe_pe`. Off by default — every current consumer
             passes a fresh graph per forward, and a stale cache would be a silent
@@ -277,6 +281,8 @@ class GraphTransformer(nn.Module):
                  directed: bool = False,
                  learn_r: bool = True,
                  hidden_norm: str = "none",
+                 phase: str = "binary",
+                 shift: str = "laplacian",
                  cache_pe: bool = False):
         super().__init__()
         if pe_readout not in ("mean", "second_moment"):
@@ -329,6 +335,8 @@ class GraphTransformer(nn.Module):
             directed=directed,
             learn_r=learn_r,
             hidden_norm=hidden_norm,
+            phase=phase,
+            shift=shift,
         )
         self.input_proj = nn.Linear(node_feature_dim, d_model) if fuse_node_features else None
         # Final block is norm-free (normalize=False) so its output magnitude
@@ -372,6 +380,40 @@ class GraphTransformer(nn.Module):
     def invalidate_cache(self) -> None:
         """Drop the cached Ψ; a no-op when ``cache_pe`` is off (see :meth:`_probe_pe`)."""
         self._pe_cache = self._pe_graph = None
+
+    def apply_blocks(self, x: Tensor, data) -> Tensor:
+        """The transformer blocks alone, over ``data``'s ≤k-hop neighborhoods.
+
+        ``x`` is ``[N, d_model]`` or the per-probe stack ``[M, N, d_model]``; the stack is
+        run as ONE block-diagonal M-copy graph (the same offset trick :meth:`forward`
+        uses), so the probes stay exactly independent and the weights are shared. The
+        return has ``x``'s own shape: the probe axis is NOT pooled and the output gate is
+        NOT applied, because the caller is taking its own statistic over the probes —
+        ``RandomGNNPositionalEncodings.covariance_token_block(pe_pool='gt')`` takes the
+        centered second moment, for which a mean over the axis would be wrong and a gate
+        would just rescale a matrix its consumer already scales.
+
+        The k-hop expansion is memoized on ``data`` under the same ``_khop_edge_index``
+        attribute :meth:`forward` uses, so a graph that has been through either path pays
+        for it once.
+        """
+        num_nodes = data.x.size(0)
+        if not hasattr(data, '_khop_edge_index'):
+            data._khop_edge_index = self._expand_edge_index(data.edge_index, num_nodes)
+        khop_edge_index = data._khop_edge_index.to(x.device)
+
+        m_probes = x.shape[0] if x.dim() == 3 else None
+        if m_probes is not None:
+            x = x.reshape(m_probes * num_nodes, -1)
+            offsets = (torch.arange(m_probes, device=x.device) * num_nodes).view(-1, 1, 1)
+            khop_edge_index = ((khop_edge_index.unsqueeze(0) + offsets)
+                               .permute(1, 0, 2).reshape(2, -1))
+        for block in self.blocks:
+            if self.training and torch.is_grad_enabled():
+                x = checkpoint(block, x, khop_edge_index, use_reentrant=False)
+            else:
+                x = block(x, khop_edge_index)
+        return x if m_probes is None else x.view(m_probes, num_nodes, -1)
 
     @torch.no_grad()
     def _expand_edge_index(self, edge_index: Tensor, num_nodes: int, k_hops: int = 1) -> Tensor:
@@ -921,10 +963,11 @@ def build_psi_producer(cfg, node_feature_dim: int = None) -> nn.Module:
             ``gt_num_layers``/``gt_heads``/``k_gt``/``d_model``/``dropout``/``eps``/
             ``use_layer_norm``/``pe_hidden_channels``/``pe_num_layers``/``num_samples``/
             ``k_pe``, plus the navigator switches ``pe_gt_from``/``semantic_gt_from``.
-            ``pe_pool`` and ``directed`` are OPTIONAL, defaulting to ``"pe"`` (E_q
-            inside R-PEARL) and ``False`` (undirected GCN backbone) — the behaviour
-            every existing run and checkpoint was trained with; the fallbacks keep
-            checkpoints written before those keys existed reloading as themselves.
+            ``pe_pool``, ``directed``, ``learn_r``, ``hidden_norm``, ``phase``,
+            ``shift``, ``probe_distribution``, ``fixed_seed_mode``/``fixed_seed_value``,
+            ``center_second_moment`` and ``cache_pe`` are OPTIONAL and each falls back
+            to the MODULE default — the behaviour every existing run and checkpoint was
+            trained with — so a config written before the key existed rebuilds as itself.
         node_feature_dim: semantic input width for the standalone GT (``None`` = random
             probes). Ignored in two-stage mode: the notebook's PE GT is probe-based.
 
@@ -974,6 +1017,17 @@ def build_psi_producer(cfg, node_feature_dim: int = None) -> nn.Module:
         # Absent -> False, the value every pre-learn_r checkpoint was trained with;
         # a recorded True is required for the strict load to find the r_logit keys.
         learn_r=cfg.get("learn_r", False),
+        # Every remaining default below is the module default, i.e. the value every
+        # existing run and checkpoint was built with, so a config predating the key
+        # rebuilds as itself. hidden_norm/phase/shift bite on the MagNet backbone only.
+        hidden_norm=cfg.get("hidden_norm", "none"),
+        phase=cfg.get("phase", "binary"),
+        shift=cfg.get("shift", "laplacian"),
+        probe_distribution=cfg.get("probe_distribution", "gaussian"),
+        fixed_seed_mode=cfg.get("fixed_seed_mode", False),
+        fixed_seed_value=cfg.get("fixed_seed_value", 0),
+        center_second_moment=cfg.get("center_second_moment", True),
+        cache_pe=cfg.get("cache_pe", False),
     )
     if not navigator:
         return pe_gt
