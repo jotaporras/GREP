@@ -32,7 +32,9 @@ from prism.data import rl_dataset
 from prism.models import architectures, inference
 from prism.models.vllm_graph import engine as vg_engine
 from prism.training import rewards, train_v3
-from prism.training.trainers_rl import GraphGRPOTrainer
+from prism.training.trainers_rl import GraphGRPOTrainer, MaskGRPOTrainer
+
+MASK_ARCHS = {"graph_mask_llm", "learnable_graph_mask"}
 
 
 def train_rl(config: omegaconf.DictConfig) -> None:
@@ -49,18 +51,26 @@ def train_rl(config: omegaconf.DictConfig) -> None:
     policy_device = int(rl_cfg.get("policy_device", 0))
 
     init_checkpoint = rl_cfg.get("init_checkpoint")
+    is_mask_arch = False
     if init_checkpoint:
         from prism.eval import checkpoint as ckpt_mod
 
-        policy = vg_engine.checkpoint_engine_policy(init_checkpoint)
+        gnn_config = _gnn_config_from_checkpoint(init_checkpoint)
+        # The checkpoint records its SFT-time structural_lr_mult (e.g. e13f:
+        # 0.012); the RL tower LR is THIS run's knob, so the live config wins.
+        gnn_config["structural_lr_mult"] = float(config.gnn.structural_lr_mult)
+        is_mask_arch = gnn_config.get("architecture") in MASK_ARCHS
+        # Additive archs also need the engine-policy fields (and the same call
+        # fails loud on unservable archs) — mask archs skip vLLM entirely.
+        policy = (None if is_mask_arch
+                  else vg_engine.checkpoint_engine_policy(init_checkpoint))
         model, tokenizer, is_gnn = ckpt_mod.load_checkpoint(
             init_checkpoint, four_bit=config.trainer.bit4, device=policy_device)
         if not is_gnn:
             raise ValueError(
                 f"{init_checkpoint} is a plain-LLM checkpoint; the graph RL "
-                "trainer needs an additive graph checkpoint. Plain-LLM RL uses "
+                "trainer needs a graph checkpoint. Plain-LLM RL uses "
                 "stock trl GRPOTrainer with use_vllm=True (the control arm).")
-        gnn_config = _gnn_config_from_checkpoint(init_checkpoint)
         peft_config = None
     else:
         bnb = None
@@ -92,25 +102,30 @@ def train_rl(config: omegaconf.DictConfig) -> None:
         policy = {"identity_rope": bool(config.model.disable_graph_token_rope),
                   "pe_inject_value": True}
 
-    # Rollout engine over the checkpoint's servable weights. GPU placement /
-    # memory split is env-driven (PRISM_VLLM_GPU_UTIL; CUDA_VISIBLE_DEVICES for
-    # the process) — the plaza two-GPU topology is settled at PoC time.
-    serving = (vg_engine.materialize_serving_dir(init_checkpoint, is_gnn=True)
-               if init_checkpoint else config.model.path)
-    # Free-form engine passthrough (mirrors trainer.rl.grpo): any vLLM engine
-    # kwarg is CLI-settable — e.g. quantization=bitsandbytes +
-    # load_format=bitsandbytes for in-flight nf4 on 48 GB cards.
-    engine_kwargs = _freeform(rl_cfg.get("engine"))
-    # The trainer syncs the policy as a LoRARequest (see GraphGRPOTrainer.
-    # _sync_policy_to_engine) — the engine must accept adapters of the
-    # policy's rank.
-    engine_kwargs.setdefault("enable_lora", True)
-    engine_kwargs.setdefault("max_lora_rank", int(config.lora.r))
-    rollout_llm, rollout_wrapper = vg_engine.build_graph_llm(
-        serving,
-        identity_rope=policy["identity_rope"],
-        pe_inject_value=policy["pe_inject_value"],
-        **engine_kwargs)
+    if is_mask_arch:
+        # Mask archs have no vLLM analog — rollouts run through the policy
+        # itself (MaskGRPOTrainer), so no engine, no serving dir, no sync.
+        rollout_llm = rollout_wrapper = None
+    else:
+        # Rollout engine over the checkpoint's servable weights. GPU placement /
+        # memory split is env-driven (PRISM_VLLM_GPU_UTIL; CUDA_VISIBLE_DEVICES
+        # for the process) — the plaza two-GPU topology is settled at PoC time.
+        serving = (vg_engine.materialize_serving_dir(init_checkpoint, is_gnn=True)
+                   if init_checkpoint else config.model.path)
+        # Free-form engine passthrough (mirrors trainer.rl.grpo): any vLLM engine
+        # kwarg is CLI-settable — e.g. quantization=bitsandbytes +
+        # load_format=bitsandbytes for in-flight nf4 on 48 GB cards.
+        engine_kwargs = _freeform(rl_cfg.get("engine"))
+        # The trainer syncs the policy as a LoRARequest (see GraphGRPOTrainer.
+        # _sync_policy_to_engine) — the engine must accept adapters of the
+        # policy's rank.
+        engine_kwargs.setdefault("enable_lora", True)
+        engine_kwargs.setdefault("max_lora_rank", int(config.lora.r))
+        rollout_llm, rollout_wrapper = vg_engine.build_graph_llm(
+            serving,
+            identity_rope=policy["identity_rope"],
+            pe_inject_value=policy["pe_inject_value"],
+            **engine_kwargs)
 
     core = inference._core_graph_model(model)
     include_edges = gnn_config.get("text_edge_list") == "present"
@@ -149,18 +164,30 @@ def train_rl(config: omegaconf.DictConfig) -> None:
     grpo_kwargs.update(_freeform(rl_cfg.get("grpo")))
     args = GRPOConfig(**grpo_kwargs)
 
-    trainer = GraphGRPOTrainer(
-        model,
-        gnn_config=gnn_config,
-        rollout_llm=rollout_llm,
-        rollout_wrapper=rollout_wrapper,
-        args=args,
-        sync_every=rl_cfg.get("sync_every", 1),
-        train_dataset=dataset,
-        reward_funcs=reward_funcs,
-        processing_class=tokenizer,
-        peft_config=peft_config,
-    )
+    if is_mask_arch:
+        trainer = MaskGRPOTrainer(
+            model,
+            gnn_config=gnn_config,
+            args=args,
+            rollout_batch_size=rl_cfg.get("rollout_batch_size", 16),
+            train_dataset=dataset,
+            reward_funcs=reward_funcs,
+            processing_class=tokenizer,
+            peft_config=peft_config,
+        )
+    else:
+        trainer = GraphGRPOTrainer(
+            model,
+            gnn_config=gnn_config,
+            rollout_llm=rollout_llm,
+            rollout_wrapper=rollout_wrapper,
+            args=args,
+            sync_every=rl_cfg.get("sync_every", 1),
+            train_dataset=dataset,
+            reward_funcs=reward_funcs,
+            processing_class=tokenizer,
+            peft_config=peft_config,
+        )
     # The e16 research question is BEFORE-vs-AFTER RL, all else equal: save the
     # untrained policy (same tower init, zero-init LoRA) as a sibling run dir so
     # both ends evaluate through the identical checkpoint/eval path.

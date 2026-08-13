@@ -2602,6 +2602,144 @@ def bucketize_prompt(input_ids_b: list, node_token_seqs : list) -> defaultdict:
     return buckets
 
 
+def mask_node_values(model, pyg_graph, device, permutation=None) -> torch.Tensor:
+    """Per-node-pair decode bias values ``[N, N]`` for the mask archs.
+
+    ``log(α + (1−α)·sim(Ψ_i, Ψ_j))`` on adjacent pairs (learned, for
+    :class:`LearnableGraphMaskLLM`; constant 0 for :class:`GraphMaskLLM`),
+    ``finfo.min`` on non-adjacent pairs — the same values
+    ``build_structural_mask`` folds into the prefill bias, computed once per
+    (graph, tower state) and reused for every decode step.
+    """
+    adj = model._node_adjacency(pyg_graph, device, permutation=permutation)
+    if hasattr(model, "pe_model"):
+        with torch.no_grad():
+            psi = model.pe_model(pyg_graph, permutation=permutation).float()
+            if model._mask_psi_scale == "cosine":
+                psi = psi / psi.norm(dim=-1, keepdim=True).clamp_min(model._mask_eps)
+                sim = psi @ psi.t()
+            else:
+                sim = (psi @ psi.t()) / (psi.shape[-1] ** 0.5)
+        gate = (model._mask_alpha + (1.0 - model._mask_alpha) * sim).clamp_min(model._mask_eps)
+        node_m = gate.log()  # log-gate: matches build_structural_mask's multiplicative fold
+    else:
+        node_m = torch.zeros_like(adj, dtype=torch.float32)
+    neg = torch.finfo(torch.float32).min
+    return torch.where(adj, node_m, torch.full_like(node_m, neg))
+
+
+class _MaskDecodeRowState:
+    """Suffix-span state for ONE sequence of a batched mask-arch generation.
+
+    Same span semantics as :class:`MaskDecodeInjector` (longest-first disjoint
+    spans, partial-mention deferral, span-end query tagging), factored out so
+    :class:`BatchedMaskDecodeInjector` can run one instance per batch row.
+    All positions are in the PADDED batch coordinate system: the caller passes
+    ``prompt_tok2node`` of length ``padded_prompt_len`` (pad positions −1).
+    """
+
+    def __init__(self, node_values, prompt_tok2node, node_token_seqs):
+        self.node_values = node_values
+        self.prompt_tok2node = prompt_tok2node
+        self.node_token_seqs = node_token_seqs
+        self.generated: list[int] = []
+        self._committed: set = set()
+
+    def _suffix_spans(self):
+        smap = build_injection_map(self.generated, self.node_token_seqs, scope_start=0)
+        n = len(self.generated)
+        out = {}
+        for nid, spans in smap.items():
+            kept = [sp for sp in spans
+                    if not (sp[1] == n and _extendable_span(
+                        list(self.generated[sp[0]:sp[1]]), self.node_token_seqs))]
+            if kept:
+                out[nid] = kept
+        return out
+
+    def step(self, token: int, prompt_len: int):
+        """Consume one decode token; return the bias row [k_len] or None."""
+        self.generated.append(token)
+        prev_committed = self._committed
+        spans = self._suffix_spans()
+        self._committed = {(nid, sp) for nid, sps in spans.items() for sp in sps}
+        p_suffix = len(self.generated) - 1
+        q_node = -1
+        for nid, sps in spans.items():
+            for start, end in sps:
+                if end - 1 == p_suffix:
+                    q_node = nid
+                elif end - 1 == p_suffix - 1 and (nid, (start, end)) not in prev_committed:
+                    q_node = nid
+        if q_node < 0:
+            return None
+        device = self.node_values.device
+        k_len = prompt_len + len(self.generated)
+        tok2node_k = torch.full((k_len,), -1, dtype=torch.long, device=device)
+        tok2node_k[:prompt_len] = self.prompt_tok2node
+        for nid, sps in spans.items():
+            for start, end in sps:
+                tok2node_k[prompt_len + start:prompt_len + end] = nid
+        row = torch.zeros(k_len, dtype=torch.float32, device=device)
+        k_pos = (tok2node_k >= 0).nonzero(as_tuple=True)[0]
+        row[k_pos] = self.node_values[q_node, tok2node_k[k_pos]]
+        return row
+
+
+class BatchedMaskDecodeInjector:
+    """Batched decode-time structural-mask extension (RL rollouts).
+
+    The eval-path :class:`MaskDecodeInjector` is batch-size-1 by construction;
+    GRPO rollouts sample ``num_generations × prompts`` completions at once, so
+    this variant keeps one :class:`_MaskDecodeRowState` per row and arms
+    ``model._decode_bias_row`` as ``[B, 1, 1, K]`` (rows whose current query is
+    untagged contribute an all-zero row — identical to the batch-1 ``None``).
+
+    Rows must be LEFT-padded to a common ``padded_prompt_len`` so every row
+    shares the key axis; pad positions map to node −1 (zero bias) and are
+    excluded by the attention mask anyway. Identity-RoPE checkpoints are NOT
+    supported here (the per-step position_ids rewrite is per-row) — callers
+    must fail loud on ``_disable_graph_token_rope``.
+    """
+
+    def __init__(self, model, row_states: list, padded_prompt_len: int):
+        if getattr(model, "_disable_graph_token_rope", False):
+            raise ValueError(
+                "BatchedMaskDecodeInjector does not support identity-RoPE "
+                "checkpoints: the decode-step position_ids rewrite is per-row.")
+        self.model = model
+        self.rows = row_states
+        self.prompt_len = padded_prompt_len
+        self.device = next(model.parameters()).device
+
+    def pre_hook(self, module, args, kwargs):
+        input_ids = kwargs.get("input_ids")
+        if input_ids is None and args:
+            input_ids = args[0]
+        if input_ids is None or input_ids.shape[1] != 1:
+            return                                # prefill (multi-token forward)
+        if input_ids.shape[0] != len(self.rows):
+            raise RuntimeError(
+                f"decode batch {input_ids.shape[0]} != armed row states "
+                f"{len(self.rows)} — generate() reordered or dropped rows.")
+        toks = input_ids[:, 0].tolist()
+        rows_out, any_tagged = [], False
+        for b, state in enumerate(self.rows):
+            row = state.step(int(toks[b]), self.prompt_len)
+            rows_out.append(row)
+            any_tagged = any_tagged or row is not None
+        if not any_tagged:
+            self.model._decode_bias_row = None
+            return
+        k_len = self.prompt_len + len(self.rows[0].generated)
+        bias = torch.zeros(len(self.rows), 1, 1, k_len, dtype=torch.float32,
+                           device=self.device)
+        for b, row in enumerate(rows_out):
+            if row is not None:
+                bias[b, 0, 0] = row
+        self.model._decode_bias_row = bias
+
+
 class MaskDecodeInjector:
     """Decode-time structural-mask extension for the mask archs (design note §2.2).
 
@@ -2637,22 +2775,8 @@ class MaskDecodeInjector:
         # `permutation` must match the one build_structural_mask used for the prefill bias:
         # the decode rows index the SAME node axis, so a permuted prefill with an
         # unpermuted decode extension would mix two different node labellings mid-rollout.
-        adj = model._node_adjacency(pyg_graph, self.device, permutation=permutation)
-        if hasattr(model, "pe_model"):
-            # LearnableGraphMaskLLM: learned relative-PE values on allowed pairs.
-            with torch.no_grad():
-                psi = model.pe_model(pyg_graph, permutation=permutation).float()
-                if model._mask_psi_scale == "cosine":
-                    psi = psi / psi.norm(dim=-1, keepdim=True).clamp_min(model._mask_eps)
-                    sim = psi @ psi.t()
-                else:
-                    sim = (psi @ psi.t()) / (psi.shape[-1] ** 0.5)
-            gate = (model._mask_alpha + (1.0 - model._mask_alpha) * sim).clamp_min(model._mask_eps)
-            node_m = gate.log()  # log-gate: matches build_structural_mask's multiplicative fold
-        else:
-            node_m = torch.zeros_like(adj, dtype=torch.float32)
-        neg = torch.finfo(torch.float32).min
-        self.node_values = torch.where(adj, node_m, torch.full_like(node_m, neg))
+        self.node_values = mask_node_values(model, pyg_graph, self.device,
+                                            permutation=permutation)
         self.prompt_tok2node = tok2node_vector(prompt_injection_map, prompt_len,
                                                self.device)
         # Flattened variant list for the partial-mention ambiguity check.

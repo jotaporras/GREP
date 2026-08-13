@@ -20,9 +20,14 @@ trainer:
   gradient_accumulation_steps: 4
 
   rl:
-    # SFT run dir to resume the policy from (additive arch). null = from scratch
-    # (base LLM + fresh LoRA + gnn.pe_gt_from navigator carry, as in e14).
+    # SFT run dir to resume the policy from. Additive archs → vLLM rollouts
+    # (GraphGRPOTrainer); mask archs → HF batched rollouts (MaskGRPOTrainer).
+    # null = from scratch (additive only: base LLM + fresh LoRA +
+    # gnn.pe_gt_from navigator carry, as in e14).
     init_checkpoint: null
+    # Mask-arch rollouts only: sequences per generate() call (memory knob for
+    # the [B,1,S,S] prefill bias + KV cache; ignored by the additive path).
+    rollout_batch_size: 16
     # Dir (or glob) of data_gen_*.json graph/task files — the RL prompt source.
     data_files: data/n_30/gen/nav100_n30_gemma_data/split/train_graphs
     num_generations: 8          # GRPO group size

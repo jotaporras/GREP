@@ -50,7 +50,17 @@ from prism.training import _trl_compat  # noqa: F401 — must precede trl.traine
 from trl import GRPOTrainer
 
 from prism.data import utils as data_utils
-from prism.models.gnn_llm import core_graph_model
+from prism.models.gnn_llm import (
+    BatchedMaskDecodeInjector,
+    _MaskDecodeRowState,
+    build_injection_map,
+    core_graph_model,
+    decode_style_query_map,
+    find_last_graph_scope,
+    mask_node_values,
+    node_token_variants,
+    tok2node_vector,
+)
 from prism.models.vllm_graph.psi import build_psi_transport
 from prism.training.run_dir import save_run_dir
 from prism.training.trainers import create_two_group_optimizer
@@ -355,6 +365,306 @@ class GraphGRPOTrainer(GRPOTrainer):
             shutil.rmtree(prev)
 
     # ---------------------------------------------------------------- save
+
+    def save_model(self, output_dir=None, _internal_call=False):
+        output_dir = output_dir or self.args.output_dir
+        save_run_dir(self.model, self.gnn_config, output_dir)
+        if getattr(self.model, "peft_config", None) is not None:
+            super().save_model(output_dir, _internal_call)
+
+
+class MaskGRPOTrainer(GRPOTrainer):
+    """GRPO trainer for the MASK archs (``learnable_graph_mask``): HF rollouts.
+
+    The mask family's graph channel is an attention-score bias with a
+    decode-time per-step extension — nothing vLLM's paged attention can carry —
+    so rollouts run through the POLICY ITSELF via ``model.generate``, batched
+    across the whole generation group by :class:`BatchedMaskDecodeInjector`
+    (the batch-1 eval injector's semantics, one row state per sequence). That
+    kills two problems at once: no engine and no weight sync exist (rollouts
+    are exactly on-policy by construction), and no sequential per-completion
+    generation.
+
+    Loss side reimplements trl's small logps loop verbatim (its fixed signature
+    cannot carry graph kwargs) and routes each chunk through
+    ``LearnableGraphMaskLLM.forward`` with the SAME ``decode_consistent``
+    query/key maps the SFT collator builds — so RL trains under semantics
+    byte-identical to the SFT checkpoint it warm-starts from, and the maps are
+    exactly what the rollout injector exposed step-by-step (parity-tested in
+    e13c). Gradients flow loss → bias → Ψ → GT (``structural_parameters``).
+
+    Fail-loud restrictions: ``injection_scope`` must be ``decode_consistent``;
+    identity-RoPE checkpoints unsupported (per-row position rewrite);
+    ``beta=0``; ``use_vllm=False``.
+    """
+
+    def __init__(self, model, *, gnn_config: dict, args,
+                 rollout_batch_size: int = 16, **kwargs):
+        core = core_graph_model(model)
+        if gnn_config.get("injection_scope") != "decode_consistent":
+            raise ValueError(
+                "mask-arch RL requires injection_scope='decode_consistent' — "
+                "the rollout injector and the loss-side maps implement exactly "
+                f"that contract. Got {gnn_config.get('injection_scope')!r}.")
+        if core._disable_graph_token_rope:
+            raise ValueError(
+                "disable_graph_token_rope checkpoints are unsupported in "
+                "mask RL: the batched injector cannot rewrite position_ids "
+                "per row.")
+        if args.beta != 0.0:
+            raise ValueError(
+                "beta must be 0: the trl ref model would compute mask-free "
+                "log-probs (plain copy without the graph channel).")
+        if args.use_vllm:
+            raise ValueError(
+                "use_vllm must be False: mask archs have no vLLM analog — "
+                "rollouts run through the policy's own generate().")
+        if args.gradient_checkpointing:
+            gc_kwargs = dict(args.gradient_checkpointing_kwargs or {})
+            if gc_kwargs.get("use_reentrant") is True:
+                raise ValueError(
+                    "use_reentrant=True gradient checkpointing silently drops "
+                    "the armed structural bias' gradients; use "
+                    "use_reentrant=False.")
+            gc_kwargs["use_reentrant"] = False
+            args.gradient_checkpointing_kwargs = gc_kwargs
+
+        super().__init__(model, args=args, **kwargs)
+        # PEFT froze every non-LoRA parameter; the GT training on the RL
+        # reward is the point — re-enable it.
+        for p in core.structural_parameters():
+            p.requires_grad = True
+        self._core = core
+        self.gnn_config = gnn_config
+        self.rollout_batch_size = int(rollout_batch_size)
+        self._edge_weights = gnn_config.get("edge_weights", "binary")
+        self._scene_by_prompt = {
+            row["prompt"]: row["scene_graph_dict"]
+            for row in self.train_dataset
+        }
+        # prompt → (prompt_ids, pyg_graph, prompt_injection_map,
+        #           node_token_seqs, node_values). node_values snapshot the
+        #           LIVE tower, so entries are valid for one optimizer step.
+        self._prompt_cache: dict[str, tuple] = {}
+        self._cache_step = -1
+        # full-row tokens → (query_map, key_map) in UNPADDED coordinates
+        # (loss-side maps; token content fully determines them). Cleared with
+        # the prompt cache — same lifetime, keeps memory bounded.
+        self._row_map_cache: dict[tuple, tuple] = {}
+
+    def create_optimizer(self):
+        opt = create_two_group_optimizer(self, self._core.structural_parameters())
+        return opt if opt is not None else super().create_optimizer()
+
+    # ------------------------------------------------------------------ cache
+
+    def _entry_for_prompt(self, prompt: str):
+        hit = self._prompt_cache.get(prompt)
+        if hit is not None:
+            return hit
+        prompt_ids = self.processing_class(
+            prompt, add_special_tokens=False)["input_ids"]
+        scene = self._scene_by_prompt.get(prompt)
+        if scene is None:
+            raise ValueError(
+                "rollout prompt not found in the RL dataset — the mask is "
+                "built from the dataset's scene_graph_dict, so prompts must "
+                "reach generation verbatim. A miss is a data/collation bug.")
+        pyg_graph = data_utils.scene_graph_dict_to_pyg(
+            scene, edge_weights=self._edge_weights)
+        node_token_seqs = node_token_variants(
+            pyg_graph.node_names, self.processing_class)
+        scope_start = find_last_graph_scope(prompt_ids, self.processing_class)
+        injection_map = build_injection_map(
+            prompt_ids, node_token_seqs, scope_start=scope_start)
+        device = next(self._core.parameters()).device
+        node_values = mask_node_values(self._core, pyg_graph, device)
+        entry = (prompt_ids, pyg_graph, injection_map, node_token_seqs,
+                 node_values)
+        self._prompt_cache[prompt] = entry
+        return entry
+
+    @staticmethod
+    def _offset_map(m: dict, off: int) -> dict:
+        return {nid: [(s + off, e + off) for s, e in spans]
+                for nid, spans in m.items()}
+
+    # --------------------------------------------------------------- rollouts
+
+    def _generate_single_turn(self, prompts: list):
+        if self.state.global_step != self._cache_step:
+            # New optimizer step ⇒ the tower moved ⇒ cached node_values are
+            # stale. Rebuild so rollouts sample under the current tower.
+            self._prompt_cache.clear()
+            self._row_map_cache.clear()
+            self._cache_step = self.state.global_step
+
+        core = self._core
+        device = next(core.parameters()).device
+        all_prompt_ids, all_completion_ids = [], []
+        for start in range(0, len(prompts), self.rollout_batch_size):
+            chunk = prompts[start:start + self.rollout_batch_size]
+            entries = [self._entry_for_prompt(p) for p in chunk]
+            max_len = max(len(e[0]) for e in entries)
+            batch_ids = torch.full((len(chunk), max_len), self.pad_token_id,
+                                   dtype=torch.long, device=device)
+            attn = torch.zeros((len(chunk), max_len), dtype=torch.long,
+                               device=device)
+            padded_maps, row_states, graphs = [], [], []
+            for b, (pids, g, imap, seqs, node_values) in enumerate(entries):
+                off = max_len - len(pids)
+                batch_ids[b, off:] = torch.tensor(pids, device=device)
+                attn[b, off:] = 1
+                pmap = self._offset_map(imap, off)
+                padded_maps.append(pmap)
+                graphs.append(g)
+                row_states.append(_MaskDecodeRowState(
+                    node_values, tok2node_vector(pmap, max_len, device), seqs))
+            injector = BatchedMaskDecodeInjector(core, row_states, max_len)
+            handle = core.llm.register_forward_pre_hook(
+                injector.pre_hook, with_kwargs=True)
+            try:
+                with torch.no_grad():
+                    core._struct_bias = core.build_structural_mask(
+                        max_len, graphs, padded_maps, device)
+                    out = core.llm.generate(
+                        input_ids=batch_ids, attention_mask=attn,
+                        max_new_tokens=self.max_completion_length,
+                        do_sample=True, temperature=self.temperature,
+                        top_p=self.top_p, top_k=self.top_k,
+                        min_p=self.min_p,
+                        repetition_penalty=self.repetition_penalty,
+                        pad_token_id=self.pad_token_id,
+                    )
+            finally:
+                core._struct_bias = None
+                handle.remove()
+                core._decode_bias_row = None
+            completions = out[:, max_len:]
+            for b, (pids, *_rest) in enumerate(entries):
+                ids = completions[b].tolist()
+                if self.eos_token_id in ids:
+                    ids = ids[:ids.index(self.eos_token_id) + 1]
+                # generate() right-pads finished rows; strip trailing pads for
+                # rows that ended without EOS too.
+                while ids and ids[-1] == self.pad_token_id and \
+                        ids[-1] != self.eos_token_id:
+                    ids.pop()
+                all_prompt_ids.append(list(pids))
+                all_completion_ids.append(ids)
+        # logprobs=None: trl's non-vLLM contract — old/ref logps, when needed,
+        # are recomputed through _get_per_token_logps_and_entropies, i.e.
+        # under the SAME mask semantics the rollout sampled with.
+        return all_prompt_ids, all_completion_ids, None, {}
+
+    # -------------------------------------------------------------- loss side
+
+    def _maps_for_row(self, toks: list, prompt_len: int, entry):
+        key = tuple(toks)
+        hit = self._row_map_cache.get(key)
+        if hit is not None:
+            return hit
+        _pids, _g, _imap, node_token_seqs, _nv = entry
+        scope_start = find_last_graph_scope(toks, self.processing_class)
+        full_map = build_injection_map(toks, node_token_seqs,
+                                       scope_start=scope_start)
+        query_map = decode_style_query_map(full_map, prompt_len, toks,
+                                           node_token_seqs)
+        self._row_map_cache[key] = (query_map, full_map)
+        return query_map, full_map
+
+    def _entries_for_rows(self, input_ids, attention_mask, logits_to_keep):
+        """Per-row cache entries + full-row token lists, recovered from the
+        rows themselves (prompt tokens key the cache — order/slicing
+        independent, trl slices micro-batches)."""
+        by_pids = {tuple(e[0]): e for e in self._prompt_cache.values()}
+        prompt_cols = input_ids.shape[1] - int(logits_to_keep or 0)
+        out = []
+        for b in range(input_ids.shape[0]):
+            pmask = attention_mask[b, :prompt_cols].bool()
+            ptoks = tuple(input_ids[b, :prompt_cols][pmask].tolist())
+            e = by_pids.get(ptoks)
+            if e is None:
+                raise ValueError(
+                    "loss-side row's prompt tokens not found in the prompt "
+                    "cache — the generate/loss tokenization contract changed.")
+            cmask = attention_mask[b, prompt_cols:].bool()
+            ctoks = input_ids[b, prompt_cols:][cmask].tolist()
+            out.append((e, list(ptoks) + ctoks, len(ptoks),
+                        prompt_cols - len(ptoks)))
+        return out
+
+    def _get_per_token_logps_and_entropies(self, model, input_ids,
+                                           attention_mask, logits_to_keep,
+                                           batch_size=None,
+                                           compute_entropy=False, **kwargs):
+        from trl.trainer.utils import entropy_from_logits, selective_log_softmax
+
+        if not self._prompt_cache:
+            return super()._get_per_token_logps_and_entropies(
+                model, input_ids, attention_mask, logits_to_keep,
+                batch_size=batch_size, compute_entropy=compute_entropy,
+                **kwargs)
+        rows = self._entries_for_rows(input_ids, attention_mask, logits_to_keep)
+        B = input_ids.shape[0]
+        chunk = batch_size or B
+        if chunk < B and getattr(self._core.llm, "is_gradient_checkpointing",
+                                 False):
+            raise ValueError(
+                "chunked logps (batch_size < batch) with gradient "
+                "checkpointing would recompute earlier chunks' attention "
+                "against the LAST chunk's armed structural bias during "
+                "backward — silently wrong gradients. Disable chunking or "
+                "gradient checkpointing.")
+        all_logps, all_ents = [], []
+        for start in range(0, B, chunk):
+            sl = slice(start, start + chunk)
+            q_maps, k_maps, graphs = [], [], []
+            for entry, toks, prompt_len, off in rows[sl]:
+                qm, km = self._maps_for_row(toks, prompt_len, entry)
+                q_maps.append(self._offset_map(qm, off))
+                k_maps.append(self._offset_map(km, off))
+                graphs.append(entry[1])
+            # Mirrors trl 0.27's inner loop exactly (slice, temperature,
+            # selective_log_softmax) — reimplemented because its fixed
+            # signature cannot carry the graph kwargs the mask forward needs.
+            logits = model(
+                input_ids=input_ids[sl], attention_mask=attention_mask[sl],
+                graphs=graphs, injection_maps=q_maps,
+                key_injection_maps=k_maps,
+                logits_to_keep=logits_to_keep + 1, use_cache=False,
+            ).logits
+            logits = logits[:, :-1, :][:, -logits_to_keep:, :]
+            logits = logits / self.temperature
+            completion_ids = input_ids[sl][:, -logits_to_keep:]
+            all_logps.append(selective_log_softmax(logits, completion_ids))
+            if compute_entropy:
+                with torch.no_grad():
+                    all_ents.append(entropy_from_logits(logits))
+        logps = torch.cat(all_logps, dim=0)
+        ents = torch.cat(all_ents, dim=0) if compute_entropy else None
+        return logps, ents
+
+    # ------------------------------------------------------------- telemetry
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        loss = super().training_step(model, inputs, num_items_in_batch)
+        sq = 0.0
+        for p in self._core.structural_parameters():
+            if p.grad is not None:
+                sq += float(p.grad.detach().float().pow(2).sum())
+        self._tower_grad_norm = sq ** 0.5
+        tr_loss = getattr(self, "_tr_loss", None)
+        if tr_loss is not None and loss.device != tr_loss.device:
+            loss = loss.to(tr_loss.device)
+        return loss
+
+    def log(self, logs: dict, *args, **kwargs):
+        if getattr(self, "_tower_grad_norm", None) is not None:
+            logs["tower_grad_norm"] = self._tower_grad_norm
+        super().log(logs, *args, **kwargs)
+
+    # ------------------------------------------------------------------ save
 
     def save_model(self, output_dir=None, _internal_call=False):
         output_dir = output_dir or self.args.output_dir
