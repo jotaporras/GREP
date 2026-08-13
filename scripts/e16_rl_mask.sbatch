@@ -45,7 +45,7 @@ INIT_CHECKPOINT=${INIT_CHECKPOINT:-$PROJ/outputs/e13f_alpha_khops/e13f_alpha00_b
 
 # RL prompt source: data_gen_*.json graph/task files — the SAME n30 corpus
 # e13f trained on (user directive: same dataset, known to work).
-DATA_ROOT=${DATA_ROOT:-data/n_30/gen/nav100_n30_gemma_data/split}
+DATA_ROOT=${DATA_ROOT:-$PROJ/data/n_30/gen/nav100_n30_gemma_data/split}
 TRAIN_GRAPHS=${TRAIN_GRAPHS:-$DATA_ROOT/train_graphs}
 
 MAX_STEPS=${MAX_STEPS:-300}
