@@ -453,14 +453,32 @@ class MaskGRPOTrainer(GRPOTrainer):
             p.requires_grad = True
         self._core = core
         self._ensure_fp32_tower()
-        # Gemma-it ends turns with <end_of_turn>, not <eos>; trl keys
-        # termination stats, the completion mask, and our rollout truncation
-        # on self.eos_token_id (= tokenizer.eos_token_id = <eos>), so without
-        # this every completion counts as unterminated full-length, all group
-        # rewards tie, and GRPO advantages are identically zero.
-        eot = self.processing_class.convert_tokens_to_ids("<end_of_turn>")
-        if eot is not None:
-            self.eos_token_id = eot
+        # Gemma-it ends assistant turns with its turn-end token (gemma-4:
+        # "<turn|>" = 106; gemma-3 called it "<end_of_turn>"), NOT
+        # tokenizer.eos ("<eos>"). trl keys termination stats, the completion
+        # mask, and our rollout truncation on self.eos_token_id, so left at
+        # <eos> every completion counts as unterminated full-length. Token
+        # NAMES drift across Gemma generations — derive the id from what the
+        # chat template actually emits after the message content, restricted
+        # to the model's declared stop ids.
+        gen_cfg = getattr(core.llm, "generation_config", None)
+        stops = getattr(gen_cfg, "eos_token_id", None)
+        stops = set(stops if isinstance(stops, (list, tuple))
+                    else [] if stops is None else [stops])
+        stops.add(self.processing_class.eos_token_id)
+        sentinel = ""
+        tail = self.processing_class.apply_chat_template(
+            [{"role": "user", "content": sentinel}],
+            tokenize=False).rsplit(sentinel, 1)[1]
+        tail_ids = self.processing_class(
+            tail, add_special_tokens=False)["input_ids"]
+        turn_end = next((i for i in tail_ids if i in stops), None)
+        if turn_end is None:
+            raise ValueError(
+                f"could not find a turn-end token: none of the chat "
+                f"template's post-content ids {tail_ids} is in the model's "
+                f"stop set {sorted(stops)}.")
+        self.eos_token_id = turn_end
         self.gnn_config = gnn_config
         self.rollout_batch_size = int(rollout_batch_size)
         self._edge_weights = gnn_config.get("edge_weights", "binary")
