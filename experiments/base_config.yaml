@@ -290,8 +290,8 @@ data:
   #   train_files: data/gen/nav100_n30_gemma_data/split/formatted_all_new__train.json
   #   val_files:   data/gen/nav100_n30_gemma_data/split/formatted_all_new__val.json
   #   text_edge_list: none
-  train_files: data/revised/gen/nav100_n30_gemma_data/split/formatted_all_new__train.json
-  val_files: data/revised/gen/nav100_n30_gemma_data/split/formatted_all_new__val.json
+  train_files: data/n_30/gen/nav100_n30_gemma_data/split/formatted_all_new__train.json
+  val_files: data/n_30/gen/nav100_n30_gemma_data/split/formatted_all_new__val.json
   val_frac: 0.1
   dataset_proportion: 1.0
   max_seq_length: 8192
@@ -397,8 +397,8 @@ trainer:
 eval:
   # Multi-graph eval: a DIRECTORY of {graph, tasks} JSONs, capped to num_graphs/interval.
   # Single-graph alternative: a single JSON file, e.g.
-  #   data: data/revised/gen/nav100_n30_gemma_data/split/test_graphs/data_gen_023.json
-  data: data/revised/gen/nav100_n30_gemma_data/split/test_graphs
+  #   data: data/n_30/gen/nav100_n30_gemma_data/split/test_graphs/data_gen_023.json
+  data: data/n_30/gen/nav100_n30_gemma_data/split/test_graphs
   num_graphs: 5       # cap on evaluated graphs; -1 = the whole directory
   epoch_interval: 1.0 # run the generation eval every this many epochs
   # false = zero-shot eval prompts (the deployed setting; matches data.icl_examples=0).
