@@ -53,6 +53,14 @@ def build_graph_llm(
     counters.
     """
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    # vLLM 0.26 selects the attention backend via the ``attention_backend``
+    # engine arg and no longer consults VLLM_ATTENTION_BACKEND. Honour the env
+    # var here so one export pins the backend across every engine this process
+    # spins (tests, RL rollouts, eval) — on sm100 the auto-pick is FLASHINFER,
+    # whose kernels JIT-compile with nvcc that cluster nodes may not have.
+    env_backend = os.environ.get("VLLM_ATTENTION_BACKEND")
+    if env_backend and "attention_backend" not in extra_engine_kwargs:
+        extra_engine_kwargs["attention_backend"] = env_backend
 
     from vllm import LLM
 
