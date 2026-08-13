@@ -22,9 +22,13 @@
 # visible set, the policy trains on cuda:1 (trainer.rl.policy_device=1 +
 # ACCELERATE_TORCH_DEVICE, same split validated on plaza).
 #
-# Precision: B200s (180 GB) fit the 31B policy AND engine in bf16 — no nf4
-# anywhere, unlike the 48 GB plaza cards. BIT4=true restores the plaza recipe
-# (nf4 policy + in-flight bnb nf4 engine) for smaller cards.
+# Precision: policy is nf4 (POLICY_BIT4, default true) — NOT for memory, for
+# placement: transformers' Trainer._move_model_to_device SKIPS quantized
+# models, and for a bf16 policy it ignores policy_device and drags the model
+# onto the engine's GPU 0 (OOM; ACCELERATE_TORCH_DEVICE does not stop it —
+# on plaza the nf4 skip was what actually protected the split). The ENGINE is
+# bf16 (suite-validated on B200); ENGINE_BIT4=true adds in-flight bnb nf4 for
+# 48 GB cards.
 #
 # Tower LR: gnn.structural_lr_mult defaults to 20 so the tower trains at its
 # SFT-native 2e-4 while the LoRA stays at the RL-safe base 1e-5 (the measured
@@ -57,7 +61,8 @@ NUM_GENERATIONS=${NUM_GENERATIONS:-8}
 MAX_COMPLETION=${MAX_COMPLETION:-1024}
 GRAD_ACCUM=${GRAD_ACCUM:-8}
 STRUCTURAL_LR_MULT=${STRUCTURAL_LR_MULT:-20}
-BIT4=${BIT4:-false}
+POLICY_BIT4=${POLICY_BIT4:-true}
+ENGINE_BIT4=${ENGINE_BIT4:-false}
 
 RUN_NAME=${1:-${RUN_NAME:-e16_rl_gt_v2}}
 # LOCKED campaign tag (see AGENTS.md memory: never invent/change experiment tags).
@@ -80,16 +85,16 @@ export VLLM_USE_FLASHINFER_SAMPLER=0
 
 source "$ENV_DIR/bin/activate"
 
-# Engine kwargs: bf16 always; bnb in-flight nf4 only under BIT4 (48 GB cards).
+# Engine kwargs: bf16 always; bnb in-flight nf4 only under ENGINE_BIT4 (48 GB cards).
 ENGINE_ARGS=(+trainer.rl.engine.dtype=bfloat16
              +trainer.rl.engine.max_model_len=8192
              +trainer.rl.engine.gpu_memory_utilization=0.85)
-if [ "$BIT4" = "true" ]; then
+if [ "$ENGINE_BIT4" = "true" ]; then
   ENGINE_ARGS+=(+trainer.rl.engine.quantization=bitsandbytes
                 +trainer.rl.engine.load_format=bitsandbytes)
 fi
 
-echo "[$(date --iso-8601=seconds)] $RUN_NAME e16 RL (v2 unfrozen tower, tag=$TAG, bit4=$BIT4, mult=$STRUCTURAL_LR_MULT)"
+echo "[$(date --iso-8601=seconds)] $RUN_NAME e16 RL (v2 unfrozen tower, tag=$TAG, policy_bit4=$POLICY_BIT4, engine_bit4=$ENGINE_BIT4, mult=$STRUCTURAL_LR_MULT)"
 
 srun python -m prism.training.train_rl \
     --config-name=e16_rl_config \
@@ -100,7 +105,7 @@ srun python -m prism.training.train_rl \
     gnn.structural_lr_mult="$STRUCTURAL_LR_MULT" \
     data.text_edge_list=none \
     data.edge_weights=binary \
-    trainer.bit4="$BIT4" \
+    trainer.bit4="$POLICY_BIT4" \
     trainer.max_steps="$MAX_STEPS" \
     trainer.per_device_train_batch_size=1 \
     trainer.gradient_accumulation_steps="$GRAD_ACCUM" \
