@@ -452,6 +452,7 @@ class MaskGRPOTrainer(GRPOTrainer):
         for p in core.structural_parameters():
             p.requires_grad = True
         self._core = core
+        self._ensure_fp32_tower()
         self.gnn_config = gnn_config
         self.rollout_batch_size = int(rollout_batch_size)
         self._edge_weights = gnn_config.get("edge_weights", "binary")
@@ -506,9 +507,22 @@ class MaskGRPOTrainer(GRPOTrainer):
         return {nid: [(s + off, e + off) for s, e in spans]
                 for nid, spans in m.items()}
 
+    def _ensure_fp32_tower(self):
+        """The GT runs fp32 (the ``build_structural_mask`` contract); graph
+        features are fp32 tensors. The HF stack casts leftover fp32 modules of
+        a quantized policy to bf16 (GRPOConfig defaults ``bf16 = not fp16``),
+        which crashes ``mask_node_values`` with a float/bf16 matmul mismatch.
+        ``Module.float()`` casts ``param.data`` in place, so the optimizer's
+        parameter references survive — safe to re-assert any time."""
+        pe = getattr(self._core, "pe_model", None)
+        if pe is not None and any(p.dtype != torch.float32
+                                  for p in pe.parameters()):
+            pe.float()
+
     # --------------------------------------------------------------- rollouts
 
     def _generate_single_turn(self, prompts: list):
+        self._ensure_fp32_tower()
         if self.state.global_step != self._cache_step:
             # New optimizer step ⇒ the tower moved ⇒ cached node_values are
             # stale. Rebuild so rollouts sample under the current tower.
