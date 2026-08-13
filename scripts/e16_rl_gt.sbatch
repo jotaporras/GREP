@@ -66,6 +66,11 @@ export HF_DATASETS_CACHE="${TMPDIR:-/tmp}/hf_datasets_${SLURM_JOB_ID:-manual}"
 export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-32}"
 # Policy on the second GPU; the in-process vLLM worker owns cuda:0.
 export ACCELERATE_TORCH_DEVICE=cuda:1
+# On B200 (sm100) vLLM auto-picks the FLASHINFER backend, whose kernels are
+# JIT-compiled with nvcc — betty compute nodes carry no CUDA toolkit, so that
+# path dies at engine start. FLASH_ATTN ships precompiled and is the backend
+# every parity test validated (it is also what plaza runs).
+export VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}
 
 source "$ENV_DIR/bin/activate"
 
