@@ -367,10 +367,20 @@ class GraphGRPOTrainer(GRPOTrainer):
     # ---------------------------------------------------------------- save
 
     def save_model(self, output_dir=None, _internal_call=False):
+        from peft import PeftModel
+
         output_dir = output_dir or self.args.output_dir
         save_run_dir(self.model, self.gnn_config, output_dir)
-        if getattr(self.model, "peft_config", None) is not None:
+        if isinstance(self.model, PeftModel):
+            # trl's peft_config path: the WHOLE policy is PEFT-wrapped and the
+            # HF Trainer machinery saves the adapter.
             super().save_model(output_dir, _internal_call)
+        elif isinstance(getattr(core_graph_model(self.model), "llm", None),
+                        PeftModel):
+            # Warm-start path: the adapter lives on the inner .llm (nf4 keeps
+            # it unmerged). Save it directly — Trainer.save_model would call
+            # save_pretrained on the WRAPPER, which has no adapter of its own.
+            core_graph_model(self.model).llm.save_pretrained(output_dir)
 
 
 class MaskGRPOTrainer(GRPOTrainer):
@@ -667,7 +677,17 @@ class MaskGRPOTrainer(GRPOTrainer):
     # ------------------------------------------------------------------ save
 
     def save_model(self, output_dir=None, _internal_call=False):
+        from peft import PeftModel
+
         output_dir = output_dir or self.args.output_dir
         save_run_dir(self.model, self.gnn_config, output_dir)
-        if getattr(self.model, "peft_config", None) is not None:
+        if isinstance(self.model, PeftModel):
+            # trl's peft_config path: the WHOLE policy is PEFT-wrapped and the
+            # HF Trainer machinery saves the adapter.
             super().save_model(output_dir, _internal_call)
+        elif isinstance(getattr(core_graph_model(self.model), "llm", None),
+                        PeftModel):
+            # Warm-start path: the adapter lives on the inner .llm (nf4 keeps
+            # it unmerged). Save it directly — Trainer.save_model would call
+            # save_pretrained on the WRAPPER, which has no adapter of its own.
+            core_graph_model(self.model).llm.save_pretrained(output_dir)

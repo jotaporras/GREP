@@ -71,6 +71,14 @@ def train_rl(config: omegaconf.DictConfig) -> None:
                 f"{init_checkpoint} is a plain-LLM checkpoint; the graph RL "
                 "trainer needs a graph checkpoint. Plain-LLM RL uses "
                 "stock trl GRPOTrainer with use_vllm=True (the control arm).")
+        from peft import PeftModel
+        if isinstance(getattr(model, "llm", None), PeftModel):
+            # Under nf4 the checkpoint's LoRA stays ATTACHED on the inner .llm
+            # (merging would round it into the nf4 grid — see loaders).
+            # transformers' validate_quantization_for_training only recognizes
+            # adapters on the TOP-LEVEL model, so mark the wrapper as
+            # PEFT-loaded: it genuinely carries a trainable adapter.
+            model._hf_peft_config_loaded = True
         peft_config = None
     else:
         bnb = None
