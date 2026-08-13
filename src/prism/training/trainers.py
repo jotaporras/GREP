@@ -207,14 +207,39 @@ class GraphSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
         return self._register_beta_projection(self.optimizer)
 
     def _register_beta_projection(self, optimizer):
-        """Attach the ``gnn.enforce_beta_bound`` post-step β projection (default on)."""
-        slack = beta_projection.register_beta_projection(
-            optimizer, self.model,
-            enabled=bool(self.gnn_config.get("enforce_beta_bound", True)),
+        """Attach the ``gnn.enforce_beta_bound`` post-step β projection (default on).
+
+        Reports the MEASURED quantity, not the intent. The flag alone says nothing about
+        whether anything is constrained: the projection covers ``MagChebConv`` filters,
+        so on the undirected TAGConv backbone (``gnn.directed=false``) there are none and
+        the whole mechanism is inert — which the log now says outright rather than
+        announcing an invariant over filters that do not exist.
+
+        The slack is read BEFORE registering, because ``register_beta_projection``
+        projects once itself and a read afterwards would report the post-projection value
+        (``<= 1`` by construction) — i.e. exactly the number that cannot tell you how far
+        the init had drifted. The extra ``project_beta_`` is idempotent with the one
+        inside up to fp32 rounding: a layer whose recomputed slack lands at ``1 + 1e-7``
+        divides once more by that factor (MEASURED: one layer of four, 1.2e-7 relative,
+        ONCE at registration — the per-step hook still projects exactly once per step).
+        """
+        enabled = bool(self.gnn_config.get("enforce_beta_bound", True))
+        slack = beta_projection.project_beta_(self.model) if enabled else {}
+        handle = beta_projection.register_beta_projection(
+            optimizer, self.model, enabled=enabled,
         )
-        if slack is not None:
-            print("[train] beta projection ON: MagNet filters held at ||H(S)|| <= 1/F "
-                  "after every optimizer step (PEARL Assumption 4.2 / Cor 4.6)")
+        if handle is not None and slack:
+            # The enforced inequality is sum_k ||H_k||_2 <= 1 on the assembled block
+            # operator (budget=None). That IS the paper's beta = 1/F, which bounds each of
+            # the F^2 SCALAR filters and hence the F x F block by F*beta = 1 — see the
+            # prism.models.beta_projection module docstring. Stating it as "<= 1/F" here
+            # would misreport the quantity by a factor of F.
+            print(f"[train] beta projection ON: {len(slack)} MagChebConv layer(s) held at "
+                  f"sum_k ||H_k||_2 <= 1 after every optimizer step (PEARL Assumption 4.2 "
+                  f"/ Cor 4.6); max pre-projection slack {max(slack.values()):.2f}")
+        elif handle is not None:
+            print("[train] beta projection ON but INERT: no MagChebConv layers in this "
+                  "model (gnn.directed=false ⇒ TAGConv backbone), so nothing is bounded.")
         return optimizer
 
     def training_step(self, model, inputs, num_items_in_batch=None, **kwargs):

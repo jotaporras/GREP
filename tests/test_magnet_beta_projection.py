@@ -406,3 +406,70 @@ def test_hidden_norm_reaches_the_backbone_through_r_pearl():
                                       d_model=4, num_samples=2, dropout=0.0, k=2,
                                       directed=True, hidden_norm="global_rms")
     assert pe.pe_gcn.hidden_norm == "global_rms"
+
+
+# --------------------------------------------------------------------------------
+# The trainer's REPORT of the projection (GraphSFTTrainer._register_beta_projection).
+# The flag alone says nothing about whether anything is constrained, so the log must
+# distinguish "N layers bounded" from "inert" — and measuring must not change what is
+# enforced.
+# --------------------------------------------------------------------------------
+def _report(model, enabled: bool, capsys):
+    """Drive _register_beta_projection without the HF Trainer machinery."""
+    from prism.training.trainers import GraphSFTTrainer
+
+    bare = GraphSFTTrainer.__new__(GraphSFTTrainer)
+    bare.model, bare.gnn_config = model, {"enforce_beta_bound": enabled}
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    bare._register_beta_projection(opt)
+    return capsys.readouterr().out
+
+
+def test_projection_report_names_the_measured_layer_count(capsys):
+    out = _report(make_magnet(device()), True, capsys)
+    assert f"{LAYERS} MagChebConv layer(s)" in out, out
+    assert "INERT" not in out
+    # The enforced inequality is the BLOCK norm <= 1; "<= 1/F" misreports it by F.
+    assert "sum_k ||H_k||_2 <= 1 " in out and "1/F" not in out, out
+    assert "pre-projection slack" in out, out
+
+
+def test_projection_report_says_inert_without_magcheb(capsys):
+    """gnn.directed=false -> TAGConv backbone -> nothing to bound. Say so."""
+    pe = RandomGNNPositionalEncodings(pe_hidden_channels=HIDDEN, pe_num_layers=2,
+                                      d_model=4, num_samples=2, dropout=0.0, k=2,
+                                      directed=False)
+    assert not any(isinstance(m, MagChebConv) for m in pe.modules())
+    out = _report(pe, True, capsys)
+    assert "INERT" in out and "nothing is bounded" in out, out
+
+
+def test_projection_report_is_silent_when_disabled(capsys):
+    assert _report(make_magnet(device()), False, capsys) == ""
+
+
+def test_measuring_the_slack_does_not_change_what_is_enforced(capsys):
+    """The trainer projects once to READ the pre-projection slack, then registers (which
+    projects again). The second pass must not change what is enforced.
+
+    It is a no-op up to fp32 ROUNDING, not bit-exactly: after a projection the recomputed
+    slack is 1 ± 1e-7, so a layer landing on the high side divides once more by that
+    factor. MEASURED at seed 3: one layer of four, relative change 1.2e-7, one time at
+    registration only (the per-step hook still projects exactly once per step). The
+    invariant is what must hold, so that is what is asserted — plus a tolerance tight
+    enough that a real second projection (slack ~4-5 here) could never pass.
+    """
+    dev = device()
+    reference = make_magnet(dev, seed=3)
+    register_beta_projection(torch.optim.SGD(reference.parameters(), lr=0.1),
+                             reference, enabled=True)
+
+    measured = make_magnet(dev, seed=3)
+    _report(measured, True, capsys)
+
+    ref = dict(reference.named_parameters())
+    for name, p in measured.named_parameters():
+        assert torch.allclose(p.detach(), ref[name].detach(), rtol=1e-5, atol=1e-7), \
+            f"{name} diverged by {(p.detach() - ref[name].detach()).abs().max():.3e}"
+    for conv in measured.convs:
+        assert tap_norm_sum(conv) <= 1 + 1e-5, "the bound must hold after both passes"

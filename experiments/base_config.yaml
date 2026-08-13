@@ -69,9 +69,17 @@ gnn:
   learn_r: false
   # --- MagNet (directed) only: PEARL Assumption 4.2, ||H(S)|| <= beta ---
   # enforce_beta_bound: post-optimizer-step projection holding every MagChebConv at
-  # sum_k ||H_k||_2 <= 1/F (F = pe_hidden_channels), the beta of Thm 4.3 / Cor 4.6.
+  #   sum_k ||H_k||_2 <= 1
+  # i.e. each layer's assembled block operator is NON-EXPANSIVE. That is the paper's
+  # beta = 1/F read correctly: 1/F bounds each of the F^2 SCALAR filters Assumption 4.1
+  # counts, which bounds the F x F block by F*beta = 1 (models/beta_projection.py, "WHICH
+  # beta"). Do NOT restate this as "<= 1/F" — the enforced quantity is the block norm,
+  # and that wording misreports it by a factor of F = pe_hidden_channels. The stricter
+  # arm (block bounded by 1/F) is reachable via budget= but drives the pre-activation
+  # under modReLU's deadzone.
   # ONE global scalar per layer; excludes r_logit, the modReLU biases and the unwind
-  # Linear. No-op on the undirected TAGConv backbone (no MagChebConv to project).
+  # Linear. INERT on the undirected TAGConv backbone (no MagChebConv to project) — the
+  # trainer now logs which of the two happened rather than claiming the bound either way.
   enforce_beta_bound: true
   # hidden_norm: normalization BETWEEN MagNet's hidden layers.
   #   "none" (DEFAULT) = none; the beta projection alone controls scale.
