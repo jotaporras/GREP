@@ -5,9 +5,10 @@
 #SBATCH --partition=dgx-b200
 #SBATCH --gpus=2
 # betty's SLURM cli_filter (2026-08-03) enforces EXACTLY 28 CPUs and 224 GB
-# per GPU on dgx-b200 — 2 GPUs therefore require 56 CPUs / 448 GB.
-#SBATCH --cpus-per-task=56
-#SBATCH --mem=448G
+# per GPU on dgx-b200, and reads --cpus-per-task as a PER-GPU figure — so the
+# request must be stated in per-GPU units.
+#SBATCH --cpus-per-gpu=28
+#SBATCH --mem-per-gpu=224G
 #
 # e16 — GRPO RL training of the ADDITIVE GT architecture (gt_llm) with
 # graph-conditioned vLLM rollouts, v2 semantics: the Ψ tower is UNFROZEN and
@@ -63,7 +64,7 @@ TAG=e16_rl_training
 export WANDB_ENTITY=${WANDB_ENTITY:-alelab}
 export HF_HOME=${HF_HOME:-$ALELAB/hf_cache}
 export HF_DATASETS_CACHE="${TMPDIR:-/tmp}/hf_datasets_${SLURM_JOB_ID:-manual}"
-export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-32}"
+export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-56}"
 # Policy on the second GPU; the in-process vLLM worker owns cuda:0.
 export ACCELERATE_TORCH_DEVICE=cuda:1
 # On B200 (sm100) vLLM reaches for flashinfer kernels that are JIT-compiled
