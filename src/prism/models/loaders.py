@@ -305,8 +305,21 @@ def graph_augmented_llm_from_pretrained(
         # The Psi producer is a standalone GraphTransformer (Psi = PE GT), or the legacy
         # TwoStagePE when the run recorded semantic_gt_from (same factory as training).
         pe_model = gt_module.build_psi_producer(gnn_cfg)
-        model = gnn_llm.WireGraphLLM(
+        # Absent key = a run predating wire_composite, i.e. the scene-graph WIRE. The
+        # two are different functions of the same state_dict (composite Ψ, RoPE off on
+        # the block), so this must be recorded, never defaulted true.
+        _composite = bool(gnn_cfg.get("wire_composite", False))
+        _wire_cls = gnn_llm.CompositeWireGraphLLM if _composite else gnn_llm.WireGraphLLM
+        model = _wire_cls(
             llm, pe_model, d_model=gnn_cfg["d_model"],
+            **({"tokenizer": tokenizer,
+                "magnet_r": gnn_cfg.get("wire_magnet_r", 0.1250305176),
+                "context_window": gnn_cfg.get("wire_context_window", 1024),
+                "cycle_weight": gnn_cfg.get("wire_cycle_weight", 1.0),
+                "cycle_causal": gnn_cfg.get("wire_cycle_causal", False),
+                "crosslink_weight": gnn_cfg.get("wire_crosslink_weight", 0.1),
+                "crosslink_bidirectional": gnn_cfg.get("wire_crosslink_bidirectional", True),
+                "anchor_weight": gnn_cfg.get("wire_anchor_weight", 10.0)} if _composite else {}),
             layer_scope=gnn_cfg.get("wire_layer_scope", "dense"),
             sigma_init=gnn_cfg.get("wire_sigma_init", 0.01),
             freeze_sigma=gnn_cfg.get("wire_freeze_sigma", False),

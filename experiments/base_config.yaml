@@ -61,6 +61,12 @@ gnn:
   # (from_networkx emits both directions), so there Theta = 0 and it is a backbone
   # A/B, not a directionality one.
   directed: false
+  # learn_r: MagNet's charge r is learned (one shared scalar, sigmoid-constrained to
+  # [0, 0.25]) instead of pinned. Read by gt.build_psi_producer, i.e. by the Psi-consuming
+  # archs; false is the value every checkpoint so far was written with, so leaving it
+  # false keeps those reloading as themselves. REQUIRED true by wire_composite, where r
+  # is the amount of directional phase the token cycle needs to carry position at all.
+  learn_r: false
   # --- MagNet (directed) only: PEARL Assumption 4.2, ||H(S)|| <= beta ---
   # enforce_beta_bound: post-optimizer-step projection holding every MagChebConv at
   # sum_k ||H_k||_2 <= 1/F (F = pe_hidden_channels), the beta of Thm 4.3 / Cor 4.6.
@@ -206,6 +212,34 @@ gnn:
   # normalised to "rotate" with a DeprecationWarning. NOTE wire_layer_scope="all" cannot
   # decode (sliding-window caches are cropped) and raises before generating.
   wire_decode: rotate          # "rotate" | "skip"  (legacy: "error" -> "rotate")
+
+  # --- wire_composite (e17): WIRE over the COMPOSITE graph, REPLACING RoPE ---
+  # false (DEFAULT) = the scene-graph WIRE above: Psi has one row per scene NODE, placed
+  # at that node's mention tokens, and R(theta) composes on top of Gemma's RoPE.
+  # true = Psi is computed on the COMPOSITE graph G = V_Tx (the directed token cycle) +
+  # V_Sc (the scene graph) + E_Cross (mention crosslinks) + one anchor node, so EVERY
+  # token in scope gets its own row, and RoPE is switched OFF (position_id 0) on exactly
+  # the positions WIRE covers. The token cycle carries sequence position ONLY as the
+  # phase of the magnetic Laplacian, so this arm REQUIRES directed=true, learn_r=true and
+  # a non-zero rotation at init (pe_gain_init > 0, wire_vanilla_omega_init != "zero") —
+  # all four are checked in CompositeWireGraphLLM.__init__, not assumed.
+  wire_composite: false
+  # Initial MagNet charge, written into the shared r_logit. 0.1250305176 = 0.25*sigmoid(2^-11)
+  # is a hair off 1/8 ON PURPOSE: L_bar^(r)'s eigenvalues collide on the length-c cycle iff
+  # dist(2rc, Z) = 0, and at c = 1024 this gives 2rc = 256.0625, a margin of 1/16 that
+  # r = 1/8 would sit exactly on. Recalibrate it if wire_context_window changes.
+  wire_magnet_r: 0.1250305176
+  # c, the token cycle length: the prompt FROM the last scene-graph block on, capped here
+  # (counted from the block, so a long prompt is cut in the tail and never on the block).
+  # Tokens outside [scope_start, scope_start + c) keep plain RoPE and get no Psi.
+  wire_context_window: 1024
+  # Composite edge weights and directions (build_composite_graph). MagNet symmetrizes A
+  # and keeps direction only as the phase, so transposing an edge conjugates Psi.
+  wire_cycle_weight: 1.0
+  wire_cycle_causal: false          # true = the transposed cycle t -> t-1 (notebook 2 form)
+  wire_crosslink_weight: 0.1
+  wire_crosslink_bidirectional: true
+  wire_anchor_weight: 10.0
 
   # Two-group LR: structural (GT/PE) params train at structural_lr_mult x base LR
   # (GraphSFTTrainer.create_optimizer). 1.0 = no boost.

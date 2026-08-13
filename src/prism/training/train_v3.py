@@ -287,6 +287,15 @@ def train_model(config: omegaconf.DictConfig):
                 "wire_omega_seed", "wire_rotate_nope_planes", "wire_max_angle",
                 "wire_decode", "wire_vanilla", "wire_vanilla_omega_init")}
                if config.gnn.arch == "wire_llm" else {}),
+            # wire_composite: the composite-graph arm is a DIFFERENT function of the same
+            # weights (Ψ over the token cycle + scene + anchor, RoPE replaced on the
+            # block), so every switch its graph depends on is recorded too.
+            **({k: config.gnn[k] for k in (
+                "wire_composite", "wire_magnet_r", "wire_context_window",
+                "wire_cycle_weight", "wire_cycle_causal", "wire_crosslink_weight",
+                "wire_crosslink_bidirectional", "wire_anchor_weight", "learn_r")}
+               if config.gnn.arch == "wire_llm" and config.gnn.get("wire_composite")
+               else {}),
             # Navigator Ψ producer (learnable_graph_mask / wire_llm): record BOTH sources.
             # pe_gt_from is provenance only (the Ψ topology is a standalone GT either way);
             # semantic_gt_from is load-bearing — it is what makes the eval rebuild pick the

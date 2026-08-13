@@ -6,7 +6,7 @@ from collections import defaultdict
 
 import torch
 from torch import nn
-from torch_geometric.data import Batch
+from torch_geometric.data import Batch, Data
 import transformers.masking_utils as masking_utils
 from transformers import AttentionInterface, PreTrainedModel
 
@@ -545,6 +545,130 @@ def node_adjacency(g, device, k_hops: int = 1, symmetrize: bool = True,
             reach = reach | power
         adj = reach
     return adj
+
+
+def build_composite_graph(scene, input_ids, injection_map, scope_start: int = 0,
+                          context_window: int = 1024, device=None,
+                          cycle_weight: float = 1.0, cycle_causal: bool = False,
+                          crosslink_weight: float = 0.1,
+                          crosslink_bidirectional: bool = True,
+                          anchor_weight: float = 10.0, permutation=None) -> Data:
+    r"""The composite graph ``G = (V_Tx ∪ V_Sc ∪ {a}, E_Tx ∪ E_Sc ∪ E_Cross ∪ E_A)``.
+
+    Ported from ``build_composite_graph`` in
+    ``notebooks/2026-08-10 e17_magnet_composite_graphs.ipynb`` (itself ported from the
+    deleted ``prism.models.composite_graph``) with its tokenization half dropped: the
+    wrapper already holds ``input_ids`` and the collator's injection map, so the text
+    layer is read off those instead of re-rendering the chat template. Used only by
+    :class:`CompositeWireGraphLLM`.
+
+    TOKEN ROWS FIRST — the layout ``covariance_token_block`` reads and the one
+    :meth:`CompositeWireGraphLLM.build_wire_signal` indexes::
+
+        row i       in [0, c)       token node, sequence position ``scope_start + i``
+        row c + j   in [c, c + n)   scene node j
+        row c + n                   the anchor (neither a token nor a scene node)
+
+    ``V_Tx`` BEGINS at ``scope_start``: everything before it is system prompt and ICL
+    graphs, which no crosslink reaches. It runs at most ``context_window`` tokens,
+    counted from the block on, so the graph block itself is never the part cut.
+
+    Every edge is weighted and directed. MagNet symmetrizes ``A`` and keeps direction
+    only as the phase ``Θ^(r) = 2πr·sgn(A − Aᵀ)``, so transposing an edge merely
+    conjugates Ψ; direction is a phase here, never a mask.
+
+    - ``E_Tx``: the cycle ``i → i+1 (mod c)``, whose wraparound makes ``S_Tx``
+      circulant — this is the layer that carries sequence position. ``cycle_causal``
+      transposes it to ``i → i−1`` so a token reads its PREDECESSOR (the notebook's §2
+      autoregressive-prefill form).
+    - ``E_Sc``: the scene edges shifted by ``+c``, keeping ``scene.edge_weight``.
+    - ``E_Cross``: each mention token reads its scene node, and with
+      ``crosslink_bidirectional`` the scene node reads back. That pair is then
+      symmetric, so its phase vanishes.
+    - ``E_A``: the anchor bond ``t_0 → a → v_0``. ``E_Tx`` is a cycle and ``E_Sc`` is
+      connected, so this one extra node makes the WHOLE of ``G`` connected whatever
+      ``E_Cross`` covers — and with it every effective resistance finite.
+
+    ``permutation`` relabels the SCENE nodes only (token nodes are ordered by the
+    sequence, so permuting them is not a symmetry of anything). It is applied here
+    rather than passed to ``pe_model``, whose ``permutation`` would relabel all
+    ``c + n + 1`` composite rows and mix the two layers.
+
+    Args:
+        scene: PyG scene graph (``edge_index``, optional ``edge_weight``).
+        input_ids: the UNPADDED token ids of one sequence.
+        injection_map: the collator's ``{node: [(start, end)]}`` in FULL-sequence
+            coordinates; shifted into window coordinates here.
+        scope_start: first token of the last scene-graph block
+            (:func:`find_last_graph_scope`).
+        context_window: cap on ``c``.
+        cycle_weight / crosslink_weight / anchor_weight: ``W`` on each edge family.
+    """
+    c = min(len(input_ids), scope_start + context_window) - scope_start
+    if c < 2:
+        raise ValueError(
+            f"the composite graph's token cycle needs c >= 2 nodes, got {c} "
+            f"(scope_start={scope_start}, len(input_ids)={len(input_ids)}): the prompt "
+            "ends at or just after the scene-graph block.")
+    n_scene = int(scene.num_nodes)
+    if n_scene == 0:
+        raise ValueError("the anchor bond needs a scene node to bond to (n_scene=0).")
+    device = device or scene.edge_index.device
+    rows, cols, vals = [], [], []
+
+    def _add(src, dst, w):
+        rows.append(src)
+        cols.append(dst)
+        vals.append(torch.full((src.numel(),), float(w), dtype=torch.float32, device=device))
+
+    # E_Tx: the directed cycle; its wraparound is what keeps S_Tx circulant.
+    i = torch.arange(c, device=device)
+    _add(i, (i - 1) % c if cycle_causal else (i + 1) % c, cycle_weight)
+
+    # Scene-node relabelling, applied to BOTH the scene edges and the crosslink targets
+    # so the composite is a genuine relabelling of itself rather than a mixed graph.
+    perm = torch.arange(n_scene, device=device)
+    if permutation is not None:
+        perm = permutation.apply(perm, n_scene, device=device)
+
+    # E_Sc: the scene edges shifted by +c, weighted by W_Sc (all ones under 'binary').
+    scene_ei = scene.edge_index.to(device)
+    scene_ew = getattr(scene, "edge_weight", None)
+    if scene_ei.numel():
+        rows.append(perm[scene_ei[0]] + c)
+        cols.append(perm[scene_ei[1]] + c)
+        vals.append((torch.ones(scene_ei.shape[1]) if scene_ew is None else scene_ew)
+                    .to(device=device, dtype=torch.float32))
+
+    # E_Cross: the collator's injection map, clamped to the window and shifted into it.
+    for node_idx, spans in injection_map.items():
+        toks = sorted({t - scope_start for start, end in spans
+                       for t in range(max(start, scope_start),
+                                      min(end, scope_start + c))})
+        if not toks:
+            continue
+        tok = torch.tensor(toks, device=device, dtype=torch.long)
+        node = torch.full_like(tok, c + int(perm[node_idx]))
+        _add(tok, node, crosslink_weight)
+        if crosslink_bidirectional:
+            _add(node, tok, crosslink_weight)
+
+    # E_A: t_0 -> a -> v_0, the bond that makes G one component.
+    a = torch.tensor([c + n_scene], device=device)
+    _add(torch.zeros_like(a), a, anchor_weight)
+    _add(a, torch.full_like(a, c + int(perm[0])), anchor_weight)
+
+    num_nodes = c + n_scene + 1
+    composite = Data(
+        x=torch.zeros(num_nodes, 1, device=device),
+        edge_index=torch.stack([torch.cat(rows), torch.cat(cols)]),
+        edge_weight=torch.cat(vals),
+        num_nodes=num_nodes,
+    )
+    composite.is_token = torch.zeros(num_nodes, dtype=torch.bool, device=device)
+    composite.is_token[:c] = True
+    composite.num_token_nodes, composite.num_scene_nodes = c, n_scene
+    return composite
 
 
 class GraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
@@ -2359,6 +2483,374 @@ class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         self.assert_decode_supported()
         self._arm(graphs, injection_maps, input_ids.shape[1], input_ids.device,
                   permutation=permutation)
+        try:
+            return self.llm.generate(input_ids=input_ids, **kwargs)
+        finally:
+            self._wire_signal = None
+            self._wire_decode_cos_sin.clear()
+
+
+class CompositeWireGraphLLM(WireGraphLLM):
+    r"""WIRE over the COMPOSITE graph: Ψ **replaces** RoPE on the scene-graph scope.
+
+    :class:`WireGraphLLM` reads Ψ off the SCENE graph and places a node's row at each of
+    its mention tokens, composing ``R(θ)`` on top of Gemma's RoPE. This subclass changes
+    what Ψ is a function of and what it stands in for, and nothing else:
+
+    1. **Ψ is computed on the composite graph** ``G = V_Tx ∪ V_Sc ∪ {a}``
+       (:func:`build_composite_graph`) — the token cycle, the scene graph, the mention
+       crosslinks and the anchor bond, as ONE graph. So EVERY in-scope token has its own
+       row (``r_i = Ψ_i``, composite token node ``i``), not only the ones that mention a
+       node, and a token's row is a function of where it sits in the cycle as well as of
+       what it is crosslinked to.
+    2. **The probe backbone is MagNet** (``directed=True``), so the shift operator is the
+       normalized magnetic Laplacian ``L̄^(r) = I − H̄^(r)`` and the cycle's DIRECTION
+       survives as the phase ``Θ^(r) = 2πr·sgn(A − Aᵀ)``. That phase is the only place
+       sequence order enters Ψ: on the undirected backbone ``S_Tx`` is symmetric
+       circulant and every token row is shift-invariant, i.e. positionless. This is why
+       the directed backbone is REQUIRED here and merely an A/B in the parent.
+    3. **RoPE is switched off exactly where WIRE is switched on.** Positions in the WIRE
+       scope carry ``position_id`` 0 (identity RoPE), so their only rotation is
+       ``R(θ_i)``, ``θ_i = ω_i·Ψ_i`` — the ``θ'`` of the design note, read off Ψ rather
+       than off a Laplacian eigenvector ``u``. Everything before the scope (system
+       prompt, ICL graphs) keeps stock RoPE and no graph phase at all.
+
+    So::
+
+        Ψ = Φ(E_q~N(0,I)[Φ(q; L̄^(r), H)], T)        (pe_pool="pe", the GT default)
+        r_i = Ψ_i        i a composite TOKEN node
+        q_i → R(ω·Ψ_i)·q_i,  k_j → R(ω·Ψ_j)·k_j      RoPE identity on the same positions
+
+    **The scope, exactly.** ``[start, end)`` with ``start`` =
+    :func:`find_last_graph_scope` (the last ``scene graph: •`` block) and
+    ``end = min(len(prompt), start + context_window)``. It is the same range
+    :func:`build_composite_graph` builds ``V_Tx`` over, so composite token node ``i`` IS
+    sequence position ``start + i`` — one definition, no second opinion. Three
+    consequences worth knowing before reading a result:
+
+    - Tokens BEFORE ``start`` are not in the graph at all (no Ψ) and keep their natural
+      RoPE positions. That is the "system prompt gets plain RoPE" rule.
+    - Tokens AFTER ``end`` (a prompt longer than ``context_window``) also keep natural
+      RoPE. The window is counted from the block on precisely so the truncation falls in
+      the tail, never on the graph block.
+    - GENERATED tokens are absent from the composite graph, so they carry ``r = 0`` and
+      keep RoPE — the prompt-only decode wiring the whole repo shares. Because the last
+      prompt position is zeroed, ``_update_model_kwargs_for_generation`` numbers the
+      generated tokens from 1; they are therefore positioned relative to the WIRE block
+      rather than to the system prompt. Training sees the answer tokens inside the WIRE
+      scope with a cycle row each, so this is a train/decode asymmetry of the same class
+      as ``injection_scope='full_sequence'`` — see the coverage gaps below.
+
+    **Positional information is not free at init here — the parent's cold starts are
+    fatal.** With RoPE off in the scope, ``θ = 0`` means those tokens have NO position at
+    all, which the parent's defaults would produce two ways: ``pe_gain_init=0.0`` (gate
+    shut ⇒ Ψ = 0) and ``vanilla_omega_init="zero"`` (ω = 0 ⇒ θ = 0). Both are REJECTED in
+    :meth:`__init__` rather than left to be discovered as a mysteriously bad run; the
+    default init is ``"exponential"``, the reference implementation's RoPE-style decay
+    (:data:`WIRE_VANILLA_OMEGA_INITS`), which is the closest thing to the RoPE it
+    replaces.
+
+    **The charge.** ``magnet_r`` is written into the (shared, learnable) ``r_logit`` of
+    every ``MagChebConv`` at construction, before any checkpoint load. The default
+    ``0.1250305176 = 0.25·sigmoid(2⁻¹¹)`` is a hair off ``1/8`` ON PURPOSE: on the
+    length-``c`` cycle the eigenvalues of ``L̄^(r)`` collide iff ``dist(2rc, Z) = 0``, and
+    at ``c = 1024`` this ``r`` gives ``2rc = 256.0625``, i.e. a margin of ``1/16`` — a
+    direction-destroying degeneracy that ``r = 1/8`` would sit exactly on. See
+    ``prism.eval.callbacks.ChargeDegeneracyCallback``, which monitors that margin;
+    changing ``context_window`` moves the degeneracies and this default is calibrated for
+    1024.
+
+    **Caching.** ``pe_model.cache_pe`` is forced on and the composite graph is memoized
+    in one slot, so a repeat forward over the same prompt (prefill then decode, an
+    injection/permutation sweep) pays for Ψ once. BOTH caches fill only under
+    ``no_grad``: a cached Ψ carries its autograd graph, and reusing it across steps would
+    raise "backward through the graph a second time" or silently reuse stale gradients.
+    :meth:`_arm` drops them whenever gradients are live. Same rule the parent's
+    :meth:`decode_cos_sin` follows.
+
+    **Cost.** Ψ now runs on ``c + n + 1 ≈ 1055`` nodes instead of ``n ≈ 30``, once per
+    forward: ``M`` probes over the composite (R-PEARL chunks them), then the GT blocks on
+    ``[c+n+1, d_model]``. The parent's per-forward ``cdist`` clamp measurement grows with
+    it (MEASURED in that docstring at 2.47 ms for N=1000 on CPU, and it is a ``no_grad``
+    O(N²·m) that is not checkpointed).
+
+    **Known coverage gaps** (on top of the parent's):
+
+    - Decode positions restart at 1, as above. ``wire_decode="rotate"`` still re-rotates
+      the cached PROMPT keys correctly (their ``r`` is fixed at prefill).
+    - RIGHT padding is assumed and CHECKED (:meth:`_sequence`): composite token node
+      ``i`` is sequence position ``start + i``, which a left-padded row breaks silently.
+    - ``injection_scope='decode_consistent'`` is not wired (inherited).
+    - The composite graph is rebuilt per forward from the collator's injection map, so
+      ``data.injection_scope`` decides which mentions become crosslinks. Under
+      ``full_sequence`` the answer-side mentions are crosslinked, which puts
+      answer-derived topology into the prefill Ψ — use ``prompt_only`` unless that is the
+      experiment.
+
+    **Deliberately omitted — do not add**: the second-moment readout ``C = E_q[ΦΦᴴ] −
+    ΨΨᴴ`` (WIRE rotates by a VECTOR per token; ``C`` is a ``[c, c]`` operator, i.e. a
+    relative position encoding, the class of method WIRE exists to replace); a Ψ row for
+    generated tokens (the composite graph is fixed at prefill and extending the cycle
+    mid-rollout would change every token's phase); anything from the parent's own
+    omitted list.
+
+    Args:
+        llm, pe_model, d_model: as :class:`WireGraphLLM`. ``pe_model`` must be a
+            :class:`~prism.models.gt.GraphTransformer` whose probe backbone is MagNet
+            with a learnable charge (``gnn.directed=true``, ``gnn.learn_r=true``).
+        tokenizer: used ONLY by :func:`find_last_graph_scope` to locate the block.
+        magnet_r: initial charge, written into the shared ``r_logit``. See the charge
+            section; must be in ``(0, 0.25)``.
+        context_window: cap on the token cycle length ``c``.
+        cycle_weight, cycle_causal, crosslink_weight, crosslink_bidirectional,
+            anchor_weight: the composite-graph edge families
+            (:func:`build_composite_graph`).
+        vanilla_omega_init: defaults to ``"exponential"`` here, not ``"zero"``.
+        **kwargs: forwarded to :class:`WireGraphLLM` (``layer_scope``, ``max_angle``,
+            ``decode``, ``pe_gain_init``, ``vanilla``, ...).
+    """
+
+    def __init__(self, llm: nn.Module, pe_model: nn.Module, d_model: int, tokenizer,
+                 magnet_r: float = 0.1250305176, context_window: int = 1024,
+                 cycle_weight: float = 1.0, cycle_causal: bool = False,
+                 crosslink_weight: float = 0.1, crosslink_bidirectional: bool = True,
+                 anchor_weight: float = 10.0,
+                 vanilla_omega_init: str = "exponential", **kwargs):
+        super().__init__(llm, pe_model, d_model,
+                         vanilla_omega_init=vanilla_omega_init, **kwargs)
+        if not 0.0 < float(magnet_r) < 0.25:
+            raise ValueError(
+                f"magnet_r must be in (0, 0.25) — r is sigmoid-reparameterized into that "
+                f"range and the endpoints have no logit. Got {magnet_r}.")
+        if int(context_window) < 2:
+            raise ValueError(f"context_window must be >= 2, got {context_window}")
+
+        # RoPE is OFF in the WIRE scope, so an identity rotation there leaves those tokens
+        # with no position at all. Both of the parent's cold starts do exactly that.
+        if float(torch.tanh(self.pe_gain).detach().abs()) == 0.0:
+            raise ValueError(
+                "pe_gain_init=0.0 shuts the gate, so Ψ = 0 ⇒ θ = 0 ⇒ the rotation is the "
+                "identity — and this architecture has already replaced RoPE on those "
+                "positions, so they would carry NO position. The parent's cold start is "
+                "not available here; set gnn.pe_gain_init > 0 (1.0 ⇒ tanh ≈ 0.76).")
+        if self._wire_vanilla and self._wire_vanilla_omega_init == "zero":
+            raise ValueError(
+                "wire_vanilla_omega_init='zero' gives ω = 0 ⇒ θ = 0 at step 0, which with "
+                "RoPE already off on the WIRE scope leaves those tokens positionless. Use "
+                "'exponential' (the RoPE-style decay, and this class's default) or "
+                "'uniform'.")
+
+        # The Ψ producer must carry the magnetic phase: the token cycle's DIRECTION is the
+        # only thing that makes its rows distinguishable, and it enters solely through Θ^(r).
+        probe = getattr(pe_model, "pe_model", None)
+        convs = getattr(getattr(probe, "pe_gcn", None), "convs", None)
+        if not getattr(probe, "directed", False) or convs is None:
+            raise ValueError(
+                "CompositeWireGraphLLM needs a DIRECTED (MagNet) Ψ producer: on the "
+                "undirected TAGConv backbone S_Tx is a symmetric circulant, every token "
+                "row of Ψ is shift-invariant, and the cycle carries no position at all. "
+                "Build the GraphTransformer with gnn.directed=true.")
+        if any(conv.r_logit is None for conv in convs):
+            raise ValueError(
+                "CompositeWireGraphLLM needs a LEARNABLE charge (gnn.learn_r=true): r is "
+                "the amount of directional phase the cycle needs to express the rotation "
+                "it is replacing, and pinning it fixes that budget by hand.")
+        with torch.no_grad():
+            # One r_logit is shared by every layer (MagNet ties them), so the loop is
+            # idempotent; write it per conv anyway rather than assume the tie.
+            logit = torch.tensor(float(magnet_r) / 0.25).logit()
+            for conv in convs:
+                conv.r_logit.fill_(logit)
+        # Ψ is a function of the composite TOPOLOGY alone, so a repeat forward over the
+        # same prompt can reuse it; see the caching section and _arm.
+        pe_model.cache_pe = True
+
+        self._tokenizer = tokenizer
+        self._composite_window = int(context_window)
+        self._composite_kwargs = dict(
+            context_window=int(context_window), cycle_weight=float(cycle_weight),
+            cycle_causal=bool(cycle_causal), crosslink_weight=float(crosslink_weight),
+            crosslink_bidirectional=bool(crosslink_bidirectional),
+            anchor_weight=float(anchor_weight))
+        # Per-forward: the [start, end) the signal was armed over, read by
+        # scope_position_ids. One-slot composite cache; see composite_graph.
+        self._wire_scope_spans: list[tuple[int, int]] = []
+        self._composite_key = None
+        self._composite_data: Data | None = None
+
+    # ------------------------------------------------------------------ composite
+
+    def invalidate_cache(self) -> None:
+        """Drop the cached composite graph and the Ψ the GT cached on it."""
+        self._composite_key = self._composite_data = None
+        self.pe_model.invalidate_cache()
+
+    def scope_span(self, input_ids_b) -> tuple[int, int]:
+        """``(start, end)`` — the token range ``V_Tx`` covers, i.e. the WIRE scope.
+
+        ``start`` is :func:`find_last_graph_scope`, the same anchor the collator scoped
+        the injection map to, so the crosslinks and the cycle agree on where the block
+        begins. ``end`` truncates to ``context_window`` tokens from there.
+        """
+        start = find_last_graph_scope(input_ids_b, self._tokenizer)
+        return start, min(len(input_ids_b), start + self._composite_window)
+
+    def composite_graph(self, scene, input_ids_b, injection_map, scope_start, device,
+                        permutation=None) -> Data:
+        """:func:`build_composite_graph` for one sequence, memoized in one slot.
+
+        The key covers everything the graph is a function of — the token ids, the scope,
+        the scene graph's shape and the permutation seed — so a changed prompt, graph or
+        relabelling misses rather than silently reusing the previous one. Filled ONLY
+        under ``no_grad``: the GT's Ψ is keyed on this object's identity, and a hit with
+        gradients live would hand back the previous step's autograd graph.
+        """
+        key = (hash(tuple(input_ids_b)), scope_start, int(scene.num_nodes),
+               int(scene.edge_index.shape[1]), getattr(permutation, "seed", None))
+        if self._composite_data is not None and self._composite_key == key:
+            return self._composite_data
+        composite = build_composite_graph(
+            scene, input_ids_b, injection_map, scope_start=scope_start, device=device,
+            permutation=permutation, **self._composite_kwargs)
+        if not torch.is_grad_enabled():
+            self._composite_key, self._composite_data = key, composite
+        return composite
+
+    def _sequence(self, input_ids, attention_mask, b: int) -> list[int]:
+        """Row ``b``'s UNPADDED token ids.
+
+        Right padding only, and checked: composite token node ``i`` is sequence position
+        ``scope_start + i``, so a left-padded row would place every node one offset off —
+        silently, since the shapes still line up. ``data.py`` pads right.
+        """
+        row = input_ids[b]
+        if attention_mask is None:
+            return row.tolist()
+        length = int(attention_mask[b].sum())
+        if not bool(attention_mask[b, :length].all()):
+            raise ValueError(
+                "CompositeWireGraphLLM requires RIGHT padding: the composite graph's "
+                "token node i is sequence position scope_start + i, and a left-padded "
+                f"row shifts every one of them (row {b} has padding inside its first "
+                f"{length} positions).")
+        return row[:length].tolist()
+
+    # ------------------------------------------------------------------- signal
+
+    def build_wire_signal(self, graphs, injection_maps, seq_len: int, device,
+                          permutation=None, input_ids=None, attention_mask=None):
+        """Assemble ``r`` ``[B, seq, m]`` — the composite Ψ, token rows in place.
+
+        Builds one composite graph per batch element and hands the PARENT exactly the two
+        things it consumes: the graphs to run ``pe_model`` on, and a placement map. The
+        map is the identity ``{i: [(start + i, start + i + 1)]}`` — composite token node
+        ``i`` at sequence position ``start + i`` — so the parent's gating (``tanh(pe_gain)``),
+        angle measurement and unconditional ``max_angle`` clamp all run UNCHANGED, over
+        Ψ rows of the WHOLE composite graph (tokens, scene and anchor), not just the ones
+        that land in the sequence. Nothing about the clamp is re-derived here.
+
+        ``permutation`` reaches the SCENE half of the composite (see
+        :func:`build_composite_graph`) and is deliberately NOT forwarded to the parent,
+        whose ``permutation`` would relabel the token nodes too.
+        """
+        if input_ids is None:
+            raise ValueError(
+                "CompositeWireGraphLLM.build_wire_signal needs input_ids: the composite "
+                "graph's text layer IS the token sequence (call it through _arm).")
+        composites, span_maps, spans = [], [], []
+        for b in range(len(injection_maps)):
+            ids = self._sequence(input_ids, attention_mask, b)
+            start, end = self.scope_span(ids)
+            composites.append(self.composite_graph(
+                graphs[b], ids, injection_maps[b], start, device, permutation))
+            span_maps.append({i: [(start + i, start + i + 1)] for i in range(end - start)})
+            spans.append((start, end))
+        self._wire_scope_spans = spans
+        return super().build_wire_signal(composites, span_maps, seq_len, device)
+
+    def scope_position_ids(self, seq_len: int, device) -> torch.Tensor:
+        """``[B, seq]`` position_ids with the WIRE scope zeroed — WIRE REPLACES RoPE there.
+
+        Delegates to :func:`graph_token_position_ids` with the scope handed over as a
+        one-entry map, so identity-RoPE has ONE definition across the architectures.
+        Must be called after :meth:`_arm`, which records the spans.
+        """
+        return graph_token_position_ids(
+            [{0: [span]} for span in self._wire_scope_spans], seq_len, device)
+
+    # ------------------------------------------------------------------ forward
+
+    def _arm(self, graphs, injection_maps, seq_len, device, permutation=None,
+             input_ids=None, attention_mask=None):
+        """As :meth:`WireGraphLLM._arm`, threading the ids the composite graph is built on.
+
+        Drops the composite/Ψ caches whenever gradients are live: they are only ever
+        filled under ``no_grad`` (see :meth:`composite_graph`), so this clears a cache
+        left behind by an earlier eval rather than carrying it into a training step.
+        """
+        if torch.is_grad_enabled():
+            self.invalidate_cache()
+        self._wire_decode_cos_sin.clear()
+        self._wire_signal = self.build_wire_signal(
+            graphs, injection_maps, seq_len, device, permutation=permutation,
+            input_ids=input_ids, attention_mask=attention_mask)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        labels: torch.Tensor | None = None,
+        graphs: Batch | None = None,
+        injection_maps: list[dict[int, list[tuple[int, int]]]] | None = None,
+        **kwargs,
+    ):
+        """Prompt forward with the graph channel armed and RoPE off on its scope.
+
+        Same contract as :meth:`WireGraphLLM.forward` — ``input_ids`` straight through,
+        signal armed only when graphs, maps and ids are all present, cleared otherwise —
+        plus the identity-RoPE ``position_ids``, which the caller may still override.
+        """
+        kwargs.pop("inputs_embeds", None)
+        kwargs.pop("input_ids", None)
+        if graphs is not None and injection_maps is not None and input_ids is not None:
+            self._arm(graphs, injection_maps, input_ids.shape[1], input_ids.device,
+                      input_ids=input_ids, attention_mask=attention_mask)
+            if kwargs.get("position_ids") is None:
+                kwargs["position_ids"] = self.scope_position_ids(
+                    input_ids.shape[1], input_ids.device)
+        else:
+            self._wire_signal = None
+        try:
+            return self.llm(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                **kwargs,
+            )
+        finally:
+            # Disarm unless under gradient checkpointing (backward recomputes the
+            # attention forwards and must see the same signal; every forward rebuilds it).
+            if not getattr(self.llm, "is_gradient_checkpointing", False):
+                self._wire_signal = None
+                self._wire_decode_cos_sin.clear()
+
+    def generate_with_graph(self, input_ids=None, graphs=None, injection_maps=None,
+                            permutation=None, **kwargs):
+        """``generate`` with the graph channel armed and the prompt's WIRE scope de-RoPE'd.
+
+        As :meth:`WireGraphLLM.generate_with_graph`, plus the ``position_ids`` the prompt
+        was trained with. transformers advances them per decode step from the LAST prompt
+        position — which is 0 whenever the prompt ends inside the scope — so generated
+        tokens are numbered 1, 2, ... and sit at natural distances from each other but at
+        the WIRE block's origin. That is the decode asymmetry recorded in the class
+        docstring, not a silent one.
+        """
+        self.assert_decode_supported()
+        self._arm(graphs, injection_maps, input_ids.shape[1], input_ids.device,
+                  permutation=permutation, input_ids=input_ids,
+                  attention_mask=kwargs.get("attention_mask"))
+        kwargs.setdefault("position_ids",
+                          self.scope_position_ids(input_ids.shape[1], input_ids.device))
         try:
             return self.llm.generate(input_ids=input_ids, **kwargs)
         finally:

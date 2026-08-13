@@ -1,0 +1,110 @@
+# @package _global_
+# e17 — WIRE over the COMPOSITE graph, REPLACING RoPE on the scene-graph block.
+#
+#   python -m prism.training.train_v3 --config-name=e17_composite_wire
+#
+# Psi = Phi(E_q~N(0,I)[Phi(q; L_bar^(r), H)], T) is computed on ONE graph holding the
+# directed token cycle V_Tx, the scene graph V_Sc, the mention crosslinks and the anchor
+# bond (gnn_llm.build_composite_graph, ported from
+# notebooks/2026-08-10 e17_magnet_composite_graphs.ipynb). Every token in
+# [scope_start, scope_start + wire_context_window) gets its own Psi row, its q/k are
+# rotated by R(omega . Psi_i), and its RoPE position is set to 0 — the rotation REPLACES
+# RoPE there rather than composing with it. The system prompt and the ICL graphs sit
+# before the scope: they are not in the graph and keep stock RoPE.
+#
+# The four preconditions the arm cannot run without are ASSERTED in
+# CompositeWireGraphLLM.__init__, so a mis-set value fails at construction, not at loss:
+#   directed=true            the cycle's position lives in the magnetic phase alone
+#   learn_r=true             r is that phase budget
+#   pe_gain_init > 0         a shut gate = no Psi = no position (RoPE is already off)
+#   omega_init != "zero"     omega = 0 = identity rotation = the same hole
+defaults:
+  - base_config
+  - _self_
+
+name: e17
+
+gnn:
+  arch: wire_llm
+  wire_composite: true
+
+  # Magnetic probe backbone. r is written into the shared r_logit at construction and
+  # trained from there; 0.1250305176 keeps dist(2rc, Z) = 1/16 at c = 1024, off the
+  # eigenvalue collision that r = 1/8 sits exactly on.
+  directed: true
+  learn_r: true
+  wire_magnet_r: 0.1250305176
+  wire_context_window: 1024
+
+  # Composite edges, as drawn: forward token cycle, bidirectional crosslinks at 0.1, and
+  # the anchor bond t_0 -> a -> v_0 at 10.0 that makes G one component.
+  wire_cycle_weight: 1.0
+  wire_cycle_causal: false
+  wire_crosslink_weight: 0.1
+  wire_crosslink_bidirectional: true
+  wire_anchor_weight: 10.0
+
+  # The rotation must be non-trivial at step 0 (RoPE is off where it applies), so both of
+  # WIRE's cold starts are replaced: the RoPE-style exponential omega decay, and an open
+  # gate. wire_max_angle still clamps the effective angle unconditionally.
+  wire_vanilla: true
+  wire_vanilla_omega_init: exponential
+  pe_gain_init: 1.0
+  wire_layer_scope: dense
+  wire_decode: rotate
+  # RAISED from base_config's 1.0, and this is load-bearing. MEASURED at this exact
+  # config (d_model=1024, c=1024, n=30, pe_gain_init=1.0): max||Psi_i - Psi_j|| = 13.3
+  # and the exponential omega's scale is 0.579, so the angle at INIT is 7.72 rad. Under
+  # wire_max_angle=1.0 the clamp would engage at scale 0.13 on step 0 — pinning the
+  # rotation at the bound and making omega's reported gradient an artifact (see
+  # WireGraphLLM.layer_scale_factor) before a single step. 16.0 is ~2x the init angle:
+  # the guard stays a backstop with room to train into, not the operating point.
+  # Large angles are CORRECT here in a way they are not for the scene-graph arm: this
+  # rotation REPLACES RoPE, which itself wraps many times over 1024 positions, and
+  # vanilla mode takes no expectation, so there is no small-angle Taylor premise to
+  # protect — only periodicity. Watch wire/clamp_engaged; it should read 0.
+  wire_max_angle: 16.0
+
+  # The notebook's create_gnn sizing (e17 cell 41), which is also e13f's: base_config's
+  # smaller pe/gt block is a dev default and would train a different model.
+  # COST: Psi now runs on c + n + 1 ~ 1055 nodes, not n ~ 30, once per forward, and
+  # num_samples is the R-PEARL probe count M that multiplies it. At M=320, N=1055 the
+  # batched GCN is 337k probe rows, chunked by max_probe_rows=65536 into 6 sequential
+  # passes of [65k, 256] complex activations (~134 MB each, gradient-checkpointed).
+  d_model: 1024
+  pe_hidden_channels: 256
+  pe_num_layers: 5
+  k_pe: 3
+  gt_num_layers: 3
+  gt_heads: 8
+  k_gt: 2
+  num_samples: 320
+
+data:
+  # prompt_only keeps the answer-side mentions OUT of the crosslinks, so the prefill Psi
+  # carries no answer-derived topology. full_sequence would put it there.
+  injection_scope: prompt_only
+  # binary is what the notebook assembles composite graphs under (build_composite_graph's
+  # own default); base_config's gaussian affinity is a different scene layer.
+  edge_weights: binary
+  # MEASURED on this corpus with the 31B tokenizer: total length 1367-1502 tokens and
+  # scope_start = 249 (text_edge_list=present), so 1024 would cut 350-480 tokens off the
+  # END — the supervised answer — and train on truncated targets. 2048 clears the longest
+  # sequence with headroom. NOTE this is NOT the same number as wire_context_window: the
+  # window is 1024 tokens counted FROM the block, so with edges present the last ~190
+  # answer tokens fall outside it and keep plain RoPE (with text_edge_list=none the whole
+  # post-block sequence is 393-528 tokens and the window covers all of it).
+  max_seq_length: 2048
+
+trainer:
+  # 4-bit NF4 QLoRA on the LLM (double-quant, bf16 compute), so the VRAM the composite
+  # graph now needs for Psi goes to the graph side. Only the BASE LLM is quantized: the
+  # LoRA adapter, the Psi producer (GT + MagNet) and omega stay fp32/bf16 and train, and
+  # train_v3 switches the optimizer to adamw_bnb_8bit with it.
+  bit4: true
+  checkpoint_dir: outputs/e17_composite_wire
+  save_name: e17_composite_wire
+
+wandb:
+  run_name: e17_composite_wire
+  tag: e17

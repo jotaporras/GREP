@@ -158,8 +158,22 @@ def build_planner_model(gnn, llm, tokenizer, *, disable_graph_token_rope=False,
         # weights poured in next by train_v3), or the legacy two-stage producer.
         # WIRE consumes Ψ as rotation angles; the producer's topology is identical.
         pe_model = gt_module.build_psi_producer(gnn)
-        model = gnn_llm.WireGraphLLM(
+        # wire_composite swaps the SCENE graph for the COMPOSITE one (token cycle +
+        # scene + crosslinks + anchor) and replaces RoPE on the scene-graph scope
+        # instead of composing with it; everything else about WIRE is unchanged, so
+        # the two share this branch and every wire_* key. See CompositeWireGraphLLM.
+        _composite = bool(gnn.get("wire_composite", False))
+        _wire_cls = gnn_llm.CompositeWireGraphLLM if _composite else gnn_llm.WireGraphLLM
+        model = _wire_cls(
             llm, pe_model, d_model=gnn.d_model,
+            **({"tokenizer": tokenizer,
+                "magnet_r": gnn.get("wire_magnet_r", 0.1250305176),
+                "context_window": gnn.get("wire_context_window", 1024),
+                "cycle_weight": gnn.get("wire_cycle_weight", 1.0),
+                "cycle_causal": gnn.get("wire_cycle_causal", False),
+                "crosslink_weight": gnn.get("wire_crosslink_weight", 0.1),
+                "crosslink_bidirectional": gnn.get("wire_crosslink_bidirectional", True),
+                "anchor_weight": gnn.get("wire_anchor_weight", 10.0)} if _composite else {}),
             layer_scope=gnn.wire_layer_scope,
             sigma_init=gnn.wire_sigma_init,
             freeze_sigma=gnn.wire_freeze_sigma,
