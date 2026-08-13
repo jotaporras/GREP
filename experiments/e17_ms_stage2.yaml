@@ -1,0 +1,95 @@
+# @package _global_
+# e17 multistage — STAGE 2: freeze the SFT'd LLM, train ONLY the graph channel.
+#
+#   python -m prism.training.train_v3 --config-name=e17_ms_stage2 \
+#       trainer.init_lora_from=<resolved Stage-1 checkpoint dir>
+#
+# The architecture is INHERITED from e17_magnetic_composite_graphs (the defaults list
+# below), not copied, so the model trained here is bit-identical to the one Stage 3
+# consumes and there is no second place for the composite-graph switches to drift.
+#
+# WHAT TRAINS: the Stage-1 LoRA adapter is carried forward (trainer.init_lora_from) and
+# FROZEN (trainer.freeze_lora=true); GraphSFTTrainer._set_trainable then re-enables
+# model.structural_parameters(), which for MagCompGraphLLM is the GT + MagNet backbone
+# + beta. Nothing else has gradient.
+#
+# ---------------------------------------------------------------------------
+# WHY loss_target IS `responses` HERE AND NOT `edge_list` (the e9 Stage-2 objective)
+# ---------------------------------------------------------------------------
+# e9's Stage 2 trains the encoder as an EDGE-LIST RECONSTRUCTOR: loss is masked to the
+# `• Region Edges:` bullets so the PE must surface adjacency for the frozen LLM to emit
+# them. That objective LEAKS on this architecture and must not be used:
+#
+#   C_tok[n, m] is elevated when token nodes n and m co-vary on the composite graph, and
+#   two mention tokens co-vary through E_Sc precisely when their SCENE NODES ARE ADJACENT.
+#   The bias injected at the edge-list positions therefore already encodes the adjacency
+#   those positions are supervised to predict.
+#
+# data.injection_scope=exclude_supervised does NOT fix it. That knob prunes the injection
+# map, i.e. the crosslinks; the token CYCLE still covers every supervised position, and
+# C_tok is computed over the whole composite, so adjacency still reaches those rows
+# through the crosslinks of the surrounding (unsupervised) mentions. There is no version
+# of the edge-list objective that is clean for a covariance over the full scope.
+#
+# So Stage 2 keeps e9's CURRICULUM (edges present in the text here, removed in Stage 3)
+# and its FREEZE REGIME, and changes only the objective to assistant-only loss. The edge
+# bullets stay in the prompt as scaffolding the frozen LLM can still read; the graph
+# channel is trained to be useful ALONGSIDE them, then Stage 3 takes them away.
+#
+# The leak-free encoder pretraining for this architecture is not an LLM stage at all: it
+# is the notebook's resistance regression (2026-08-10 e17_magnet_composite_graphs.ipynb
+# §3), which fits C_tok's induced distance to alpha * R_eff of this same composite graph
+# with no LLM in the loop. Point gnn.pe_gt_from at its state_dict to start from it.
+defaults:
+  - e17_magnetic_composite_graphs
+  - _self_
+
+name: e17_ms_s2
+
+data:
+  # Edges PRESENT — e9's Stage-2 scaffold. Stage 3 removes them.
+  text_edge_list: present
+  spine_tools: none
+  icl_examples: 0
+  # Answer-side mentions stay OUT of the crosslinks, so the prefill C_tok carries no
+  # answer-derived topology.
+  injection_scope: prompt_only
+
+eval:
+  # Bound eval cost over the long channel-only run.
+  epoch_interval: 2.0
+
+trainer:
+  # Stage-2 freeze regime: LLM + carried adapter frozen, graph channel trains.
+  freeze_lora: true
+  # init_lora_from: <resolved Stage-1 checkpoint dir>   # supply on the CLI
+  loss_target: responses
+  epochs: 8
+
+  # NOT e9's 3e-7. That number was tuned for an additive PE whose gate is already open at
+  # init; here beta starts at 0 and IS the channel. Under Adam the step size is ~lr
+  # regardless of gradient magnitude, so 3e-7 moves beta by ~1.2e-4 over 400 steps and
+  # mag/bias_absmax never leaves the noise floor — the stage would report a clean run that
+  # trained nothing. base_config's 2e-4 puts beta at ~0.08 after 400 steps, which is the
+  # right order for a bias added to logits of size O(1-10).
+  # THIS IS A CHOSEN NUMBER, NOT A MEASURED ONE. Check it on the first run: mag/beta must
+  # be visibly off zero within ~100 steps, and mag/bias_absmax must land within an order
+  # of magnitude of the attention logit scale. Adjust lr, not beta_init.
+  learning_rate: 0.0002
+  # The graph channel is the only thing training, so keep it at base LR (a multiplier here
+  # would just rescale the single active group and confuse the comparison with Stage 3).
+  # structural_lr_mult stays at base_config's 1.0.
+
+  # 4-bit. base_config says bf16 "is required for the PE-only stage" — that predates this
+  # architecture and assumes the PE is cheap. Gemma-4 31B in bf16 is ~62 GB before the
+  # graph channel, which does not fit a 24 GB card at all, and the probe path now needs
+  # several GB of its own. On an 80 GB card set bit4=false and keep Stage 1/2/3 on ONE
+  # quantization setting; on 24 GB this must stay true (see the Stage-1 note in the
+  # suite README).
+  bit4: true
+  checkpoint_dir: outputs/e17_magnetic_composite_graphs
+  save_name: e17_ms_stage2
+
+wandb:
+  run_name: e17_ms_stage2_channel
+  tag: e17

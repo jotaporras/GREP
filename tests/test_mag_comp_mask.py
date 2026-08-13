@@ -284,6 +284,86 @@ def test_beta_has_gradient_at_zero_and_c_does_not():
         "the GT received gradient at beta=0; dL/dC = beta * dL/dbias should be exactly 0")
 
 
+# ------------------------------------------------------------------- telemetry
+def test_telemetry_reports_beta_and_the_realised_bias_scale():
+    """beta's VALUE is the headline; bias_absmax is what says whether it is calibrated."""
+    model = _model(beta_init=0.4)
+    ids = _ids().to(DEVICE)
+    assert model.telemetry() == {}, "no graph armed yet -> nothing to report"
+    with torch.no_grad():
+        model(input_ids=ids, graphs=[_scene()], injection_maps=[_injection_map()])
+    t = model.telemetry()
+    assert t["mag/beta"] == pytest.approx(0.4)
+    assert t["mag/c_tok_absmax"] > 0
+    assert t["mag/bias_absmax"] == pytest.approx(0.4 * t["mag/c_tok_absmax"])
+    assert t["mag/cycle_c"] == CYCLE                      # the REALISED c, not the cap
+    assert t["mag/scope_start"] == SCOPE_START
+    assert t["mag/num_nodes"] == CYCLE + 4 + 1
+    assert t["debug/pe_has_nan"] == 0                     # measured, not defaulted
+    assert t["debug/pe_output_norm"] == pytest.approx(t["mag/c_tok_fro"])
+    assert t["mag/c_tok_fro"] > 0, "a zero PE norm would mean nothing was measured"
+
+
+def test_telemetry_beta_zero_still_reports_a_live_c_tok():
+    """At the cold start the BIAS is zero but C_tok is not — the two must be separable.
+
+    If both read zero there is no way to tell "beta has not opened yet" from "the probe
+    covariance is dead", which are different failures with different fixes.
+    """
+    model = _model(beta_init=0.0)
+    ids = _ids().to(DEVICE)
+    with torch.no_grad():
+        model(input_ids=ids, graphs=[_scene()], injection_maps=[_injection_map()])
+    t = model.telemetry()
+    assert t["mag/beta"] == 0.0
+    assert t["mag/bias_absmax"] == 0.0
+    assert t["mag/c_tok_absmax"] > 0
+
+
+def test_gradient_callback_captures_beta_backbone_and_charge():
+    """The callback must split beta / backbone / r_logit out of the aggregates.
+
+    beta is not in pe_model.parameters(), and the MagNet backbone is buried inside the
+    R-PEARL aggregate — each can go to zero while the aggregate above it looks healthy.
+    """
+    from prism.eval.callbacks import GradientDebugCallback
+
+    model = _model(beta_init=0.3)
+    ids = _ids().to(DEVICE)
+    out = model(input_ids=ids, labels=ids, graphs=[_scene()],
+                injection_maps=[_injection_map()])
+    out.loss.backward()
+
+    cb = GradientDebugCallback()
+    cb._capture_grad_norms(model)
+    g = cb._captured_grad_norms
+    for key in ("beta", "gnn", "gt_blocks", "rpearl", "backbone", "r_logit"):
+        assert key in g, f"{key} grad norm not captured"
+        assert g[key] > 0, f"{key} grad norm is zero"
+    # The splits must be strictly inside their aggregates, else they are mislabelled.
+    assert g["backbone"] <= g["rpearl"] + 1e-6
+    assert g["r_logit"] <= g["backbone"] + 1e-6
+
+
+def test_charge_callback_uses_the_realised_c_not_the_cap():
+    """delta = dist(2rc, Z) is meaningless at the wrong c.
+
+    ``mask_cycle_size`` is a CAP; the graph is built over the prompt length past the
+    block. A callback that used the cap would report the margin of a graph nobody built.
+    """
+    from prism.eval.callbacks import ChargeDegeneracyCallback
+
+    model = _model()
+    ids = _ids().to(DEVICE)
+    with torch.no_grad():
+        model(input_ids=ids, graphs=[_scene()], injection_maps=[_injection_map()])
+    cb = ChargeDegeneracyCallback(cycle_length=8192)       # the config cap
+    assert cb._live_c(model) == CYCLE                      # the realised cycle
+    assert cb._live_c(None) == 8192                        # falls back to the cap
+    r = cb._read_charge(model.pe_model.pe_model.pe_gcn)
+    assert cb._delta(r, CYCLE) != cb._delta(r, 8192)
+
+
 # ---------------------------------------------------------------- the preconditions
 @pytest.mark.parametrize("kw, match", [
     (dict(directed=False, learn_r=True, pe_pool="gt"), "DIRECTED"),
@@ -341,6 +421,40 @@ def test_pretrained_load_still_rejects_a_real_mismatch(tmp_path):
     torch.save(wrong.state_dict(), path)
     with pytest.raises(RuntimeError, match="did not match"):
         load_navigator_pe_into(_model(), str(path), None)
+
+
+def test_multistage_carry_restores_beta(tmp_path):
+    """Stage 2 -> Stage 3 (``trainer.init_pe_from``) must carry beta, not reset it.
+
+    beta is the channel's entire gain and is NOT in ``pe_model``, so a carry that moved Ψ
+    alone would restart Stage 3 at ``mask_beta_init`` (0.0 = the base LLM) and discard the
+    whole of Stage 2 with a clean load and no warning.
+    """
+    from prism.models.loaders import load_pe_weights_into
+    from prism.training.run_dir import save_run_dir
+
+    stage2 = _model(beta_init=0.0)
+    with torch.no_grad():
+        stage2.beta.fill_(0.42)                      # as if Stage 2 trained it here
+    save_run_dir(stage2, {"architecture": "learnable_graph_mask", "mask_composite": True},
+                 str(tmp_path))
+
+    stage3 = _model(beta_init=0.0)                   # cold start, as the config says
+    assert float(stage3.beta) == 0.0
+    load_pe_weights_into(stage3, str(tmp_path), "learnable_graph_mask")
+    assert float(stage3.beta.detach()) == pytest.approx(0.42)
+    for k, v in stage2.pe_model.state_dict().items():
+        assert torch.equal(stage3.pe_model.state_dict()[k], v), f"{k} did not carry"
+
+
+def test_multistage_carry_without_beta_fails_loud(tmp_path):
+    """A source run with no mask_beta must raise, not silently reset the channel."""
+    from prism.models.loaders import load_pe_weights_into
+
+    model = _model(beta_init=0.3)
+    torch.save({"pe_model": model.pe_model.state_dict()}, tmp_path / "gnn_weights.pt")
+    with pytest.raises(KeyError, match="mask_beta"):
+        load_pe_weights_into(_model(), str(tmp_path), "learnable_graph_mask")
 
 
 def test_save_run_dir_carries_beta(tmp_path):

@@ -3059,6 +3059,8 @@ class MagCompGraphLLM(LearnableGraphMaskLLM):
         self._composite_data: Data | None = None
         self._ctok_graph = None
         self._ctok_cache: torch.Tensor | None = None
+        # Per-forward measurements for telemetry(); a plain list, never a buffer.
+        self._telemetry: list[dict] = []
 
     def structural_parameters(self) -> list[nn.Parameter]:
         """Graph-side parameters for the boosted-LR group: the GT, plus ``β``.
@@ -3148,6 +3150,7 @@ class MagCompGraphLLM(LearnableGraphMaskLLM):
             dtype = self.llm.get_input_embeddings().weight.dtype
         bias = torch.zeros(len(injection_maps), 1, seq_len, seq_len,
                            device=device, dtype=dtype)
+        stats = []
         for b in range(len(injection_maps)):
             ids = unpadded_row(input_ids, attention_mask, b, type(self).__name__)
             start, end = self.scope_span(ids)
@@ -3155,7 +3158,84 @@ class MagCompGraphLLM(LearnableGraphMaskLLM):
                 graphs[b], ids, injection_maps[b], start, device, permutation)
             c_tok = self.covariance_token_block(composite, end - start)
             bias[b, 0, start:end, start:end] = (self.beta * c_tok).to(dtype)
+            stats.append(self._measure(c_tok, composite, start, end))
+        self._telemetry = stats
         return bias
+
+    @torch.no_grad()
+    def _measure(self, c_tok, composite, start: int, end: int) -> dict:
+        """Per-sequence scalars for :meth:`telemetry`, measured off the LIVE ``C_tok``.
+
+        Detached and ``no_grad``, so this adds a few reductions over an already-resident
+        ``[c, c]`` and nothing to the autograd graph. Everything here is a quantity the
+        architecture has no bound on and therefore cannot be assumed: ``C`` is read off
+        the UNGATED, un-normed probe responses by design, so its scale is set by the
+        backbone's weights alone, and ``c`` is data-dependent (it is the prompt length
+        past the block, capped by ``cycle_size``).
+        """
+        f = c_tok.detach().float()
+        return {
+            "c_tok_fro": float(f.norm()),
+            "c_tok_absmax": float(f.abs().max()),
+            "c_tok_trace": float(f.diagonal().sum()),
+            "c_tok_has_nan": bool(f.isnan().any() or f.isinf().any()),
+            "cycle_c": float(end - start),
+            "scope_start": float(start),
+            "num_nodes": float(composite.num_nodes),
+            "num_edges": float(composite.edge_index.shape[1]),
+        }
+
+    def telemetry(self) -> dict:
+        r"""Per-forward scalars for the training logs (``GradientDebugCallback`` merges
+        this dict when the wrapped model exposes it, exactly as it does
+        :meth:`WireGraphLLM.wire_telemetry`).
+
+        ``mag/beta`` is the headline. The architecture starts at ``β = 0``, where it IS
+        the base LLM, and ``∂L/∂C = β·∂L/∂bias = 0`` — so on step 1 the graph side
+        receives nothing by construction and only ``β`` moves. Read it as::
+
+            mag/beta            == 0 after step 1   ⇒ the channel NEVER opened
+            debug/grad_norm_gnn == 0 after step 1   ⇒ same, seen from the GT's side
+            mag/bias_absmax     vs the attention logit scale (qkᵀ/√d_h, O(1–10))
+                                ≫ ⇒ the bias swamps content; ≪ ⇒ it is invisible
+
+        ``mag/bias_absmax = |β|·max|C_tok|`` is the largest additive logit shift the model
+        actually applies, and it is the ONE number that says whether β is calibrated.
+        Nothing in the architecture bounds it: there is deliberately no gate on ``C`` (β
+        is the gate), so it must be measured rather than assumed.
+
+        ``mag/cycle_c`` is logged because ``c`` is DATA-dependent — it is the prompt
+        length past the scene-graph block, capped by ``cycle_size`` — and every cost and
+        every degeneracy margin ``δ = dist(2rc, ℤ)`` is stated in terms of it. A run whose
+        ``c`` differs from the one a config was budgeted for is a different experiment.
+
+        Batch reduction: ``absmax`` and ``has_nan`` take the WORST over the batch (they
+        are the safety numbers), the rest the mean. Returns ``{}`` when no graph is armed.
+        """
+        stats = getattr(self, "_telemetry", None)
+        if not stats:
+            return {}
+        beta = float(self.beta.detach())
+        absmax = max(s["c_tok_absmax"] for s in stats)
+        mean = lambda k: sum(s[k] for s in stats) / len(stats)
+        out = {
+            "mag/beta": beta,
+            "mag/bias_absmax": abs(beta) * absmax,
+            "mag/c_tok_absmax": absmax,
+            "mag/c_tok_fro": mean("c_tok_fro"),
+            "mag/c_tok_trace": mean("c_tok_trace"),
+            "mag/cycle_c": mean("cycle_c"),
+            "mag/scope_start": mean("scope_start"),
+            "mag/num_nodes": mean("num_nodes"),
+            "mag/num_edges": mean("num_edges"),
+        }
+        # The callback's pe_output_norm hook is registered on pe_model.__call__, which this
+        # architecture never goes through (it calls covariance_token_block / apply_blocks
+        # directly), so the hook would report NaN and — worse — pe_has_nan=0, i.e. "clean"
+        # for a quantity nothing measured. Supply both from the tensor that IS the PE here.
+        out["debug/pe_output_norm"] = mean("c_tok_fro")
+        out["debug/pe_has_nan"] = int(any(s["c_tok_has_nan"] for s in stats))
+        return out
 
     def forward(
         self,

@@ -1,0 +1,58 @@
+# @package _global_
+# e17 multistage — STAGE 3: unfreeze, train the graph channel + LoRA jointly, NO edges.
+#
+#   python -m prism.training.train_v3 --config-name=e17_ms_stage3 \
+#       trainer.init_lora_from=<stage2 dir> trainer.init_pe_from=<stage2 dir>
+#
+# Launched AFTER analyzing Stage 2. The Stage-2 run dir is self-contained:
+# init_lora_from reattaches the SFT adapter as TRAINABLE, init_pe_from loads the trained
+# Psi producer AND its learned `beta` (loaders.load_pe_weights_into raises if the source
+# has no mask_beta, rather than silently restarting the channel at mask_beta_init = 0).
+# So `mag/beta` at step 0 here must equal the value Stage 2 finished at — check it.
+#
+# data.text_edge_list=none removes the edge bullets, so connectivity must now come from
+# beta * C_tok alone. Assistant-only loss, for a fair comparison with Stage 1 / baselines.
+#
+# The architecture is INHERITED from e17_magnetic_composite_graphs, so Stage 2 and Stage 3
+# train the same model by construction.
+defaults:
+  - e17_magnetic_composite_graphs
+  - _self_
+
+name: e17_ms_s3
+
+gnn:
+  # Two-group LR (GraphSFTTrainer.create_optimizer): the graph channel — GT + MagNet +
+  # beta, i.e. model.structural_parameters() — trains at 10x the LoRA's LR so it can still
+  # move against an adapter that is already fitted. Lives under gnn, not trainer.
+  structural_lr_mult: 10.0
+
+data:
+  # Edge list REMOVED — connectivity must come from the graph channel now.
+  text_edge_list: none
+  spine_tools: none
+  icl_examples: 0
+  injection_scope: prompt_only
+
+trainer:
+  # Stage-3 regime: both the carried adapter and the graph channel train.
+  # init_lora_from / init_pe_from: <resolved Stage-2 checkpoint dir>   # supply on the CLI
+  loss_target: responses
+  epochs: 3
+
+  # NOT e9's 0.003. That is 15x base_config's LoRA LR and was tuned for the additive arm;
+  # applied to a joint run it would move beta by ~0.003/step under Adam, i.e. past any
+  # sane bias magnitude within a few dozen steps, and the clamp-free bias here has nothing
+  # to catch it. Base LoRA LR, with the graph channel boosted 10x so it can still move
+  # against a LoRA that is already fitted.
+  # BOTH numbers are chosen, not measured. The first run is the baseline that measures
+  # them: watch mag/bias_absmax and debug/grad_norm_beta.
+  learning_rate: 0.0002
+
+  bit4: true
+  checkpoint_dir: outputs/e17_magnetic_composite_graphs
+  save_name: e17_ms_stage3
+
+wandb:
+  run_name: e17_ms_stage3_joint
+  tag: e17

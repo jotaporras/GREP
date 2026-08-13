@@ -140,6 +140,14 @@ class GradientDebugCallback(TrainerCallback):
     LoRA, and (GT variant) inner R-PEARL + GT blocks; plus pe_proj output
     magnitude — and ``LearnableGraphMaskLLM`` (PE/GT norms only).
 
+    Two families report extra scalars through a ``telemetry``-style method the model owns,
+    merged into the log row: ``WireGraphLLM.wire_telemetry`` (σ clamp saturation) and
+    ``MagCompGraphLLM.telemetry`` (β, ‖C_tok‖, the realised bias magnitude). The graph
+    channel is split as finely as the failure modes demand — for the magnetic arms that
+    means the MagNet backbone and its charge ``r_logit`` are reported SEPARATELY from the
+    R-PEARL aggregate, and ``β`` separately from ``pe_model`` (it is not in it), because
+    each of those can go to zero while the aggregate above it still looks healthy.
+
     Grad norms are captured by ``_capture_grad_norms`` (called after backward,
     before zero_grad) — HF Trainer zeroes grads before ``on_log``, so ``.grad``
     reads 0 there.
@@ -239,12 +247,28 @@ class GradientDebugCallback(TrainerCallback):
             self._captured_grad_norms["pe_proj"] = self._grad_norm(inner.pe_proj.parameters())
         if hasattr(inner, "pe_gain"):
             self._captured_grad_norms["pe_gain"] = self._grad_norm([inner.pe_gain])
+        # mask_composite (MagCompGraphLLM): beta scales the WHOLE graph channel and is a
+        # parameter of the wrapper, NOT of pe_model — so the "gnn" norm above excludes it.
+        # It is also the only parameter with gradient at beta=0 (dL/dC = beta*dL/dbias = 0
+        # there), which makes this the one number that says whether the channel opens.
+        if hasattr(inner, "beta"):
+            self._captured_grad_norms["beta"] = self._grad_norm([inner.beta])
         if hasattr(inner.pe_model, "blocks"):
             self._captured_grad_norms["gt_blocks"] = self._grad_norm(inner.pe_model.blocks.parameters())
             # rpearl_gt_llm wraps an R-PEARL inside the GT; gt_llm (SemanticGraphTransformer)
             # has no inner pe_model — guard so the debug callback doesn't crash.
             if hasattr(inner.pe_model, "pe_model"):
                 self._captured_grad_norms["rpearl"] = self._grad_norm(inner.pe_model.pe_model.parameters())
+                # Split the BACKBONE out of the R-PEARL aggregate (which also carries
+                # output_projection + output_gain). On the magnetic arms the backbone and
+                # its charge carry the positional signal outright, so an aggregate that
+                # stays healthy while pe_gcn goes to zero is exactly the silent failure.
+                backbone = getattr(inner.pe_model.pe_model, "pe_gcn", None)
+                if backbone is not None:
+                    self._captured_grad_norms["backbone"] = self._grad_norm(backbone.parameters())
+                    r_logit = getattr(getattr(backbone, "convs", [None])[0], "r_logit", None)
+                    if r_logit is not None:
+                        self._captured_grad_norms["r_logit"] = self._grad_norm([r_logit])
         elif hasattr(inner.pe_model, "semantic_gt"):
             # TwoStagePE (legacy): two stacked GTs. Reported SEPARATELY because the aggregate
             # "gnn" norm hides the failure that matters here — one half (usually the
@@ -286,10 +310,20 @@ class GradientDebugCallback(TrainerCallback):
             metrics["debug/pe_gain"] = inner.pe_gain.item()
             metrics["debug/grad_norm_pe_gain"] = g.get("pe_gain", 0.0)
         # rpearl_gt_llm / learnable_graph_mask: split gradient norms by GT sub-component.
+        # mask_composite: beta's VALUE and its gradient. beta=0 is the base LLM, so a beta
+        # that never leaves 0 is a run that trained nothing — and the aggregate gnn norm
+        # cannot show it (beta is not in pe_model).
+        if hasattr(inner, "beta"):
+            metrics["debug/beta"] = float(inner.beta.detach())
+            metrics["debug/grad_norm_beta"] = g.get("beta", 0.0)
         if hasattr(inner.pe_model, "blocks"):
             metrics["debug/grad_norm_gt_blocks"] = g.get("gt_blocks", 0.0)
             if hasattr(inner.pe_model, "pe_model"):  # inner R-PEARL
                 metrics["debug/grad_norm_rpearl"] = g.get("rpearl", 0.0)
+                if "backbone" in g:                  # MagNet / TAGConv, split out
+                    metrics["debug/grad_norm_backbone"] = g["backbone"]
+                if "r_logit" in g:                   # the learnable magnetic charge
+                    metrics["debug/grad_norm_r_logit"] = g["r_logit"]
         elif hasattr(inner.pe_model, "semantic_gt"):  # TwoStagePE (PE GT + Semantic GT)
             metrics["debug/grad_norm_nav_pe_gt"] = g.get("nav_pe_gt", 0.0)
             metrics["debug/grad_norm_nav_semantic_gt"] = g.get("nav_semantic_gt", 0.0)
@@ -300,6 +334,14 @@ class GradientDebugCallback(TrainerCallback):
         # wire/sigma_eff_max is the signature.
         if hasattr(inner, "wire_telemetry"):
             metrics.update(inner.wire_telemetry())
+        # mask_composite: beta, ||C_tok||, the realised bias magnitude, and the
+        # data-dependent cycle length. Merged LAST and allowed to override, because it
+        # also supplies debug/pe_output_norm + debug/pe_has_nan: this architecture never
+        # calls pe_model.__call__ (it goes through covariance_token_block / apply_blocks),
+        # so the forward hook below never fires and those two would otherwise report NaN
+        # and a FALSE "no NaN". See MagCompGraphLLM.telemetry.
+        if hasattr(inner, "telemetry"):
+            metrics.update(inner.telemetry())
 
         if wandb.run is not None:
             wandb.log(metrics, step=state.global_step)
@@ -330,7 +372,9 @@ class ChargeDegeneracyCallback(TrainerCallback):
 
     def __init__(self, cycle_length: int):
         # c is the token-cycle length the composite graph is built with; it is not
-        # recoverable from the module, so it must be supplied (Hydra), never guessed.
+        # recoverable from the module, so the CAP must be supplied (Hydra), never guessed.
+        # Each step prefers the REALIZED c the model reports (see _live_c) — the cap only
+        # binds on prompts long enough to reach it.
         if not cycle_length or int(cycle_length) <= 0:
             raise ValueError(
                 f"ChargeDegeneracyCallback needs the token-cycle length c > 0, got "
@@ -374,19 +418,35 @@ class ChargeDegeneracyCallback(TrainerCallback):
             )
         return rs[0].item()
 
-    def _delta(self, r: float):
-        s = 2.0 * r * self.c
+    def _delta(self, r: float, c: int = None):
+        s = 2.0 * r * (self.c if c is None else c)
         frac = s - math.floor(s)
         return s, min(frac, 1.0 - frac)
 
-    def _warn_once(self, r: float, s: float, delta: float):
+    def _live_c(self, model) -> int:
+        """The REALIZED token-cycle length, when the model reports one.
+
+        The constructor's ``cycle_length`` is the CAP (``mask_cycle_size`` /
+        ``wire_context_window``); the composite graph is built over
+        ``min(len(prompt), scope_start + cap) − scope_start``. On any corpus whose prompts
+        are shorter than the cap the two differ, and delta computed from the cap is a
+        margin for a graph that was never built. Prefer what the model measured, and fall
+        back to the configured cap only when it reports nothing.
+        """
+        inner = GradientDebugCallback._unwrap_peft(model) if model is not None else None
+        fn = getattr(inner, "telemetry", None)
+        c = fn().get("mag/cycle_c") if fn is not None else None
+        return int(c) if c else self.c
+
+    def _warn_once(self, r: float, s: float, delta: float, c: int = None):
         if self._warned or delta >= self._DELTA_WARN:
             return
         self._warned = True
-        safe = (round(s - 0.5) + 0.5) / (2 * self.c)
+        c = self.c if c is None else c
+        safe = (round(s - 0.5) + 0.5) / (2 * c)
         warnings.warn(
             f"[charge] delta={delta:.3e} < {self._DELTA_WARN} at r={r:.8f} (s={s:.4f}): "
-            f"L_bar^(r) is near-degenerate on the c={self.c} token cycle and the "
+            f"L_bar^(r) is near-degenerate on the c={c} token cycle and the "
             f"encoder is losing direction. Nearest safe charge: r={safe:.8f}.",
             RuntimeWarning,
         )
@@ -414,12 +474,14 @@ class ChargeDegeneracyCallback(TrainerCallback):
             return control
 
         r = self._read_charge(self._magnet)
-        s, delta = self._delta(r)
+        c = self._live_c(kwargs.get("model"))
+        s, delta = self._delta(r, c)
         self._delta_min = min(self._delta_min, delta)
-        self._warn_once(r, s, delta)
+        self._warn_once(r, s, delta, c)
 
         metrics = {
             "charge/r": r,
+            "charge/c": c,
             "charge/s": s,
             "charge/delta": delta,
             "charge/cond_proxy": self._COND_NUM / max(delta, 1e-6),

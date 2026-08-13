@@ -400,6 +400,18 @@ def train_model(config: omegaconf.DictConfig):
     if config.trainer.gradient_debug:
         trainer.add_callback(callbacks.GradientDebugCallback())
 
+    # Magnetic composite arms: watch the spectral-injectivity margin delta = dist(2rc, Z).
+    # A collision is direction-destroying and leaves NO signature in the loss, and with a
+    # learnable r the margin is a sawtooth of period 1/(2c) that one Adam step can cross —
+    # so this is the only instrument for it. c is the token-cycle length, which is not
+    # recoverable from the module: it comes from whichever arm's config owns it, never a
+    # guess. Diagnostic only; it never writes r.
+    _cycle_c = (config.gnn.get("mask_cycle_size") if config.gnn.get("mask_composite")
+                else config.gnn.get("wire_context_window") if config.gnn.get("wire_composite")
+                else None)
+    if _cycle_c and config.gnn.get("directed"):
+        trainer.add_callback(callbacks.ChargeDegeneracyCallback(cycle_length=int(_cycle_c)))
+
     cross_eval_dir = os.path.join(sft_args.output_dir, "eval_logs", "cross_eval")
 
     # no_train: evaluate the untrained base model zero-shot instead of training. Uses

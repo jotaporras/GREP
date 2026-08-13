@@ -534,6 +534,20 @@ def load_pe_weights_into(model, init_pe_from: str, architecture: str) -> None:
                 "pretrained GT exactly, and gnn.semantic_gt_from must select the SAME "
                 "Ψ-producer topology as the source run (a legacy TwoStagePE checkpoint "
                 "carries semantic_gt.* keys the PE-only Ψ lacks).")
+        # mask_composite (MagCompGraphLLM): beta is the graph channel's ENTIRE gain and is
+        # NOT part of pe_model, so carrying Ψ alone would silently reset the channel to
+        # mask_beta_init (0.0 = the base LLM) at the start of the next stage — a stage-2
+        # run's whole result, discarded with a clean load and no warning.
+        if hasattr(model, "beta"):
+            if "mask_beta" not in gnn_weights:
+                raise KeyError(
+                    f"{weights_path} carries no 'mask_beta' but the target is a "
+                    f"{type(model).__name__}, whose bias is beta * C_tok. Carrying Ψ "
+                    "without beta restarts the channel at mask_beta_init. Re-save the "
+                    "source run (run_dir.save_run_dir writes it), or set "
+                    "gnn.mask_beta_init explicitly if you MEAN to reset it.")
+            model.beta.data.copy_(gnn_weights["mask_beta"].to(model.beta.device))
+            print(f"[multistage] carried beta = {float(model.beta.detach()):.6g}")
         print(f"[multistage] loaded GT (relative-PE) weights from {weights_path}")
         return
 
