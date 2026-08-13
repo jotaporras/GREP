@@ -281,6 +281,13 @@ def graph_augmented_llm_from_pretrained(
         # matching training, which never merges.
         if not load_in_4bit:
             llm = peft_model.merge_and_unload()
+        else:
+            # llm is NOT a PeftModel instance (the LoRA layers were injected
+            # in place); keep the PeftModel handle reachable for continued
+            # training (RL warm start): the flag detection and adapter
+            # re-save both need it. object.__setattr__ avoids registering a
+            # submodule cycle (peft_model wraps llm).
+            object.__setattr__(llm, "_prism_peft_handle", peft_model)
 
     tokenizer = AutoTokenizer.from_pretrained(path)
 

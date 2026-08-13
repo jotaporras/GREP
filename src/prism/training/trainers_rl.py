@@ -375,12 +375,19 @@ class GraphGRPOTrainer(GRPOTrainer):
             # trl's peft_config path: the WHOLE policy is PEFT-wrapped and the
             # HF Trainer machinery saves the adapter.
             super().save_model(output_dir, _internal_call)
-        elif isinstance(getattr(core_graph_model(self.model), "llm", None),
-                        PeftModel):
-            # Warm-start path: the adapter lives on the inner .llm (nf4 keeps
-            # it unmerged). Save it directly — Trainer.save_model would call
-            # save_pretrained on the WRAPPER, which has no adapter of its own.
-            core_graph_model(self.model).llm.save_pretrained(output_dir)
+        else:
+            # Warm-start path: the LoRA layers live INSIDE the inner .llm (nf4
+            # keeps them unmerged; the llm is not a PeftModel instance) — the
+            # loader stashed the PeftModel handle for exactly this re-save.
+            # Trainer.save_model would call save_pretrained on the WRAPPER,
+            # which has no adapter of its own.
+            handle = getattr(core_graph_model(self.model).llm,
+                             "_prism_peft_handle", None)
+            if handle is None:
+                raise RuntimeError(
+                    "no adapter to save: policy is neither PEFT-wrapped nor a "
+                    "warm-started checkpoint with an attached LoRA.")
+            handle.save_pretrained(output_dir)
 
 
 class MaskGRPOTrainer(GRPOTrainer):
@@ -685,9 +692,16 @@ class MaskGRPOTrainer(GRPOTrainer):
             # trl's peft_config path: the WHOLE policy is PEFT-wrapped and the
             # HF Trainer machinery saves the adapter.
             super().save_model(output_dir, _internal_call)
-        elif isinstance(getattr(core_graph_model(self.model), "llm", None),
-                        PeftModel):
-            # Warm-start path: the adapter lives on the inner .llm (nf4 keeps
-            # it unmerged). Save it directly — Trainer.save_model would call
-            # save_pretrained on the WRAPPER, which has no adapter of its own.
-            core_graph_model(self.model).llm.save_pretrained(output_dir)
+        else:
+            # Warm-start path: the LoRA layers live INSIDE the inner .llm (nf4
+            # keeps them unmerged; the llm is not a PeftModel instance) — the
+            # loader stashed the PeftModel handle for exactly this re-save.
+            # Trainer.save_model would call save_pretrained on the WRAPPER,
+            # which has no adapter of its own.
+            handle = getattr(core_graph_model(self.model).llm,
+                             "_prism_peft_handle", None)
+            if handle is None:
+                raise RuntimeError(
+                    "no adapter to save: policy is neither PEFT-wrapped nor a "
+                    "warm-started checkpoint with an attached LoRA.")
+            handle.save_pretrained(output_dir)
