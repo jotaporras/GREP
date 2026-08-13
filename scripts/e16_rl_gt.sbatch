@@ -5,10 +5,12 @@
 #SBATCH --partition=dgx-b200
 #SBATCH --gpus=2
 # betty's SLURM cli_filter (2026-08-03) enforces EXACTLY 28 CPUs and 224 GB
-# per GPU on dgx-b200, and reads --cpus-per-task as a PER-GPU figure — so the
-# request must be stated in per-GPU units.
-#SBATCH --cpus-per-gpu=28
-#SBATCH --mem-per-gpu=224G
+# per GPU on dgx-b200 and assumes ntasks = #GPUs unless pinned — this job is
+# ONE process driving both GPUs (policy + in-process engine), so ntasks=1 with
+# the 2-GPU totals: 56 CPUs, 448 GB.
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=56
+#SBATCH --mem=448G
 #
 # e16 — GRPO RL training of the ADDITIVE GT architecture (gt_llm) with
 # graph-conditioned vLLM rollouts, v2 semantics: the Ψ tower is UNFROZEN and
