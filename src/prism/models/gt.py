@@ -96,8 +96,8 @@ class _SafeBatchedSparseAttn(torch.autograd.Function):
         fp32 score tensor is local and freed when the head finishes.
         """
         N = qi.shape[0]
-        # Sparse ops (sampled_addmm, sparse.mm) are fp32-only; disable autocast so a
-        # surrounding bf16 context can't recast the operands and raise on BFloat16.
+        # sampled_addmm is fp32-only; disable autocast so a surrounding bf16 context
+        # can't recast the operands and raise on BFloat16.
         with torch.autocast(device_type=qi.device.type, enabled=False):
             unnormalized = torch.sparse.sampled_addmm(
                 input=A_csr_f, mat1=qi.float(), mat2=ki.float().T, beta=0.0
@@ -111,8 +111,13 @@ class _SafeBatchedSparseAttn(torch.autograd.Function):
             # Scaled dot-product scores with per-neighborhood (per-row) softmax.
             attn_alpha = softmax(src=unnormalized.values() * scale, index=row_index,
                                  dim=0, num_nodes=N)
-            B = torch.sparse_csr_tensor(crow, col, attn_alpha, size=(N, N))
-            return torch.sparse.mm(B, vi.float())  # [N, F_head], fp32
+            # A·V by explicit gather/scatter rather than torch.sparse.mm: the latter's
+            # backward w.r.t. its SPARSE operand materializes a dense [N, N] gradient,
+            # which is fatal once N is M·|V| (pe_pool='gt' stacks the probes as one
+            # block-diagonal graph). Same product, at nnz × F_head instead of N².
+            messages = vi.float()[col.long()] * attn_alpha.unsqueeze(-1)
+            return torch.index_add(torch.zeros_like(vi, dtype=torch.float32),
+                                   0, row_index, messages)  # [N, F_head], fp32
 
     @staticmethod
     def forward(ctx, QX, KX, VX, A_csr, scale, attn_dropout, training):
@@ -401,7 +406,22 @@ class GraphTransformer(nn.Module):
         expanded_edge_index = reachable.indices()
         return coalesce(expanded_edge_index, num_nodes=num_nodes)
 
-    def forward(self, data, token_embeddings=None, is_token=None, permutation=None) -> Tensor:
+    def forward(self, data, token_embeddings=None, is_token=None, permutation=None,
+                pool: bool = True) -> Tensor:
+        """Ψ = E_q[Φ'(q)] (``pool=True``), or the per-probe stack Φ'(q^(s)) [M, N, d_model].
+
+        ``pool=False`` hands the probe axis to the caller instead of averaging it away,
+        so a statistic other than the mean can be taken over the SAME responses — e.g.
+        the centered second moment C = E_q[Φ'Φ'ᵀ] − ΨΨᵀ, which is what
+        :meth:`RandomGNNPositionalEncodings.covariance_token_block` forms one stage
+        earlier, over Φ rather than Φ'. Requires ``pe_pool='gt'``: that is the only
+        configuration in which a probe axis survives the blocks.
+        """
+        if not pool and self.pe_pool != "gt":
+            raise ValueError(
+                "pool=False returns the per-probe stack and needs the probe axis to reach "
+                f"the blocks, which only pe_pool='gt' does (got pe_pool={self.pe_pool!r})."
+            )
         try:
             device = next(self.parameters()).device
         except StopIteration:
@@ -501,7 +521,10 @@ class GraphTransformer(nn.Module):
                 # Ψ = E_q[Φ(Φ(q; S, H), G, T)]. Symmetric in the probe set, so Ψ stays a
                 # Monte-Carlo estimator. Averaged in fp32: a bf16 mean over M terms loses
                 # the precision the pe_pool="pe" path gets for free (it pools in fp32).
-                x = x.view(m_probes, num_nodes, -1).float().mean(dim=0).to(x.dtype)
+                # pool=False stops one step short and returns the stack itself.
+                x = x.view(m_probes, num_nodes, -1)
+                if pool:
+                    x = x.float().mean(dim=0).to(x.dtype)
             # Learnable output gate (no-op when token_embeddings is None).
             if token_embeddings is not None:
                 x = x * torch.tanh(self.output_gain).to(x.dtype)
