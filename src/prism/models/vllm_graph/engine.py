@@ -58,8 +58,13 @@ def build_graph_llm(
     # var here so one export pins the backend across every engine this process
     # spins (tests, RL rollouts, eval) — on sm100 the auto-pick is FLASHINFER,
     # whose kernels JIT-compile with nvcc that cluster nodes may not have.
+    # fp32 engines (parity tests) must stay on auto-selection: explicit
+    # FLASH_ATTN is refused for fp32 ("dtype not supported"), while fp32
+    # auto-pick already excludes FLASHINFER — only half/bf16 engines need the
+    # pin (their auto-pick prefers FLASHINFER on sm100).
     env_backend = os.environ.get("VLLM_ATTENTION_BACKEND")
-    if env_backend and "attention_backend" not in extra_engine_kwargs:
+    if (env_backend and "attention_backend" not in extra_engine_kwargs
+            and str(dtype).replace("torch.", "") not in ("float32", "float")):
         extra_engine_kwargs["attention_backend"] = env_backend
 
     from vllm import LLM
