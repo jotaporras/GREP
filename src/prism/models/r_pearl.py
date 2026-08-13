@@ -65,6 +65,7 @@ class RandomGNNPositionalEncodings(nn.Module):
         directed: bool = False,
         learn_r: bool = True,
         hidden_norm: str = "none",
+        readout_norm: str = "global_rms",
     ):
         super().__init__()
         if probe_distribution not in ("gaussian", "rademacher"):
@@ -93,9 +94,13 @@ class RandomGNNPositionalEncodings(nn.Module):
         self.output_projection = nn.Linear(pe_hidden_channels, d_model)
 
         self.dropout = nn.Dropout(dropout)
-        # ``use_layer_norm`` retained for config back-compat; always a plain LayerNorm.
-        self.use_layer_norm = use_layer_norm
-        self.norm = nn.LayerNorm(d_model)
+        # ``use_layer_norm`` retained for config back-compat; superseded by
+        # ``readout_norm``, which selects the Ψ readout. Only "layer"/"rms" build a module.
+        assert readout_norm in ("global_rms", "rms", "layer", "none"), "Invalid readout_norm"
+        self.use_layer_norm, self.readout_norm = use_layer_norm, readout_norm
+        self.norm = (nn.LayerNorm(d_model) if readout_norm == "layer" else
+                     nn.RMSNorm(d_model, elementwise_affine=False)
+                     if readout_norm == "rms" else nn.Identity())
         # Learnable tanh(g) gate applied to Ψ and C·s. g = tanh(output_gain) ∈ (-1,1);
         # init output_gain=1 → g ≈ 0.76. Scalar parameter, saved.
         self.output_gain = nn.Parameter(torch.tensor(1.0))
@@ -203,8 +208,26 @@ class RandomGNNPositionalEncodings(nn.Module):
         if edge_weight is not None:
             g.edge_weight = edge_weight
         out = self.output_projection(self.dropout(self.pe_gcn(g)))   # [N, d_model]
-        out = self.norm(out)
+        out = self._readout(out)
         return out * torch.tanh(self.output_gain).to(out.dtype)
+
+    def _readout(self, x: torch.Tensor) -> torch.Tensor:
+        r"""Normalize Ψ for the readout, per ``readout_norm``.
+
+        ``"global_rms"`` (default) divides by ONE detached scalar over all nodes
+        and channels, so Ψ's scale is bounded while the RELATIVE magnitudes across
+        nodes survive — those carry the structure counted by PEARL Corollary 4.4,
+        and they set the per-node angle scale under WIRE's φ_v = ⟨ω, Ψ_v⟩. The
+        per-node alternatives pin ‖Ψ_v‖ to a constant and discard that channel:
+        ``"layer"`` additionally centers across channels and carries an affine
+        shift (not conjugation-equivariant, and not 1-Lipschitz, so it breaks
+        PEARL Assumption 4.1 at C_σ = 1); ``"rms"`` is the milder per-node option.
+        ``"none"`` leaves the scale unconstrained.
+        """
+        if self.readout_norm != "global_rms":
+            return self.norm(x)
+        scale = x.float().pow(2).mean().sqrt().clamp_min(self.eps)
+        return x / scale.detach().to(x.dtype)
 
     def forward(self, data, permutation=None, pool: bool = True):
         """Ψ = E_q[Φ(q; S, H)] (``pool=True``), or the per-probe stack Φ(q^(s); S, H).
@@ -285,7 +308,7 @@ class RandomGNNPositionalEncodings(nn.Module):
 
         # LayerNorm is over d_model, so this is the same per-node readout in both
         # branches — applied to Ψ when pooled, to every Φ_s when not.
-        pooled_pe = self.norm(pooled_pe)
+        pooled_pe = self._readout(pooled_pe)
         return pooled_pe * torch.tanh(self.output_gain).to(pooled_pe.dtype)
 
     def second_moment_apply(self, data, signal: torch.Tensor,
@@ -419,4 +442,3 @@ class RandomGNNPositionalEncodings(nn.Module):
         C_tok = torch.einsum("mtf,muf->tu", Ct, Ct) / m            # PSD covariance [c, c]
         Psi_tok = psi @ psi.transpose(0, 1)                        # ΨΨᵀ token block [c, c]
         return C_tok, Psi_tok
-
