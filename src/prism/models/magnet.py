@@ -39,8 +39,18 @@ def modrelu(x: Tensor, bias: Tensor, eps: float = 1e-12) -> Tensor:
 
 
 def clin(lin: Linear, x: Tensor) -> Tensor:
-    r"""Applies a real-valued linear transformation to a complex tensor."""
-    return torch.complex(lin(x.real), lin(x.imag))
+    r"""Applies a real-valued linear transformation to a complex tensor.
+
+    :func:`torch.complex` has no ``bfloat16`` kernel (Half, Float and Double only), and
+    under a ``bfloat16`` autocast :class:`~torch.nn.Linear` returns ``bfloat16`` whatever
+    dtype it was given — so the two halves are promoted back to ``float32`` before they
+    are recombined. This is the same fp32 the rest of the probe path already runs in; it
+    is not a widening of the layer.
+    """
+    re, im = lin(x.real), lin(x.imag)
+    if re.dtype == torch.bfloat16:
+        re, im = re.float(), im.float()
+    return torch.complex(re, im)
 
 
 def global_rms(x: Tensor, eps: float = 1e-12) -> Tensor:
