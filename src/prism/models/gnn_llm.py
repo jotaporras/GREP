@@ -2784,11 +2784,18 @@ class CompositeWireGraphLLM(WireGraphLLM):
              input_ids=None, attention_mask=None):
         """As :meth:`WireGraphLLM._arm`, threading the ids the composite graph is built on.
 
-        Drops the composite/Ψ caches whenever gradients are live: they are only ever
-        filled under ``no_grad`` (see :meth:`composite_graph`), so this clears a cache
-        left behind by an earlier eval rather than carrying it into a training step.
+        Everything the PREVIOUS iteration's autograd graph is reachable from is dropped
+        FIRST, before this one is built. Two references outlive a backward here:
+        ``_wire_signal``, which the parent keeps armed on purpose so gradient
+        checkpointing can recompute the attention forwards, and the Ψ ``cache_pe`` parks
+        (it carries its graph — see :meth:`~prism.models.gt.GraphTransformer._probe_pe`).
+        Letting either live until its new value overwrites it keeps the previous
+        iteration's ``AccumulateGrad`` nodes alive into this one, which torch reports as
+        an AccumulateGrad stream mismatch and which pins the old activations for no
+        reason. Both are rebuilt unconditionally below, so clearing them only ever frees.
         """
         if torch.is_grad_enabled():
+            self._wire_signal = None
             self.invalidate_cache()
         self._wire_decode_cos_sin.clear()
         self._wire_signal = self.build_wire_signal(
