@@ -247,6 +247,14 @@ class GraphTransformer(nn.Module):
             Requires ``node_feature_dim``.
         directed (bool): Forwarded to the R-PEARL probe backbone (MagNet when True);
             see :class:`RandomGNNPositionalEncodings`. The GT blocks are unaffected.
+        learn_r (bool): Forwarded to the same backbone — learn MagNet's charge r per
+            layer; ``directed`` only. See :class:`RandomGNNPositionalEncodings`.
+        hidden_norm (str): Forwarded to the same backbone — MagNet's inter-layer
+            normalization, ``"none"`` (default) or ``"global_rms"``; ``directed`` only.
+        cache_pe (bool): Reuse Ψ across consecutive forwards over the SAME ``Data``
+            object; see :meth:`_probe_pe`. Off by default — every current consumer
+            passes a fresh graph per forward, and a stale cache would be a silent
+            train/eval drift. Callers that set it own :meth:`invalidate_cache`.
     """
 
     def __init__(self, num_layers: int, pe_hidden_channels: int,
@@ -261,7 +269,10 @@ class GraphTransformer(nn.Module):
                  node_feature_dim: int = None,
                  pe_pool: str = "pe",
                  fuse_node_features: bool = False,
-                 directed: bool = False):
+                 directed: bool = False,
+                 learn_r: bool = True,
+                 hidden_norm: str = "none",
+                 cache_pe: bool = False):
         super().__init__()
         if pe_readout not in ("mean", "second_moment"):
             raise ValueError(
@@ -311,6 +322,8 @@ class GraphTransformer(nn.Module):
             # by R-PEARL, so the probe path stays live and P = E_q[Φ(q; S, H)].
             node_feature_dim=None if fuse_node_features else node_feature_dim,
             directed=directed,
+            learn_r=learn_r,
+            hidden_norm=hidden_norm,
         )
         self.input_proj = nn.Linear(node_feature_dim, d_model) if fuse_node_features else None
         # Final block is norm-free (normalize=False) so its output magnitude
@@ -324,6 +337,36 @@ class GraphTransformer(nn.Module):
         # Learnable scalar output gate: g = tanh(output_gain) ∈ (-1, 1), init ≈ 0.76.
         # Lets the model scale the structural output (0 recovers the base LLM).
         self.output_gain = nn.Parameter(torch.tensor(1.0))
+        # Ψ cache; see _probe_pe. Plain attributes, so nothing enters the state dict.
+        self.cache_pe = cache_pe
+        self._pe_cache = self._pe_graph = None
+
+    def _probe_pe(self, pe_data, **kwargs) -> Tensor:
+        """Ψ for ``pe_data``, reusing the cached tensor when ``cache_pe`` is set.
+
+        Ψ is a function of the TOPOLOGY alone — R-PEARL's probes never read ``data.x`` —
+        so a caller sweeping several node-feature matrices over one graph (an
+        autoregressive prefill, a rollout) can pay for it once. Two consequences the
+        caller owns. The cached tensor keeps its autograd graph, so every loss that
+        consumes it must be covered by ONE backward; a second backward raises
+        ``Trying to backward through the graph a second time`` rather than quietly
+        using stale gradients. And the whole sweep then shares ONE probe draw, which
+        is a single Monte-Carlo estimate of E_q reused across the sweep rather than an
+        independent one per forward. Call :meth:`invalidate_cache` after that backward.
+
+        The cache is keyed on the identity of the ``Data`` it was built from, so a new
+        graph misses on its own; only a weight update needs the explicit invalidation.
+        """
+        if not self.cache_pe:
+            return self.pe_model(pe_data, **kwargs)
+        if self._pe_cache is None or self._pe_graph is not pe_data:
+            self._pe_graph = pe_data
+            self._pe_cache = self.pe_model(pe_data, **kwargs)
+        return self._pe_cache
+
+    def invalidate_cache(self) -> None:
+        """Drop the cached Ψ; a no-op when ``cache_pe`` is off (see :meth:`_probe_pe`)."""
+        self._pe_cache = self._pe_graph = None
 
     @torch.no_grad()
     def _expand_edge_index(self, edge_index: Tensor, num_nodes: int, k_hops: int = 1) -> Tensor:
@@ -389,7 +432,7 @@ class GraphTransformer(nn.Module):
         pe_kw = {} if self.pe_pool == "pe" else {"pool": False}
         if token_embeddings is None:
             # Legacy pure-PE-generator path (rpearl_gt_llm): first moment is the PE.
-            x = self.pe_model(pe_data, **pe_kw)
+            x = self._probe_pe(pe_data, **pe_kw)
             if self.fuse_node_features:
                 # Φ(X + P; T): semantic features X = input_proj(data.x) added to the
                 # probe PE P before the blocks. Both fp32 on this path.
@@ -399,7 +442,7 @@ class GraphTransformer(nn.Module):
             rows = slice(0, token_embeddings.shape[0]) if is_token is None else is_token
             x_full[rows] = token_embeddings.to(device=device, dtype=torch.float32)
             if self.pe_readout == "second_moment":
-                psi = self.pe_model(pe_data)              # first moment Ψ ∈ [N, d_model]
+                psi = self._probe_pe(pe_data)            # first moment Ψ ∈ [N, d_model]
                 seeded = x_full.clone()
                 if is_token is not None:
                     # scene rows ← first-moment Ψ; token rows stay the verbal embeddings X.
@@ -408,7 +451,7 @@ class GraphTransformer(nn.Module):
                 x = seeded + cx.to(seeded.dtype)          # H0 = seeded + C·seeded
             else:
                 # Broadcasts over the probe axis when pe_pool="gt" (x_full is [N, d]).
-                x = x_full + self.pe_model(pe_data, **pe_kw)
+                x = x_full + self._probe_pe(pe_data, **pe_kw)
 
         # Precompute k-hop neighborhood diffusions.
         if permutation is not None:
@@ -905,6 +948,9 @@ def build_psi_producer(cfg, node_feature_dim: int = None) -> nn.Module:
         node_feature_dim=None if navigator else node_feature_dim,
         pe_pool=cfg.get("pe_pool", "pe"),
         directed=cfg.get("directed", False),
+        # Absent -> False, the value every pre-learn_r checkpoint was trained with;
+        # a recorded True is required for the strict load to find the r_logit keys.
+        learn_r=cfg.get("learn_r", False),
     )
     if not navigator:
         return pe_gt

@@ -606,7 +606,13 @@ def _parse_rollout(convo: List[Dict[str, str]], include_tools: bool):
     :func:`icl_demos_from_rollouts` so a demo and a target are built identically.
     """
     msgs = strip_icl(convo)
-    user_turn = next(m for m in reversed(msgs) if m["role"] == "user")
+    # The LAST user turn is not always the task: a rollout whose answer failed SPINE's
+    # JSON parse carries a "Feedback: ..." user turn and a corrected assistant turn
+    # after it. The task turn is the last one that actually states a scene graph; the
+    # last assistant turn is still the answer to keep (the corrected one).
+    user_turn = next(m for m in reversed(msgs)
+                     if m["role"] == "user"
+                     and re.search(r"[Ss]cene graph:", m.get("content", "")))
     assistant_turn = next(m for m in reversed(msgs) if m["role"] == "assistant")
     sg = _extract_scene_graph_dict(user_turn["content"])
     turn = {

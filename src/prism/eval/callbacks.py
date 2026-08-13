@@ -1,4 +1,5 @@
 import json
+import math
 import warnings
 
 import torch
@@ -302,3 +303,136 @@ class GradientDebugCallback(TrainerCallback):
 
         if wandb.run is not None:
             wandb.log(metrics, step=state.global_step)
+
+
+class ChargeDegeneracyCallback(TrainerCallback):
+    r"""Per-step monitor of MagNet's spectral-injectivity margin on the token cycle.
+
+    The charge is r = 0.25*sigmoid(r_logit), shared by every MagChebConv. On the
+    length-c token cycle the eigenvalues of L_bar^(r) collide iff
+
+        s = 2*r*c        delta = dist(s, Z) = min(frac(s), 1 - frac(s))
+
+    is zero, and every collision is direction-destroying — half the spectrum is lost
+    with no signature in the loss. delta is a sawtooth in r of period 1/(2c) (6.1e-5
+    at c=8192) while one Adam step at lr=1e-3 moves r by ~3e-5, so training is
+    expected to cross degeneracies every step or two; `charge/periods_per_step` is
+    the headline number (>= 0.5 means delta is unlearnable in practice).
+
+    DIAGNOSTIC ONLY — it never writes r. The true minimum eigenvalue gap is not
+    computed: that is an O(c^3) eigendecomposition at c=8192, and delta is the cheap
+    surrogate the conditioning result is stated in.
+    """
+
+    # Empirical conditioning fit, cond ~ _COND_NUM / delta.
+    _COND_NUM = 0.637
+    _DELTA_WARN = 0.05
+
+    def __init__(self, cycle_length: int):
+        # c is the token-cycle length the composite graph is built with; it is not
+        # recoverable from the module, so it must be supplied (Hydra), never guessed.
+        if not cycle_length or int(cycle_length) <= 0:
+            raise ValueError(
+                f"ChargeDegeneracyCallback needs the token-cycle length c > 0, got "
+                f"{cycle_length!r}; source it from the composite-graph config."
+            )
+        self.c = int(cycle_length)
+        self._magnet = None
+        self._static = False        # learn_r=False: delta is constant, logged once
+        self._prev_r = None
+        self._prev_s = None
+        self._crossings = 0
+        self._delta_min = float("inf")
+        self._warned = False
+
+    @staticmethod
+    def _find_magnet(model):
+        """The MagNet backbone, or None when this run has no charge to watch.
+
+        ``pe_gcn`` hangs off R-PEARL (rpearl_llm) or off the R-PEARL nested in the GT
+        (rpearl_gt_llm); the undirected TAGConv backbone has no ``r``.
+        """
+        inner = GradientDebugCallback._unwrap_peft(model)
+        pe = getattr(inner, "pe_model", None)
+        pe = getattr(pe, "pe_model", pe)
+        pe_gcn = getattr(pe, "pe_gcn", None)
+        return pe_gcn if hasattr(pe_gcn, "r") else None
+
+    def _read_charge(self, magnet) -> float:
+        """The scalar charge, verified equal across layers.
+
+        ``MagNet.r`` reports ``convs[0]`` alone; the layers are tied by sharing one
+        ``r_logit``. Untying breaks every proposition delta is stated under, so read
+        each layer and fail loudly rather than silently trusting the head.
+        """
+        rs = torch.stack([torch.as_tensor(conv.r).detach().reshape(())
+                          for conv in magnet.convs]).float().cpu()
+        if not torch.equal(rs, rs[0].expand_as(rs)):
+            raise RuntimeError(
+                f"MagNet charges diverged across layers: {rs.tolist()}. delta is "
+                "defined for ONE shared charge; per-layer charges invalidate it."
+            )
+        return rs[0].item()
+
+    def _delta(self, r: float):
+        s = 2.0 * r * self.c
+        frac = s - math.floor(s)
+        return s, min(frac, 1.0 - frac)
+
+    def _warn_once(self, r: float, s: float, delta: float):
+        if self._warned or delta >= self._DELTA_WARN:
+            return
+        self._warned = True
+        safe = (round(s - 0.5) + 0.5) / (2 * self.c)
+        warnings.warn(
+            f"[charge] delta={delta:.3e} < {self._DELTA_WARN} at r={r:.8f} (s={s:.4f}): "
+            f"L_bar^(r) is near-degenerate on the c={self.c} token cycle and the "
+            f"encoder is losing direction. Nearest safe charge: r={safe:.8f}.",
+            RuntimeWarning,
+        )
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        if model is None:
+            return control
+        self._magnet = self._find_magnet(model)
+        if self._magnet is None:
+            return control
+        # learn_r=False pins r, so delta never moves: report it once and stand down.
+        self._static = self._magnet.convs[0].r_logit is None
+        if self._static:
+            r = self._read_charge(self._magnet)
+            s, delta = self._delta(r)
+            self._warn_once(r, s, delta)
+            if wandb.run is not None:
+                wandb.log({"charge/r": r, "charge/s": s, "charge/delta": delta,
+                           "charge/cond_proxy": self._COND_NUM / max(delta, 1e-6)},
+                          step=state.global_step)
+        return control
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if self._magnet is None or self._static:
+            return control
+
+        r = self._read_charge(self._magnet)
+        s, delta = self._delta(r)
+        self._delta_min = min(self._delta_min, delta)
+        self._warn_once(r, s, delta)
+
+        metrics = {
+            "charge/r": r,
+            "charge/s": s,
+            "charge/delta": delta,
+            "charge/cond_proxy": self._COND_NUM / max(delta, 1e-6),
+            "charge/delta_min_since_start": self._delta_min,
+        }
+        # First step has no predecessor: the step-difference keys simply don't exist yet.
+        if self._prev_s is not None:
+            self._crossings += abs(math.floor(s) - math.floor(self._prev_s))
+            metrics["charge/dr_per_step"] = abs(r - self._prev_r)
+            metrics["charge/periods_per_step"] = abs(s - self._prev_s)
+        metrics["charge/crossings"] = self._crossings
+        self._prev_r, self._prev_s = r, s
+
+        if wandb.run is not None:
+            wandb.log(metrics, step=state.global_step)
+        return control

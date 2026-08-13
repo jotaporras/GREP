@@ -17,6 +17,7 @@ from trl import SFTTrainer
 
 from prism.eval import callbacks
 from prism.eval import evaluate
+from prism.models import beta_projection
 
 
 # Maps loss_target values to their precomputed per-example index column. "all" is
@@ -154,13 +155,17 @@ class GraphSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
         """Two learning-rate groups: structural path (GT + R-PEARL + gate) at
         ``structural_lr_mult`` × base LR; LLM/LoRA at base LR. Falls back to the
         stock optimizer when the multiplier is 1.0.
+
+        Either way the optimizer carries the ``enforce_beta_bound`` post-step hook,
+        which re-projects the MagNet filters into PEARL Assumption 4.2 after every
+        update; it is a no-op on backbones that hold no ``MagChebConv``.
         """
         mult = float(self.gnn_config.get("structural_lr_mult", 1.0))
         opt_model = self.model
         structural = self.model.structural_parameters()
         # No multiplier, or a parameter-free arch (empty structural set) → stock optimizer.
         if self.optimizer is not None or mult == 1.0 or not structural:
-            return super().create_optimizer()
+            return self._register_beta_projection(super().create_optimizer())
 
         structural_ids = {id(p) for p in structural}
 
@@ -199,7 +204,18 @@ class GraphSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
             f"[train] structural LR group: {mult}x base = {base_lr * mult:.2e} "
             f"({n_struct / 1e6:.2f}M params); LLM/LoRA at base LR {base_lr:.2e}"
         )
-        return self.optimizer
+        return self._register_beta_projection(self.optimizer)
+
+    def _register_beta_projection(self, optimizer):
+        """Attach the ``gnn.enforce_beta_bound`` post-step β projection (default on)."""
+        slack = beta_projection.register_beta_projection(
+            optimizer, self.model,
+            enabled=bool(self.gnn_config.get("enforce_beta_bound", True)),
+        )
+        if slack is not None:
+            print("[train] beta projection ON: MagNet filters held at ||H(S)|| <= 1/F "
+                  "after every optimizer step (PEARL Assumption 4.2 / Cor 4.6)")
+        return optimizer
 
     def training_step(self, model, inputs, num_items_in_batch=None, **kwargs):
         loss = super().training_step(

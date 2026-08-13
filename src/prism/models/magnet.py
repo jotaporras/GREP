@@ -43,6 +43,24 @@ def clin(lin: Linear, x: Tensor) -> Tensor:
     return torch.complex(lin(x.real), lin(x.imag))
 
 
+def global_rms(x: Tensor, eps: float = 1e-12) -> Tensor:
+    r"""The single scalar :math:`\sqrt{\mathbb{E}\left[|z|^2\right]}`, the mean
+    taken over every node AND every channel of :math:`\mathbf{X}`.
+
+    Being a function of the moduli alone, it is invariant under the gauge
+    :math:`z \mapsto e^{i \gamma} z` and under conjugation, so dividing by it
+    commutes with both and leaves :class:`MagChebConv`'s gauge property intact.
+    It is returned detached, so the division is a fixed scalar rather than a
+    learned reparameterization: the layer stays a bounded linear map whose norm
+    folds into the :math:`\beta` accounting of
+    :mod:`prism.models.beta_projection`. There is deliberately no affine part —
+    a learnable scale or shift would restore exactly the per-channel freedom
+    that makes :class:`~torch.nn.LayerNorm` non-equivariant here. ``eps`` floors
+    an all-zero input (an isolated node, an empty graph) away from ``0/0``.
+    """
+    return (x.real.square() + x.imag.square()).mean().sqrt().clamp_min(eps).detach()
+
+
 class MagChebConv(ChebConv):
     r"""The magnetic Chebyshev spectral graph convolutional operator from the
     `"MagNet: A Neural Network for Directed Graphs"
@@ -62,8 +80,9 @@ class MagChebConv(ChebConv):
         \mathbf{Z}_k &= 2 \cdot \mathbf{S}
         \mathbf{Z}_{k-1} - \mathbf{Z}_{k-2}
 
-    and :math:`\mathbf{S} = \mathbf{\bar{H}}^{(r)}` denotes the normalized
-    magnetic adjacency matrix
+    and :math:`\mathbf{S} = \mathbf{\hat{L}}^{(r)}` denotes the scaled
+    normalized magnetic Laplacian, built from the normalized magnetic
+    adjacency matrix
 
     .. math::
         \mathbf{\bar{H}}^{(r)} \coloneqq \mathbf{D}_s^{-1/2} \mathbf{A}_s
@@ -74,12 +93,23 @@ class MagChebConv(ChebConv):
     matrix, and :math:`\odot` the Hadamard product. Since
     :math:`\mathbf{\Theta}^{(r)}` is skew-symmetric,
     :math:`\mathbf{\bar{H}}^{(r)}` is Hermitian with
-    :math:`\mathrm{spec}(\mathbf{\bar{H}}^{(r)}) \subseteq [-1, 1]`, and
-    relates to the scaled normalized magnetic Laplacian by
-    :math:`\mathbf{\hat{L}}^{(r)} = - \mathbf{\bar{H}}^{(r)}`, so that no
-    rescaling by :math:`\lambda_{\max}` is required. The bound holds
+    :math:`\mathrm{spec}(\mathbf{\bar{H}}^{(r)}) \subseteq [-1, 1]`, so
+    :math:`\mathbf{L}^{(r)} = \mathbf{I} - \mathbf{\bar{H}}^{(r)}` has
+    :math:`\lambda_{\max} = 2` (Zhang et al., Theorem 2) and the identity
+    cancels exactly,
+
+    .. math::
+        \mathbf{\hat{L}}^{(r)} = \frac{2 \mathbf{L}^{(r)}}{\lambda_{\max}}
+        - \mathbf{I} = - \mathbf{\bar{H}}^{(r)}
+
+    so that no rescaling by :math:`\lambda_{\max}` is required, no self-loop
+    entries are needed, and :math:`\mathrm{spec}(\mathbf{\hat{L}}^{(r)})
+    \subseteq [-1, 1]` as the Chebyshev recursion demands. The bound holds
     block-wise, so a disjoint union of graphs is scaled exactly as each graph
-    would be on its own.
+    would be on its own. Setting :obj:`shift` to :obj:`"adjacency"` filters
+    over :math:`\mathbf{\bar{H}}^{(r)}` instead; since
+    :math:`T_k(-x) = (-1)^k T_k(x)`, the two span the same family of filters
+    and differ only by a sign on the odd-order taps.
 
     In contrast to :class:`~torch_geometric.nn.conv.ChebConv`, the shift
     operator is complex-valued, so that :math:`\mathbf{X}^{\prime}` aggregates
@@ -121,6 +151,10 @@ class MagChebConv(ChebConv):
             The latter follows the paper, which assumes an unweighted graph,
             and wraps around :math:`2 \pi` whenever an edge weight exceeds
             :math:`r^{-1}`.
+        shift (str, optional): The shift operator :math:`\mathbf{S}`, either
+            :obj:`"laplacian"` for :math:`\mathbf{\hat{L}}^{(r)}` or
+            :obj:`"adjacency"` for :math:`\mathbf{\bar{H}}^{(r)} =
+            -\mathbf{\hat{L}}^{(r)}`, see above. (default: :obj:`"laplacian"`)
         **kwargs (optional): Additional arguments of
             :class:`torch_geometric.nn.conv.MessagePassing`.
 
@@ -139,17 +173,19 @@ class MagChebConv(ChebConv):
         K: int,
         normalization: Optional[str] = 'sym',
         bias: bool = True,
-        r: float = 0.25,
-        learn_r: bool = False,
+        r: float = 0.126,
+        learn_r: bool = True,
         phase: str = 'binary',
+        shift: str = 'laplacian',
         **kwargs,
     ):
         super().__init__(in_channels, out_channels, K, normalization, bias,
                          **kwargs)
 
         assert phase in ['binary', 'weight'], 'Invalid phase'
+        assert shift in ['laplacian', 'adjacency'], 'Invalid shift'
 
-        self.phase, self.r_const = phase, r
+        self.phase, self.shift, self.r_const = phase, shift, r
         self.r_logit = nn.Parameter(
             torch.tensor(min(max(r, 1e-3), 0.249) / 0.25).logit(),
         ) if learn_r else None
@@ -187,6 +223,8 @@ class MagChebConv(ChebConv):
                                            num_nodes, add_self_loops=False)
         asym = edge_attr[:, 1].sign() if self.phase == 'binary' else edge_attr[:, 1]
         theta = (2 * math.pi) * self.r * asym
+        if self.shift == 'laplacian':  # L_hat = -H_bar, the identity cancels
+            edge_weight = -edge_weight
 
         return edge_index, torch.complex(edge_weight * theta.cos(),
                                          edge_weight * theta.sin())
@@ -250,9 +288,9 @@ class MagNet(nn.Module):
         \mathrm{Im}\Big(\mathbf{X}^{(L)}\Big) \right]
 
     For :math:`r = 0` the phase matrix vanishes and the model reduces to
-    :class:`~torch_geometric.nn.conv.ChebConv` on the symmetrized graph. Each
-    layer holds its own charge, so :obj:`learn_r` fits :math:`L` of them, and
-    its own modReLU bias, initialized to zero.
+    :class:`~torch_geometric.nn.conv.ChebConv` on the symmetrized graph. Every
+    layer shares one charge, so :obj:`learn_r` fits a single :math:`r`, while
+    each holds its own modReLU bias.
 
     Args:
         in_channels (int): Size of each input sample.
@@ -272,6 +310,17 @@ class MagNet(nn.Module):
             (default: :obj:`False`)
         phase (str, optional): The phase matrix, see
             :class:`MagChebConv`. (default: :obj:`"binary"`)
+        shift (str, optional): The shift operator, see
+            :class:`MagChebConv`. (default: :obj:`"laplacian"`)
+        hidden_norm (str, optional): Normalization between the hidden layers
+            (default: :obj:`"none"`):
+
+            1. :obj:`"none"`: none at all. Scale is controlled by the
+            :math:`\beta` projection of :mod:`prism.models.beta_projection`,
+            which bounds every layer's operator norm directly.
+
+            2. :obj:`"global_rms"`: divide by :func:`global_rms`, ONE detached
+            non-affine scalar per layer.
 
     Shapes:
         - **input:** a :class:`~torch_geometric.data.Data` or
@@ -290,21 +339,25 @@ class MagNet(nn.Module):
         skip_connection: bool = False,
         dropout: float = 0.5,
         k: int = 3,
-        r: float = 0.25,
-        learn_r: bool = False,
+        r: float = 0.126,
+        learn_r: bool = True,
         phase: str = 'binary',
+        shift: str = 'laplacian',
+        hidden_norm: str = 'none',
     ):
         super().__init__()
 
         assert num_layers >= 2, 'MagNet requires at least 2 layers'
+        assert hidden_norm in ['none', 'global_rms'], 'Invalid hidden_norm'
 
         dims = [in_channels] + [hidden_channels] * (num_layers - 1)
         self.convs = nn.ModuleList([
             MagChebConv(i, hidden_channels, k, r=r, learn_r=learn_r,
-                        phase=phase) for i in dims
+                        phase=phase, shift=shift) for i in dims
         ])
-        self.norms = nn.ModuleList(
-            [nn.LayerNorm(hidden_channels) for _ in range(num_layers - 2)])
+        for conv in self.convs[1:]:  # one charge for the whole network
+            conv.r_logit = self.convs[0].r_logit
+        self.hidden_norm = hidden_norm
         self.biases = nn.ParameterList(
             [nn.Parameter(torch.full((hidden_channels,), -4.6))  # softplus(-4.6) ≈ 0.01
              for _ in range(num_layers - 1)])
@@ -315,8 +368,8 @@ class MagNet(nn.Module):
 
     @property
     def r(self) -> Tensor:
-        r"""The charge parameter :math:`r` of each layer."""
-        return torch.stack([torch.as_tensor(conv.r) for conv in self.convs])
+        r"""The charge parameter :math:`r`, shared by every layer."""
+        return self.convs[0].r
 
     def forward(self, data: Data) -> Tensor:
         device = next(self.parameters()).device
@@ -331,8 +384,8 @@ class MagNet(nn.Module):
         x = x_prev = x + 0j
         for i, conv in enumerate(self.convs[:-1]):
             x = conv(x_prev, edge_index, edge_weight, batch)
-            if i < len(self.norms):
-                x = torch.complex(self.norms[i](x.real), self.norms[i](x.imag))
+            if self.hidden_norm == 'global_rms' and i < len(self.convs) - 2:
+                x = x / global_rms(x)
             x = modrelu(x, self.biases[i]) * self.dropout(torch.ones_like(x.real))
             if self.skip_connection and i > 0:
                 x = x + x_prev

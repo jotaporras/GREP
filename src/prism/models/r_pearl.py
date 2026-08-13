@@ -35,6 +35,15 @@ class RandomGNNPositionalEncodings(nn.Module):
             that keeps edge direction as a phase; it symmetrizes A and encodes the
             asymmetry in Θ = 2πr·sgn(A − Aᵀ), so it is a no-op on graphs whose
             ``edge_index`` already carries both directions.
+        hidden_norm (str): ``directed`` only — normalization between MagNet's hidden
+            layers, ``"none"`` (default) or ``"global_rms"``. The pre-fix per-node
+            LayerNorm is gone: it is not 1-Lipschitz (so it breaks PEARL Assumption
+            4.2) and its affine shift is not conjugation-equivariant (so it breaks
+            MagNet's gauge property). See :class:`~prism.models.magnet.MagNet`.
+        learn_r (bool): ``directed`` only — learn the MagNet charge r (one per layer,
+            sigmoid-constrained to [0, 0.25]) instead of pinning it at 0.25. Adds
+            ``pe_gcn.convs.*.r_logit`` to the state dict, so a checkpoint trained with
+            it set must be rebuilt with it set.
     """
 
     def __init__(self,
@@ -54,6 +63,8 @@ class RandomGNNPositionalEncodings(nn.Module):
         center_second_moment: bool = True,
         node_feature_dim: int = None,
         directed: bool = False,
+        learn_r: bool = True,
+        hidden_norm: str = "none",
     ):
         super().__init__()
         if probe_distribution not in ("gaussian", "rademacher"):
@@ -73,9 +84,11 @@ class RandomGNNPositionalEncodings(nn.Module):
         # Same (in, hidden, layers, skip, dropout, k) contract and the same
         # Data -> [N, hidden] forward, so the backbone swap is local to this line.
         self.directed = directed
+        # learn_r / hidden_norm are MagNet-only: TAGConv has no charge and no complex path.
         self.pe_gcn = (magnet.MagNet if directed else gcn.GCN)(
             in_channels, pe_hidden_channels, pe_num_layers,
-            skip_connection=True, dropout=dropout, k=k
+            skip_connection=True, dropout=dropout, k=k,
+            **({"learn_r": learn_r, "hidden_norm": hidden_norm} if directed else {})
         )
         self.output_projection = nn.Linear(pe_hidden_channels, d_model)
 

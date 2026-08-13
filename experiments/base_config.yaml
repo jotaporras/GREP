@@ -61,6 +61,19 @@ gnn:
   # (from_networkx emits both directions), so there Theta = 0 and it is a backbone
   # A/B, not a directionality one.
   directed: false
+  # --- MagNet (directed) only: PEARL Assumption 4.2, ||H(S)|| <= beta ---
+  # enforce_beta_bound: post-optimizer-step projection holding every MagChebConv at
+  # sum_k ||H_k||_2 <= 1/F (F = pe_hidden_channels), the beta of Thm 4.3 / Cor 4.6.
+  # ONE global scalar per layer; excludes r_logit, the modReLU biases and the unwind
+  # Linear. No-op on the undirected TAGConv backbone (no MagChebConv to project).
+  enforce_beta_bound: true
+  # hidden_norm: normalization BETWEEN MagNet's hidden layers.
+  #   "none" (DEFAULT) = none; the beta projection alone controls scale.
+  #   "global_rms" = divide by one detached, non-affine scalar sqrt(mean|x|^2) over all
+  #        nodes and channels. Modulus-based, so conjugation-equivariant.
+  # The pre-fix per-node LayerNorm is REMOVED, not offered: it is not 1-Lipschitz and
+  # its affine shift is not conjugation-equivariant. Deliberately omitted — do not add.
+  hidden_norm: none
   # WHERE the probe expectation E_q is taken. Read ONLY by gt.build_psi_producer, i.e.
   # by the Ψ-consuming archs (learnable_graph_mask / wire_llm); train_v3 rejects a
   # non-default value on any other arch rather than ignoring it.
