@@ -183,6 +183,53 @@ def test_pe_pool_gt_changes_c_tok():
     assert rel > 1e-3, f"pe_pool='gt' left C_tok unchanged (rel diff {rel:.2e})"
 
 
+def test_c_tok_is_chunk_invariant():
+    """``max_probe_rows`` is a MEMORY dial, not a math one.
+
+    The covariance is accumulated over gradient-checkpointed probe chunks; if the
+    reduction were wrong (double-counted, mis-normalized, or centered per chunk rather
+    than over all M) the chunk size would change the answer.
+    """
+    g = _composite()
+    ref = None
+    for max_probe_rows, expect_chunk in ((1 << 20, 6), (128, 4), (32, 1)):
+        torch.manual_seed(11)
+        gt = GraphTransformer(num_layers=2, pe_hidden_channels=8, pe_num_layers=2,
+                              d_model=8, heads=2, num_samples=6, dropout=0.0, k_pe=3,
+                              k_gt=2, directed=True, learn_r=True, pe_pool="gt",
+                              fixed_seed_mode=True, fixed_seed_value=0,
+                              max_probe_rows=max_probe_rows)
+        assert max(1, min(6, max_probe_rows // g.num_nodes)) == expect_chunk
+        with torch.no_grad():
+            c_tok, _ = gt.pe_model.covariance_token_block(g, CYCLE, pe_pool="gt", gt=gt)
+        if ref is None:
+            ref = c_tok
+        else:
+            assert torch.allclose(c_tok, ref, atol=1e-5), (
+                f"chunk={expect_chunk} changed C_tok by "
+                f"{float((c_tok - ref).abs().max()):.2e}")
+
+
+def test_gt_receives_gradient_through_the_chunked_reduction():
+    """beta != 0 must reach the MagNet backbone through the checkpointed probe loop.
+
+    Complements the beta=0 stall test: there the GT correctly gets nothing, so this is
+    the only test that exercises the two-pass reduction's BACKWARD at all.
+    """
+    model = _model(beta_init=0.3)
+    ids = _ids().to(DEVICE)
+    out = model(input_ids=ids, labels=ids, graphs=[_scene()],
+                injection_maps=[_injection_map()])
+    out.loss.backward()
+    r_logit = model.pe_model.pe_model.pe_gcn.convs[0].r_logit
+    named = dict(model.pe_model.named_parameters())
+    live = [n for n, p in named.items() if p.grad is not None and float(p.grad.abs().max()) > 0]
+    assert live, "no GT parameter received gradient"
+    assert any(n.startswith("pe_model.pe_gcn") for n in live), "MagNet backbone got nothing"
+    assert any(n.startswith("blocks.") for n in live), "the GT blocks got nothing"
+    assert r_logit.grad is not None and float(r_logit.grad.abs()) > 0, "the charge r is dead"
+
+
 def test_pe_pool_and_gt_argument_must_agree():
     g = _composite()
     gt = _gt()

@@ -271,6 +271,7 @@ class GraphTransformer(nn.Module):
                  dropout: float = 0.1, k_pe: int = 3, k_gt: int = 3,
                  eps: float = 1e-8, use_layer_norm: bool = True,
                  probe_distribution: str = "gaussian",
+                 max_probe_rows: int = 65536,
                  max_gather_rows: int = 2_000_000,
                  fixed_seed_mode: bool = False, fixed_seed_value: int = 0,
                  pe_readout: str = "mean",
@@ -326,6 +327,7 @@ class GraphTransformer(nn.Module):
             pe_hidden_channels=pe_hidden_channels, pe_num_layers=pe_num_layers, d_model=d_model,
             num_samples=num_samples, dropout=dropout, k=k_pe, eps=eps, use_layer_norm=use_layer_norm,
             probe_distribution=probe_distribution,
+            max_probe_rows=max_probe_rows,
             max_gather_rows=max_gather_rows,
             fixed_seed_mode=fixed_seed_mode, fixed_seed_value=fixed_seed_value,
             center_second_moment=center_second_moment,
@@ -1028,6 +1030,11 @@ def build_psi_producer(cfg, node_feature_dim: int = None) -> nn.Module:
         fixed_seed_value=cfg.get("fixed_seed_value", 0),
         center_second_moment=cfg.get("center_second_moment", True),
         cache_pe=cfg.get("cache_pe", False),
+        # The probe-chunk dials. chunk = min(M, max_probe_rows/N, max_gather_rows/E), and
+        # the chunk is the unit of peak activation, so these are the memory knob when the
+        # probe path shares a GPU with a quantized LLM.
+        max_probe_rows=cfg.get("max_probe_rows", 65536),
+        max_gather_rows=cfg.get("max_gather_rows", 2_000_000),
     )
     if not navigator:
         return pe_gt

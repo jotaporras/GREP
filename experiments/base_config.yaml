@@ -175,6 +175,11 @@ gnn:
   # for the GT; C_tok for mask_composite). Fills only under no_grad — a cached tensor
   # carries its autograd graph. false = recompute every forward.
   cache_pe: false
+  # Probe chunking: chunk = min(num_samples, max_probe_rows/N, max_gather_rows/E) probes
+  # are pushed through the backbone at a time, and ONE chunk is the peak activation, so
+  # these are the memory dial for the probe path. Defaults are the module values.
+  max_probe_rows: 65536
+  max_gather_rows: 2000000
 
   # --- wire_llm (WIRE: Psi enters as a ROTATION of q/k, not an added signal) ---
   # q_i -> R(theta_i) q_i, k_j -> R(theta_j) k_j with theta_n = omega_n . Psi_i, composed

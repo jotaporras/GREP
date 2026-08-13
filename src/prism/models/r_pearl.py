@@ -469,11 +469,8 @@ class RandomGNNPositionalEncodings(nn.Module):
         Q = self._sample_probes(N, m, device, gen)
         chunk = max(1, min(m, self.max_probe_rows // max(1, N),
                            self.max_gather_rows // max(1, ei.shape[1])))
-        # Covariance via centered outer products (1/m)Σ(Φ_s−Ψ)(Φ_s−Ψ)ᵀ — manifestly PSD,
-        # avoids fp32 cancellation from un-centered E[ΦΦᵀ]−ΨΨᵀ.
-        Pt_chunks = []
-        for start in range(0, m, chunk):
-            Qc = Q[:, start:start + chunk]
+        def _phi_tok(Qc):
+            """Φ' token rows for one probe chunk, ``[mc, c, F]``."""
             P = self._batched_gcn_forward(Qc, ei, N, Qc.shape[1],
                                           edge_weight=ew, device=device, pool=False)  # [mc,N,F]
             if gt is not None:
@@ -481,10 +478,42 @@ class RandomGNNPositionalEncodings(nn.Module):
                 # composite (so the token rows keep reading the scene through the
                 # crosslinks); the token slice below is taken after, never before.
                 P = gt.apply_blocks(P, data)                        # [mc, N, F]
-            Pt_chunks.append(P[:, :c, :])                           # token rows [mc, c, F]
-        Pt = torch.cat(Pt_chunks, dim=0)                           # [m, c, F]
-        psi = Pt.mean(dim=0)                                        # Ψ token rows [c, F]
-        Ct = Pt - psi.unsqueeze(0)                                 # centered [m, c, F]
-        C_tok = torch.einsum("mtf,muf->tu", Ct, Ct) / m            # PSD covariance [c, c]
-        Psi_tok = psi @ psi.transpose(0, 1)                        # ΨΨᵀ token block [c, c]
+            return P[:, :c, :]
+
+        def _chunked(fn, *args):
+            """Σ over probe chunks of ``fn(Q_chunk, *args)``, recomputed on backward.
+
+            Gradient checkpointing is what makes the reduction fit: without it EVERY
+            chunk's MagNet and GT activations stay live at once, which is a multi-GiB
+            standing allocation next to a quantized LLM. The dummy gives checkpoint a
+            grad-requiring input (``Q`` is a constant).
+            """
+            acc = None
+            for start in range(0, m, chunk):
+                Qc = Q[:, start:start + chunk]
+                if torch.is_grad_enabled():
+                    dummy = Qc.new_ones(1, requires_grad=True)
+                    part = checkpoint(fn, Qc, *args, dummy, use_reentrant=False)
+                else:
+                    part = fn(Qc, *args)
+                acc = part if acc is None else acc + part
+            return acc
+
+        # Covariance via centered outer products (1/m)Σ(Φ'_s−Ψ)(Φ'_s−Ψ)ᵀ — manifestly PSD,
+        # avoids fp32 cancellation from un-centered E[Φ'Φ'ᵀ]−ΨΨᵀ. TWO passes over the SAME
+        # `Q` (drawn once above, so this is exact whatever fixed_seed_mode says): the first
+        # accumulates Ψ [c, F], the second the Gram [c, c]. The [m, c, F] stack is NEVER
+        # materialized — at m=320, c=1800, F=1024 it is 2.4 GB on its own, and the MagNet
+        # gathers and GT block activations behind it are several times that again. The
+        # price is 2 forwards + 2 backward recomputes; memory is what binds here, not FLOPs.
+        def _sum_phi(Qc, _dummy=None):
+            return _phi_tok(Qc).sum(dim=0)                          # [c, F]
+
+        def _sum_outer(Qc, p, _dummy=None):
+            Ct = _phi_tok(Qc) - p.unsqueeze(0)                      # centered [mc, c, F]
+            return torch.einsum("mtf,muf->tu", Ct, Ct)              # [c, c]
+
+        psi = _chunked(_sum_phi) / m                                # Ψ token rows [c, F]
+        C_tok = _chunked(_sum_outer, psi) / m                       # PSD covariance [c, c]
+        Psi_tok = psi @ psi.transpose(0, 1)                         # ΨΨᵀ token block [c, c]
         return C_tok, Psi_tok

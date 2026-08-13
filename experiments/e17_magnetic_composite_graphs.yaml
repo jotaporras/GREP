@@ -96,7 +96,24 @@ gnn:
   gt_num_layers: 3           # the GT's `num_layers`
   gt_heads: 8
   k_gt: 2
-  num_samples: 320           # the probe count M
+
+  # --- The probe count M, and the memory it costs ---
+  # M is NOT transferable from e17_composite_wire (which ran M=320). There pe_pool='pe'
+  # means the GT runs ONCE on [N, D]; here pe_pool='gt' pushes all M probes through the
+  # blocks, so the GT activations and nnz(A_k) both scale with M. Measured shapes on this
+  # corpus: c ~ 1800 (max_seq_length 2048 minus scope_start ~ 249), N = c + n + 1 ~ 1830,
+  # E ~ 1960 composite edges (~3.9k after MagNet symmetrizes).
+  #   one [M, N, D] fp32 tensor         = M * 7.5 MB   ->  M=320: 2.4 GB, M=32: 240 MB
+  #   GT retains ~(gt_num_layers+1) of them          ->  M=320: 9.6 GB, M=32: 960 MB
+  #   MagNet gather [2*chunk*E, F] cplx = chunk * 8.0 MB  (x2 propagates x 5 convs)
+  # A 24 GB card holding the 31B NF4 base has roughly 4-5 GB left, so M=320 does not fit
+  # and no amount of chunking changes that: the GT stack is M-proportional. 32 fits with
+  # headroom. Raise it only against a measured torch.cuda.max_memory_allocated().
+  num_samples: 32
+  # chunk = min(num_samples, max_probe_rows/N, max_gather_rows/E). 16384/1830 = 8 probes
+  # per chunk, and ONE chunk is the peak (the loop is gradient-checkpointed), which caps
+  # the MagNet gather at ~64 MB per propagate instead of ~280 MB at the 65536 default.
+  max_probe_rows: 16384
 
   # --- Pretrained MagGT channel ---
   # A GT pretrained by the notebook's resistance-regression stage
