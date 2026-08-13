@@ -66,11 +66,14 @@ export HF_DATASETS_CACHE="${TMPDIR:-/tmp}/hf_datasets_${SLURM_JOB_ID:-manual}"
 export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-32}"
 # Policy on the second GPU; the in-process vLLM worker owns cuda:0.
 export ACCELERATE_TORCH_DEVICE=cuda:1
-# On B200 (sm100) vLLM auto-picks the FLASHINFER backend, whose kernels are
-# JIT-compiled with nvcc — betty compute nodes carry no CUDA toolkit, so that
-# path dies at engine start. FLASH_ATTN ships precompiled and is the backend
-# every parity test validated (it is also what plaza runs).
+# On B200 (sm100) vLLM reaches for flashinfer kernels that are JIT-compiled
+# with nvcc — betty compute nodes carry no CUDA toolkit, so those paths die at
+# engine start. Two switches: FLASH_ATTN is the precompiled attention backend
+# every parity test validated (also what plaza runs), and the flashinfer
+# SAMPLER (used on sm100 regardless of attention backend) must be disabled in
+# favor of the torch-native sampler plaza sampled with.
 export VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}
+export VLLM_USE_FLASHINFER_SAMPLER=0
 
 source "$ENV_DIR/bin/activate"
 
