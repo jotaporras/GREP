@@ -30,6 +30,15 @@ Usage:
 
     python scripts/animate_eval_rollout.py \
         --rollouts results/e13f_transferability/data_gen_001.json --out rollout.html --open
+
+``--format md`` skips the player and writes a plain-text rollout summary instead:
+one Markdown section per task with its metrics and a single ASCII frame of the
+finished path (no playback), where each hop is marked valid or hallucinated —
+the cheapest form to hand to an LLM.
+
+    python scripts/animate_eval_rollout.py \
+        --rollouts results/e17_.../eval_logs/step_000200_epoch_1.000.json \
+        --format md --out rollout.md
 """
 
 import argparse
@@ -851,6 +860,88 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 """
 
 
+# --------------------------------------------------------------------------- #
+# Markdown / ASCII summary — the same episodes, flattened for an LLM reader.    #
+# --------------------------------------------------------------------------- #
+_ASCII_LEGEND = ("`|` = valid hop (edge exists in the graph) · "
+                 "`X` = hallucinated hop (no such edge) · "
+                 "`[?]` = node absent from the graph")
+
+
+def _ascii_path(sample: dict) -> list:
+    """The animation's *final frame* as a vertical ASCII chain (no playback).
+
+    Vertical rather than inline so arbitrarily long paths never need wrapping.
+    """
+    path, segs = sample["path"], sample["segments"]
+    if not path:
+        return ["(no path parsed)"]
+    missing = set(sample.get("missing", []))
+    goal = sample.get("goal", "")
+
+    lines = []
+    for i, node in enumerate(path):
+        tags = (["START"] if i == 0 else []) + \
+               (["GOAL"] if node and node == goal else []) + \
+               (["END"] if i == len(path) - 1 else [])
+        label = node + (" [?]" if node in missing else "")
+        lines.append(label + (f"   <- {', '.join(tags)}" if tags else ""))
+        if i < len(segs):
+            lines.append("  |" if segs[i]["valid"]
+                         else f"  X   no edge: {segs[i]['from']} -- {segs[i]['to']}")
+    return lines
+
+
+def _fmt_metric(v):
+    if isinstance(v, bool):
+        return "yes" if v else "no"
+    if isinstance(v, float):
+        return f"{v:.2f}"
+    if isinstance(v, list):
+        return ",".join("+".join(map(str, e)) if isinstance(e, list) else str(e)
+                        for e in v) or "none"
+    return "—" if v is None else str(v)
+
+
+def render_markdown(episodes: list, out_path: str, title: str) -> None:
+    """Write a compact per-task rollout summary: metrics + one ASCII path frame."""
+    n_tasks = sum(len(e["samples"]) for e in episodes)
+    out = [f"# {title}", "",
+           f"{len(episodes)} graphs · {n_tasks} tasks", "",
+           f"Legend: {_ASCII_LEGEND}", ""]
+
+    for e in episodes:
+        head = f"## {e['name']}"
+        if e.get("accuracy") is not None:
+            head += f" — accuracy {100 * e['accuracy']:.0f}%"
+        out += [head, ""]
+        if e.get("robot_location"):
+            out += [f"Robot start: `{e['robot_location']}`", ""]
+
+        for s in e["samples"]:
+            n_bad = sum(1 for seg in s["segments"] if not seg["valid"])
+            out += [f"### Task {s['idx']} — "
+                    f"{'CORRECT' if s['correct'] else 'INCORRECT'}", ""]
+            out.append(f"- Question: {' '.join((s['task'] or '').split())}")
+            out.append(f"- Goal: `{s['goal'] or '—'}`")
+            out.append(f"- Hops: {len(s['segments'])} ({n_bad} hallucinated)")
+            if s["dijkstra"]:
+                out.append(f"- Optimal ({len(s['dijkstra']) - 1} hops): "
+                           + " > ".join(s["dijkstra"]))
+            if s["answer"]:
+                out.append(f"- Answer: {' '.join(s['answer'].split())}")
+            if s["answer_key"]:
+                out.append(f"- Answer key: `{s['answer_key']}`")
+            if s["metrics"]:
+                out.append("- Metrics: " + " · ".join(
+                    f"{k}={_fmt_metric(v)}" for k, v in s["metrics"].items()))
+            out += ["", "```", *_ascii_path(s), "```", ""]
+
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(out_path).write_text("\n".join(out), encoding="utf-8")
+    print(f"Saved → {out_path}  ({len(episodes)} graphs, {n_tasks} tasks)")
+
+
 def render_html(episodes: list, out_path: str, title: str) -> None:
     n_tasks = sum(len(e["samples"]) for e in episodes)
     subtitle = f"{len(episodes)} graphs · {n_tasks} tasks"
@@ -871,8 +962,12 @@ def main():
     parser.add_argument("--graphs-dir",
                         default="data/n_100/gen/nav_n100_gemma_data/test_graphs",
                         help="Directory of matching scene-graph JSONs (matched by filename stem)")
-    parser.add_argument("--out", default="rollout_animation.html",
-                        help="Output HTML path (default: rollout_animation.html)")
+    parser.add_argument("--format", choices=["html", "md"], default="html",
+                        help="html: neon path player · md: plain-text ASCII "
+                             "rollout summary for an LLM (default: html)")
+    parser.add_argument("--out", default=None,
+                        help="Output path (default: rollout_animation.html / "
+                             "rollout_summary.md)")
     parser.add_argument("--title", default="Rollout Navigator",
                         help="Title shown in the header")
     parser.add_argument("--min-sep", type=float, default=52.0,
@@ -887,9 +982,12 @@ def main():
     if not episodes:
         raise SystemExit("No episodes could be built — check --rollouts / --graphs-dir.")
 
-    render_html(episodes, args.out, args.title)
+    out = args.out or ("rollout_summary.md" if args.format == "md"
+                       else "rollout_animation.html")
+    (render_markdown if args.format == "md" else render_html)(
+        episodes, out, args.title)
     if args.open:
-        webbrowser.open(Path(args.out).resolve().as_uri())
+        webbrowser.open(Path(out).resolve().as_uri())
 
 
 if __name__ == "__main__":
