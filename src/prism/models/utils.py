@@ -59,42 +59,59 @@ class SparseCSRDropout(nn.Module):
         self.p = p
         self.set_to_neg_inf = set_to_neg_inf
 
+    def forward_values(self, v: torch.Tensor, row_index: torch.Tensor,
+                       num_rows: int) -> torch.Tensor:
+        """The same dropout in nnz-space, for callers that hold the values themselves.
+
+        :meth:`forward` has to rebuild a CSR around the result, and differentiating
+        through that reconstruction materializes a DENSE ``[N, N]`` gradient — which is
+        fatal once ``N`` is ``M·|V|`` (the block-diagonal probe stack under
+        ``pe_pool='gt'``). A caller that only needs the values stays here, and no sparse
+        tensor ever enters the autograd graph.
+
+        Args:
+            v: the ``[nnz]`` values.
+            row_index: the row each value belongs to, ``[nnz]``.
+            num_rows: the number of rows, for the per-row rescue below.
+        """
+        if not self.training or self.p == 0.0:
+            return v
+
+        keep = 1.0 - self.p
+        if self.set_to_neg_inf:
+            mask = torch.rand_like(v) < keep
+            kept_per_row = utils.scatter(
+                mask.to(v.dtype), index=row_index, dim=0, reduce="sum", dim_size=num_rows
+            )
+            row_counts = utils.scatter(
+                torch.ones_like(v), index=row_index, dim=0, reduce="sum", dim_size=num_rows
+            )
+            need_force = (kept_per_row == 0) & (row_counts > 0)
+            rand_vals = torch.rand_like(v)
+            max_per_row = utils.scatter(
+                rand_vals, row_index, dim=0, reduce="max", dim_size=num_rows
+            )
+            is_force = need_force[row_index] & (rand_vals == max_per_row[row_index])
+            return v.masked_fill(~(mask | is_force), float("-inf"))
+        if keep == 0.0:
+            return torch.zeros_like(v)
+        mask = (torch.rand_like(v) < keep).to(v.dtype)
+        return (v * mask) / keep
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not x.is_sparse_csr:
             raise TypeError("Input must be a sparse CSR tensor")
         if not self.training or self.p == 0.0:
             return x
 
-        keep = 1.0 - self.p
-        v = x.values()
-        if self.set_to_neg_inf:
-            crow = x.crow_indices()
-            N = x.size(0)
-            row_counts = crow[1:] - crow[:-1]
-            row_index = torch.arange(N, device=v.device).repeat_interleave(row_counts)
-            mask = torch.rand_like(v) < keep
-            kept_per_row = utils.scatter(
-                mask.to(v.dtype), index=row_index, dim=0, reduce="sum", dim_size=N
-            )
-            need_force = (kept_per_row == 0) & (row_counts > 0)
-            rand_vals = torch.rand_like(v)
-            max_per_row = utils.scatter(
-                rand_vals, row_index, dim=0, reduce="max", dim_size=N
-            )
-            is_force = need_force[row_index] & (rand_vals == max_per_row[row_index])
-            mask = mask | is_force
-            new_values = v.masked_fill(~mask, float("-inf"))
-        else:
-            if keep == 0.0:
-                new_values = torch.zeros_like(v)
-            else:
-                mask = (torch.rand_like(v) < keep).to(v.dtype)
-                new_values = (v * mask) / keep
-
+        crow = x.crow_indices()
+        N = x.size(0)
+        row_index = torch.arange(
+            N, device=x.values().device).repeat_interleave(crow[1:] - crow[:-1])
         return torch.sparse_csr_tensor(
-            crow_indices=x.crow_indices(),
+            crow_indices=crow,
             col_indices=x.col_indices(),
-            values=new_values,
+            values=self.forward_values(x.values(), row_index, N),
             size=x.size(),
             dtype=x.dtype,
             device=x.device,

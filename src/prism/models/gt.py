@@ -102,15 +102,18 @@ class _SafeBatchedSparseAttn(torch.autograd.Function):
             unnormalized = torch.sparse.sampled_addmm(
                 input=A_csr_f, mat1=qi.float(), mat2=ki.float().T, beta=0.0
             )
-            if training and attn_dropout is not None:
-                unnormalized = attn_dropout(unnormalized)
             crow = unnormalized.crow_indices()
             col = unnormalized.col_indices()
             row_counts = crow[1:] - crow[:-1]
             row_index = torch.arange(N, device=qi.device).repeat_interleave(row_counts)
+            values = unnormalized.values()
+            if training and attn_dropout is not None:
+                # Dropped in nnz-space: rebuilding a CSR around the result would put a
+                # sparse tensor in the autograd graph, and its backward materializes a
+                # dense [N, N] — 92.7 GiB at N = M·|V| for M = 320, |V| ≈ 500.
+                values = attn_dropout.forward_values(values, row_index, N)
             # Scaled dot-product scores with per-neighborhood (per-row) softmax.
-            attn_alpha = softmax(src=unnormalized.values() * scale, index=row_index,
-                                 dim=0, num_nodes=N)
+            attn_alpha = softmax(src=values * scale, index=row_index, dim=0, num_nodes=N)
             # A·V by explicit gather/scatter rather than torch.sparse.mm: the latter's
             # backward w.r.t. its SPARSE operand materializes a dense [N, N] gradient,
             # which is fatal once N is M·|V| (pe_pool='gt' stacks the probes as one
