@@ -2711,6 +2711,11 @@ class BatchedMaskDecodeInjector:
         self.rows = row_states
         self.prompt_len = padded_prompt_len
         self.device = next(model.parameters()).device
+        # Counts single-token decode forwards. Cache-less generation (e.g.
+        # gradient checkpointing left enabled in train mode) re-runs the full
+        # sequence every step — the hook then never fires and rollouts sample
+        # WITHOUT the mask. Callers assert this advanced.
+        self.decode_steps = 0
 
     def pre_hook(self, module, args, kwargs):
         input_ids = kwargs.get("input_ids")
@@ -2722,6 +2727,7 @@ class BatchedMaskDecodeInjector:
             raise RuntimeError(
                 f"decode batch {input_ids.shape[0]} != armed row states "
                 f"{len(self.rows)} — generate() reordered or dropped rows.")
+        self.decode_steps += 1
         toks = input_ids[:, 0].tolist()
         rows_out, any_tagged = [], False
         for b, state in enumerate(self.rows):

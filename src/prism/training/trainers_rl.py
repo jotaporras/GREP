@@ -453,6 +453,14 @@ class MaskGRPOTrainer(GRPOTrainer):
             p.requires_grad = True
         self._core = core
         self._ensure_fp32_tower()
+        # Gemma-it ends turns with <end_of_turn>, not <eos>; trl keys
+        # termination stats, the completion mask, and our rollout truncation
+        # on self.eos_token_id (= tokenizer.eos_token_id = <eos>), so without
+        # this every completion counts as unterminated full-length, all group
+        # rewards tie, and GRPO advantages are identically zero.
+        eot = self.processing_class.convert_tokens_to_ids("<end_of_turn>")
+        if eot is not None:
+            self.eos_token_id = eot
         self.gnn_config = gnn_config
         self.rollout_batch_size = int(rollout_batch_size)
         self._edge_weights = gnn_config.get("edge_weights", "binary")
@@ -532,6 +540,31 @@ class MaskGRPOTrainer(GRPOTrainer):
 
         core = self._core
         device = next(core.parameters()).device
+        # generate() must run CACHED: with gradient checkpointing enabled on a
+        # train-mode model, transformers drops past_key_values, every decode
+        # step becomes a multi-token forward, and the decode injector (which
+        # only fires on q_len==1) never engages — rollouts would sample with
+        # NO mask. Disable GC + dropout for the sampling pass, restore after.
+        was_training = core.llm.training
+        was_gc = getattr(core.llm, "is_gradient_checkpointing", False)
+        if was_gc:
+            core.llm.gradient_checkpointing_disable()
+        core.llm.eval()
+        try:
+            all_prompt_ids, all_completion_ids = self._rollout_chunks(
+                prompts, core, device)
+        finally:
+            if was_training:
+                core.llm.train()
+            if was_gc:
+                core.llm.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False})
+        # logprobs=None: trl's non-vLLM contract — old/ref logps, when needed,
+        # are recomputed through _get_per_token_logps_and_entropies, i.e.
+        # under the SAME mask semantics the rollout sampled with.
+        return all_prompt_ids, all_completion_ids, None, {}
+
+    def _rollout_chunks(self, prompts, core, device):
         all_prompt_ids, all_completion_ids = [], []
         for start in range(0, len(prompts), self.rollout_batch_size):
             chunk = prompts[start:start + self.rollout_batch_size]
@@ -566,12 +599,18 @@ class MaskGRPOTrainer(GRPOTrainer):
                         min_p=self.min_p,
                         repetition_penalty=self.repetition_penalty,
                         pad_token_id=self.pad_token_id,
+                        use_cache=True,
                     )
             finally:
                 core._struct_bias = None
                 handle.remove()
                 core._decode_bias_row = None
             completions = out[:, max_len:]
+            if completions.shape[1] > 1 and injector.decode_steps == 0:
+                raise RuntimeError(
+                    "decode injector never fired during generate() — "
+                    "generation ran uncached (multi-token forwards only), so "
+                    "completions were sampled WITHOUT the structural mask.")
             for b, (pids, *_rest) in enumerate(entries):
                 ids = completions[b].tolist()
                 if self.eos_token_id in ids:
@@ -583,10 +622,7 @@ class MaskGRPOTrainer(GRPOTrainer):
                     ids.pop()
                 all_prompt_ids.append(list(pids))
                 all_completion_ids.append(ids)
-        # logprobs=None: trl's non-vLLM contract — old/ref logps, when needed,
-        # are recomputed through _get_per_token_logps_and_entropies, i.e.
-        # under the SAME mask semantics the rollout sampled with.
-        return all_prompt_ids, all_completion_ids, None, {}
+        return all_prompt_ids, all_completion_ids
 
     # -------------------------------------------------------------- loss side
 
