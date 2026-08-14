@@ -2,19 +2,20 @@
 # e17 multistage — STAGE 3: unfreeze, train the graph channel + LoRA jointly, NO edges.
 #
 #   python -m prism.training.train_v3 --config-name=e17_ms_stage3 \
-#       trainer.init_lora_from=<stage2 dir> trainer.init_pe_from=<stage2 dir>
+#       gnn.pe_gt_from=outputs/e17_mag_gt/suite2/mag_gt.pt
 #
-# Launched AFTER analyzing Stage 2. The Stage-2 run dir is self-contained:
-# init_lora_from reattaches the SFT adapter as TRAINABLE, init_pe_from loads the trained
-# Psi producer AND its learned `beta` (loaders.load_pe_weights_into raises if the source
-# has no mask_beta, rather than silently restarting the channel at mask_beta_init = 0).
-# So `mag/beta` at step 0 here must equal the value Stage 2 finished at — check it.
+# RUN STANDALONE (no Stage 2). The MagGT arrives from the NOTEBOOK's resistance +
+# link-prediction pretraining (2026-08-10 e17_magnet_composite_graphs.ipynb, §2 and §3)
+# through gnn.pe_gt_from, and the LoRA starts fresh. Supply trainer.init_lora_from /
+# trainer.init_pe_from ONLY when a Stage-2 run exists to carry: init_pe_from also restores
+# that run's learned `beta`, and loaders raises if the source has no mask_beta rather than
+# silently restarting the channel at mask_beta_init = 0.
 #
 # data.text_edge_list=none removes the edge bullets, so connectivity must now come from
 # beta * C_tok alone. Assistant-only loss, for a fair comparison with Stage 1 / baselines.
 #
-# The architecture is INHERITED from e17_magnetic_composite_graphs, so Stage 2 and Stage 3
-# train the same model by construction.
+# The architecture is INHERITED from e17_magnetic_composite_graphs, so the model trained
+# here is the one the notebook pretrained, switch for switch.
 defaults:
   - e17_magnetic_composite_graphs
   - _self_
@@ -22,37 +23,67 @@ defaults:
 name: e17_ms_s3
 
 gnn:
+  # The MagGT the notebook produced. suite2 is the current run; suite1 is finished.
+  pe_gt_from: outputs/e17_mag_gt/suite2/mag_gt.pt
+  semantic_gt_from: null
+
+  # beta = 0.5 at step 0: the channel is ARMED from the first forward, rather than the
+  # base config's cold start at 0. Two properties are given up deliberately —
+  #   (a) step 0 no longer reproduces the base LLM's logits, so acceptance A2 does not
+  #       hold at this setting (it still holds at beta_init = 0, which is what A2 tests);
+  #   (b) there is no one-step stall: dL/dC = beta * dL/dbias is nonzero immediately, so
+  #       the GT/MagNet train from step 1 instead of step 2.
+  # In exchange the channel cannot sit at zero and report a clean run that trained
+  # nothing. Watch mag/bias_absmax against the attention logit scale from the FIRST step.
+  mask_beta_init: 0.5
+
   # Two-group LR (GraphSFTTrainer.create_optimizer): the graph channel — GT + MagNet +
-  # beta, i.e. model.structural_parameters() — trains at 10x the LoRA's LR so it can still
-  # move against an adapter that is already fitted. Lives under gnn, not trainer.
-  structural_lr_mult: 10.0
+  # beta, i.e. model.structural_parameters() — trains at 0.0012x the LoRA's LR, the e13f
+  # multiplier. The channel therefore moves SLOWLY relative to the adapter: at
+  # trainer.learning_rate 2.5e-4 the structural group sits at 3e-7, so beta is expected to
+  # stay near its init over a 3-epoch run. That is coherent with mask_beta_init = 0.5 —
+  # the channel is armed at a useful magnitude from step 0 rather than trained up to one.
+  structural_lr_mult: 0.0012
 
 data:
   # Edge list REMOVED — connectivity must come from the graph channel now.
   text_edge_list: none
   spine_tools: none
   icl_examples: 0
-  # Scoped to the last `scene graph: •` block on, as in Stage 2 and the notebook.
+  # NOT the e13f command's decode_consistent: train_v3._validate_config REJECTS it under
+  # mask_composite, and it is the wrong rule here anyway — that map reduces an answer
+  # mention to its single knowable position, while this arm crosslinks every sub-token and
+  # grows the graph as the answer arrives. full_sequence is what the notebook builds under.
   injection_scope: full_sequence
+  edge_weights: binary
 
 trainer:
-  # Stage-3 regime: both the carried adapter and the graph channel train.
-  # init_lora_from / init_pe_from: <resolved Stage-2 checkpoint dir>   # supply on the CLI
+  # Stage-3 regime: both the adapter and the graph channel train.
+  freeze_lora: false
+  freeze_pe: false
   loss_target: responses
   epochs: 3
 
-  # NOT e9's 0.003. That is 15x base_config's LoRA LR and was tuned for the additive arm;
-  # applied to a joint run it would move beta by ~0.003/step under Adam, i.e. past any
-  # sane bias magnitude within a few dozen steps, and the clamp-free bias here has nothing
-  # to catch it. Base LoRA LR, with the graph channel boosted 10x so it can still move
-  # against a LoRA that is already fitted.
-  # BOTH numbers are chosen, not measured. The first run is the baseline that measures
-  # them: watch mag/bias_absmax and debug/grad_norm_beta.
-  learning_rate: 0.0002
+  # The e13f command's 0.00025. beta does NOT have to travel from zero here (it starts at
+  # 0.5), and the structural group is at 0.0012x this, so the LoRA is what this LR governs.
+  # CHOSEN, not measured: watch mag/bias_absmax stay within an order of magnitude of the
+  # attention logit scale, and mag/beta stay near 0.5 rather than run away.
+  learning_rate: 0.00025
 
   bit4: true
   checkpoint_dir: outputs/e17_magnetic_composite_graphs
   save_name: e17_ms_stage3
+  sft:
+    save_total_limit: 1
+
+eval:
+  data: data/n_30/gen/nav100_n30_gemma_data/split/test_graphs
+  # 3 graphs, for a cheap A/B against the other arms rather than a headline accuracy.
+  # Generation is the expensive half here: the mask forces EAGER attention (the bias has
+  # to reach the logits), so a 2500-token prompt costs several GB on top of the NF4 base
+  # and a full -1 sweep is what pushes a 24 GB card over. Raise it for a final number,
+  # and use the SAME value across arms or the comparison is not one.
+  num_graphs: 3
 
 wandb:
   run_name: e17_ms_stage3_joint

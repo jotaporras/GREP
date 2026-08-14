@@ -46,6 +46,11 @@ defaults:
 
 name: e17_ms_s2
 
+gnn:
+  # Same MagGT channel Stage 3 consumes, so the two stages start from one encoder.
+  pe_gt_from: outputs/e17_mag_gt/suite2/mag_gt.pt
+  semantic_gt_from: null
+
 data:
   # Edges PRESENT — e9's Stage-2 scaffold. Stage 3 removes them.
   text_edge_list: present
@@ -54,10 +59,13 @@ data:
   # Scoped to the last `scene graph: •` block on and no further, matching the notebook
   # that pretrains the MagGT; see the base config for the train/eval asymmetry it buys.
   injection_scope: full_sequence
+  edge_weights: binary
 
 eval:
   # Bound eval cost over the long channel-only run.
   epoch_interval: 2.0
+  data: data/n_30/gen/nav100_n30_gemma_data/split/test_graphs
+  num_graphs: -1
 
 trainer:
   # Stage-2 freeze regime: LLM + carried adapter frozen, graph channel trains.
@@ -89,6 +97,8 @@ trainer:
   bit4: true
   checkpoint_dir: outputs/e17_magnetic_composite_graphs
   save_name: e17_ms_stage2
+  sft:
+    save_total_limit: 1
 
 wandb:
   run_name: e17_ms_stage2_channel

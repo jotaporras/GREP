@@ -5,6 +5,7 @@ import warnings
 from collections import defaultdict
 
 import torch
+from torch.utils.checkpoint import checkpoint
 from torch import nn
 from torch_geometric.data import Batch, Data
 import transformers.masking_utils as masking_utils
@@ -3206,7 +3207,19 @@ class MagCompGraphLLM(LearnableGraphMaskLLM):
                 composite = self.composite_graph(
                     graphs[b], ids[:p_ref], injection_maps[b], start, device, permutation)
                 c_seg = composite.num_token_nodes
-                c_tok = self.covariance_token_block(composite, c_seg)
+                if torch.is_grad_enabled():
+                    # Memory only: one segment's Phi' activations live at a time instead
+                    # of all ceil(c / refresh) of them, recomputed in backward. Exactly
+                    # equivalent, not an approximation — use_reentrant=False restores the
+                    # RNG state, so the recompute draws the SAME probes even under
+                    # fixed_seed_mode=false. The dummy gives checkpoint a grad-carrying
+                    # input (the composite is data and the block reads no tensor arg).
+                    dummy = torch.ones(1, device=device, requires_grad=True)
+                    c_tok = checkpoint(
+                        lambda _d, _g=composite, _c=c_seg: self.covariance_token_block(_g, _c),
+                        dummy, use_reentrant=False)
+                else:
+                    c_tok = self.covariance_token_block(composite, c_seg)
                 q1 = min(p_ref, end)
                 bias[b, 0, q0:q1, start:start + c_seg] = (
                     self.beta * c_tok[q0 - start:q1 - start, :]).to(dtype)

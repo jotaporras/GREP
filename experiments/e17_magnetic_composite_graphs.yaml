@@ -54,7 +54,7 @@ gnn:
   # The graph GROWS during decode, so C_tok is rebuilt every 8 generated tokens. At
   # c ~ 1800, M = 320 that is a MagNet + GT forward over M*N nodes plus a 2*M*c^2*D
   # contraction per rebuild, i.e. about a prefill: 1 would cost one per token.
-  mask_decode_refresh: 1
+  mask_decode_refresh: 512
   # Crosslink DIRECTION is not a knob: scene node -> token, arrowheads on the cycle.
   # Reversing or doubling it symmetrizes the pair and cancels Theta^(r) on exactly the
   # edges that bind text to scene. Fixed in MagCompGraphLLM, asserted in the tests.
@@ -62,7 +62,7 @@ gnn:
   # --- The bias scale ---
   # beta = 0 at step 0 => identical logits to the base LLM. Note the one-step stall this
   # implies: dL/dC = beta * dL/dbias = 0 there, so beta moves first and the GT/MagNet
-  # train from step 2. Watch that beta actually leaves 0.
+  # train from step 2. Stage 3 overrides this; see e17_ms_stage3.yaml.
   mask_beta_init: 0.0
   mask_layer_scope: dense
 
