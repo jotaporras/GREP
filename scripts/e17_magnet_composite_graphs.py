@@ -964,7 +964,7 @@ test_graphs = generate_data(test_keys)
 batch_size = 4
 val_freq = 5
 epochs = _env('E17_EDGE_EPOCHS', 150)
-es_patience = 1
+es_patience = 2
 train_edges = True
 
 def test_loop_edges(dataloader, model, loss_fn, wandb_prefix=None, epoch=None):
