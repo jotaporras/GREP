@@ -51,10 +51,18 @@ gnn:
   # and with it every magnetic effective resistance finite. Set false to ablate it.
   mask_anchor_enabled: true
   mask_anchor_weight: 10.0
-  # The graph GROWS during decode, so C_tok is rebuilt every 8 generated tokens. At
-  # c ~ 1800, M = 320 that is a MagNet + GT forward over M*N nodes plus a 2*M*c^2*D
-  # contraction per rebuild, i.e. about a prefill: 1 would cost one per token.
-  mask_decode_refresh: 512
+  # R = 1 is the ONLY value at which training and decode agree, and correctness here is not
+  # negotiable: build_structural_mask segments training at the CEILING boundary (p_ref >= p,
+  # gnn_llm.py:3193) while CompositeDecodeInjector holds the last C_tok at the FLOOR one
+  # (short by up to R nodes, gnn_llm.py:3761). They round opposite ways, so any R > 1 both
+  # leaks up to R-1 future tokens into the training bias and starves decode by up to R-1 --
+  # at R = 512 the whole answer is one segment and C_tok[p, p'] sees e_{>p}, which is the
+  # leak this schedule exists to prevent. A15-A17 / P7 are true at 1 and false above it.
+  # COST, and it is the real one: rebuilds go from 2 per sequence to 1 + |answer|, each a
+  # MagNet + GT forward over M*N nodes plus a 2*M*c^2*D contraction (2.1 TFLOP at c ~ 1800,
+  # M = 320). Memory is unchanged -- the loop is gradient-checkpointed, one segment live --
+  # so this buys correctness with WALL-CLOCK alone. Measure a step before sizing the run.
+  mask_decode_refresh: 1
   # Crosslink DIRECTION is not a knob: scene node -> token, arrowheads on the cycle.
   # Reversing or doubling it symmetrizes the pair and cancels Theta^(r) on exactly the
   # edges that bind text to scene. Fixed in MagCompGraphLLM, asserted in the tests.

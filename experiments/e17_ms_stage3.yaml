@@ -38,12 +38,12 @@ gnn:
   mask_beta_init: 0.5
 
   # Two-group LR (GraphSFTTrainer.create_optimizer): the graph channel — GT + MagNet +
-  # beta, i.e. model.structural_parameters() — trains at 0.0012x the LoRA's LR, the e13f
-  # multiplier. The channel therefore moves SLOWLY relative to the adapter: at
-  # trainer.learning_rate 2.5e-4 the structural group sits at 3e-7, so beta is expected to
-  # stay near its init over a 3-epoch run. That is coherent with mask_beta_init = 0.5 —
-  # the channel is armed at a useful magnitude from step 0 rather than trained up to one.
-  structural_lr_mult: 0.0012
+  # beta, i.e. model.structural_parameters() — trains at 0.12x the LoRA's LR. At
+  # trainer.learning_rate 2.5e-4 that puts the structural group at 3e-5: slower than the
+  # adapter, but a rate the channel genuinely moves at, so beta is NOT expected to sit at
+  # its init. Watch mag/beta over the run — starting armed at 0.5, it is free to grow or
+  # decay, and a run that drives it toward zero is the channel reporting it is not useful.
+  structural_lr_mult: 0.12
 
 data:
   # Edge list REMOVED — connectivity must come from the graph channel now.
@@ -65,9 +65,9 @@ trainer:
   epochs: 3
 
   # The e13f command's 0.00025. beta does NOT have to travel from zero here (it starts at
-  # 0.5), and the structural group is at 0.0012x this, so the LoRA is what this LR governs.
-  # CHOSEN, not measured: watch mag/bias_absmax stay within an order of magnitude of the
-  # attention logit scale, and mag/beta stay near 0.5 rather than run away.
+  # 0.5), and the structural group is at 0.12x this, so both the adapter and the channel
+  # move. CHOSEN, not measured: watch mag/bias_absmax stay within an order of magnitude of
+  # the attention logit scale, and mag/beta neither collapse nor run away.
   learning_rate: 0.00025
 
   bit4: true

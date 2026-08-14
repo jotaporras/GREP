@@ -416,7 +416,7 @@ eval:
   # Single-graph alternative: a single JSON file, e.g.
   #   data: data/n_30/gen/nav100_n30_gemma_data/split/test_graphs/data_gen_023.json
   data: data/n_30/gen/nav100_n30_gemma_data/split/test_graphs
-  num_graphs: 5       # cap on evaluated graphs; -1 = the whole directory
+  num_graphs: -1      # cap on evaluated graphs; -1 = the whole directory
   epoch_interval: 1.0 # run the generation eval every this many epochs
   # false = zero-shot eval prompts (the deployed setting; matches data.icl_examples=0).
   # true keeps SPINE's two ICL examples, compacted, ahead of the query — and moves the
