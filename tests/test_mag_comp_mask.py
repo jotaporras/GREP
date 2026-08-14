@@ -711,3 +711,50 @@ def test_training_and_decode_bias_agree_position_by_position():
             k = row.shape[-1]
             assert torch.allclose(row[0, 0, 0], trained[0, 0, p, :k], atol=1e-5), (
                 f"training and decode disagree at position {p}")
+
+
+def test_frozen_graph_ignores_the_answer_entirely():
+    """``decode_refresh=0`` pins every segment to the prompt.
+
+    The bias must then be a function of ``ids[:answer_start]`` alone: changing the answer
+    tokens cannot move a single entry, and answer QUERIES carry no bias at all, because a
+    prompt-only composite has no token node for them. That is exactly what decode does
+    past its window, which is what makes the two identical.
+    """
+    model = _model(beta_init=1.0, decode_refresh=0)
+    ids = _ids().to(DEVICE)
+    answer = SCOPE_START + 4
+    other = ids.clone()
+    other[0, answer:] = 11                      # rewrite the whole answer
+    with torch.no_grad():
+        a = model.build_structural_mask(
+            ids.shape[1], [_scene()], [_injection_map()], DEVICE,
+            dtype=torch.float32, input_ids=ids, answer_starts=[answer])
+        b = model.build_structural_mask(
+            other.shape[1], [_scene()], [_injection_map()], DEVICE,
+            dtype=torch.float32, input_ids=other, answer_starts=[answer])
+    assert torch.allclose(a, b, atol=1e-5), (
+        "frozen bias changed when the answer changed — the graph is still growing")
+    assert a[0, 0, answer:, :].abs().max() == 0, (
+        "answer queries carry bias under a prompt-only composite, which has no node "
+        "for them; decode cannot reproduce that")
+
+
+def test_frozen_decode_never_rebuilds_and_uses_the_prompt_alone():
+    """The injector at ``refresh=0`` builds once, from the prompt, and stops."""
+    model = _model(beta_init=1.0, decode_refresh=0)
+    prompt = _ids()[0].tolist()
+    inj = CompositeDecodeInjector(model, _scene(), prompt, refresh=0)
+    calls = []
+    real = inj._rebuild
+
+    def counting():
+        calls.append(list(inj.generated))
+        return real()
+
+    inj._rebuild = counting
+    for tok in (11, 12, 13, 14, 15):
+        inj.pre_hook(None, (), {"input_ids": torch.tensor([[tok]], device=DEVICE)})
+    assert len(calls) == 1, f"frozen decode rebuilt {len(calls)} times, expected exactly 1"
+    assert inj._c_tok.shape[0] == model.scope_span(prompt)[1] - model.scope_span(prompt)[0], (
+        "frozen C_tok is not the prompt-scope size — the suffix leaked into the graph")

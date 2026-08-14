@@ -51,18 +51,20 @@ gnn:
   # and with it every magnetic effective resistance finite. Set false to ablate it.
   mask_anchor_enabled: true
   mask_anchor_weight: 10.0
-  # R = 1 is the ONLY value at which training and decode agree, and correctness here is not
-  # negotiable: build_structural_mask segments training at the CEILING boundary (p_ref >= p,
-  # gnn_llm.py:3193) while CompositeDecodeInjector holds the last C_tok at the FLOOR one
-  # (short by up to R nodes, gnn_llm.py:3761). They round opposite ways, so any R > 1 both
-  # leaks up to R-1 future tokens into the training bias and starves decode by up to R-1 --
-  # at R = 512 the whole answer is one segment and C_tok[p, p'] sees e_{>p}, which is the
-  # leak this schedule exists to prevent. A15-A17 / P7 are true at 1 and false above it.
-  # COST, and it is the real one: rebuilds go from 2 per sequence to 1 + |answer|, each a
-  # MagNet + GT forward over M*N nodes plus a 2*M*c^2*D contraction (2.1 TFLOP at c ~ 1800,
-  # M = 320). Memory is unchanged -- the loop is gradient-checkpointed, one segment live --
-  # so this buys correctness with WALL-CLOCK alone. Measure a step before sizing the run.
-  mask_decode_refresh: 1
+  # 0 FREEZES the composite at the prompt, which is the only setting under which the
+  # NOTEBOOK, TRAINING and DECODE all build the same graph. R > 0 cannot get there: R sets
+  # when the rebuild happens, not what exists, and training holds an answer decode has not
+  # written yet -- build_structural_mask rounds to the CEILING boundary (p_ref >= p) while
+  # CompositeDecodeInjector holds the last C_tok at the FLOOR one, so they meet only at
+  # R = 1, and the notebook (one graph over the whole conversation) agrees with neither.
+  # Frozen, every segment reads ids[:answer_start], decode never rebuilds, and answer rows
+  # carry no bias -- what decode already does past its window.
+  # WHAT IT COSTS: the growing mention set. Generated tokens never join the directed cycle
+  # and their labels never crosslink, so the bias encodes prompt structure only.
+  # WHAT IT BUYS: one rebuild per sequence. Measured at M=32 on one 3090, one step took
+  # 13.3s at R=512, 51.4s at R=8, and 324.1s at R=1; frozen is the 13s regime with none of
+  # the leak. M, not R, is what made steps unfinishable at M=320.
+  mask_decode_refresh: 0
   # Crosslink DIRECTION is not a knob: scene node -> token, arrowheads on the cycle.
   # Reversing or doubling it symmetrizes the pair and cancels Theta^(r) on exactly the
   # edges that bind text to scene. Fixed in MagCompGraphLLM, asserted in the tests.

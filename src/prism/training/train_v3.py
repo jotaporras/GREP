@@ -597,10 +597,11 @@ def _validate_config(config: omegaconf.DictConfig) -> None:
                 raise ValueError(
                     "gnn.mask_magnet_r must be in (0, 0.25) (sigmoid-reparameterized; the "
                     f"endpoints have no logit), got {config.gnn.mask_magnet_r}")
-            if int(config.gnn.get("mask_decode_refresh", 8)) < 1:
+            if int(config.gnn.get("mask_decode_refresh", 8)) < 0:
                 raise ValueError(
-                    "gnn.mask_decode_refresh must be >= 1 (tokens between decode-time "
-                    f"composite rebuilds), got {config.gnn.get('mask_decode_refresh')}")
+                    "gnn.mask_decode_refresh must be >= 0 (tokens between decode-time "
+                    "composite rebuilds; 0 freezes the graph at the prompt), got "
+                    f"{config.gnn.get('mask_decode_refresh')}")
     if config.gnn.arch == "wire_llm":
         if config.gnn.wire_layer_scope not in ("all", "dense", "dense_top_half", "dense_first"):
             raise ValueError(

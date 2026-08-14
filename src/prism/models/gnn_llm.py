@@ -3061,8 +3061,15 @@ class MagCompGraphLLM(LearnableGraphMaskLLM):
             crosslink_mention_to_node=False, crosslink_bidirectional=True,
             anchor=bool(anchor_enabled), anchor_weight=float(anchor_weight))
         # How often decode rebuilds the composite; see CompositeDecodeInjector.
-        if int(decode_refresh) < 1:
-            raise ValueError(f"decode_refresh must be >= 1, got {decode_refresh}")
+        # 0 FREEZES the graph at the prompt: training pins every segment to p_ref = a and
+        # decode never rebuilds, so the prompt-only composite is the SAME graph in both.
+        # No R > 0 can achieve that -- R sets WHEN the rebuild happens, not what exists,
+        # and training holds an answer decode has not written yet (training rounds to the
+        # ceiling boundary, decode to the floor). The price is the growing mention set:
+        # answer tokens never join V_Tx, so their mentions never crosslink and answer rows
+        # carry no bias -- which is exactly what decode does past its window.
+        if int(decode_refresh) < 0:
+            raise ValueError(f"decode_refresh must be >= 0, got {decode_refresh}")
         self._decode_refresh = int(decode_refresh)
         # One-slot memos, keyed on identity/content; see composite_graph / _cache_pe.
         self._cache_pe = bool(cache_pe)
@@ -3203,7 +3210,9 @@ class MagCompGraphLLM(LearnableGraphMaskLLM):
             composite = c_tok = None
             q0 = start
             while q0 < end:
-                p_ref = a if q0 < a else min(q0 + refresh, end)
+                # refresh == 0 FREEZES at the prompt: every segment reads ids[:a], which is
+                # exactly what decode's prefill builds and never rebuilds.
+                p_ref = a if (q0 < a or refresh == 0) else min(q0 + refresh, end)
                 composite = self.composite_graph(
                     graphs[b], ids[:p_ref], injection_maps[b], start, device, permutation)
                 c_seg = composite.num_token_nodes
@@ -3223,7 +3232,10 @@ class MagCompGraphLLM(LearnableGraphMaskLLM):
                 q1 = min(p_ref, end)
                 bias[b, 0, q0:q1, start:start + c_seg] = (
                     self.beta * c_tok[q0 - start:q1 - start, :]).to(dtype)
-                q0 = q1
+                # Frozen: the prompt rows are the only rows there are, so leave the answer
+                # queries at zero bias (what decode does past its window) and stop, rather
+                # than looping on a p_ref that can no longer advance.
+                q0 = end if refresh == 0 else q1
             stats.append(self._measure(c_tok, composite, start, end))
         self._telemetry = stats
         return bias
@@ -3776,7 +3788,9 @@ class CompositeDecodeInjector:
         self.model = model
         self.graph = pyg_graph
         self.prompt_ids = list(prompt_ids)
-        self.refresh = max(1, int(refresh))
+        # 0 = FROZEN: build once over the PROMPT and never again, matching
+        # build_structural_mask's p_ref = a. Any other value grows the graph as it decodes.
+        self.refresh = max(0, int(refresh))
         self.permutation = permutation
         self.device = next(model.parameters()).device
         self.generated: list[int] = []
@@ -3786,8 +3800,12 @@ class CompositeDecodeInjector:
 
     @torch.no_grad()
     def _rebuild(self) -> None:
-        """Rebuild the composite over prompt + suffix and recompute ``C_tok`` on it."""
-        ids = self.prompt_ids + self.generated
+        """Rebuild the composite over prompt + suffix and recompute ``C_tok`` on it.
+
+        Frozen (``refresh == 0``) the suffix is EXCLUDED, so the graph is the prompt's
+        alone -- bit-identical to the ``ids[:a]`` segment training builds.
+        """
+        ids = self.prompt_ids if self.refresh == 0 else self.prompt_ids + self.generated
         tau, end = self.model.scope_span(ids)
         c = end - tau
         if c < 2:
@@ -3818,7 +3836,7 @@ class CompositeDecodeInjector:
             self._rebuild()
         else:
             self._since += 1
-            if self._since >= self.refresh:
+            if self.refresh and self._since >= self.refresh:
                 self._rebuild()
         if self._c_tok is None:
             self.model._decode_bias_row = None
