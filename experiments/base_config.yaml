@@ -155,7 +155,7 @@ gnn:
   # mask_alpha / mask_psi_scale / mask_k_hops / mask_symmetrize / mask_use_edges are
   # INERT under it — build_structural_mask is overridden wholesale.
   mask_composite: false
-  mask_cycle_size: 2048      # cap on c, the token cycle length. COST scales as c^2.
+  mask_cycle_size: 8192      # cap on c, the token cycle length. COST scales as c^2.
   mask_beta_init: 0.0        # beta at step 0. 0.0 = the base LLM's logits, exactly.
   # Initial MagNet charge, written into the shared r_logit before any checkpoint load.
   # Eigenvalues of L_bar^(r) collide on the length-c cycle iff dist(2rc, Z) = 0; at
@@ -170,7 +170,7 @@ gnn:
   # Decode rebuilds the composite every N generated tokens: each generated token joins
   # the cycle and brings its mentions, and appending a node changes L_bar^(r) GLOBALLY,
   # so a rebuild is a full recomputation (~one prefill). 1 = exact, larger = staler.
-  mask_decode_refresh: 1
+  mask_decode_refresh: 0
 
   # --- MagNet phase / shift and the R-PEARL probe statistic (Psi-producer archs) ---
   # Read by gt.build_psi_producer; each default IS the module default, i.e. what every
