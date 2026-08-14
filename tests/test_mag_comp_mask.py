@@ -758,3 +758,59 @@ def test_frozen_decode_never_rebuilds_and_uses_the_prompt_alone():
     assert len(calls) == 1, f"frozen decode rebuilt {len(calls)} times, expected exactly 1"
     assert inj._c_tok.shape[0] == model.scope_span(prompt)[1] - model.scope_span(prompt)[0], (
         "frozen C_tok is not the prompt-scope size — the suffix leaked into the graph")
+
+
+def test_training_and_decode_agree_at_refresh_above_one():
+    """Floor rounding: training and decode must agree at EVERY position, at R > 1.
+
+    Training rounds DOWN to the last refresh boundary, as decode does, so a training query
+    can no longer see its own future. Between boundaries decode has no node for the query
+    and arms no row; training must likewise leave those queries at zero.
+    """
+    R = 4
+    model = _model(beta_init=1.0, decode_refresh=R)
+    ids = _ids().to(DEVICE)
+    prompt_len = SCOPE_START + 6
+    prompt = ids[0, :prompt_len].tolist()
+    seqs = _node_seqs()
+    imap = build_injection_map(ids[0].tolist(), seqs, scope_start=SCOPE_START)
+
+    with torch.no_grad():
+        trained = model.build_structural_mask(
+            ids.shape[1], [_scene()], [imap], DEVICE,
+            dtype=torch.float32, input_ids=ids, answer_starts=[prompt_len])
+        inj = CompositeDecodeInjector(model, _scene(), prompt, refresh=R)
+        for t in ids[0, prompt_len:].tolist():
+            inj.pre_hook(None, (), {"input_ids": torch.tensor([[t]])})
+            p = prompt_len + len(inj.generated) - 1
+            row = model._decode_bias_row
+            if row is None:                      # decode armed nothing between rebuilds
+                assert trained[0, 0, p, :].abs().max() == 0, (
+                    f"training biased query {p} where decode has no row at all")
+            else:
+                k = row.shape[-1]
+                assert torch.allclose(row[0, 0, 0], trained[0, 0, p, :k], atol=1e-5), (
+                    f"training and decode disagree at position {p} with R={R}")
+
+
+def test_no_future_leak_at_refresh_above_one():
+    """At R > 1 a query's bias must not move when LATER tokens are removed.
+
+    TRUNCATION, not rewriting: shortening the sequence changes ``c`` and so changes
+    ``C_tok`` outright. Rewriting tokens to an id that matches no node name leaves the
+    graph topology identical, so it would pass whatever the rounding does.
+    """
+    model = _model(beta_init=1.0, decode_refresh=4)
+    ids = _ids().to(DEVICE)
+    answer = SCOPE_START + 6
+    cut = answer + 5                             # mid-segment, so round-up would overshoot
+    with torch.no_grad():
+        full = model.build_structural_mask(
+            ids.shape[1], [_scene()], [_injection_map()], DEVICE,
+            dtype=torch.float32, input_ids=ids, answer_starts=[answer])
+        short = model.build_structural_mask(
+            cut, [_scene()], [_injection_map()], DEVICE,
+            dtype=torch.float32, input_ids=ids[:, :cut], answer_starts=[answer])
+    assert torch.allclose(full[0, 0, :cut, :cut], short[0, 0], atol=1e-5), (
+        "a query's bias changed when LATER tokens were removed — training is still "
+        "rounding up and reading its own future")

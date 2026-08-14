@@ -3210,9 +3210,21 @@ class MagCompGraphLLM(LearnableGraphMaskLLM):
             composite = c_tok = None
             q0 = start
             while q0 < end:
-                # refresh == 0 FREEZES at the prompt: every segment reads ids[:a], which is
-                # exactly what decode's prefill builds and never rebuilds.
-                p_ref = a if (q0 < a or refresh == 0) else min(q0 + refresh, end)
+                if q0 < a:
+                    # The prompt is ONE segment: exactly what eval's prefill builds.
+                    p_ref, q1 = a, a
+                elif refresh == 0:
+                    # FROZEN: the answer never enters the graph, and its queries carry no
+                    # bias -- what decode does past its window.
+                    break
+                else:
+                    # FLOOR, the way decode rounds. CompositeDecodeInjector rebuilds AT the
+                    # boundary over ids[:q0+1], so q0 is the graph's last node and the only
+                    # query with a row; the next refresh-1 queries read a graph that has no
+                    # node for them and carry no bias, exactly as decode carries none
+                    # between rebuilds. Rounding UP instead (ids[:q0+refresh]) is what let a
+                    # training query see up to refresh-1 tokens of its own future.
+                    p_ref, q1 = min(q0 + 1, end), min(q0 + refresh, end)
                 composite = self.composite_graph(
                     graphs[b], ids[:p_ref], injection_maps[b], start, device, permutation)
                 c_seg = composite.num_token_nodes
@@ -3229,13 +3241,12 @@ class MagCompGraphLLM(LearnableGraphMaskLLM):
                         dummy, use_reentrant=False)
                 else:
                     c_tok = self.covariance_token_block(composite, c_seg)
-                q1 = min(p_ref, end)
-                bias[b, 0, q0:q1, start:start + c_seg] = (
-                    self.beta * c_tok[q0 - start:q1 - start, :]).to(dtype)
-                # Frozen: the prompt rows are the only rows there are, so leave the answer
-                # queries at zero bias (what decode does past its window) and stop, rather
-                # than looping on a p_ref that can no longer advance.
-                q0 = end if refresh == 0 else q1
+                # Only the queries this graph actually has token nodes for get a row.
+                rows = min(q1, start + c_seg) - q0
+                if rows > 0:
+                    bias[b, 0, q0:q0 + rows, start:start + c_seg] = (
+                        self.beta * c_tok[q0 - start:q0 - start + rows, :]).to(dtype)
+                q0 = q1
             stats.append(self._measure(c_tok, composite, start, end))
         self._telemetry = stats
         return bias
