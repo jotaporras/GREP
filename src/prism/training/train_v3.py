@@ -333,7 +333,8 @@ def train_model(config: omegaconf.DictConfig):
             **({k: config.gnn[k] for k in (
                 "mask_composite", "mask_cycle_size", "mask_beta_init", "mask_magnet_r",
                 "mask_cycle_weight", "mask_cycle_causal", "mask_crosslink_weight",
-                "mask_anchor_enabled", "mask_anchor_weight", "learn_r", "hidden_norm",
+                "mask_anchor_enabled", "mask_anchor_weight", "mask_decode_refresh",
+                "learn_r", "hidden_norm",
                 "phase", "shift", "probe_distribution", "fixed_seed_mode",
                 "fixed_seed_value", "center_second_moment", "cache_pe")}
                if config.gnn.arch == "learnable_graph_mask" and config.gnn.get("mask_composite")
@@ -596,6 +597,10 @@ def _validate_config(config: omegaconf.DictConfig) -> None:
                 raise ValueError(
                     "gnn.mask_magnet_r must be in (0, 0.25) (sigmoid-reparameterized; the "
                     f"endpoints have no logit), got {config.gnn.mask_magnet_r}")
+            if int(config.gnn.get("mask_decode_refresh", 8)) < 1:
+                raise ValueError(
+                    "gnn.mask_decode_refresh must be >= 1 (tokens between decode-time "
+                    f"composite rebuilds), got {config.gnn.get('mask_decode_refresh')}")
     if config.gnn.arch == "wire_llm":
         if config.gnn.wire_layer_scope not in ("all", "dense", "dense_top_half", "dense_first"):
             raise ValueError(

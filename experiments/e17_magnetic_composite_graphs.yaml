@@ -51,6 +51,10 @@ gnn:
   # and with it every magnetic effective resistance finite. Set false to ablate it.
   mask_anchor_enabled: true
   mask_anchor_weight: 10.0
+  # The graph GROWS during decode, so C_tok is rebuilt every 8 generated tokens. At
+  # c ~ 1800, M = 320 that is a MagNet + GT forward over M*N nodes plus a 2*M*c^2*D
+  # contraction per rebuild, i.e. about a prefill: 1 would cost one per token.
+  mask_decode_refresh: 1
   # Crosslink DIRECTION is not a knob: scene node -> token, arrowheads on the cycle.
   # Reversing or doubling it symmetrizes the pair and cancels Theta^(r) on exactly the
   # edges that bind text to scene. Fixed in MagCompGraphLLM, asserted in the tests.
@@ -76,16 +80,22 @@ gnn:
   # --- The probe statistic ---
   # pe_pool=gt is load-bearing: it is what applies T per probe INSIDE E_q, so both
   # moments are taken over the block outputs. center_second_moment=true makes C the
-  # centered covariance (manifestly PSD, no fp32 cancellation), and fixed_seed_mode
-  # makes the two moments share one probe draw exactly rather than in expectation.
+  # centered covariance (manifestly PSD, no fp32 cancellation).
+  # fixed_seed_mode=false matches the notebook, which redraws every forward: the two
+  # moments then share a draw in EXPECTATION rather than exactly, and C_tok carries
+  # probe noise from step to step. That noise is the estimator the LLM is trained
+  # against, so pinning the draw here would train beta on a C the notebook never fitted.
   pe_pool: gt
   probe_distribution: gaussian
-  fixed_seed_mode: true
+  fixed_seed_mode: false
   fixed_seed_value: 0
   center_second_moment: true
-  # C_tok is a function of the composite TOPOLOGY alone, so prefill + any repeat forward
-  # over the same prompt pays for it once. Fills only under no_grad.
-  cache_pe: true
+  # false because the graph GROWS during decode: each generated token joins the directed
+  # cycle and brings its own crosslinks as the mention set extends, so C_tok is a function
+  # of a topology that changes every step. The memo would miss anyway (its key is
+  # hash(input_ids) + scope + scene shape), but false states the intent rather than
+  # relying on the key to save us.
+  cache_pe: false
 
   # --- Sizing (the notebook's create_gnn, e17 cell 41; also e13f's) ---
   # base_config's smaller pe/gt block is a dev default and would train a different model.
@@ -106,10 +116,12 @@ gnn:
   #   one [M, N, D] fp32 tensor         = M * 7.5 MB   ->  M=320: 2.4 GB, M=32: 240 MB
   #   GT retains ~(gt_num_layers+1) of them          ->  M=320: 9.6 GB, M=32: 960 MB
   #   MagNet gather [2*chunk*E, F] cplx = chunk * 8.0 MB  (x2 propagates x 5 convs)
-  # A 24 GB card holding the 31B NF4 base has roughly 4-5 GB left, so M=320 does not fit
-  # and no amount of chunking changes that: the GT stack is M-proportional. 32 fits with
-  # headroom. Raise it only against a measured torch.cuda.max_memory_allocated().
-  num_samples: 32
+  # M=320 is the notebook's value and this arm now matches it, so the pretrained MagGT is
+  # fitted and consumed under the same probe count rather than a lower-variance C than the
+  # LLM ever sees. It costs ~9.6 GB of GT activations: that fits a 48 GB card beside the
+  # 31B NF4 base, and does NOT fit a 24 GB one (roughly 4-5 GB free there) — no amount of
+  # chunking changes that, the GT stack is M-proportional. Drop to 32 for a 24 GB card.
+  num_samples: 320
   # chunk = min(num_samples, max_probe_rows/N, max_gather_rows/E). 16384/1830 = 8 probes
   # per chunk, and ONE chunk is the peak (the loop is gradient-checkpointed), which caps
   # the MagNet gather at ~64 MB per propagate instead of ~280 MB at the 65536 default.
@@ -127,9 +139,14 @@ gnn:
   semantic_gt_from: null
 
 data:
-  # prompt_only keeps the answer-side mentions OUT of the crosslinks, so the prefill
-  # C_tok carries no answer-derived topology. decode_consistent is REJECTED for this arm.
-  injection_scope: prompt_only
+  # full_sequence scopes the crosslinks to everything from the last `scene graph: •` block
+  # on — build_injection_map already takes scope_start=tau — and clamps nothing after it.
+  # This is what the notebook assembles composite graphs under, so the MagGT is pretrained
+  # and consumed on the SAME E_Cross. The cost is a train/eval asymmetry the arm has to
+  # own: at train time the answer is in the sequence and its mentions become crosslinks,
+  # while at eval the prompt has no answer yet, so the prefill C_tok is built from fewer
+  # crosslinks than training saw. decode_consistent is REJECTED for this arm.
+  injection_scope: full_sequence
   # binary is what the notebook assembles composite graphs under; base_config's gaussian
   # affinity is a different scene layer.
   edge_weights: binary

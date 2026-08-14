@@ -167,6 +167,10 @@ gnn:
   mask_crosslink_weight: 0.1
   mask_anchor_enabled: true  # false ablates the t_0 -> a -> v_0 bond (G may disconnect)
   mask_anchor_weight: 10.0
+  # Decode rebuilds the composite every N generated tokens: each generated token joins
+  # the cycle and brings its mentions, and appending a node changes L_bar^(r) GLOBALLY,
+  # so a rebuild is a full recomputation (~one prefill). 1 = exact, larger = staler.
+  mask_decode_refresh: 1
 
   # --- MagNet phase / shift and the R-PEARL probe statistic (Psi-producer archs) ---
   # Read by gt.build_psi_producer; each default IS the module default, i.e. what every

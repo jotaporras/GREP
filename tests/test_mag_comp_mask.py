@@ -32,7 +32,9 @@ import pytest
 import torch
 from torch_geometric.data import Data
 
-from prism.models.gnn_llm import MagCompGraphLLM, build_composite_graph
+from prism.models.gnn_llm import (CompositeDecodeInjector, MagCompGraphLLM,
+                                  build_composite_graph, build_injection_map,
+                                  defer_open_mentions, node_token_variants)
 from prism.models.gt import GraphTransformer
 
 DEVICE = torch.device("cpu")
@@ -51,6 +53,14 @@ class _Tokenizer:
 
     def batch_decode(self, seqs, **kwargs):
         return ["scene graph: •" if s[0] == self.MARKER else f"<{s[0]}>" for s in seqs]
+
+    # Node name -> its token ids. The ONE source the model derives variants from, so a
+    # test that needs a different naming (a prefix pair, say) overrides this per instance.
+    VOCAB = {"Park": [13, 14, 15], "Office": [19, 20, 21],
+             "House": [77, 78], "Hankee": [7, 8, 9, 10]}
+
+    def encode(self, text, **kwargs):
+        return list(self.VOCAB.get(text.strip(), []))
 
 
 def _ids(seq_len=CYCLE + SCOPE_START):
@@ -254,8 +264,13 @@ def test_beta_zero_reproduces_base_logits_exactly():
 
 
 def test_bias_is_zero_outside_the_scope_and_c_tok_inside():
-    """The system prompt gets NO bias; the scope block IS beta * C_tok; nothing is -inf."""
-    model = _model(beta_init=0.5)
+    """The system prompt gets NO bias; the scope block IS beta * C_tok; nothing is -inf.
+
+    ``decode_refresh >= c`` puts the whole scope in ONE segment, which is the only regime
+    in which the block equals a single C_tok; the autoregressive schedule is the subject
+    of ``test_training_bias_grows_autoregressively``.
+    """
+    model = _model(beta_init=0.5, decode_refresh=CYCLE)
     ids = _ids().to(DEVICE)
     with torch.no_grad():
         bias = model.build_structural_mask(
@@ -477,3 +492,222 @@ def test_left_padding_is_rejected():
     with pytest.raises(ValueError, match="RIGHT padding"):
         model.build_structural_mask(ids.shape[1], [_scene()], [_injection_map()], DEVICE,
                                     input_ids=ids, attention_mask=mask)
+
+
+# ------------------------------------------------- decode-time composite growth
+def _node_seqs():
+    """Token-id sequences for the four node names, matching ``_injection_map``'s spans.
+
+    ``_Tokenizer`` decodes id t to "<t>", so a node "name" is just the id run its
+    mentions occupy: Hankee = 6..9, Park = 12..14, Office = 18..20 (ids are 1-based).
+    """
+    return [[13, 14, 15], [19, 20, 21], [77, 78], [7, 8, 9, 10]]
+
+
+def test_decode_injector_grows_the_cycle_and_crosslinks():
+    """Each refresh rebuilds over prompt + suffix: the cycle gains the generated tokens
+    and E_Cross gains the mentions they completed."""
+    model = _model(beta_init=1.0)
+    prompt = _ids(SCOPE_START + 8)[0].tolist()          # c = 8 at prefill
+    inj = CompositeDecodeInjector(model, _scene(), prompt, refresh=1)
+
+    inj.generated = [77, 78]                            # a complete "House" mention
+    inj._rebuild()
+    c_grown = inj._c_tok.shape[0]
+    assert c_grown == len(prompt) + 2 - SCOPE_START, (
+        f"the cycle must cover the generated tokens: {c_grown}")
+
+    # The generated mention reaches E_Cross: rebuild the same graph and read its edges.
+    ids = prompt + inj.generated
+    tau, end = model.scope_span(ids)
+    imap = build_injection_map(ids, _node_seqs(), scope_start=tau)
+    g = model.composite_graph(_scene(), ids, imap, tau, DEVICE)
+    ei = {(int(u), int(v)) for u, v in g.edge_index.t().tolist()}
+    c = end - tau
+    gen_rows = [p - tau for spans in imap.values() for s, e in spans
+                for p in range(s, e) if p >= len(prompt)]
+    assert gen_rows, "the generated tokens completed no mention — fixture is wrong"
+    assert all(any((c + j, p) in ei for j in range(4)) for p in gen_rows), (
+        "a generated token's mention must appear as a scene -> token crosslink")
+
+
+def test_decode_injector_bias_row_matches_c_tok_and_scope():
+    """The armed row is beta * C_tok[q, :] over [tau, tau + c) and zero outside it."""
+    model = _model(beta_init=0.7)
+    prompt = _ids(SCOPE_START + 8)[0].tolist()
+    inj = CompositeDecodeInjector(model, _scene(), prompt, refresh=1)
+    inj.pre_hook(None, (), {"input_ids": torch.tensor([[77]])})
+
+    row = model._decode_bias_row
+    assert row is not None and row.shape == (1, 1, 1, len(prompt) + 1)
+    flat = row[0, 0, 0]
+    assert torch.count_nonzero(flat[:SCOPE_START]) == 0, "the system prompt got a bias"
+    q = len(prompt) + 1 - 1 - SCOPE_START
+    expected = float(model.beta) * inj._c_tok[q, : flat.shape[0] - SCOPE_START]
+    assert torch.allclose(flat[SCOPE_START:], expected.float(), atol=1e-5)
+
+
+def test_decode_injector_refresh_cadence():
+    """refresh=k rebuilds once per k tokens, not once per token."""
+    model = _model(beta_init=1.0)
+    prompt = _ids(SCOPE_START + 8)[0].tolist()
+    inj = CompositeDecodeInjector(model, _scene(), prompt, refresh=4)
+    calls = {"n": 0}
+    real = inj._rebuild
+
+    def counted():
+        calls["n"] += 1
+        real()
+
+    inj._rebuild = counted
+    for t in range(9):
+        inj.pre_hook(None, (), {"input_ids": torch.tensor([[77]])})
+    assert calls["n"] == 3, f"expected ceil(9/4) rebuilds, got {calls['n']}"
+
+
+def test_half_written_label_is_not_a_mention():
+    """`house` must not crosslink while `house_1` is still being written.
+
+    Node 2 is named by tokens [77, 78] and node 1 by [77] alone, so the suffix `[77]`
+    matches node 1 exactly AND is a strict prefix of node 2's name. Until the 78 lands,
+    neither is a mention; once it does, node 2 is.
+    """
+    seqs = [[13, 14, 15], [[77]], [[77, 78]], [90, 91, 92, 93]]
+    prompt = _ids(SCOPE_START + 8)[0].tolist()
+
+    open_ids = prompt + [77]
+    raw = build_injection_map(open_ids, seqs, scope_start=SCOPE_START)
+    assert 1 in raw, "fixture is wrong: [77] must match node 1 outright"
+    assert defer_open_mentions(raw, seqs, open_ids) == {}, (
+        "a label the sequence is mid-way through writing must not be a mention")
+
+    closed_ids = prompt + [77, 78]
+    done = defer_open_mentions(
+        build_injection_map(closed_ids, seqs, scope_start=SCOPE_START), seqs, closed_ids)
+    assert done == {2: [(len(prompt), len(prompt) + 2)]}, (
+        f"completed label must commit: {done}")
+
+
+def test_decode_injector_defers_the_half_written_label():
+    """The composite the injector builds gains no crosslink for a partial label."""
+    model = _model(beta_init=1.0)
+    seqs = [[13, 14, 15], [[77]], [[77, 78]], [90, 91, 92, 93]]
+    prompt = _ids(SCOPE_START + 8)[0].tolist()
+
+    inj = CompositeDecodeInjector(model, _scene(), prompt, refresh=1)
+    inj.pre_hook(None, (), {"input_ids": torch.tensor([[77]])})
+    ids = prompt + [77]
+    tau, end = model.scope_span(ids)
+    c = end - tau
+    g = model.composite_graph(
+        _scene(), ids,
+        defer_open_mentions(build_injection_map(ids, seqs, scope_start=tau), seqs, ids),
+        tau, DEVICE)
+    ei = {(int(u), int(v)) for u, v in g.edge_index.t().tolist()}
+    partial_row = len(ids) - 1 - tau
+    assert not any((c + j, partial_row) in ei for j in range(4)), (
+        "the half-written label got scene-graph out-edges")
+
+    inj.pre_hook(None, (), {"input_ids": torch.tensor([[78]])})
+    ids2 = prompt + [77, 78]
+    tau2, end2 = model.scope_span(ids2)
+    g2 = model.composite_graph(
+        _scene(), ids2,
+        defer_open_mentions(build_injection_map(ids2, seqs, scope_start=tau2), seqs, ids2),
+        tau2, DEVICE)
+    ei2 = {(int(u), int(v)) for u, v in g2.edge_index.t().tolist()}
+    c2 = end2 - tau2
+    rows = [len(prompt) - tau2, len(prompt) + 1 - tau2]
+    assert all((c2 + 2, r) in ei2 for r in rows), (
+        "the completed label must crosslink from its OWN node (2), on every sub-token")
+
+
+def test_decode_and_training_build_the_same_composite():
+    """The requirement, asserted: for one sequence, the graph decode converges to is the
+    graph training builds — same nodes, same edges, same weights.
+
+    Training sees prompt + answer at once; decode reaches the same text one token at a
+    time. Both go through ``MagCompGraphLLM.composite_graph``, so the injection map is
+    closed by the same rule and the edge families are laid down by the same call.
+    """
+    model = _model(beta_init=1.0)
+    # The model's OWN variants, since it derives them itself now; the answer completes a
+    # House ([77, 78]) and a Park ([13, 14, 15]) mention so E_Cross grows with the cycle.
+    seqs = model._node_seqs(_scene())
+    prompt = _ids(SCOPE_START + 8)[0].tolist()
+    answer = [77, 78, 50, 13, 14, 15]
+
+    # Training: the whole sequence at once, exactly as the collator hands it over.
+    full = prompt + answer
+    tau, end = model.scope_span(full)
+    trained = model.composite_graph(
+        _scene(), full, build_injection_map(full, seqs, scope_start=tau), tau, DEVICE)
+
+    # Decode: the same text, one token at a time, rebuilt every step.
+    inj = CompositeDecodeInjector(model, _scene(), prompt, refresh=1)
+    for t in answer:
+        inj.pre_hook(None, (), {"input_ids": torch.tensor([[t]])})
+    ids = prompt + inj.generated
+    decoded = model.composite_graph(
+        _scene(), ids, build_injection_map(ids, seqs, scope_start=tau), tau, DEVICE)
+
+    assert decoded.num_nodes == trained.num_nodes, (
+        f"node count diverged: {decoded.num_nodes} vs {trained.num_nodes}")
+    assert decoded.num_token_nodes == trained.num_token_nodes
+    e_dec = {(int(u), int(v), round(float(w), 6)) for (u, v), w in
+             zip(decoded.edge_index.t().tolist(), decoded.edge_weight.tolist())}
+    e_tra = {(int(u), int(v), round(float(w), 6)) for (u, v), w in
+             zip(trained.edge_index.t().tolist(), trained.edge_weight.tolist())}
+    assert e_dec == e_tra, (
+        f"edges diverged: decode-only {sorted(e_dec - e_tra)[:5]}, "
+        f"train-only {sorted(e_tra - e_dec)[:5]}")
+
+
+def test_training_bias_grows_autoregressively():
+    """A query's bias must not depend on a token after it.
+
+    Built once over the whole sequence, ``C_tok[p, p']`` is a function of everything —
+    including the answer's own continuation, which decode cannot see. With the schedule,
+    row ``p`` comes from the composite over ``ids[:p_ref]``, so truncating the sequence
+    after ``p_ref`` leaves that row unchanged.
+    """
+    model = _model(beta_init=1.0, decode_refresh=1)
+    ids = _ids().to(DEVICE)
+    answer = SCOPE_START + 4                    # everything past here grows per token
+    cut = SCOPE_START + 8
+    with torch.no_grad():
+        full = model.build_structural_mask(
+            ids.shape[1], [_scene()], [_injection_map()], DEVICE,
+            dtype=torch.float32, input_ids=ids, answer_starts=[answer])
+        short = model.build_structural_mask(
+            cut, [_scene()], [_injection_map()], DEVICE,
+            dtype=torch.float32, input_ids=ids[:, :cut], answer_starts=[answer])
+    assert torch.allclose(full[0, 0, :cut, :cut], short[0, 0], atol=1e-5), (
+        "a query's bias changed when LATER tokens were removed — the graph is not "
+        "growing autoregressively and the future is leaking into the past")
+
+
+def test_training_and_decode_bias_agree_position_by_position():
+    """The requirement: the bias training gives query p equals the row decode arms at p."""
+    model = _model(beta_init=1.0, decode_refresh=1)
+    ids = _ids().to(DEVICE)
+    prompt_len = SCOPE_START + 6
+    prompt = ids[0, :prompt_len].tolist()
+    # BOTH sides derive the map from the same variants: decode has no other source, and
+    # handing training a different one would compare two different graphs.
+    seqs = _node_seqs()
+    imap = build_injection_map(ids[0].tolist(), seqs, scope_start=SCOPE_START)
+
+    with torch.no_grad():
+        trained = model.build_structural_mask(
+            ids.shape[1], [_scene()], [imap], DEVICE,
+            dtype=torch.float32, input_ids=ids, answer_starts=[prompt_len])
+        inj = CompositeDecodeInjector(model, _scene(), prompt, refresh=1)
+        for t in ids[0, prompt_len:].tolist():
+            inj.pre_hook(None, (), {"input_ids": torch.tensor([[t]])})
+            p = prompt_len + len(inj.generated) - 1
+            row = model._decode_bias_row
+            assert row is not None, f"no bias armed at position {p}"
+            k = row.shape[-1]
+            assert torch.allclose(row[0, 0, 0], trained[0, 0, p, :k], atol=1e-5), (
+                f"training and decode disagree at position {p}")

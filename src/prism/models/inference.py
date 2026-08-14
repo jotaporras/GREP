@@ -9,6 +9,7 @@ from spine import models as spine_models
 from prism.data import compact_prompt
 from prism.data import utils
 from prism.models.gnn_llm import (
+    CompositeDecodeInjector,
     MaskDecodeInjector,
     GraphAugmentedLLM,
     GraphMaskLLM,
@@ -274,7 +275,18 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
                 # mentions: a forward pre-hook arms a per-step bias row (span-end
                 # assignment, design note §2.2). Other scopes keep the historical
                 # prompt-only behavior.
-                if self.injection_scope == "decode_consistent":
+                if isinstance(graph_model, MagCompGraphLLM):
+                    # The composite arm GROWS: every generated token joins the directed
+                    # cycle and brings its mentions with it, which is what training sees
+                    # under injection_scope='full_sequence'. Rebuilt every
+                    # mask_decode_refresh tokens, since a rebuild is a full recomputation.
+                    injector = CompositeDecodeInjector(
+                        graph_model, pyg_graph, input_ids[0].tolist(),
+                        refresh=graph_model._decode_refresh,
+                        permutation=self.permutation)
+                    hook_handle = graph_model.llm.register_forward_pre_hook(
+                        injector.pre_hook, with_kwargs=True)
+                elif self.injection_scope == "decode_consistent":
                     injector = MaskDecodeInjector(
                         graph_model, pyg_graph, injection_map,
                         input_ids.shape[1], node_token_seqs,

@@ -588,7 +588,8 @@ def build_composite_graph(scene, input_ids, injection_map, scope_start: int = 0,
                           crosslink_mention_to_node: bool = True,
                           crosslink_bidirectional: bool = True,
                           anchor: bool = True,
-                          anchor_weight: float = 10.0, permutation=None) -> Data:
+                          anchor_weight: float = 10.0, permutation=None,
+                          node_token_seqs=None) -> Data:
     r"""The composite graph ``G = (V_Tx ∪ V_Sc ∪ {a}, E_Tx ∪ E_Sc ∪ E_Cross ∪ E_A)``.
 
     Ported from ``build_composite_graph`` in
@@ -646,6 +647,11 @@ def build_composite_graph(scene, input_ids, injection_map, scope_start: int = 0,
         crosslink_mention_to_node / crosslink_bidirectional / anchor: which of the
             families above are emitted, see the edge list.
     """
+    # Given the name variants, a label the sequence is still WRITING is not a mention
+    # (see defer_open_mentions). Applied HERE so the notebook, training and eval close the
+    # map identically — every composite in the codebase is built by this function.
+    if node_token_seqs is not None:
+        injection_map = defer_open_mentions(injection_map, node_token_seqs, input_ids)
     c = min(len(input_ids), scope_start + context_window) - scope_start
     if c < 2:
         raise ValueError(
@@ -3004,7 +3010,7 @@ class MagCompGraphLLM(LearnableGraphMaskLLM):
                  magnet_r: float = 0.126, cycle_weight: float = 1.0,
                  cycle_causal: bool = False, crosslink_weight: float = 0.1,
                  anchor_enabled: bool = True, anchor_weight: float = 10.0,
-                 cache_pe: bool = True, **kwargs):
+                 cache_pe: bool = True, decode_refresh: int = 8, **kwargs):
         super().__init__(llm, pe_model, **kwargs)
         if int(cycle_size) < 2:
             raise ValueError(f"cycle_size must be >= 2, got {cycle_size}")
@@ -3053,6 +3059,10 @@ class MagCompGraphLLM(LearnableGraphMaskLLM):
             # so the pair stays asymmetric and keeps its phase (see the class docstring).
             crosslink_mention_to_node=False, crosslink_bidirectional=True,
             anchor=bool(anchor_enabled), anchor_weight=float(anchor_weight))
+        # How often decode rebuilds the composite; see CompositeDecodeInjector.
+        if int(decode_refresh) < 1:
+            raise ValueError(f"decode_refresh must be >= 1, got {decode_refresh}")
+        self._decode_refresh = int(decode_refresh)
         # One-slot memos, keyed on identity/content; see composite_graph / _cache_pe.
         self._cache_pe = bool(cache_pe)
         self._composite_key = None
@@ -3086,6 +3096,20 @@ class MagCompGraphLLM(LearnableGraphMaskLLM):
         start = find_last_graph_scope(input_ids_b, self._tokenizer)
         return start, min(len(input_ids_b), start + self._composite_window)
 
+    def _node_seqs(self, scene):
+        """Token-id variants of ``scene``'s node names, memoized on the name tuple.
+
+        Derived HERE and nowhere else: training and decode must close the injection map
+        against the SAME variants, and a caller-supplied list is a second source of truth
+        that can disagree (it did). The graph is rebuilt once per refresh, so
+        re-tokenizing every time would dominate the loop.
+        """
+        names = tuple(scene.node_names)
+        if getattr(self, "_seqs_key", None) != names:
+            self._seqs_key, self._seqs = names, node_token_variants(list(names),
+                                                                    self._tokenizer)
+        return self._seqs
+
     def composite_graph(self, scene, input_ids_b, injection_map, scope_start, device,
                         permutation=None) -> Data:
         """:func:`build_composite_graph` for one sequence, memoized in one slot.
@@ -3095,14 +3119,23 @@ class MagCompGraphLLM(LearnableGraphMaskLLM):
         relabelling misses rather than silently reusing the previous one. Filled ONLY
         under ``no_grad`` (``C_tok`` is keyed on this object's identity, and a hit with
         gradients live would hand back the previous step's autograd graph).
+
+        THE choke point: training, eval prefill and every decode rebuild reach the
+        composite through here, so the map is closed the same way for all three —
+        :func:`defer_open_mentions` drops a label the sequence is still writing. Put that
+        rule anywhere else and decode would build a graph training cannot produce.
+        ``node_token_seqs`` defaults to the scene's own names under this model's
+        tokenizer; callers that already hold them pass them to skip the re-tokenization.
         """
+        node_token_seqs = self._node_seqs(scene)
         key = (hash(tuple(input_ids_b)), scope_start, int(scene.num_nodes),
                int(scene.edge_index.shape[1]), getattr(permutation, "seed", None))
         if self._composite_data is not None and self._composite_key == key:
             return self._composite_data
         composite = build_composite_graph(
             scene, input_ids_b, injection_map, scope_start=scope_start, device=device,
-            permutation=permutation, **self._composite_kwargs)
+            permutation=permutation, node_token_seqs=node_token_seqs,
+            **self._composite_kwargs)
         if self._cache_pe and not torch.is_grad_enabled():
             self._composite_key, self._composite_data = key, composite
         return composite
@@ -3130,7 +3163,7 @@ class MagCompGraphLLM(LearnableGraphMaskLLM):
 
     def build_structural_mask(self, seq_len, graphs, injection_maps, device, dtype=None,
                               key_injection_maps=None, permutation=None,
-                              input_ids=None, attention_mask=None):
+                              input_ids=None, attention_mask=None, answer_starts=None):
         """Additive attention bias ``[B, 1, seq, seq]``: ``β·C_tok`` on the scope, 0 elsewhere.
 
         Overrides the parent wholesale — none of ``α`` / ``psi_scale`` / the adjacency
@@ -3151,13 +3184,33 @@ class MagCompGraphLLM(LearnableGraphMaskLLM):
         bias = torch.zeros(len(injection_maps), 1, seq_len, seq_len,
                            device=device, dtype=dtype)
         stats = []
+        refresh = self._decode_refresh
         for b in range(len(injection_maps)):
             ids = unpadded_row(input_ids, attention_mask, b, type(self).__name__)
             start, end = self.scope_span(ids)
-            composite = self.composite_graph(
-                graphs[b], ids, injection_maps[b], start, device, permutation)
-            c_tok = self.covariance_token_block(composite, end - start)
-            bias[b, 0, start:end, start:end] = (self.beta * c_tok).to(dtype)
+            # AUTOREGRESSIVE growth, the same schedule decode follows: the query at p sees
+            # the composite over ids[:p_ref] for the last refresh boundary p_ref >= p, so
+            # its bias never depends on a token past that boundary. Built once over the
+            # whole sequence instead, C_tok[p, p'] would be a function of tokens AFTER p —
+            # the answer's own continuation leaking into the bias that predicts it, and a
+            # graph decode can never reproduce. Cost: ceil(c / refresh) rebuilds.
+            # The PROMPT is one segment — eval's prefill covers it whole, so a prompt
+            # query legitimately sees the rest of the prompt. Only the ANSWER grows, one
+            # refresh at a time, exactly as decode extends it. Without answer_starts the
+            # whole sequence IS the prompt, which is the eval-prefill call.
+            a = end if not answer_starts else min(max(int(answer_starts[b]), start + 2), end)
+            composite = c_tok = None
+            q0 = start
+            while q0 < end:
+                p_ref = a if q0 < a else min(q0 + refresh, end)
+                composite = self.composite_graph(
+                    graphs[b], ids[:p_ref], injection_maps[b], start, device, permutation)
+                c_seg = composite.num_token_nodes
+                c_tok = self.covariance_token_block(composite, c_seg)
+                q1 = min(p_ref, end)
+                bias[b, 0, q0:q1, start:start + c_seg] = (
+                    self.beta * c_tok[q0 - start:q1 - start, :]).to(dtype)
+                q0 = q1
             stats.append(self._measure(c_tok, composite, start, end))
         self._telemetry = stats
         return bias
@@ -3245,6 +3298,7 @@ class MagCompGraphLLM(LearnableGraphMaskLLM):
         graphs: Batch | None = None,
         injection_maps: list[dict[int, list[tuple[int, int]]]] | None = None,
         key_injection_maps: list[dict[int, list[tuple[int, int]]]] | None = None,
+        answer_starts: list[int] | None = None,
         **kwargs,
     ):
         """As :meth:`LearnableGraphMaskLLM.forward`, threading the ids the graph is built on.
@@ -3269,7 +3323,8 @@ class MagCompGraphLLM(LearnableGraphMaskLLM):
         if graphs is not None and injection_maps is not None and input_ids is not None:
             self._struct_bias = self.build_structural_mask(
                 input_ids.shape[1], graphs, injection_maps, input_ids.device,
-                input_ids=input_ids, attention_mask=attention_mask)
+                input_ids=input_ids, attention_mask=attention_mask,
+                answer_starts=answer_starts)
         else:
             self._struct_bias = None
         try:
@@ -3409,6 +3464,28 @@ def _extendable_span(tokens: list[int], node_token_seqs: list) -> bool:
             if len(seq) > k and seq[:k] == tokens:
                 return True
     return False
+
+
+def defer_open_mentions(injection_map: dict[int, list[tuple[int, int]]],
+                        node_token_seqs: list,
+                        input_ids_b: list[int]) -> dict[int, list[tuple[int, int]]]:
+    """Drop the mention the sequence is still WRITING, so a half-formed label is no node.
+
+    A span that ends at the sequence END and that some node-name variant strictly extends
+    is ambiguous: ``house`` can be a label in its own right AND a prefix of ``house_1``,
+    and :func:`build_injection_map`'s longest-first resolution would hand the open span to
+    the shorter node. Training never meets that state — there the whole label sits in the
+    text and resolves outright — so deferring is what keeps DECODE in distribution rather
+    than a rule of its own. The span commits on the next rebuild, once the label closes.
+    """
+    n = len(input_ids_b)
+    out: dict[int, list[tuple[int, int]]] = {}
+    for nid, spans in injection_map.items():
+        kept = [(s, e) for s, e in spans
+                if e < n or not _extendable_span(list(input_ids_b[s:e]), node_token_seqs)]
+        if kept:
+            out[nid] = kept
+    return out
 
 
 def decode_style_query_map(
@@ -3654,3 +3731,96 @@ class MaskDecodeInjector:
         pos = kwargs.get("position_ids")
         if getattr(self.model, "_disable_graph_token_rope", False) and pos is not None:
             return args, {**kwargs, "position_ids": torch.zeros_like(pos)}
+
+
+class CompositeDecodeInjector:
+    """Decode-time COMPOSITE-GRAPH extension for :class:`MagCompGraphLLM`.
+
+    Batch-size-1 generation only. Register :meth:`pre_hook` as a forward pre-hook on
+    ``model.llm`` for the duration of one ``generate`` call; remove the handle and clear
+    ``model._decode_bias_row`` after.
+
+    Training sees the whole sequence, so under ``injection_scope='full_sequence'`` the
+    answer's tokens are already IN the cycle and their mentions are already crosslinks.
+    This reproduces that at decode: every ``refresh`` generated tokens the composite is
+    REBUILT over prompt + suffix, so the directed cycle gains the tokens generated since
+    and E_Cross gains whatever node names they completed, and ``C_tok`` is recomputed on
+    it. Between refreshes the previous ``C_tok`` is reused, so the cycle is short by up to
+    ``refresh`` nodes and the crosslinks by up to ``refresh`` tokens.
+
+    A refresh is a FULL recomputation, never an update: appending a node changes
+    ``L̄^(r)`` globally, so every row's ``Φ'`` moves and no incremental form is valid. That
+    is what ``refresh`` amortizes — each one costs a MagNet + GT forward over ``M·N``
+    nodes plus the ``2·M·c²·D`` contraction, i.e. about a whole prefill.
+
+    The bias row placed for the query at absolute position ``p`` is
+    ``β · C_tok[p − τ, p' − τ]`` for every key ``p' ∈ [τ, τ + c)``, and zero elsewhere —
+    the same value, and the same scope, that :meth:`build_structural_mask` writes at
+    prefill.
+    """
+
+    def __init__(self, model, pyg_graph, prompt_ids, refresh: int = 8, permutation=None):
+        self.model = model
+        self.graph = pyg_graph
+        self.prompt_ids = list(prompt_ids)
+        self.refresh = max(1, int(refresh))
+        self.permutation = permutation
+        self.device = next(model.parameters()).device
+        self.generated: list[int] = []
+        self._c_tok = None          # [c, c] for the composite as of the last refresh
+        self._tau = None
+        self._since = None          # tokens generated since that refresh
+
+    @torch.no_grad()
+    def _rebuild(self) -> None:
+        """Rebuild the composite over prompt + suffix and recompute ``C_tok`` on it."""
+        ids = self.prompt_ids + self.generated
+        tau, end = self.model.scope_span(ids)
+        c = end - tau
+        if c < 2:
+            self._c_tok = None
+            return
+        # The model's variants, not a caller's: the map and the deferral inside
+        # composite_graph must be closed against the SAME names training uses.
+        injection_map = build_injection_map(
+            ids, self.model._node_seqs(self.graph), scope_start=tau)
+        composite = self.model.composite_graph(
+            self.graph, ids, injection_map, tau, self.device,
+            permutation=self.permutation)
+        self._c_tok = self.model.covariance_token_block(composite, c)
+        self._tau, self._since = tau, 0
+
+    def pre_hook(self, module, args, kwargs):
+        input_ids = kwargs.get("input_ids")
+        if input_ids is None and args:
+            input_ids = args[0]
+        if input_ids is None or input_ids.shape[1] != 1:
+            return                                # prefill (multi-token forward)
+        if input_ids.shape[0] != 1:
+            raise RuntimeError(
+                "CompositeDecodeInjector supports batch-size-1 generation only "
+                f"(got batch {input_ids.shape[0]}; beam search is not wired).")
+        self.generated.append(int(input_ids[0, 0]))
+        if self._c_tok is None:
+            self._rebuild()
+        else:
+            self._since += 1
+            if self._since >= self.refresh:
+                self._rebuild()
+        if self._c_tok is None:
+            self.model._decode_bias_row = None
+            return
+
+        # The query is the token just consumed; its composite row is its offset into the
+        # window. Past the last refresh's window it has no row yet, so it carries no bias.
+        k_len = len(self.prompt_ids) + len(self.generated)
+        q_row = k_len - 1 - self._tau
+        c = self._c_tok.shape[0]
+        if not 0 <= q_row < c:
+            self.model._decode_bias_row = None
+            return
+        row = torch.zeros(k_len, dtype=torch.float32, device=self.device)
+        keys = min(c, k_len - self._tau)
+        row[self._tau:self._tau + keys] = (
+            self.model.beta * self._c_tok[q_row, :keys]).float()
+        self.model._decode_bias_row = row.view(1, 1, 1, k_len)

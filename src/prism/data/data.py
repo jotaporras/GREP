@@ -14,6 +14,7 @@ from prism.data import utils
 from prism.eval import evaluate
 from prism.models.gnn_llm import (
     build_injection_map,
+    defer_open_mentions,
     clamp_injection_map,
     decode_style_query_map,
     exclude_positions_from_injection_map,
@@ -496,6 +497,14 @@ class SpineDataCollator(TokenIndexCollator):
         injection_map = build_injection_map(
             example["input_ids"], node_token_seqs, scope_start=scope_start
         )
+        # A label the sequence is still mid-way through writing is not a mention: a
+        # span ending at the last token that some longer node name strictly extends
+        # (`house _` before its `1`) is deferred, so a truncated sequence never
+        # crosslinks the wrong node — and decode, which defers the same way, builds
+        # the same graph for the same prefix.
+        injection_map = defer_open_mentions(
+            injection_map, node_token_seqs, example["input_ids"]
+        )
         key_injection_map = None
         if self.injection_scope == "prompt_only":
             injection_map = clamp_injection_map(injection_map, example["answer_start"])
@@ -529,6 +538,12 @@ class SpineDataCollator(TokenIndexCollator):
         batch = super().__call__(features)
         batch["graphs"] = Batch.from_data_list(pyg_graphs)
         batch["injection_maps"] = injection_maps
+        # Where the answer begins, per row: the composite arm grows its graph from here
+        # ONE refresh at a time, so that a training query sees the same prefix its decode
+        # counterpart would (MagCompGraphLLM.build_structural_mask). Dropped from the
+        # padded tensors above, so it is re-attached as a plain list.
+        batch["answer_starts"] = [int(f["answer_start"]) for f in features
+                                  if "answer_start" in f] or None
         if self.injection_scope == "decode_consistent":
             batch["key_injection_maps"] = key_injection_maps
         return batch

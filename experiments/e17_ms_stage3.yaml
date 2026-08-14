@@ -32,7 +32,8 @@ data:
   text_edge_list: none
   spine_tools: none
   icl_examples: 0
-  injection_scope: prompt_only
+  # Scoped to the last `scene graph: •` block on, as in Stage 2 and the notebook.
+  injection_scope: full_sequence
 
 trainer:
   # Stage-3 regime: both the carried adapter and the graph channel train.
