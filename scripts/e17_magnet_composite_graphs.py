@@ -638,7 +638,7 @@ def build_composite_graph(
     edge_weights: str = 'binary',
     include_edges: bool = False,
     include_tools: bool = False,
-    context_window: int = 8192,
+    context_window: int = 2048,
     cycle_weight: float = 1.0,
     cycle_causal: bool = False,
     crosslink_weight: float = 0.1,
@@ -750,9 +750,14 @@ tokenizer = AutoTokenizer.from_pretrained(llm_path)
 eval_composite = build_composite_graph(
     graph_file_by_name[graph_file], tokenizer, device=device
 )
+# ONE plan, as `generate_data` builds them: globbing every plan gives c ~ 2900, a
+# conversation five times longer than anything §2 or §3 trains on, and pe_pool='gt' runs
+# the blocks over M*N nodes — 320 * 2912 does not fit a 24 GB card. The demo has to sit
+# in the regime the stages actually train in.
 train_composite = build_composite_graph(
     graph_file_by_name[graph_file], tokenizer, device=device,
-    plan_files=f"{plan_path}/sample_{graph_file.split('_')[-1]}_*.json",
+    plan_files=sorted(glob.glob(
+        f"{plan_path}/sample_{graph_file.split('_')[-1]}_*.json"))[:1],
 )
 
 # `directed=True` swaps R-PEARL's TAGConv backbone for MagNet, so S = H̄^(r); untrained.
@@ -959,7 +964,7 @@ test_graphs = generate_data(test_keys)
 batch_size = 4
 val_freq = 5
 epochs = _env('E17_EDGE_EPOCHS', 150)
-es_patience = 5
+es_patience = 1
 train_edges = True
 
 def test_loop_edges(dataloader, model, loss_fn, wandb_prefix=None, epoch=None):
@@ -1151,15 +1156,12 @@ render_matrix(out.sigmoid())
 # 
 # Specifically, we take the probe expectation OUTSIDE the Transformer blocks, so that $\mathbf{\Phi}' = T(\Phi)$ is the block output per probe and both moments are taken over it. $T$ is nonlinear, so $\mathbb{E}_\mathbf{q}\big[T(\Phi)\big] \ne T\big(\mathbb{E}_\mathbf{q}[\Phi]\big)$, and this is the already implemented `pe_pool = 'gt'` path of `covariance_token_block`, which chunks the probe axis rather than materializing $\mathbf{\Phi}' \in \mathbb{R}^{M \times N \times D}$. We hold $\alpha$ and the charge $r$ fixed for this stage: a learnable $\alpha$ would be minimized by $(\mathbf{C},\, \alpha) \to (\mathbf{0},\, 0)$, and a learnable $r$ would let the model move $R^{(r)}_\text{eff}$ rather than meet it. Centering leaves $\operatorname{rank}(\mathbf{C}) \le \min\big(N,\, (M - 1)D\big)$, which at $M = 32$ and $D = 1024$ is $31{,}744$, far above $N$, so the metric is not rank-limited and the cell below states the bound rather than assuming it.
 # 
-# We assemble the composite graph exactly as `MagCompGraphLLM` does, through the same `gnn_llm.build_composite_graph`. $\mathcal{V}_\text{Tx}$ is the window of at most $c_{\max} = 8192$ tokens counted from the last scene graph block on, since the system preamble and any ICL graphs are text no crosslink reaches. $\mathcal{E}_\text{Tx}$ is the directed cycle $i \to i + 1 \bmod c$, $\mathcal{E}_\text{Sc}$ carries both directions and therefore magnitude alone, and $\mathcal{E}_\text{Cross}$ runs $\mathcal{V}_\text{Sc} \to \mathcal{V}_\text{Tx}$ and never back, so that the arrowheads land on the cycle and the phase $\Theta^{(r)} = 2 \pi r$ survives on exactly the edges that bind text to scene; a symmetric pair would cancel it. The anchor bond $t_0 \to a \to v_0$ adds one node and two edges, which is what keeps $\mathcal{G}$ one component whatever $\mathcal{E}_\text{Cross}$ covers, and so keeps every $R^{(r)}_\text{eff}(u, v)$ finite without reshaping it as a fan to all of $\mathcal{V}_\text{Sc}$ would.
+# We assemble the composite graph exactly as `MagCompGraphLLM` does, through the same `gnn_llm.build_composite_graph`. $\mathcal{V}_\text{Tx}$ is the window of at most $c_{\max} = 2048$ tokens counted from the last scene graph block on, since the system preamble and any ICL graphs are text no crosslink reaches. $\mathcal{E}_\text{Tx}$ is the directed cycle $i \to i + 1 \bmod c$, $\mathcal{E}_\text{Sc}$ carries both directions and therefore magnitude alone, and $\mathcal{E}_\text{Cross}$ runs $\mathcal{V}_\text{Sc} \to \mathcal{V}_\text{Tx}$ and never back, so that the arrowheads land on the cycle and the phase $\Theta^{(r)} = 2 \pi r$ survives on exactly the edges that bind text to scene; a symmetric pair would cancel it. The anchor bond $t_0 \to a \to v_0$ adds one node and two edges, which is what keeps $\mathcal{G}$ one component whatever $\mathcal{E}_\text{Cross}$ covers, and so keeps every $R^{(r)}_\text{eff}(u, v)$ finite without reshaping it as a fan to all of $\mathcal{V}_\text{Sc}$ would.
 
 # In[ ]:
 
 
 # Define the effective-resistance target and the covariance metric that must match it.
-ALPHA = 1.0
-
-
 @torch.no_grad()
 def magnetic_resistance(graph, conv) -> Tensor:
     """R_eff(u, v) = (e_u - e_v)^H (L̄^(r))† (e_u - e_v) over the whole composite graph.
@@ -1233,7 +1235,16 @@ conv = gnn.pe_model.pe_gcn.convs[0]
 assert model_hparams['directed'], 'the resistance target is defined by the magnetic shift'
 assert model_hparams['pe_pool'] == 'gt', 'C is the second moment of T(Φ), not of Φ'
 
-res_composite = build_composite_graph(graph_file_by_name[graph_file], tokenizer, device=device)
+# Read off a TRAIN graph, not `graph_file`: that one is drawn from the eval pool
+# `test_keys` samples, and α is a scalar the training loss uses. One plan, as
+# `generate_data` builds them, so these diagnostics describe the regime §3 trains in.
+assert train_keys, 'train_samples // plans_per_graph rounded to zero train keys'
+res_key = train_keys[0]
+res_composite = build_composite_graph(
+    graph_file_by_name[res_key], tokenizer, device=device,
+    plan_files=sorted(glob.glob(
+        f"{plan_path}/sample_{res_key.split('_')[-1]}_*.json"))[:1],
+)
 c_res = res_composite.num_token_nodes
 check_composite(res_composite, c_res)
 R = magnetic_resistance(res_composite, conv)[:c_res, :c_res].double()
@@ -1253,10 +1264,22 @@ rank = min(res_composite.num_nodes,
 print(f"Rank bound: min(N, (M - 1)D) = {rank} against N = {res_composite.num_nodes} "
       f"| {'NOT rank-limited' if rank >= res_composite.num_nodes else 'RANK-LIMITED'}")
 
-# The untrained C_tok, to state the scale the loss starts from and the memory it costs.
+# C_tok as §2 leaves it, to state the scale the loss starts from and the memory it costs.
 with torch.no_grad():
     C = probe_covariance(gnn.eval(), res_composite).double()
 assert C.trace() > 0, 'a zero C_tok would leave the metric with nothing to shape'
+
+# α is the unit conversion between R_eff and the scale C_tok is written in, and it is
+# MEASURED at §3's STARTING POINT — the §2-pretrained gnn, not an untrained one — rather
+# than chosen. C's width is set by the blocks, which know nothing of R: at α = 1 the
+# measured d²(C) sits about two orders of magnitude above αR_eff, and MSE would spend its
+# budget collapsing that scale rather than shaping the structure the stage is for. Fixing
+# α to the ratio the model already holds starts the loss on the structure instead.
+# Measured on `res_composite` alone — one graph fixes a scalar to O(1).
+ALPHA = (gram_distances(C).mean() / R.mean()).item()
+assert math.isfinite(ALPHA) and ALPHA > 0, 'α must be a finite positive scale'
+print(f"α: {ALPHA:.4f} (calibrated: d²(C) mean / R_eff mean at §3 start)")
+
 print(f"C_tok: {tuple(C.shape)} | Trace: {C.trace():.4f} | Asymmetry: "
       f"{(C - C.T).abs().max():.2e} | d²(C) mean: {gram_distances(C).mean():.4f} "
       f"against αR_eff mean: {ALPHA * R.mean():.4f} "
