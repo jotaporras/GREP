@@ -43,7 +43,7 @@ gnn:
   # COST at the cap: the contraction forming C_tok is 2*M*c^2*D FLOP (4.4e13 at M=320,
   # D=1024) and C_tok is c^2 fp32 = 268 MB. It scales as c^2, not c — this is the single
   # most expensive number in the file.
-  mask_cycle_size: 2048
+  mask_cycle_size: 8192
   mask_cycle_weight: 1.0
   mask_cycle_causal: false
   mask_crosslink_weight: 0.1
@@ -160,7 +160,7 @@ data:
   # binary is what the notebook assembles composite graphs under; base_config's gaussian
   # affinity is a different scene layer.
   edge_weights: binary
-  max_seq_length: 2048
+  max_seq_length: 8192
 
 trainer:
   bit4: true

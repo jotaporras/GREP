@@ -638,7 +638,7 @@ def build_composite_graph(
     edge_weights: str = 'binary',
     include_edges: bool = False,
     include_tools: bool = False,
-    context_window: int = 2048,
+    context_window: int = 8192,
     cycle_weight: float = 1.0,
     cycle_causal: bool = False,
     crosslink_weight: float = 0.1,
@@ -964,7 +964,7 @@ test_graphs = generate_data(test_keys)
 batch_size = 4
 val_freq = 5
 epochs = _env('E17_EDGE_EPOCHS', 150)
-es_patience = 2
+es_patience = 5
 train_edges = True
 
 def test_loop_edges(dataloader, model, loss_fn, wandb_prefix=None, epoch=None):
@@ -1156,7 +1156,7 @@ render_matrix(out.sigmoid())
 # 
 # Specifically, we take the probe expectation OUTSIDE the Transformer blocks, so that $\mathbf{\Phi}' = T(\Phi)$ is the block output per probe and both moments are taken over it. $T$ is nonlinear, so $\mathbb{E}_\mathbf{q}\big[T(\Phi)\big] \ne T\big(\mathbb{E}_\mathbf{q}[\Phi]\big)$, and this is the already implemented `pe_pool = 'gt'` path of `covariance_token_block`, which chunks the probe axis rather than materializing $\mathbf{\Phi}' \in \mathbb{R}^{M \times N \times D}$. We hold $\alpha$ and the charge $r$ fixed for this stage: a learnable $\alpha$ would be minimized by $(\mathbf{C},\, \alpha) \to (\mathbf{0},\, 0)$, and a learnable $r$ would let the model move $R^{(r)}_\text{eff}$ rather than meet it. Centering leaves $\operatorname{rank}(\mathbf{C}) \le \min\big(N,\, (M - 1)D\big)$, which at $M = 32$ and $D = 1024$ is $31{,}744$, far above $N$, so the metric is not rank-limited and the cell below states the bound rather than assuming it.
 # 
-# We assemble the composite graph exactly as `MagCompGraphLLM` does, through the same `gnn_llm.build_composite_graph`. $\mathcal{V}_\text{Tx}$ is the window of at most $c_{\max} = 2048$ tokens counted from the last scene graph block on, since the system preamble and any ICL graphs are text no crosslink reaches. $\mathcal{E}_\text{Tx}$ is the directed cycle $i \to i + 1 \bmod c$, $\mathcal{E}_\text{Sc}$ carries both directions and therefore magnitude alone, and $\mathcal{E}_\text{Cross}$ runs $\mathcal{V}_\text{Sc} \to \mathcal{V}_\text{Tx}$ and never back, so that the arrowheads land on the cycle and the phase $\Theta^{(r)} = 2 \pi r$ survives on exactly the edges that bind text to scene; a symmetric pair would cancel it. The anchor bond $t_0 \to a \to v_0$ adds one node and two edges, which is what keeps $\mathcal{G}$ one component whatever $\mathcal{E}_\text{Cross}$ covers, and so keeps every $R^{(r)}_\text{eff}(u, v)$ finite without reshaping it as a fan to all of $\mathcal{V}_\text{Sc}$ would.
+# We assemble the composite graph exactly as `MagCompGraphLLM` does, through the same `gnn_llm.build_composite_graph`. $\mathcal{V}_\text{Tx}$ is the window of at most $c_{\max} = 8192$ tokens counted from the last scene graph block on, since the system preamble and any ICL graphs are text no crosslink reaches. $\mathcal{E}_\text{Tx}$ is the directed cycle $i \to i + 1 \bmod c$, $\mathcal{E}_\text{Sc}$ carries both directions and therefore magnitude alone, and $\mathcal{E}_\text{Cross}$ runs $\mathcal{V}_\text{Sc} \to \mathcal{V}_\text{Tx}$ and never back, so that the arrowheads land on the cycle and the phase $\Theta^{(r)} = 2 \pi r$ survives on exactly the edges that bind text to scene; a symmetric pair would cancel it. The anchor bond $t_0 \to a \to v_0$ adds one node and two edges, which is what keeps $\mathcal{G}$ one component whatever $\mathcal{E}_\text{Cross}$ covers, and so keeps every $R^{(r)}_\text{eff}(u, v)$ finite without reshaping it as a fan to all of $\mathcal{V}_\text{Sc}$ would.
 
 # In[ ]:
 
