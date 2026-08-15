@@ -39,8 +39,10 @@ SUBS = [
     (re.compile(r"^get_ipython\(\)\.run_line_magic\((.*)\)$", re.M),
      r"_ = None  # magic: \1"),
     # Env-overridable knobs.
-    (re.compile(r"^suite     = 'suite2'$", re.M),
-     "suite     = _env('E17_SUITE', 'suite2')"),
+    (re.compile(r"^save_suite     = 'suite3'$", re.M),
+     "save_suite     = _env('E17_SAVE_SUITE', 'suite3')"),
+    (re.compile(r"^load_suite     = 'suite2'$", re.M),
+     "load_suite     = _env('E17_LOAD_SUITE', 'suite2')"),
     (re.compile(r"^epochs = 150$", re.M), "epochs = _env('E17_EDGE_EPOCHS', 150)"),
     (re.compile(r"^epochs = 50$", re.M), "epochs = _env('E17_RES_EPOCHS', 50)"),
     (re.compile(r"^        num_samples=320,$", re.M),

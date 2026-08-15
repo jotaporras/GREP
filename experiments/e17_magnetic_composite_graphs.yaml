@@ -36,10 +36,10 @@ gnn:
 
   # --- The composite graph ---
   # c = min(len(prompt), scope_start + mask_cycle_size) - scope_start, counted FROM the
-  # block so the graph block itself is never the part cut. This is a CAP: at
-  # data.max_seq_length=2048 below and scope_start ~ 249 the binding constraint is the
-  # sequence, so c ~ 1800 and the cap never engages. Raise max_seq_length before reading
-  # the cost of c = 8192 into a wall-clock.
+  # block so the graph block itself is never the part cut. MEASURED on this corpus: the
+  # Stage-3 training sequences run 4767-10593 tokens (median 5523) and scope_start ~ 540,
+  # so c reaches ~7650 and this cap DOES engage on the longest few. At max_seq_length 2048
+  # every one of 400 examples was truncated to about a third; 8192 truncates 3.
   # COST at the cap: the contraction forming C_tok is 2*M*c^2*D FLOP (4.4e13 at M=320,
   # D=1024) and C_tok is c^2 fp32 = 268 MB. It scales as c^2, not c — this is the single
   # most expensive number in the file.
@@ -121,8 +121,8 @@ gnn:
   # M is NOT transferable from e17_composite_wire (which ran M=320). There pe_pool='pe'
   # means the GT runs ONCE on [N, D]; here pe_pool='gt' pushes all M probes through the
   # blocks, so the GT activations and nnz(A_k) both scale with M. Measured shapes on this
-  # corpus: c ~ 1800 (max_seq_length 2048 minus scope_start ~ 249), N = c + n + 1 ~ 1830,
-  # E ~ 1960 composite edges (~3.9k after MagNet symmetrizes).
+  # corpus: c up to ~7650 (max_seq_length 8192 minus scope_start ~ 540), N = c + n + 1,
+  # E ~ c + 2|E_Sc| + sum_j |M_j| + 2 composite edges (doubled after MagNet symmetrizes).
   #   one [M, N, D] fp32 tensor         = M * 7.5 MB   ->  M=320: 2.4 GB, M=32: 240 MB
   #   GT retains ~(gt_num_layers+1) of them          ->  M=320: 9.6 GB, M=32: 960 MB
   #   MagNet gather [2*chunk*E, F] cplx = chunk * 8.0 MB  (x2 propagates x 5 convs)

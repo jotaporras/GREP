@@ -33,7 +33,11 @@ if [ "${E17_SMOKE:-0}" = "1" ]; then
          E17_EDGE_EPOCHS E17_RES_EPOCHS
 fi
 
-SUITE="${E17_SUITE:-suite2}"
+# The notebook writes save_suite and reads load_suite; the checkpoint path must follow the
+# one it WRITES or the run trains for hours and then fails the test -f below.
+SAVE_SUITE="${E17_SAVE_SUITE:-suite3}"
+LOAD_SUITE="${E17_LOAD_SUITE:-suite2}"
+SUITE="$SAVE_SUITE"
 NOTEBOOK="notebooks/2026-08-10 e17_magnet_composite_graphs.ipynb"
 SCRIPT="scripts/e17_magnet_composite_graphs.py"
 CKPT="outputs/e17_mag_gt/${SUITE}/mag_gt.pt"
@@ -43,7 +47,8 @@ STAGE3_EPOCHS="${E17_STAGE3_EPOCHS:-3}"
 STAGE3_MAX_STEPS="${E17_STAGE3_MAX_STEPS:-0}"
 # W&B must not block an unattended run; override with E17_WANDB_MODE=online.
 export WANDB_MODE="${E17_WANDB_MODE:-offline}"
-export E17_SUITE="$SUITE"
+export E17_SAVE_SUITE="$SAVE_SUITE"
+export E17_LOAD_SUITE="$LOAD_SUITE"
 
 echo "=== [1/3] notebook -> script ($(date +%H:%M:%S))"
 jupyter nbconvert --to script --output-dir=scripts \
