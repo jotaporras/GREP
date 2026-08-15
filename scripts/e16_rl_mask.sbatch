@@ -55,6 +55,9 @@ GRAD_ACCUM=${GRAD_ACCUM:-8}
 ROLLOUT_BATCH=${ROLLOUT_BATCH:-16}
 STRUCTURAL_LR_MULT=${STRUCTURAL_LR_MULT:-1}
 POLICY_BIT4=${POLICY_BIT4:-true}
+# Space-separated extra hydra overrides, e.g. "+trainer.rl.grpo.temperature=1.15".
+# Expanded unquoted on purpose so each override becomes its own argv entry.
+EXTRA_OVERRIDES=${EXTRA_OVERRIDES:-}
 
 RUN_NAME=${1:-${RUN_NAME:-e16_rl_mask_e13f}}
 # LOCKED campaign tag (see AGENTS.md memory: never invent/change experiment tags).
@@ -89,6 +92,7 @@ srun python -m prism.training.train_rl \
     +trainer.rl.grpo.gradient_checkpointing=true \
     +trainer.rl.grpo.save_steps=50 \
     +trainer.rl.grpo.save_strategy=steps \
-    wandb.run_name="$RUN_NAME" wandb.tag="$TAG"
+    wandb.run_name="$RUN_NAME" wandb.tag="$TAG" \
+    $EXTRA_OVERRIDES
 
 echo "[$(date --iso-8601=seconds)] $RUN_NAME DONE"
