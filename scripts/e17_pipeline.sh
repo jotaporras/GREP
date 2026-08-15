@@ -45,6 +45,11 @@ STAGE3_EPOCHS="${E17_STAGE3_EPOCHS:-3}"
 # Smoke: E17_STAGE3_MAX_STEPS=1 runs ONE gradient step (train_v3 switches to step-based
 # save/eval when max_steps > 0). 0 = epoch-based, i.e. the real run.
 STAGE3_MAX_STEPS="${E17_STAGE3_MAX_STEPS:-0}"
+# §3 keeps TWO M=320 autograd graphs alive per sample (probe_covariance for C_tok, plus
+# the detector's cached_pe), and c varies 270-808 across samples, so the caching allocator
+# fragments badly: the OOM that killed a full run reported 14.5 GiB allocated against 8.0
+# GiB reserved-but-unallocated. expandable_segments lets those blocks be reused.
+export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
 # W&B must not block an unattended run; override with E17_WANDB_MODE=online.
 export WANDB_MODE="${E17_WANDB_MODE:-offline}"
 export E17_SAVE_SUITE="$SAVE_SUITE"
