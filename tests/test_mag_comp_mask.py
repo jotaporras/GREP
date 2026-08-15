@@ -814,3 +814,46 @@ def test_no_future_leak_at_refresh_above_one():
     assert torch.allclose(full[0, 0, :cut, :cut], short[0, 0], atol=1e-5), (
         "a query's bias changed when LATER tokens were removed — training is still "
         "rounding up and reading its own future")
+
+
+def test_isolated_unmentioned_scene_nodes_are_pruned():
+    """A scene node with no edge and no mention must not enter the composite.
+
+    Nothing of any edge class touches it, so it would contribute a pure-noise row to C and
+    split G into components across which R_eff is infinite. A scene-isolated node that IS
+    mentioned stays: MagNet symmetrizes A, so its crosslink carries flow both ways.
+    """
+    # nodes 0-1 joined; node 2 isolated BUT mentioned; node 3 isolated and unmentioned
+    scene = Data(x=torch.zeros(4, 1),
+                 edge_index=torch.tensor([[0, 1], [1, 0]]), num_nodes=4)
+    g = build_composite_graph(
+        scene, input_ids=list(range(10)), scope_start=0,
+        injection_map={0: [(2, 3)], 2: [(6, 7)]}, context_window=10,
+        crosslink_mention_to_node=False, crosslink_bidirectional=True, device='cpu')
+    c = g.num_token_nodes
+    assert g.num_scene_nodes == 3, (
+        f"expected node 3 pruned (3 scene nodes), got {g.num_scene_nodes}")
+    assert g.num_nodes == c + 3 + 1
+
+    # and the result is CONNECTED, which is the whole point
+    import networkx as nx
+    from torch_geometric.utils import to_networkx
+    plain = Data(edge_index=g.edge_index, num_nodes=g.num_nodes)
+    assert nx.is_connected(to_networkx(plain, to_undirected=True)), (
+        "composite still disconnected after pruning")
+
+    # the surviving mentioned-but-isolated node kept its crosslink (remapped 2 -> 2)
+    es = {(int(u), int(v)) for u, v in g.edge_index.t().tolist()}
+    assert any(u >= c and v == 6 for u, v in es), "the mentioned isolated node lost its crosslink"
+
+
+def test_prune_is_a_noop_when_every_scene_node_has_a_neighbour():
+    """The n_30 case: nothing is dropped, so no run changes behaviour."""
+    scene = Data(x=torch.zeros(4, 1),
+                 edge_index=torch.tensor([[0, 1, 1, 2, 2, 3], [1, 0, 2, 1, 3, 2]]),
+                 num_nodes=4)
+    g = build_composite_graph(
+        scene, input_ids=list(range(10)), scope_start=0,
+        injection_map={0: [(2, 4)]}, context_window=10,
+        crosslink_mention_to_node=False, crosslink_bidirectional=True, device='cpu')
+    assert g.num_scene_nodes == 4, "a connected scene graph must be left untouched"

@@ -663,6 +663,35 @@ def build_composite_graph(scene, input_ids, injection_map, scope_start: int = 0,
     if n_scene == 0:
         raise ValueError("the anchor bond needs a scene node to bond to (n_scene=0).")
     device = device or scene.edge_index.device
+
+    # PRUNE the scene nodes no edge of any class would touch: no scene edge AND no mention
+    # inside the window. Nothing propagates in or out of such a node, so it contributes a
+    # pure-noise row to C and splits G into components across which R_eff is infinite.
+    # A node with a mention is KEPT even at scene-degree 0 -- MagNet symmetrizes A, so its
+    # crosslink carries flow both ways. A no-op wherever every scene node has a neighbour.
+    scene_deg = torch.zeros(n_scene, dtype=torch.long)
+    if scene.edge_index.numel():
+        scene_deg.scatter_add_(0, scene.edge_index[0].cpu(),
+                               torch.ones(scene.edge_index.shape[1], dtype=torch.long))
+    windowed = {j for j, spans in injection_map.items()
+                if any(max(s, scope_start) < min(e, scope_start + c) for s, e in spans)}
+    keep = [j for j in range(n_scene) if scene_deg[j] > 0 or j in windowed]
+    if not keep:
+        raise ValueError("every scene node is isolated and unmentioned; G would be empty.")
+    if len(keep) != n_scene:
+        keep_t = torch.tensor(keep)
+        lut = torch.full((n_scene,), -1, dtype=torch.long)
+        lut[keep_t] = torch.arange(len(keep))
+        pruned = Data(x=scene.x[keep_t] if getattr(scene, "x", None) is not None else None,
+                      num_nodes=len(keep),
+                      edge_index=lut[scene.edge_index.cpu()].to(scene.edge_index.device))
+        if getattr(scene, "edge_weight", None) is not None:
+            pruned.edge_weight = scene.edge_weight      # no EDGE is dropped, only nodes
+        if getattr(scene, "node_names", None) is not None:
+            pruned.node_names = [scene.node_names[j] for j in keep]
+        pruned.raw_scene_graph = getattr(scene, "raw_scene_graph", None)
+        injection_map = {int(lut[j]): v for j, v in injection_map.items() if j in windowed}
+        scene, n_scene = pruned, len(keep)
     rows, cols, vals = [], [], []
 
     def _add(src, dst, w):
