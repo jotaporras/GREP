@@ -1430,7 +1430,7 @@ batch_size = 4
 val_freq = 5
 epochs = _env('E17_RES_EPOCHS', 50)
 es_patience = 5
-multiplier = 10e-10
+multiplier = 1e-10
 train_resistance = True
 
 
