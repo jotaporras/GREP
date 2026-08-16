@@ -24,11 +24,9 @@ def _env(name, default):
 
 # ## Introduction
 
-# The current codebase focuses on delivering text $\mathbf{X}$ and positional encodings $\Psi$ through separate channels to the LLM, which seems to be confounding their interleaving process. $\Psi$, the GREPs, are defined as follows:
+# The current codebase focuses on delivering text $\mathbf{X}$ and positional encodings $\Psi$ through separate channels to the LLM, which seems to be confounding their interleaving process. The positional encodings are acquired from an Expectational Graph Transformer (E-GT) delivering $\Psi$, the GREPs, defined as follows:
 # 
-# $$\Phi = \Phi\big(\mathbf{q};\, \mathbf{S}, \mathcal{H}\big) \qquad \mathbf{P} \coloneqq \mathbb{E}_{\mathbf{q} \sim \mathcal{N}(0,\, \mathbf{I}_D)}\big[\Phi\big] \qquad \mathbf{C} \coloneqq \mathbb{E}_{\mathbf{q}}\big[\Phi\Phi^\top\big] - \mathbf{P}\mathbf{P}^\top$$
-# 
-# $$\mathbf{\Psi} = \Phi\big(\mathbf{X} + \mathbf{P};\, \mathcal{T}\big) \quad \text{or} \quad \mathbf{\Psi} = \Phi\bigg((\mathbf{I}_{n + c} + \mathbf{C})\begin{bmatrix}\mathbf{X} \\ \mathbf{P}\end{bmatrix};\, \mathcal{T}\bigg)$$
+# $$\Phi = \Phi\big(\Phi\big(\mathbf{q};\, \mathbf{S}, \mathcal{H}\big);\, \mathcal{T}\big) \qquad \mathbf{\Psi} \coloneqq \mathbb{E}_{\mathbf{q} \sim \mathcal{N}(0,\, \mathbf{I}_D)}\big[\Phi\big] \qquad \mathbf{C} \coloneqq \mathbb{E}_{\mathbf{q}}\big[\Phi\Phi^\top\big] - \mathbf{\Psi}\mathbf{\Psi}^\top$$
 # 
 # In this experiment, we wish to work with the Composite Graph paradigm to determine whether the MagNet architecture from the paper [“MagNet: A Neural Network for Directed Graphs” (Zhang et al., 2021)](https://arxiv.org/pdf/2102.11391) can encode the directional spectral information essential to the full Composite Graphs architecture to correct the issues that were appearing during the latest iteration of the experiment in June.
 # 
@@ -1313,13 +1311,13 @@ res_composite = build_composite_graph(
 c_res = res_composite.num_token_nodes
 check_composite(res_composite, c_res)
 R = magnetic_resistance(res_composite, conv)[:c_res, :c_res].double()
-print(f"R_eff: {tuple(R.shape)} | Charge: {conv.r:.4f} | Asymmetry: {(R - R.T).abs().max():.2e} "
+print(f"R_eff: {tuple(R.shape)} | Charge: {conv.r.detach():.4f} | Asymmetry: {(R - R.T).abs().max():.2e} "
       f"| Diagonal: {R.diagonal().abs().max():.2e} | Min: {R.min():.4f}, "
       f"Mean: {R.mean():.4f}, Max: {R.max():.4f}")
 
 # The charge margin δ(r, c) = dist(2rc, Z), as `ChargeDegeneracyCallback` reports it:
 # at δ = 0 the cycle's eigenvalues collide and the direction of E_Tx is destroyed.
-s = 2 * float(conv.r) * c_res
+s = 2 * float(conv.r.detach()) * c_res
 print(f"Charge margin: δ(r, c) = {min(s % 1, 1 - s % 1):.4f} at 2rc = {s:.3f}")
 
 # C is a centered sample covariance of M probe responses of width D, so
@@ -1519,7 +1517,7 @@ def train_loop_resistance(train_dataloader, val_dataloader, test_dataloader, mod
         'batch_size': batch_size, 'epochs': epochs,
         'val_freq': val_freq, 'es_patience': es_patience,
         'plans_per_graph': plans_per_graph,
-        'charge': float(conv.r), 'alpha': ALPHA,
+        'charge': float(conv.r.detach()), 'alpha': ALPHA,
         **optimizer_hparams(optimizer),
         **scheduler_hparams(scheduler),
         **loss_hparams(loss_fn['resistance']),
@@ -1645,7 +1643,7 @@ if eval_n100 and n100_res:
         'eval_corpus': 'n_100', 'trained_on': 'n_30',
         'scene_nodes': 'approx 100 vs 30 in training',
         'batch_size': batch_size, 'plans_per_graph': plans_per_graph,
-        'charge': float(conv.r), 'alpha': ALPHA,
+        'charge': float(conv.r.detach()), 'alpha': ALPHA,
         'weights_from': save_path_gt if train_resistance else load_path_gt,
         'n100_graphs': len(n100_keys), 'n100_samples': len(n100_res),
         **loss_hparams(loss_fn['resistance']),
