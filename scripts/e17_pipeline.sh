@@ -131,7 +131,6 @@ uv run -m prism.training.train_v3 --config-name=e17_ms_stage3 \
     ${E17_NUM_SAMPLES:+gnn.num_samples=$E17_NUM_SAMPLES} \
     ${E17_EVAL_GRAPHS:+eval.num_graphs=$E17_EVAL_GRAPHS} \
     trainer.epochs="$STAGE3_EPOCHS" \
-    trainer.max_steps="$STAGE3_MAX_STEPS" \
     trainer.checkpoint_dir="outputs/e17_magnetic_composite_graphs/${SUITE}" \
     trainer.save_name="e17_ms_stage3_${SUITE}" \
     ${INIT_LORA:+trainer.init_lora_from=$INIT_LORA} \
