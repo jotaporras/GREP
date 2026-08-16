@@ -59,6 +59,12 @@ def train_rl(config: omegaconf.DictConfig) -> None:
         # The checkpoint records its SFT-time structural_lr_mult (e.g. e13f:
         # 0.012); the RL tower LR is THIS run's knob, so the live config wins.
         gnn_config["structural_lr_mult"] = float(config.gnn.structural_lr_mult)
+        # Free-form arch overrides on top of the checkpoint's recorded config —
+        # e.g. e17: +trainer.rl.gnn_overrides.post_fusion=true enables the
+        # zero-init residual injection on a warm-started mask checkpoint. The
+        # merged dict is what save_run_dir records, so the new fields persist.
+        gnn_overrides = _freeform(rl_cfg.get("gnn_overrides"))
+        gnn_config.update(gnn_overrides)
         is_mask_arch = gnn_config.get("architecture") in MASK_ARCHS
         # Additive archs also need the engine-policy fields (and the same call
         # fails loud on unservable archs) — mask archs skip vLLM entirely.
@@ -71,6 +77,15 @@ def train_rl(config: omegaconf.DictConfig) -> None:
                 f"{init_checkpoint} is a plain-LLM checkpoint; the graph RL "
                 "trainer needs a graph checkpoint. Plain-LLM RL uses "
                 "stock trl GRPOTrainer with use_vllm=True (the control arm).")
+        if gnn_config.get("post_fusion", False) and not getattr(
+                model, "_post_fusion", False):
+            # Warm start from a PRE-post-fusion checkpoint (e17 v1): the loader
+            # rebuilt the plain mask arch from the recorded config; attach the
+            # fresh zero-init residual pathway now (bitwise no-op at init).
+            model.enable_post_fusion(
+                layer_scope=gnn_config.get("post_fusion_layer_scope",
+                                           "dense_top_half"),
+                d_gt=gnn_config["d_model"])
         if hasattr(model.llm, "_prism_peft_handle"):
             # Under nf4 the checkpoint's LoRA stays ATTACHED inside the inner
             # .llm (merging would round it into the nf4 grid — see loaders,

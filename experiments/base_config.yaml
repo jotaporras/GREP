@@ -104,6 +104,11 @@ gnn:
   mask_alpha: 0.7            # edge value = alpha + (1-alpha)*sim; non-edge = blocked (alpha in [0,1))
   mask_layer_scope: dense    # "all" = every layer | "dense" = all global layers | "dense_top_half" = deeper half of globals | "dense_first" = first global only
   mask_psi_scale: cosine     # "cosine" (row-normalized, sim in [-1,1]) | "inv_sqrt_d" (Gemma-style raw/sqrt(D))
+  # e17 post-fusion: gated residual injection of proj(Psi) at query-role node
+  # positions on the scoped layers. tanh(gain) zero-init => bitwise no-op at
+  # init, so pre-e17 mask checkpoints warm-start unchanged.
+  post_fusion: false
+  post_fusion_layer_scope: dense_top_half   # same vocabulary as mask_layer_scope
 
   # --- wire_llm (WIRE: Psi enters as a ROTATION of q/k, not an added signal) ---
   # q_i -> R(theta_i) q_i, k_j -> R(theta_j) k_j with theta_n = omega_n . Psi_i, composed

@@ -523,8 +523,14 @@ class MaskGRPOTrainer(GRPOTrainer):
             prompt_ids, node_token_seqs, scope_start=scope_start)
         device = next(self._core.parameters()).device
         node_values = mask_node_values(self._core, pyg_graph, device)
+        # Post-fusion: snapshot raw Ψ for decode-step arming (rollouts run
+        # no-grad; the loss-side forward recomputes Ψ WITH grad itself).
+        psi = None
+        if getattr(self._core, "_post_fusion", False):
+            with torch.no_grad():
+                psi = self._core.pe_model(pyg_graph).float()
         entry = (prompt_ids, pyg_graph, injection_map, node_token_seqs,
-                 node_values)
+                 node_values, psi)
         self._prompt_cache[prompt] = entry
         return entry
 
@@ -544,6 +550,14 @@ class MaskGRPOTrainer(GRPOTrainer):
         if pe is not None and any(p.dtype != torch.float32
                                   for p in pe.parameters()):
             pe.float()
+        if getattr(self._core, "_post_fusion", False):
+            # Same contract for the post-fusion modules (fp32 tower side; the
+            # hook casts the signal to the hidden-state dtype at read time).
+            for mod in (self._core.pf_proj, self._core.pf_norm):
+                if any(p.dtype != torch.float32 for p in mod.parameters()):
+                    mod.float()
+            if self._core.pf_gain.dtype != torch.float32:
+                self._core.pf_gain.data = self._core.pf_gain.data.float()
 
     # --------------------------------------------------------------- rollouts
 
@@ -592,23 +606,33 @@ class MaskGRPOTrainer(GRPOTrainer):
                                    dtype=torch.long, device=device)
             attn = torch.zeros((len(chunk), max_len), dtype=torch.long,
                                device=device)
-            padded_maps, row_states, graphs = [], [], []
-            for b, (pids, g, imap, seqs, node_values) in enumerate(entries):
+            padded_maps, row_states, graphs, psi_by_row = [], [], [], []
+            for b, (pids, g, imap, seqs, node_values, psi) in enumerate(entries):
                 off = max_len - len(pids)
                 batch_ids[b, off:] = torch.tensor(pids, device=device)
                 attn[b, off:] = 1
                 pmap = self._offset_map(imap, off)
                 padded_maps.append(pmap)
                 graphs.append(g)
+                psi_by_row.append(psi)
                 row_states.append(_MaskDecodeRowState(
                     node_values, tok2node_vector(pmap, max_len, device), seqs))
-            injector = BatchedMaskDecodeInjector(core, row_states, max_len)
+            post_fusion = getattr(core, "_post_fusion", False)
+            injector = BatchedMaskDecodeInjector(
+                core, row_states, max_len,
+                psi_by_row=psi_by_row if post_fusion else None)
             handle = core.llm.register_forward_pre_hook(
                 injector.pre_hook, with_kwargs=True)
             try:
                 with torch.no_grad():
                     core._struct_bias = core.build_structural_mask(
                         max_len, graphs, padded_maps, device)
+                    if post_fusion:
+                        # generate() bypasses the wrapper forward, so the
+                        # prefill residual signal is armed manually here (the
+                        # decode steps are armed by the injector).
+                        core._pf_signal = core.build_pf_signal(
+                            max_len, graphs, padded_maps, device)
                     out = core.llm.generate(
                         input_ids=batch_ids, attention_mask=attn,
                         max_new_tokens=self.max_completion_length,
@@ -623,6 +647,8 @@ class MaskGRPOTrainer(GRPOTrainer):
                 core._struct_bias = None
                 handle.remove()
                 core._decode_bias_row = None
+                core._pf_signal = None
+                core._pf_decode_vec = None
             completions = out[:, max_len:]
             if completions.shape[1] > 1 and injector.decode_steps == 0:
                 raise RuntimeError(
@@ -649,7 +675,7 @@ class MaskGRPOTrainer(GRPOTrainer):
         hit = self._row_map_cache.get(key)
         if hit is not None:
             return hit
-        _pids, _g, _imap, node_token_seqs, _nv = entry
+        _pids, _g, _imap, node_token_seqs, _nv, _psi = entry
         scope_start = find_last_graph_scope(toks, self.processing_class)
         full_map = build_injection_map(toks, node_token_seqs,
                                        scope_start=scope_start)

@@ -134,7 +134,11 @@ def build_planner_model(gnn, llm, tokenizer, *, disable_graph_token_rope=False,
             k_hops=gnn.mask_k_hops, symmetrize=gnn.mask_symmetrize,
             use_edges=gnn.mask_use_edges, psi_scale=gnn.mask_psi_scale,
             buggy_causal_fold=gnn.mask_buggy_causal_fold,
-            disable_graph_token_rope=disable_graph_token_rope)
+            disable_graph_token_rope=disable_graph_token_rope,
+            post_fusion=gnn.get("post_fusion", False),
+            post_fusion_layer_scope=gnn.get("post_fusion_layer_scope",
+                                            "dense_top_half"),
+            post_fusion_d_gt=gnn.d_model)
         collator = data.SpineDataCollator(tokenizer, mlm=False)
 
         if freeze_llm:

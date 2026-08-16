@@ -793,7 +793,10 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
     def __init__(self, llm: nn.Module, pe_model: nn.Module, alpha: float = 0.7,
                  layer_scope: str = "dense", k_hops: int = 1, symmetrize: bool = True,
                  use_edges: bool = True, psi_scale: str = "cosine", eps: float = 1e-8,
-                 buggy_causal_fold: bool = False, disable_graph_token_rope: bool = False):
+                 buggy_causal_fold: bool = False, disable_graph_token_rope: bool = False,
+                 post_fusion: bool = False,
+                 post_fusion_layer_scope: str = "dense_top_half",
+                 post_fusion_d_gt: int | None = None):
         # Wrapper is not a registered HF architecture or MoE class; force "eager" so
         # PreTrainedModel doesn't reject SDPA/flash or expert-impl validation.
         config = copy.copy(llm.config)
@@ -843,11 +846,115 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         # Per-forward additive attention bias [B, 1, seq, seq]; carries grad to the GT.
         self._struct_bias: torch.Tensor | None = None
         self._decode_bias_row: torch.Tensor | None = None
+        # e17 candidate A — post-fusion residual injection (off unless enabled).
+        self._post_fusion: bool = False
+        self._pf_signal: torch.Tensor | None = None       # [B, S, hidden] fp32
+        self._pf_decode_vec: torch.Tensor | None = None   # [B, 1, hidden] fp32
         self._install_graph_mask()
+        if post_fusion:
+            self.enable_post_fusion(post_fusion_layer_scope, post_fusion_d_gt)
+
+    def enable_post_fusion(self, layer_scope: str, d_gt: int | None) -> None:
+        """Install the e17-A post-fusion pathway: gated residual Ψ injection.
+
+        At each in-scope decoder layer, node-token hidden states receive::
+
+            h[p] += tanh(pf_gain_l) · pf_norm(pf_proj(Ψ[node(p)]))
+
+        ``pf_gain`` is zero-initialised, so an enabled-but-untrained pathway is a
+        bitwise no-op — the SFT warm start's behaviour is unchanged at init. The
+        projection/norm are SHARED across layers (one per-layer scalar gain), so
+        the added capacity stays ~d_gt·hidden. Positions are the QUERY-role
+        injection-map spans — the same single definition of "graph token" the
+        mask and identity-RoPE use. Callable post-hoc on a loaded checkpoint
+        (the RL warm-start path) or from ``__init__`` (rebuilds/from-scratch).
+        """
+        if self._post_fusion:
+            raise RuntimeError("post-fusion is already enabled on this model.")
+        if layer_scope not in MASK_LAYER_SCOPES:
+            raise ValueError(
+                f"post_fusion_layer_scope must be one of {MASK_LAYER_SCOPES}, "
+                f"got {layer_scope!r}")
+        if not d_gt:
+            raise ValueError(
+                "post_fusion_d_gt (the Ψ producer's output width, gnn.d_model) "
+                "is required to size pf_proj.")
+        hidden = self.llm.config.get_text_config().hidden_size
+        device = next(self.llm.parameters()).device
+        # fp32 like the tower (build_structural_mask contract); hooks cast per use.
+        self.pf_proj = nn.Linear(int(d_gt), hidden).float().to(device)
+        self.pf_norm = nn.RMSNorm(hidden).float().to(device)
+        layers = self._decoder_layers()
+        flags = resolve_mask_active_flags(layers, layer_scope)
+        active_idx = [i for i, f in enumerate(flags) if f]
+        self.pf_gain = nn.Parameter(
+            torch.zeros(len(active_idx), dtype=torch.float32, device=device))
+        self._pf_handles = []
+        for slot, layer_i in enumerate(active_idx):
+            self._pf_handles.append(layers[layer_i].register_forward_pre_hook(
+                self._make_pf_hook(slot), with_kwargs=True))
+        self._pf_layer_scope = layer_scope
+        self._pf_d_gt = int(d_gt)
+        self._post_fusion = True
+
+    def _make_pf_hook(self, slot: int):
+        def hook(module, args, kwargs):
+            hs = kwargs.get("hidden_states")
+            in_args = hs is None and bool(args)
+            if in_args:
+                hs = args[0]
+            if hs is None or not torch.is_tensor(hs):
+                return None
+            sig = None
+            if (self._pf_signal is not None
+                    and hs.shape[:2] == self._pf_signal.shape[:2]):
+                sig = self._pf_signal                      # prefill / full forward
+            elif (self._pf_decode_vec is not None and hs.shape[1] == 1
+                    and hs.shape[0] == self._pf_decode_vec.shape[0]):
+                sig = self._pf_decode_vec                  # cached decode step
+            if sig is None:
+                return None
+            gain = torch.tanh(self.pf_gain[slot]).to(dtype=hs.dtype)
+            hs = hs + gain * sig.to(device=hs.device, dtype=hs.dtype)
+            if in_args:
+                return (hs,) + tuple(args[1:]), kwargs
+            return args, {**kwargs, "hidden_states": hs}
+        return hook
+
+    def _pf_project(self, psi: torch.Tensor) -> torch.Tensor:
+        """``pf_norm(pf_proj(Ψ))`` in fp32; Ψ is ``[*, d_gt]``."""
+        return self.pf_norm(self.pf_proj(psi.float()))
+
+    def build_pf_signal(self, seq_len, graphs, injection_maps, device,
+                        permutation=None) -> torch.Tensor:
+        """Post-fusion residual signal ``[B, seq, hidden]`` (fp32, carries grad).
+
+        Zero everywhere except QUERY-role node-token positions, which carry the
+        projected Ψ of their node. The per-layer ``tanh(pf_gain)`` gate is applied
+        at the hook, not here, so one signal serves every in-scope layer.
+        """
+        hidden = self.pf_proj.out_features
+        sig = torch.zeros(len(injection_maps), seq_len, hidden,
+                          device=device, dtype=torch.float32)
+        for b, imap in enumerate(injection_maps):
+            tok2node = tok2node_vector(imap, seq_len, device)
+            pos = (tok2node >= 0).nonzero(as_tuple=True)[0]
+            if pos.numel() == 0:
+                continue
+            psi = self.pe_model(graphs[b], permutation=permutation).float()
+            vec = self._pf_project(psi).to(device)         # [N, hidden]
+            sig[b, pos] = vec[tok2node[pos]]
+        return sig
 
     def structural_parameters(self) -> list[nn.Parameter]:
-        """Graph-side parameters for the boosted-LR group: the standalone GT."""
-        return list(self.pe_model.parameters())
+        """Graph-side parameters for the boosted-LR group: the standalone GT
+        (plus the post-fusion projection/norm/gains when enabled)."""
+        params = list(self.pe_model.parameters())
+        if self._post_fusion:
+            params += list(self.pf_proj.parameters())
+            params += list(self.pf_norm.parameters())
+            params.append(self.pf_gain)
+        return params
 
     def graph_token_position_ids(
         self,
@@ -1029,8 +1136,14 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             self._struct_bias = self.build_structural_mask(
                 input_ids.shape[1], graphs, injection_maps, input_ids.device,
                 key_injection_maps=key_injection_maps)
+            if self._post_fusion:
+                # Same QUERY-role spans as the mask/identity-RoPE — one
+                # definition of "graph token" (see enable_post_fusion).
+                self._pf_signal = self.build_pf_signal(
+                    input_ids.shape[1], graphs, injection_maps, input_ids.device)
         else:
             self._struct_bias = None
+            self._pf_signal = None
         # Identity-RoPE the injected spans when requested, unless the caller already
         # supplied position_ids (mirrors GraphAugmentedLLM.forward).
         if (self._disable_graph_token_rope and injection_maps is not None
@@ -1049,6 +1162,7 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             # attention forwards and must see the same bias; every forward rebuilds it).
             if not getattr(self.llm, "is_gradient_checkpointing", False):
                 self._struct_bias = None
+                self._pf_signal = None
 
 
 class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
@@ -2671,6 +2785,9 @@ class _MaskDecodeRowState:
                     q_node = nid
                 elif end - 1 == p_suffix - 1 and (nid, (start, end)) not in prev_committed:
                     q_node = nid
+        # Exposed for the post-fusion decode extension (BatchedMaskDecodeInjector
+        # arms the residual vector for exactly the query-tagged steps).
+        self.last_q_node = q_node
         if q_node < 0:
             return None
         device = self.node_values.device
@@ -2702,14 +2819,20 @@ class BatchedMaskDecodeInjector:
     must fail loud on ``_disable_graph_token_rope``.
     """
 
-    def __init__(self, model, row_states: list, padded_prompt_len: int):
+    def __init__(self, model, row_states: list, padded_prompt_len: int,
+                 psi_by_row: list | None = None):
         if getattr(model, "_disable_graph_token_rope", False):
             raise ValueError(
                 "BatchedMaskDecodeInjector does not support identity-RoPE "
                 "checkpoints: the decode-step position_ids rewrite is per-row.")
+        if getattr(model, "_post_fusion", False) and psi_by_row is None:
+            raise ValueError(
+                "post-fusion is enabled on the model but psi_by_row was not "
+                "supplied — decode steps would silently skip the residual write.")
         self.model = model
         self.rows = row_states
         self.prompt_len = padded_prompt_len
+        self.psi_by_row = psi_by_row
         self.device = next(model.parameters()).device
         # Counts single-token decode forwards. Cache-less generation (e.g.
         # gradient checkpointing left enabled in train mode) re-runs the full
@@ -2734,6 +2857,8 @@ class BatchedMaskDecodeInjector:
             row = state.step(int(toks[b]), self.prompt_len)
             rows_out.append(row)
             any_tagged = any_tagged or row is not None
+        if getattr(self.model, "_post_fusion", False):
+            self._arm_pf([state.last_q_node for state in self.rows])
         if not any_tagged:
             self.model._decode_bias_row = None
             return
@@ -2744,6 +2869,24 @@ class BatchedMaskDecodeInjector:
             if row is not None:
                 bias[b, 0, 0] = row
         self.model._decode_bias_row = bias
+
+    def _arm_pf(self, q_nodes: list):
+        """Arm the post-fusion decode vector [B, 1, hidden] for tagged rows.
+
+        Same tagging as the bias rows: a row whose current query is untagged
+        contributes a zero vector (identical to the prefill non-node positions).
+        """
+        if all(q < 0 for q in q_nodes):
+            self.model._pf_decode_vec = None
+            return
+        hidden = self.model.pf_proj.out_features
+        vec = torch.zeros(len(q_nodes), 1, hidden, dtype=torch.float32,
+                          device=self.device)
+        with torch.no_grad():
+            for b, q in enumerate(q_nodes):
+                if q >= 0:
+                    vec[b, 0] = self.model._pf_project(self.psi_by_row[b][q])
+        self.model._pf_decode_vec = vec
 
 
 class MaskDecodeInjector:
@@ -2783,6 +2926,13 @@ class MaskDecodeInjector:
         # unpermuted decode extension would mix two different node labellings mid-rollout.
         self.node_values = mask_node_values(model, pyg_graph, self.device,
                                             permutation=permutation)
+        # Post-fusion: keep the raw Ψ rows so tagged decode steps can arm the
+        # residual vector with the SAME tower output the prefill signal used.
+        self._pf_psi = None
+        if getattr(model, "_post_fusion", False):
+            with torch.no_grad():
+                self._pf_psi = model.pe_model(
+                    pyg_graph, permutation=permutation).float()
         self.prompt_tok2node = tok2node_vector(prompt_injection_map, prompt_len,
                                                self.device)
         # Flattened variant list for the partial-mention ambiguity check.
@@ -2839,7 +2989,13 @@ class MaskDecodeInjector:
                     q_node = nid
         if q_node < 0:
             self.model._decode_bias_row = None    # untagged query: bias row is all-zero
+            if self._pf_psi is not None:
+                self.model._pf_decode_vec = None
             return
+        if self._pf_psi is not None:
+            with torch.no_grad():
+                self.model._pf_decode_vec = self.model._pf_project(
+                    self._pf_psi[q_node]).view(1, 1, -1)
         k_len = self.prompt_len + len(self.generated)
         tok2node_k = torch.full((k_len,), -1, dtype=torch.long, device=self.device)
         tok2node_k[:self.prompt_len] = self.prompt_tok2node

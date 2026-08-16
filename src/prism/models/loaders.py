@@ -374,9 +374,26 @@ def graph_augmented_llm_from_pretrained(
             psi_scale=gnn_cfg.get("mask_psi_scale", "cosine"),
             buggy_causal_fold=gnn_cfg.get("mask_buggy_causal_fold", False),
             disable_graph_token_rope=gnn_cfg.get("disable_graph_token_rope", False),
+            post_fusion=gnn_cfg.get("post_fusion", False),
+            post_fusion_layer_scope=gnn_cfg.get("post_fusion_layer_scope",
+                                                "dense_top_half"),
+            post_fusion_d_gt=gnn_cfg["d_model"],
         )
         gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
         _load_psi_producer_state(model.pe_model, gnn_weights["pe_model"], path, gnn_cfg)
+        if gnn_cfg.get("post_fusion", False):
+            # Fail loud: a post-fusion checkpoint whose pf weights are absent would
+            # silently reload as a zero-gain no-op (= plain mask arch).
+            missing = [k for k in ("pf_proj", "pf_norm", "pf_gain")
+                       if k not in gnn_weights]
+            if missing:
+                raise KeyError(
+                    f"{os.path.join(path, 'gnn_weights.pt')} records post_fusion=true "
+                    f"but is missing {missing} — the post-fusion weights were not "
+                    "checkpointed.")
+            model.pf_proj.load_state_dict(gnn_weights["pf_proj"])
+            model.pf_norm.load_state_dict(gnn_weights["pf_norm"])
+            model.pf_gain.data.copy_(gnn_weights["pf_gain"])
     elif architecture in ("postfusion_graph_llm", "composite_graph_gt"):
         raise ValueError(
             f"architecture {architecture!r} was removed from the codebase (legacy "

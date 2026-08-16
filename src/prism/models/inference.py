@@ -264,6 +264,13 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
                 graph_model._struct_bias = graph_model.build_structural_mask(
                     input_ids.shape[1], [pyg_graph], [injection_map], input_ids.device,
                     permutation=self.permutation)
+                if getattr(graph_model, "_post_fusion", False):
+                    # generate() bypasses the wrapper forward — arm the prefill
+                    # residual signal manually (decode steps: MaskDecodeInjector).
+                    with torch.no_grad():
+                        graph_model._pf_signal = graph_model.build_pf_signal(
+                            input_ids.shape[1], [pyg_graph], [injection_map],
+                            input_ids.device, permutation=self.permutation)
                 # decode_consistent checkpoints extend the channel to generated
                 # mentions: a forward pre-hook arms a per-step bias row (span-end
                 # assignment, design note §2.2). Other scopes keep the historical
@@ -285,6 +292,9 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
                 return outputs[:, input_ids.shape[-1]:]
             finally:
                 graph_model._struct_bias = None
+                if getattr(graph_model, "_post_fusion", False):
+                    graph_model._pf_signal = None
+                    graph_model._pf_decode_vec = None
                 if hook_handle is not None:
                     hook_handle.remove()
                     graph_model._decode_bias_row = None
