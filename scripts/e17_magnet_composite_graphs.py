@@ -258,8 +258,8 @@ save_path = '../data/pickle/e6_eval_graphs.pkl'
 llm_path  = 'google/gemma-4-31B-it'
 device    = 'cuda'
 # The suite this run writes. suite1 is a finished run; never write into it.
-save_suite     = _env('E17_SAVE_SUITE', 'suite3')
-load_suite     = _env('E17_LOAD_SUITE', 'suite2')
+save_suite     = _env('E17_SAVE_SUITE', 'suite4')
+load_suite     = _env('E17_LOAD_SUITE', 'suite3')
 assert save_suite != load_suite
 save_path_gt = f'../outputs/e17_mag_gt/{save_suite}'
 load_path_gt = f'../outputs/e17_mag_gt/{load_suite}'
@@ -1431,7 +1431,7 @@ val_freq = 5
 epochs = _env('E17_RES_EPOCHS', 50)
 es_patience = 5
 multiplier = 1e-10
-train_resistance = True
+train_resistance = False
 
 
 def test_loop_resistance(dataloader, model, loss_fn, wandb_prefix=None, epoch=None):
@@ -1655,11 +1655,4 @@ if eval_n100 and n100_res:
                          {'resistance': gnn, 'edges': detector}, loss_fn,
                          wandb_prefix='test')
     run.finish()
-
-
-# In[ ]:
-
-
-torch.save(gnn.state_dict(), f'{save_path_gt}/mag_gt.pt')
-torch.save(detector.classifier.state_dict(), f'{save_path_gt}/detector.pt')
 
