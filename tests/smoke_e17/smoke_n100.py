@@ -1,4 +1,4 @@
-"""Is the N=100 test set VIABLE for the MagGT on both objectives?
+"""Is the N=100 test set VIABLE for the MagE-GT on both objectives?
 
 Runs the notebook's own cells, then checks the test set is (a) built from completed plans
 only, (b) genuinely ~100 scene nodes, (c) fully crosslinked, (d) scorable by the §2
@@ -91,7 +91,7 @@ if os.path.exists(sd):
     gnn.load_state_dict(torch.load(sd, map_location=ns['device']))
     detector.classifier.load_state_dict(
         torch.load(os.path.join(load, 'detector.pt'), map_location=ns['device']))
-    print(f"loaded trained MagGT from   : {load}")
+    print(f"loaded trained MagE-GT from   : {load}")
     gnn.eval(); detector.eval().to(ns['device'])
     tp = fp = fn = tn = 0
     with torch.no_grad():

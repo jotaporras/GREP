@@ -1,4 +1,4 @@
-"""Is the suite2 MagGT agnostic to the cycle length max_seq_length would change?
+"""Is the suite2 MagE-GT agnostic to the cycle length max_seq_length would change?
 
 Builds the SAME conversation at growing context_window caps and asks whether the encoding's
 scale and the charge margin hold as c grows from the trained range into the 8192 range.

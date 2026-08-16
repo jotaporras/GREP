@@ -88,6 +88,15 @@ gnn:
   hidden_norm: none
 
   # --- The probe statistic ---
+  # NAMING. pe_pool is what separates the two models, which share weights but are
+  # DIFFERENT FUNCTIONS (acceptance A8):
+  #   pe_pool=gt  Psi = E_q[ Phi(Phi(q; S^(r), H), T) ]   MagE-GT, the Magnetic
+  #               EXPECTATIONAL Graph Transformer: the blocks T run PER PROBE and the
+  #               expectation is taken AFTER them, so C is the covariance of the block
+  #               outputs. THIS ARM.
+  #   pe_pool=pe  Psi = Phi( E_q[Phi(q; S^(r), H)], T )   plain MagGT: the expectation is
+  #               taken FIRST and T sees only the first moment, so C would be the
+  #               PRE-block covariance and the blocks would not shape it at all.
   # pe_pool=gt is load-bearing: it is what applies T per probe INSIDE E_q, so both
   # moments are taken over the block outputs. center_second_moment=true makes C the
   # centered covariance (manifestly PSD, no fp32 cancellation).
@@ -126,7 +135,7 @@ gnn:
   #   one [M, N, D] fp32 tensor         = M * 7.5 MB   ->  M=320: 2.4 GB, M=32: 240 MB
   #   GT retains ~(gt_num_layers+1) of them          ->  M=320: 9.6 GB, M=32: 960 MB
   #   MagNet gather [2*chunk*E, F] cplx = chunk * 8.0 MB  (x2 propagates x 5 convs)
-  # M=320 is the notebook's value and this arm now matches it, so the pretrained MagGT is
+  # M=320 is the notebook's value and this arm now matches it, so the pretrained MagE-GT is
   # fitted and consumed under the same probe count rather than a lower-variance C than the
   # LLM ever sees. It costs ~9.6 GB of GT activations: that fits a 48 GB card beside the
   # 31B NF4 base, and does NOT fit a 24 GB one (roughly 4-5 GB free there) — no amount of
@@ -137,7 +146,7 @@ gnn:
   # the MagNet gather at ~64 MB per propagate instead of ~280 MB at the 65536 default.
   max_probe_rows: 16384
 
-  # --- Pretrained MagGT channel ---
+  # --- Pretrained MagE-GT channel ---
   # A GT pretrained by the notebook's resistance-regression stage
   # (2026-08-10 e17_magnet_composite_graphs.ipynb §3, which fits C's induced distances to
   # alpha * R_eff of this same composite graph) is poured in here, straight into
@@ -151,7 +160,7 @@ gnn:
 data:
   # full_sequence scopes the crosslinks to everything from the last `scene graph: •` block
   # on — build_injection_map already takes scope_start=tau — and clamps nothing after it.
-  # This is what the notebook assembles composite graphs under, so the MagGT is pretrained
+  # This is what the notebook assembles composite graphs under, so the MagE-GT is pretrained
   # and consumed on the SAME E_Cross. The cost is a train/eval asymmetry the arm has to
   # own: at train time the answer is in the sequence and its mentions become crosslinks,
   # while at eval the prompt has no answer yet, so the prefill C_tok is built from fewer

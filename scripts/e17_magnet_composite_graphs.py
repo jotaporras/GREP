@@ -598,7 +598,7 @@ render_matrix(ex_graph.paths[node1, node2][None, :], sig_figs=0)
 # In[ ]:
 
 
-# Instantiate THE GNN. One MagGT serves the whole notebook: §1 renders it untrained, §2
+# Instantiate THE GNN. One MagE-GT serves the whole notebook: §1 renders it untrained, §2
 # trains it for link prediction, §3 fine-tunes it on the covariance metric. `model_type` /
 # `model_hparams` are exposed at module scope so init_wandb can log the GNN config.
 def create_gnn(model_type: str, **overrides):

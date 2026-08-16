@@ -47,7 +47,7 @@ defaults:
 name: e17_ms_s2
 
 gnn:
-  # Same MagGT channel Stage 3 consumes, so the two stages start from one encoder.
+  # Same MagE-GT channel Stage 3 consumes, so the two stages start from one encoder.
   pe_gt_from: outputs/e17_mag_gt/suite2/mag_gt.pt
   semantic_gt_from: null
 
@@ -57,7 +57,7 @@ data:
   spine_tools: none
   icl_examples: 0
   # Scoped to the last `scene graph: •` block on and no further, matching the notebook
-  # that pretrains the MagGT; see the base config for the train/eval asymmetry it buys.
+  # that pretrains the MagE-GT; see the base config for the train/eval asymmetry it buys.
   injection_scope: full_sequence
   edge_weights: binary
 

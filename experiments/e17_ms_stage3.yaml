@@ -4,7 +4,7 @@
 #   python -m prism.training.train_v3 --config-name=e17_ms_stage3 \
 #       gnn.pe_gt_from=outputs/e17_mag_gt/suite2/mag_gt.pt
 #
-# RUN STANDALONE (no Stage 2). The MagGT arrives from the NOTEBOOK's resistance +
+# RUN STANDALONE (no Stage 2). The MagE-GT arrives from the NOTEBOOK's resistance +
 # link-prediction pretraining (2026-08-10 e17_magnet_composite_graphs.ipynb, §2 and §3)
 # through gnn.pe_gt_from, and the LoRA starts fresh. Supply trainer.init_lora_from /
 # trainer.init_pe_from ONLY when a Stage-2 run exists to carry: init_pe_from also restores
@@ -23,7 +23,7 @@ defaults:
 name: e17_ms_s3
 
 gnn:
-  # The MagGT the notebook produced. suite2 is the current run; suite1 is finished.
+  # The MagE-GT the notebook produced. suite2 is the current run; suite1 is finished.
   pe_gt_from: outputs/e17_mag_gt/suite2/mag_gt.pt
   semantic_gt_from: null
 

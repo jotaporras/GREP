@@ -393,9 +393,9 @@ def test_producer_preconditions_fail_loud(kw, match):
         MagCompGraphLLM(_llm(), gt, tokenizer=_Tokenizer(), cycle_size=CYCLE)
 
 
-# --------------------------------------------------- the pretrained-MagGT channel
+# --------------------------------------------------- the pretrained-MagE-GT channel
 def test_pretrained_pinned_charge_maggt_loads_and_r_cold_starts(tmp_path):
-    """``gnn.pe_gt_from`` accepts the notebook's PINNED-charge MagGT.
+    """``gnn.pe_gt_from`` accepts the notebook's PINNED-charge MagE-GT.
 
     The resistance-regression stage trains with ``learn_r=False`` so its target is a fixed
     function of the topology; its state dict therefore has no ``r_logit``. The loader must

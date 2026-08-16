@@ -1,0 +1,21 @@
+# @package _global_
+# e17 multistage training — STAGE 1: SFT the LLM (LoRA), edges in text, PE frozen.
+#
+# Pure SFT for a single epoch. The composite graph channel is structurally PRESENT (the
+# architecture is inherited from e17_magnetic_composite_graphs, so this is the same
+# MagCompGraphLLM Stage 3 trains) but FROZEN and gated off at mask_beta_init = 0, so it
+# contributes exactly nothing to the logits and trains nothing — this stage only fits the
+# LoRA adapter to the SPINE style. Inheriting the e17 architecture rather than base_config
+# is what lets the adapter carry into Stage 3 with no architecture mismatch.
+#
+#   python -m prism.training.train_v3 --config-name=e17_ms_stage1
+defaults:
+  - e17_magnetic_composite_graphs
+  - _self_
+
+name: e17_ms_s1
+wandb:
+  run_name: e17_ms_stage1_sft
+trainer:
+  # Stage-1 freeze regime: train ONLY the LoRA; the graph channel stays inert.
+  freeze_pe: true
