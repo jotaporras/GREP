@@ -936,14 +936,19 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         hidden = self.pf_proj.out_features
         sig = torch.zeros(len(injection_maps), seq_len, hidden,
                           device=device, dtype=torch.float32)
-        for b, imap in enumerate(injection_maps):
-            tok2node = tok2node_vector(imap, seq_len, device)
-            pos = (tok2node >= 0).nonzero(as_tuple=True)[0]
-            if pos.numel() == 0:
-                continue
-            psi = self.pe_model(graphs[b], permutation=permutation).float()
-            vec = self._pf_project(psi).to(device)         # [N, hidden]
-            sig[b, pos] = vec[tok2node[pos]]
+        # The loss forward runs under accelerate's bf16 autocast, which would
+        # downcast the fp32 pf_proj matmul (and crash the fp32 index_put
+        # below). The tower contract is fp32 compute — disable autocast here.
+        with torch.autocast(device_type=torch.device(device).type,
+                            enabled=False):
+            for b, imap in enumerate(injection_maps):
+                tok2node = tok2node_vector(imap, seq_len, device)
+                pos = (tok2node >= 0).nonzero(as_tuple=True)[0]
+                if pos.numel() == 0:
+                    continue
+                psi = self.pe_model(graphs[b], permutation=permutation).float()
+                vec = self._pf_project(psi).to(device)     # [N, hidden]
+                sig[b, pos] = vec[tok2node[pos]]
         return sig
 
     def structural_parameters(self) -> list[nn.Parameter]:

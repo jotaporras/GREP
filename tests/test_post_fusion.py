@@ -68,6 +68,18 @@ def test_gradients_reach_pf_and_tower():
                for p in m.pe_model.parameters())
 
 
+def test_build_pf_signal_survives_autocast():
+    # The RL loss forward runs under accelerate's bf16 autocast; the fp32
+    # signal build must not crash (or silently downcast) inside it.
+    m = _model(post_fusion=True)
+    ids, gs, imaps = _inputs(m)
+    with torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16):
+        sig = m.build_pf_signal(ids.shape[1], gs, imaps, DEVICE)
+        out = m(input_ids=ids, graphs=gs, injection_maps=imaps).logits
+    assert sig.dtype == torch.float32
+    assert torch.isfinite(out).all()
+
+
 def test_structural_parameters_include_pf():
     m = _model(post_fusion=True)
     params = set(map(id, m.structural_parameters()))
