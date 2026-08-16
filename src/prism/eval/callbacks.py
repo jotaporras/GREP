@@ -109,7 +109,7 @@ class EvalCallback(TrainerCallback):
             if path_metrics.get(k) is not None:
                 wandb_metrics[f"eval/{k}"] = path_metrics[k]
         if wandb.run is not None:
-            wandb.log(wandb_metrics)
+            wandb.log(wandb_metrics, step=state.global_step)
         self.metrics = {"eval/accuracy": accuracy}
         self.metrics.update({f"grep/path_{k}": v for k, v in path_metrics.items()
                              if v is not None and k not in self._EVAL_PATH_KEYS})

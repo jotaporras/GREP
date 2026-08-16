@@ -58,6 +58,11 @@ SCRIPT="scripts/e17_magnet_composite_graphs.py"
 # wrote. Set E17_PE_GT_FROM to consume a freshly trained one instead.
 CKPT="${E17_PE_GT_FROM:-outputs/e17_mag_gt/${MAGGT_LOAD_SUITE}/mag_gt.pt}"
 STAGE3_EPOCHS="${E17_STAGE3_EPOCHS:-3}"
+# train_v3 hard-codes logging_steps=15, and HF's on_log is the ONLY hook train/loss,
+# learning_rate and GradientDebugCallback (debug/*, mag/*) fire on — at 15 they exist on
+# one step in fifteen. trainer.sft is merged LAST over the computed SFTConfig, so this
+# needs no code change. charge/* is unaffected either way: it rides on_step_end.
+E17_LOGGING_STEPS="${E17_LOGGING_STEPS:-1}"
 # §3 keeps TWO M=320 autograd graphs alive per sample (probe_covariance for C_tok, plus
 # the detector's cached_pe), and c varies 270-808 across samples, so the caching allocator
 # fragments badly: the OOM that killed a full run reported 14.5 GiB allocated against 8.0
@@ -94,6 +99,7 @@ uv run -m prism.training.train_v3 --config-name=e17_ms_stage1 \
     trainer.device=-1 \
     ${E17_STAGE1_MAX_STEPS:+trainer.max_steps=$E17_STAGE1_MAX_STEPS} \
     ${E17_EVAL_GRAPHS:+eval.num_graphs=$E17_EVAL_GRAPHS} \
+    +trainer.sft.logging_steps="$E17_LOGGING_STEPS" \
     trainer.checkpoint_dir="outputs/e17_magnetic_composite_graphs/${SUITE}" \
     trainer.save_name="e17_ms_stage1_${SUITE}" \
     wandb.run_name="e17_ms_stage1_${SUITE}"
@@ -130,6 +136,7 @@ uv run -m prism.training.train_v3 --config-name=e17_ms_stage3 \
     gnn.semantic_gt_from=null \
     ${E17_NUM_SAMPLES:+gnn.num_samples=$E17_NUM_SAMPLES} \
     ${E17_EVAL_GRAPHS:+eval.num_graphs=$E17_EVAL_GRAPHS} \
+    +trainer.sft.logging_steps="$E17_LOGGING_STEPS" \
     trainer.epochs="$STAGE3_EPOCHS" \
     trainer.checkpoint_dir="outputs/e17_magnetic_composite_graphs/${SUITE}" \
     trainer.save_name="e17_ms_stage3_${SUITE}" \
