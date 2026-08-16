@@ -50,6 +50,28 @@ A small head maps (last hidden state at position t, ψ of candidate next-node to
 - Most direct actuator possible for path choice; gradient path is 1 hop.
 - Cons: needs the node↔vocab-token mapping (exists implicitly in the injectors' node-position machinery, but vocab-side is new work: multi-token node names need span scoring, not single-token bias); risks degenerating into a learned lookup that ignores the LLM. Good **v2 / ablation**, not v1.
 
+### D. Graph-generated LoRA (Javier's idea 1)
+
+A LoRA adapter on late-layer projections where **one of the two factors is produced by the GT** rather than learned as a free parameter: e.g. for a target weight `W`, the update is `ΔW = B · A(ψ)` with `A(ψ)` emitted per-graph by the tower (hypernetwork-style), `B` a trained free matrix (zero-init ⇒ no-op at init, same warm-start story as A).
+
+- The graph then modulates the *computation* (the weights), not the activations — per-graph task conditioning rather than per-token signal injection. Strictly more expressive than A for "this graph changes how you plan" and composes with the existing LoRA (separate adapter name).
+- Design choices to pin down: which factor is graph-generated (generating the down-projection `A` from pooled ψ is cheapest: `d_gt → r·hidden` head); per-graph (pooled ψ) vs per-node (needs a routing story for which tokens see which node's ΔW — per-graph is the sane v1); which modules (late-layer `down_proj`/`o_proj` first).
+- Gradient path: reward → logits → few layers → `B`/head → tower. Comparable to A. Main risk: rank-r bottleneck × pooled-ψ bottleneck may be *too* low-bandwidth; and peft won't express input-dependent factors, so it's a manual wrapper on the target modules (moderate implementation cost, more than A, far less than C).
+
+### E. GT node distribution ⊕ LLM vocab distribution (Javier's idea 2; supersedes B)
+
+The GT emits its own probability distribution over **nodes** (e.g. score each node against the current decode state: `p_gt(node) ∝ exp(score(h_t, ψ_node))`), the LLM emits its usual vocab distribution, and the two are merged into a reweighed vocab distribution — a pointer/copy mechanism in the RAG/CopyNet lineage:
+
+```
+p(tok) = (1 − g_t) · p_llm(tok) + g_t · Σ_{node} p_gt(node) · p_spell(tok | node)
+```
+
+with a learned (zero-init ⇒ no-op) gate `g_t = σ(w·h_t + b)`, and `p_spell` distributing node mass over the tokenization of each node's name.
+
+- This is the most honest division of labor: the GT owns *which node comes next*, the LLM owns *fluency and everything else*. GRPO's advantage signal lands directly on `p_gt` — a 1-hop gradient path into the tower, the shortest of all candidates.
+- The hard part is `p_spell` for multi-token node names: mass must be placed on the *next* token of a partially-spelled name (prefix-tracking over the trie of node-name tokenizations during decode). The injectors' node↔position machinery gives us node spans in the prompt; the vocab-side trie is new but self-contained work. Constrained-decoding literature has this exact machinery.
+- Also the best *interpretability* payoff: `g_t` and `p_gt` are directly inspectable per step (when does the model consult the graph, and what does the graph want).
+
 ### C. Cross-attention adapter block (full post-fusion)
 
 Insert 1–2 new cross-attention blocks after the last decoder layer: queries from the LLM hidden states, keys/values from Ψ (per-node embeddings), gated residual output. This is the "proper" post-fusion arch (Flamingo-style) and the strongest version of the idea — the LLM can *query* the graph per decoding step.
@@ -67,7 +89,7 @@ Tag stays `e16_rl_training` for the probes unless we declare e17 — **decide be
 
 ## 5. Open questions for Javier
 
-- Q1: Is "post-fusion" in your head design A (late residual), B (logit steering), or C (cross-attention)? This sketch bets on A-then-C.
+- Q1: Candidate ranking. Javier's two ideas are D (graph-generated LoRA) and E (node-dist ⊕ vocab-dist merge, superseding B). Claude's current ordering by decision-value-per-week: **E ≈ A first** (E has the shortest gradient path and the cleanest division of labor but needs the spell-trie; A is the smallest code delta), then D, then C. To discuss.
 - Q2: OK to keep the mask bias active alongside the residual injection in v1 (isolates the *added* pathway), or do you want post-fusion *replacing* the mask (isolates the *fusion point*)?
 - Q3: Warm-start question: A preserves init-no-op so ai8c2bm0 works as-is; if you'd rather give the new pathway an SFT warm-up first (teacher-forced on n60_v3 train), that's ~1 day extra but de-risks C later.
 - Q4: e17 tag now, or keep probing under e16?
