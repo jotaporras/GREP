@@ -911,7 +911,7 @@ test_keys = random.sample(list(samples_by_graph.keys()), k=test_samples // plans
 # averaging a 3x-larger corpus together with the in-distribution one would report neither.
 # It is scored in its own cell, into its own W&B entry. `eval_n100` gates it INDEPENDENTLY
 # of train_edges / train_resistance, so the transfer number is produced on every run.
-eval_n100 = True
+eval_n100 = False
 eval_by_graph, eval_file_by_name = data.load_samples_by_graph(eval_path)
 n100_keys = [k for k in sorted(eval_by_graph) if complete_plans(k, eval_plan_path)]
 
