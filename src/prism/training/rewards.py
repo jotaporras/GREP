@@ -22,7 +22,13 @@ from prism.eval import path_validator
 # Shaped-reward composition; overridable via trainer.rl.reward_weights.
 DEFAULT_REWARD_WEIGHTS = {
     "full_path_valid": 1.0,
-    "edge_validity_rate": 0.3,
+    # e17 RCA (2026-08-16): 76% of held-out failures were paths that reached
+    # the goal with 1-3 hallucinated edges (mostly exact 2-hop shortcuts).
+    # Linear partial credit made a single skipped hop nearly free, so v2
+    # doubles the dense edge term AND adds clean_path — a binary all-edges-
+    # and-nodes-real bonus that any hallucination forfeits entirely.
+    "edge_validity_rate": 0.6,
+    "clean_path": 1.0,
     "nodes_exist_rate": 0.2,
     "cost_optimality": 0.3,
     "format_ok": 0.2,
@@ -49,10 +55,15 @@ def grade_completion(completion: str, scene_graph_dict: dict, init_node: str,
     metrics = path_validator.validate_path(
         plan, scene_graph_dict, start=init_node,
         reasoning_text=str(parsed.get("reasoning", "")))
+    edge_validity = float(metrics.get("edge_validity_rate") or 0.0)
+    nodes_exist = float(metrics.get("nodes_exist_rate") or 0.0)
+    num_parsed = int(metrics.get("num_parsed") or 0)
     return {
         "full_path_valid": float(metrics.get("full_path_valid") or 0.0),
-        "edge_validity_rate": float(metrics.get("edge_validity_rate") or 0.0),
-        "nodes_exist_rate": float(metrics.get("nodes_exist_rate") or 0.0),
+        "edge_validity_rate": edge_validity,
+        "clean_path": float(
+            num_parsed > 0 and edge_validity == 1.0 and nodes_exist == 1.0),
+        "nodes_exist_rate": nodes_exist,
         "cost_optimality": float(metrics.get("cost_optimality") or 0.0),
         "format_ok": float(format_ok),
         "keyword": float(keyword),

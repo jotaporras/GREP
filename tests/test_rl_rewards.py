@@ -64,6 +64,18 @@ def test_reward_funcs_weighted_and_named():
     assert out == [2.0]
 
 
+def test_clean_path_is_binary():
+    # Fully real path -> 1.0; any hallucinated edge forfeits the whole bonus
+    # even though the goal node is reached (the e17 dominant failure mode).
+    assert grade_completion(GOOD, GRAPH, "kitchen",
+                            r"(?i)\boffice\b")["clean_path"] == 1.0
+    bad = grade_completion(BAD_EDGE, GRAPH, "kitchen", r"(?i)\boffice\b")
+    assert bad["clean_path"] == 0.0
+    # Garbage (no parsed path) must not collect the bonus either.
+    assert grade_completion("total garbage %%%", GRAPH, "kitchen",
+                            r"x")["clean_path"] == 0.0
+
+
 def test_default_weights_cover_all_components():
     g = grade_completion(GOOD, GRAPH, "kitchen", r"(?i)\boffice\b")
     assert set(DEFAULT_REWARD_WEIGHTS) == set(g)

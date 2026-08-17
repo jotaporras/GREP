@@ -36,9 +36,13 @@ trainer:
     sync_every: 1               # optimizer steps between engine weight syncs
     # Shaped-reward composition (see training/rewards.py); raw components are
     # logged separately regardless.
+    # v2 (e17 RCA): edge_validity doubled + binary clean_path bonus — a path
+    # with ANY hallucinated edge/node forfeits the full point (76% of held-out
+    # failures were goal-reaching paths with 1-3 hallucinated 2-hop shortcuts).
     reward_weights:
       full_path_valid: 1.0
-      edge_validity_rate: 0.3
+      edge_validity_rate: 0.6
+      clean_path: 1.0
       nodes_exist_rate: 0.2
       cost_optimality: 0.3
       format_ok: 0.2
