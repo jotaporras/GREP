@@ -45,9 +45,10 @@ export HF_HOME=${HF_HOME:-$ALELAB/hf_cache}
 export HF_DATASETS_CACHE="${TMPDIR:-/tmp}/hf_datasets_${SLURM_JOB_ID:-manual}"
 export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-28}"
 
-# GREP-PRISM-v3 is a conda env (no venv-style bin/activate) — mirror e13f.
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate "$ENV_NAME"
+# GREP-PRISM-v3 is a conda env; compute-node batch shells have no conda on
+# PATH (exit 127 on jobs 7639051-53), so activate by prepending the env's bin
+# — equivalent for python/pip and shell-agnostic.
+export PATH="$ENV_NAME/bin:$PATH"
 
 echo "[$(date --iso-8601=seconds)] $RUN_NAME e17 post-fusion SFT (data=$DATA_SPLIT, tag=$TAG)"
 
