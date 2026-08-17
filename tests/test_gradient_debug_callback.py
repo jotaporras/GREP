@@ -34,7 +34,6 @@ sys.modules.setdefault("prism.eval.evaluate", _ev)
 import torch
 from torch import nn
 
-import prism.eval.callbacks as cbmod
 from prism.eval.callbacks import GradientDebugCallback as GDC
 
 
@@ -62,17 +61,6 @@ class _LLM(nn.Module):
 
     def get_input_embeddings(self):
         return self.emb
-
-
-class FakeWandb:
-    """Truthy .run + capturing .log() (from smoke_test_callbacks.py)."""
-
-    def __init__(self):
-        self.run = object()
-        self.logged = []
-
-    def log(self, metrics, step=None):
-        self.logged.append((step, dict(metrics)))
 
 
 def _global_norm(params):
@@ -266,9 +254,7 @@ def test_on_log_legacy_keys_and_lr():
     cb._captured_grad_norms = {"gnn": 1.0, "pe_proj": 2.0, "lora": 3.0, "pe_gain": 4.0}
     cb._pe_norm, cb._emb_norm, cb._num_injections, cb._pe_has_nan = 0.5, 0.7, 9, True
 
-    fake = FakeWandb(); cbmod.wandb = fake
-    cb.on_log(None, _state(lr=1e-4), None, model=inner)
-    m = fake.logged[-1][1]
+    m = cb.debug_metrics(inner, _state(lr=1e-4))
 
     expected = {"debug/grad_norm_gnn", "debug/grad_norm_pe_proj", "debug/grad_norm_lora",
                 "debug/pe_output_norm", "debug/pe_has_nan", "debug/embedding_norm",
@@ -292,9 +278,7 @@ def test_on_log_legacy_gt_blocks_present():
     cb = GDC()
     cb._captured_grad_norms = {"gnn": 1.0, "pe_proj": 2.0, "lora": 3.0,
                                "pe_gain": 4.0, "gt_blocks": 5.0, "rpearl": 6.0}
-    fake = FakeWandb(); cbmod.wandb = fake
-    cb.on_log(None, _state(lr=1e-4), None, model=inner)
-    m = fake.logged[-1][1]
+    m = cb.debug_metrics(inner, _state(lr=1e-4))
     assert m["debug/grad_norm_gt_blocks"] == 5.0
     assert m["debug/grad_norm_rpearl"] == 6.0
 
@@ -303,9 +287,7 @@ def test_on_log_lr_nan_when_no_history():
     inner = Bag(llm=nn.Linear(2, 2), pe_model=nn.Linear(2, 2),
                 pe_proj=nn.Linear(2, 2), pe_gain=nn.Parameter(torch.tensor(0.0)))
     cb = GDC()
-    fake = FakeWandb(); cbmod.wandb = fake
-    cb.on_log(None, _state(lr=None), None, model=inner)
-    assert math.isnan(fake.logged[-1][1]["debug/lr"])
+    assert math.isnan(cb.debug_metrics(inner, _state(lr=None))["debug/lr"])
 
 
 # --------------------------------------------------------------------------- #
@@ -328,8 +310,34 @@ def test_gradient_debug_gates_callback_registration():
     assert "callbacks.GradientDebugCallback()" in src
 
 
+
+# --------------------------------------------------------------------------- #
+# REGRESSION: the callback must not log to W&B itself.
+#
+# transformers' WandbCallback.on_log issues a STEPLESS wandb.log, which commits the open
+# row and advances W&B's pointer past state.global_step. Any wandb.log(step=global_step)
+# firing after it is rejected as non-monotonic and DROPPED — that is how runs augepp57
+# and 3hasg0sn lost 100% of mag/* and debug/grad_norm_*. The row must instead be RETURNED
+# and merged by GraphSFTTrainer.log (see tests/test_graph_token_acc.py for that half).
+# --------------------------------------------------------------------------- #
+def test_callback_makes_no_wandb_call():
+    """AST, not substring: the docstrings legitimately DISCUSS wandb.log."""
+    import ast, inspect
+    from prism.eval import callbacks as _cb
+
+    tree = ast.parse(inspect.getsource(_cb.GradientDebugCallback))
+    calls = [n for n in ast.walk(tree)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+             and isinstance(n.func.value, ast.Name) and n.func.value.id == "wandb"]
+    assert not calls, (
+        f"GradientDebugCallback calls wandb.{calls[0].func.attr} again — that row is "
+        "dropped whenever transformers' WandbCallback commits the step first"
+    )
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
             fn(); print(f"{name}: PASS")
     print("done")
+

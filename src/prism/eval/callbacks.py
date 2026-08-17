@@ -46,6 +46,12 @@ class EvalCallback(TrainerCallback):
         self._steps_per_interval: int | None = None
         self._last_eval_step: int = -1
         self.metrics = {}
+        # Drained into the Trainer's own log row by GraphTokenAccuracyMixin.log. NOT
+        # wandb.log(step=global_step): HF's evaluate() issues an extra STEPLESS
+        # wandb.log per epoch, so W&B's pointer permanently outruns global_step and
+        # every stepped row after the first eval is rejected. MEASURED over 600 steps:
+        # eval rows accepted at step 200, DROPPED at 400 and 600.
+        self.pending = {}
 
     def on_train_begin(self, args, state, control, **kwargs):
         steps_per_epoch = state.max_steps / args.num_train_epochs
@@ -108,8 +114,7 @@ class EvalCallback(TrainerCallback):
         for k in self._EVAL_PATH_KEYS:
             if path_metrics.get(k) is not None:
                 wandb_metrics[f"eval/{k}"] = path_metrics[k]
-        if wandb.run is not None:
-            wandb.log(wandb_metrics, step=state.global_step)
+        self.pending.update(wandb_metrics)
         self.metrics = {"eval/accuracy": accuracy}
         self.metrics.update({f"grep/path_{k}": v for k, v in path_metrics.items()
                              if v is not None and k not in self._EVAL_PATH_KEYS})
@@ -282,12 +287,21 @@ class GradientDebugCallback(TrainerCallback):
         if model is not None and self._supported(self._unwrap_peft(model)):
             self._install_hooks(model)
 
-    def on_log(self, args, state, control, model=None, logs=None, **kwargs):
+    def debug_metrics(self, model, state):
+        """The ``debug/*`` (+ arch ``mag/*`` / ``wire/*``) row for this step, or ``{}``.
+
+        Returned rather than logged: ``transformers``' own ``WandbCallback.on_log``
+        commits a STEPLESS ``wandb.log``, which advances W&B's step pointer past
+        ``state.global_step``, so a later ``wandb.log(..., step=state.global_step)`` from
+        here is rejected as non-monotonic and DROPPED — every logging step, silently.
+        ``GraphSFTTrainer.log`` merges this into the Trainer's own row instead, the same
+        way :class:`~prism.eval.evaluate.GraphTokenAccuracyMixin` lands ``graph_acc/*``.
+        """
         if model is None:
-            return
+            return {}
         inner = self._unwrap_peft(model)
         if not self._supported(inner):
-            return
+            return {}
 
         lr = state.log_history[-1].get("learning_rate", float("nan")) if state.log_history else float("nan")
         g = self._captured_grad_norms
@@ -343,8 +357,7 @@ class GradientDebugCallback(TrainerCallback):
         if hasattr(inner, "telemetry"):
             metrics.update(inner.telemetry())
 
-        if wandb.run is not None:
-            wandb.log(metrics, step=state.global_step)
+        return metrics
 
 
 class ChargeDegeneracyCallback(TrainerCallback):
@@ -388,6 +401,9 @@ class ChargeDegeneracyCallback(TrainerCallback):
         self._crossings = 0
         self._delta_min = float("inf")
         self._warned = False
+        # See EvalCallback.pending: charge/* rides the Trainer's log row, never a
+        # stepped wandb.log — MEASURED as 400/600 steps dropped when it did.
+        self.pending = {}
 
     @staticmethod
     def _find_magnet(model):
@@ -463,10 +479,8 @@ class ChargeDegeneracyCallback(TrainerCallback):
             r = self._read_charge(self._magnet)
             s, delta = self._delta(r)
             self._warn_once(r, s, delta)
-            if wandb.run is not None:
-                wandb.log({"charge/r": r, "charge/s": s, "charge/delta": delta,
-                           "charge/cond_proxy": self._COND_NUM / max(delta, 1e-6)},
-                          step=state.global_step)
+            self.pending.update({"charge/r": r, "charge/s": s, "charge/delta": delta,
+                                 "charge/cond_proxy": self._COND_NUM / max(delta, 1e-6)})
         return control
 
     def on_step_end(self, args, state, control, **kwargs):
@@ -495,6 +509,5 @@ class ChargeDegeneracyCallback(TrainerCallback):
         metrics["charge/crossings"] = self._crossings
         self._prev_r, self._prev_s = r, s
 
-        if wandb.run is not None:
-            wandb.log(metrics, step=state.global_step)
+        self.pending.update(metrics)
         return control

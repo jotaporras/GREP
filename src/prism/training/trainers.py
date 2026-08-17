@@ -223,7 +223,10 @@ class GraphSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
         divides once more by that factor (MEASURED: one layer of four, 1.2e-7 relative,
         ONCE at registration — the per-step hook still projects exactly once per step).
         """
-        enabled = bool(self.gnn_config.get("enforce_beta_bound", True))
+        # Default FALSE: absence must not silently re-enable the projection. It was the
+        # True fallback here, combined with the key missing from train_v3's gnn_config
+        # whitelist, that made `gnn.enforce_beta_bound=false` a no-op on run 3hasg0sn.
+        enabled = bool(self.gnn_config.get("enforce_beta_bound", False))
         slack = beta_projection.project_beta_(self.model) if enabled else {}
         handle = beta_projection.register_beta_projection(
             optimizer, self.model, enabled=enabled,
@@ -252,6 +255,18 @@ class GraphSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
                 cb._capture_grad_norms(model)
                 break
         return loss
+
+    def log(self, logs, *args, **kwargs):
+        # debug/* + mag/* ride the Trainer's OWN row. They cannot be logged from the
+        # callback's on_log: transformers' WandbCallback commits a stepless wandb.log
+        # first, pushing W&B's pointer past state.global_step, so a wandb.log(step=...)
+        # afterwards is dropped as non-monotonic — MEASURED as 100% loss of mag/beta and
+        # every grad-norm split across runs augepp57 and 3hasg0sn.
+        for cb in self.callback_handler.callbacks:
+            if isinstance(cb, callbacks.GradientDebugCallback):
+                logs.update(cb.debug_metrics(self.model, self.state))
+                break
+        return super().log(logs, *args, **kwargs)
 
     def save_model(self, output_dir=None, _internal_call=False):
         output_dir = output_dir or self.args.output_dir

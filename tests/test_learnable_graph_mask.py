@@ -470,7 +470,7 @@ def test_gradient_debug_callback_handles_learnable_mask():
     class _State:
         log_history = []
         global_step = 1
-    cb.on_log(None, _State(), None, model=model)          # must not raise (no pe_gain access)
+    cb.debug_metrics(model, _State())                     # must not raise (no pe_gain access)
 
 
 # ---------------------------------------------------------------------------

@@ -30,7 +30,6 @@ from torch import nn
 from torch_geometric.data import Data
 from transformers import LlamaConfig, LlamaForCausalLM
 
-import prism.eval.callbacks as cbmod
 from prism.eval.callbacks import GradientDebugCallback
 from prism.models.gnn_llm import GraphAugmentedLLM
 from prism.models.r_pearl import RandomGNNPositionalEncodings
@@ -56,16 +55,6 @@ def check(name, cond, detail=""):
 # --------------------------------------------------------------------------- #
 # Shared fixtures
 # --------------------------------------------------------------------------- #
-class FakeWandb:
-    """Stand-in for the wandb module: truthy .run + capturing .log()."""
-    def __init__(self):
-        self.run = object()
-        self.logged = []
-
-    def log(self, metrics, step=None):
-        self.logged.append((step, dict(metrics)))
-
-
 def fake_state():
     s = types.SimpleNamespace()
     s.global_step = 5
@@ -107,12 +96,11 @@ def gt_encoder():
 
 
 def run_callback(model, graphs, *, with_grads=True):
-    """Install hooks, do one forward+backward, capture grad norms, fire on_log.
+    """Install hooks, do one forward+backward, capture grad norms, build the row.
 
-    Returns the metrics dict the callback handed to wandb.log.
+    Returns the metrics dict the callback hands to ``GraphSFTTrainer.log`` (it no longer
+    calls wandb itself — see GradientDebugCallback.debug_metrics).
     """
-    fake = FakeWandb()
-    cbmod.wandb = fake  # redirect the module-level wandb reference
     cb = GradientDebugCallback()
     state = fake_state()
 
@@ -125,9 +113,9 @@ def run_callback(model, graphs, *, with_grads=True):
         out.loss.backward()
         cb._capture_grad_norms(model)
 
-    cb.on_log(None, state, None, model=model)
-    assert fake.logged, "on_log did not call wandb.log"
-    return cb, fake.logged[-1][1]
+    metrics = cb.debug_metrics(model, state)
+    assert metrics, "debug_metrics returned no row"
+    return cb, metrics
 
 
 # --------------------------------------------------------------------------- #

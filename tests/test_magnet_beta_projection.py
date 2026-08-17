@@ -473,3 +473,50 @@ def test_measuring_the_slack_does_not_change_what_is_enforced(capsys):
             f"{name} diverged by {(p.detach() - ref[name].detach()).abs().max():.3e}"
     for conv in measured.convs:
         assert tap_norm_sum(conv) <= 1 + 1e-5, "the bound must hold after both passes"
+
+
+# --------------------------------------------------------------------------- #
+# (e) CONFIG PLUMBING — the flag must reach the trainer, not just the YAML
+#
+# GraphSFTTrainer reads `gnn_config.get("enforce_beta_bound", True)`, and gnn_config is
+# an explicit WHITELIST built in train_v3. A key missing from that whitelist makes the
+# default win no matter what Hydra resolved, silently. MEASURED on run 3hasg0sn, which
+# launched with gnn.enforce_beta_bound=false and still projected all 5 MagChebConv
+# layers to sum_k ||H_k||_2 = 1, collapsing C by ~3.5e-8 and killing the graph channel.
+# Same defect class as tests/test_identity_rope_wiring.py covers for disable_graph_token_rope.
+# --------------------------------------------------------------------------- #
+import re
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+KEY = "enforce_beta_bound"
+
+
+def test_train_v3_records_the_flag_in_gnn_config():
+    """Absent from gnn_config, the trainer's ``.get(KEY, True)`` always wins and the
+    projection runs even when the config turned it off."""
+    src = (REPO / "src" / "prism" / "training" / "train_v3.py").read_text()
+    # Slice on the surrounding statements, not a paren match: the tuple's comments
+    # contain unbalanced parentheses that any `\(...\)` regex trips over.
+    block = re.search(r"_direct = \(\n(.*?)\n\s*gnn_config = \{", src, re.S)
+    assert block, "train_v3 no longer builds gnn_config from a _direct tuple"
+    assert f'"{KEY}"' in block.group(1), (
+        f"train_v3 does not record {KEY} in gnn_config — the config switch is inert"
+    )
+
+
+def test_trainer_default_is_off_so_absence_is_safe():
+    """Belt and braces. The key IS recorded (test above), but the fallback must also be
+    False: a True fallback plus the missing whitelist entry is exactly what made
+    `gnn.enforce_beta_bound=false` a silent no-op on run 3hasg0sn."""
+    src = (REPO / "src" / "prism" / "training" / "trainers.py").read_text()
+    assert re.search(rf'gnn_config\.get\(\s*"{KEY}"\s*,\s*False\s*\)', src), (
+        f"trainers.py must read {KEY} with a False default"
+    )
+
+
+def test_config_default_is_off():
+    """base_config is what every arm composes from; the projection must be off there."""
+    import yaml
+    cfg = yaml.safe_load((REPO / "experiments" / "base_config.yaml").read_text())
+    assert cfg["gnn"][KEY] is False, f"base_config {KEY} must default to false"

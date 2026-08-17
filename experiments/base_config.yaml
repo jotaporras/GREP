@@ -80,7 +80,14 @@ gnn:
   # ONE global scalar per layer; excludes r_logit, the modReLU biases and the unwind
   # Linear. INERT on the undirected TAGConv backbone (no MagChebConv to project) — the
   # trainer now logs which of the two happened rather than claiming the bound either way.
-  enforce_beta_bound: true
+  # FALSE by default. The projection divides every MagChebConv by its slack at optimizer
+  # construction (MEASURED 4.18/5.93/6.04/6.04/5.95 on the notebook-pretrained MagE-GT),
+  # which is a scale the notebook never trained under: Stage 3 then took NO gradient
+  # anywhere in the graph channel and scored 6.7% against Stage 1's 90%. Assumption 4.2 is
+  # a HYPOTHESIS of the stability bound, not a training procedure — the honest route is to
+  # MEASURE the realised beta and carry it into the constant. Turn back on only together
+  # with a notebook that pretrains under the same bound, so the two agree.
+  enforce_beta_bound: false
   # hidden_norm: normalization BETWEEN MagNet's hidden layers.
   #   "none" (DEFAULT) = none; the beta projection alone controls scale.
   #   "global_rms" = divide by one detached, non-affine scalar sqrt(mean|x|^2) over all
@@ -157,6 +164,15 @@ gnn:
   mask_composite: false
   mask_cycle_size: 8192      # cap on c, the token cycle length. COST scales as c^2.
   mask_beta_init: 0.0        # beta at step 0. 0.0 = the base LLM's logits, exactly.
+  # HOW C_tok enters the logits. "log" (DEFAULT) is the MULTIPLICATIVE fold the working
+  # ΨΨᵀ arm uses — correlation, then the mask_alpha gate, then log, so
+  # softmax(qᵀk + β·log g) ∝ g^β · exp(qᵀk). Scale-INVARIANT, which is the point: the
+  # same encoder gave 6.7% with C at ~1e-8 of its fitted scale (β-projection on) and 10%
+  # with max|C| = 3.8e4 saturating the softmax to exactly zero graph gradient
+  # (projection off). "linear" is the raw β·C_tok that produced both — kept as the
+  # ablation only. mask_alpha and eps ARE read under "log" (they build the gate); the
+  # "INERT" note above applies to the linear path.
+  mask_bias_mode: log
   # Initial MagNet charge, written into the shared r_logit before any checkpoint load.
   # Eigenvalues of L_bar^(r) collide on the length-c cycle iff dist(2rc, Z) = 0; at
   # c = 8192 this r gives 2rc = 2064.384, a margin of 0.384. Changing mask_cycle_size

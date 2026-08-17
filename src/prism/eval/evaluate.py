@@ -1174,6 +1174,17 @@ class GraphTokenAccuracyMixin:
         return (loss, outputs) if return_outputs else loss
 
     def log(self, logs, *args, **kwargs):
+        # Drain any callback that buffered a row for this step (EvalCallback,
+        # ChargeDegeneracyCallback). They must NOT call wandb.log(step=global_step)
+        # themselves: HF's evaluate() adds an extra stepless wandb.log each epoch, so
+        # W&B's pointer outruns global_step and every stepped row after the first eval
+        # is rejected as non-monotonic. Both trainers inherit this method, so the
+        # baseline arm gets the same treatment.
+        for cb in getattr(getattr(self, "callback_handler", None), "callbacks", ()):
+            pending = getattr(cb, "pending", None)
+            if pending:
+                logs.update(pending)
+                pending.clear()
         gta = getattr(self, "_gta", None)
         if gta is not None:
             # int64, not float64: these are exact token COUNTS, so an integer sum is

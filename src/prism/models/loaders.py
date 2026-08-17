@@ -393,6 +393,7 @@ def graph_augmented_llm_from_pretrained(
                 "anchor_enabled": gnn_cfg.get("mask_anchor_enabled", True),
                 "anchor_weight": gnn_cfg.get("mask_anchor_weight", 10.0),
                 "cache_pe": gnn_cfg.get("cache_pe", True),
+                "bias_mode": gnn_cfg.get("mask_bias_mode", "log"),
                 "decode_refresh": gnn_cfg.get("mask_decode_refresh", 8)} if _composite else {}),
             layer_scope=gnn_cfg.get("mask_layer_scope", "dense"),
             k_hops=gnn_cfg.get("mask_k_hops", 1),

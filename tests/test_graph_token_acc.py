@@ -175,3 +175,84 @@ def test_compute_loss_pops_index_columns_and_returns_loss():
     assert "answer_node_idx" not in t.seen_keys
     # and the metric was accumulated
     assert t._gta["scene_n"] == 2 and t._gta["ans_n"] == 2
+
+
+# --------------------------------------------------------------------------
+# The SIBLING merge: GraphSFTTrainer.log folds the gradient-debug row into `logs`
+# the same way the mixin above folds in graph_acc/*.
+#
+# It cannot be logged from GradientDebugCallback.on_log instead: transformers'
+# WandbCallback issues a STEPLESS wandb.log that commits the row and pushes W&B's
+# pointer past state.global_step, so a wandb.log(step=global_step) arriving after it
+# is rejected as non-monotonic and silently dropped. Runs augepp57 and 3hasg0sn lost
+# every mag/* and debug/grad_norm_* sample that way.
+# --------------------------------------------------------------------------
+def test_graph_sft_trainer_log_merges_the_gradient_debug_row(monkeypatch):
+    from torch import nn
+    from prism.eval.callbacks import GradientDebugCallback
+    from prism.training.trainers import GraphSFTTrainer
+
+    class _Bag(nn.Module):
+        def __init__(self, **kw):
+            super().__init__()
+            for k, v in kw.items():
+                setattr(self, k, v)
+
+    inner = _Bag(llm=nn.Linear(2, 2), pe_model=nn.Linear(2, 2), pe_proj=nn.Linear(2, 2))
+    cb = GradientDebugCallback()
+    cb._captured_grad_norms = {"gnn": 1.5, "pe_proj": 2.0, "lora": 3.0}
+
+    # Intercept super().log() one level up the MRO so no HF Trainer machinery is needed.
+    seen = {}
+    monkeypatch.setattr(GraphTokenAccuracyMixin, "log",
+                        lambda self, logs, *a, **k: seen.update(logs))
+
+    bare = GraphSFTTrainer.__new__(GraphSFTTrainer)
+    bare.model = inner
+    bare.state = SimpleNamespace(global_step=15, log_history=[{"learning_rate": 1e-4}])
+    bare.callback_handler = SimpleNamespace(callbacks=[cb])
+
+    GraphSFTTrainer.log(bare, {"loss": 0.5})
+
+    assert seen["debug/grad_norm_gnn"] == approx(1.5), "debug row never reached logs"
+    assert seen["debug/lr"] == approx(1e-4)
+    assert seen["loss"] == approx(0.5), "the merge must not clobber the Trainer's keys"
+
+
+def test_graph_sft_trainer_log_is_a_noop_without_the_callback(monkeypatch):
+    """No GradientDebugCallback attached (gradient_debug=false) ⇒ logs pass through."""
+    from prism.training.trainers import GraphSFTTrainer
+
+    seen = {}
+    monkeypatch.setattr(GraphTokenAccuracyMixin, "log",
+                        lambda self, logs, *a, **k: seen.update(logs))
+    bare = GraphSFTTrainer.__new__(GraphSFTTrainer)
+    bare.callback_handler = SimpleNamespace(callbacks=[])
+    GraphSFTTrainer.log(bare, {"loss": 0.5})
+    assert seen == {"loss": 0.5}
+
+
+def test_log_drains_callback_pending_rows():
+    """EvalCallback / ChargeDegeneracyCallback buffer their row on `.pending` instead of
+    calling wandb.log(step=global_step) — HF's per-epoch stepless log pushes W&B's
+    pointer past global_step, so a stepped row is rejected for the rest of the run
+    (MEASURED: charge/* dead from step 201 of 600). This mixin is the single drain."""
+    cb = SimpleNamespace(pending={"charge/delta": 0.25, "eval/accuracy": 0.9})
+    t = _Trainer()
+    t.callback_handler = SimpleNamespace(callbacks=[cb])
+    t._reset_token_acc()
+
+    t.log({"loss": 0.5})
+
+    assert t.logged["charge/delta"] == approx(0.25)
+    assert t.logged["eval/accuracy"] == approx(0.9)
+    assert t.logged["loss"] == approx(0.5)      # existing keys preserved
+    assert cb.pending == {}                      # cleared, so rows are not duplicated
+
+
+def test_log_without_callback_handler_is_unchanged():
+    """Trainers built without a callback_handler (unit fixtures) must not break."""
+    t = _Trainer()
+    t._reset_token_acc()
+    t.log({"loss": 0.5})
+    assert t.logged == {"loss": 0.5}

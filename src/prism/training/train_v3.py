@@ -264,6 +264,15 @@ def train_model(config: omegaconf.DictConfig):
             # are a different state_dict shape than the GCN one — a missing key would
             # fail the rebuild loudly rather than silently, but record it anyway.
             "directed",
+            # LOAD-BEARING at train time: GraphSFTTrainer reads it off THIS dict, so a
+            # missing key meant `.get(..., True)` won and the projection ran regardless of
+            # the config — MEASURED on run 3hasg0sn, which passed enforce_beta_bound=false
+            # and still projected all 5 MagChebConv layers to sum_k ||H_k||_2 = 1.
+            "enforce_beta_bound",
+            # LOAD-BEARING at reload: 'log' vs 'linear' is a DIFFERENT function of the
+            # same weights (multiplicative gate vs raw covariance), so a missing key would
+            # score a log-trained checkpoint under the linear bias.
+            "mask_bias_mode",
             # LOAD-BEARING at reload: selects the GT's input_proj (Φ(X + P; T)). The
             # pe_model load is strict=False, so a missing key would silently drop it.
             "fuse_node_features",

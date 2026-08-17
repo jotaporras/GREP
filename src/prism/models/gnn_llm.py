@@ -3040,8 +3040,12 @@ class MagCompGraphLLM(LearnableGraphMaskLLM):
                  magnet_r: float = 0.126, cycle_weight: float = 1.0,
                  cycle_causal: bool = False, crosslink_weight: float = 0.1,
                  anchor_enabled: bool = True, anchor_weight: float = 10.0,
-                 cache_pe: bool = True, decode_refresh: int = 8, **kwargs):
+                 cache_pe: bool = True, decode_refresh: int = 8,
+                 bias_mode: str = "log", **kwargs):
         super().__init__(llm, pe_model, **kwargs)
+        if bias_mode not in ("log", "linear"):
+            raise ValueError(f"bias_mode must be 'log' or 'linear', got {bias_mode!r}")
+        self._bias_mode = bias_mode
         if int(cycle_size) < 2:
             raise ValueError(f"cycle_size must be >= 2, got {cycle_size}")
         if not 0.0 < float(magnet_r) < 0.25:
@@ -3198,10 +3202,49 @@ class MagCompGraphLLM(LearnableGraphMaskLLM):
             self._ctok_graph, self._ctok_cache = composite, c_tok
         return c_tok
 
+    def bias_block(self, c_tok: torch.Tensor) -> torch.Tensor:
+        r"""The per-entry matrix ``β`` scales into the logits — ``log`` or ``linear``.
+
+        ``log`` (DEFAULT) folds ``C_tok`` MULTIPLICATIVELY, the same way the parent's
+        ``ΨΨᵀ`` gate does (:meth:`LearnableGraphMaskLLM.build_structural_mask`,
+        ``gate.log()``): ``softmax(qᵀk + log g) ∝ g · exp(qᵀk)``. Two steps, both
+        load-bearing:
+
+        1. CORRELATION, ``C_ij / sqrt(C_ii C_jj)`` — the scale-free reading of a
+           covariance, and the exact analogue of the parent's row-normalized cosine.
+           This is what makes the bias invariant to ``‖C‖``, which nothing in this
+           architecture bounds: the SAME encoder scored 6.7% with ``C`` ~1e-8 of its
+           fitted scale (β-projection ON) and 10% with ``max|C| = 3.8e4`` and
+           ``bias_absmax = 1.9e4`` (projection OFF), the second saturating the softmax
+           so hard that grad_norm reached the graph channel as EXACTLY 0.
+        2. The parent's gate ``α + (1−α)·corr``, clamped at ``eps`` and logged. ``corr``
+           is in [−1, 1] like cosine, so ``α`` carries its usual meaning and the gate is
+           positive by construction; ``log`` then maps it to ``(log eps, 0]``.
+
+        ``linear`` is the original ``C_tok`` passed through, kept ONLY as the ablation
+        that shows why the fold is needed. It is not a supported training setting.
+
+        The diagonal is clamped before the square root: ``C`` is PSD so ``C_ii >= 0``,
+        but a token node whose probe responses are identical across draws has
+        ``C_ii = 0`` exactly, and ``0/0`` would put NaN into every logit of that row.
+        """
+        if self._bias_mode == "linear":
+            return c_tok
+        diag = c_tok.diagonal()
+        # RELATIVE floor. An absolute clamp_min(eps) would re-break scale invariance the
+        # moment the whole matrix falls under eps — exactly the beta-projection regime,
+        # where max|C| was ~1e-8 of its fitted value. Scaling C by s scales diag and its
+        # max together, so this floor scales with it and the correlation does not move.
+        d = diag.clamp_min(diag.max() * self._mask_eps).sqrt()
+        denom = d.unsqueeze(1) * d.unsqueeze(0)
+        corr = c_tok / denom.clamp_min(torch.finfo(denom.dtype).tiny)
+        gate = (self._mask_alpha + (1.0 - self._mask_alpha) * corr).clamp_min(self._mask_eps)
+        return gate.log()
+
     def build_structural_mask(self, seq_len, graphs, injection_maps, device, dtype=None,
                               key_injection_maps=None, permutation=None,
                               input_ids=None, attention_mask=None, answer_starts=None):
-        """Additive attention bias ``[B, 1, seq, seq]``: ``β·C_tok`` on the scope, 0 elsewhere.
+        """Additive attention bias ``[B, 1, seq, seq]``: ``β·bias_block(C_tok)``, 0 elsewhere.
 
         Overrides the parent wholesale — none of ``α`` / ``psi_scale`` / the adjacency
         ``A`` / the ``−inf`` block is used here. ``key_injection_maps`` is accepted for
@@ -3236,7 +3279,7 @@ class MagCompGraphLLM(LearnableGraphMaskLLM):
             # refresh at a time, exactly as decode extends it. Without answer_starts the
             # whole sequence IS the prompt, which is the eval-prefill call.
             a = end if not answer_starts else min(max(int(answer_starts[b]), start + 2), end)
-            composite = c_tok = None
+            composite = c_tok = m = None
             q0 = start
             while q0 < end:
                 if q0 < a:
@@ -3270,18 +3313,20 @@ class MagCompGraphLLM(LearnableGraphMaskLLM):
                         dummy, use_reentrant=False)
                 else:
                     c_tok = self.covariance_token_block(composite, c_seg)
+                m = self.bias_block(c_tok)
                 # Only the queries this graph actually has token nodes for get a row.
                 rows = min(q1, start + c_seg) - q0
                 if rows > 0:
                     bias[b, 0, q0:q0 + rows, start:start + c_seg] = (
-                        self.beta * c_tok[q0 - start:q0 - start + rows, :]).to(dtype)
+                        self.beta * m[q0 - start:q0 - start + rows, :]).to(dtype)
                 q0 = q1
-            stats.append(self._measure(c_tok, composite, start, end))
+            stats.append(self._measure(c_tok, composite, start, end,
+                                       gated=None if c_tok is None else m))
         self._telemetry = stats
         return bias
 
     @torch.no_grad()
-    def _measure(self, c_tok, composite, start: int, end: int) -> dict:
+    def _measure(self, c_tok, composite, start: int, end: int, gated=None) -> dict:
         """Per-sequence scalars for :meth:`telemetry`, measured off the LIVE ``C_tok``.
 
         Detached and ``no_grad``, so this adds a few reductions over an already-resident
@@ -3292,7 +3337,12 @@ class MagCompGraphLLM(LearnableGraphMaskLLM):
         past the block, capped by ``cycle_size``).
         """
         f = c_tok.detach().float()
+        # The bias is beta * bias_block(C), NOT beta * C: under bias_mode='log' the two
+        # differ by orders of magnitude, and mag/bias_absmax is the number that says
+        # whether beta is calibrated, so it must be measured off what is actually added.
+        g = f if gated is None else gated.detach().float()
         return {
+            "gate_absmax": float(g.abs().max()),
             "c_tok_fro": float(f.norm()),
             "c_tok_absmax": float(f.abs().max()),
             "c_tok_trace": float(f.diagonal().sum()),
@@ -3338,7 +3388,7 @@ class MagCompGraphLLM(LearnableGraphMaskLLM):
         mean = lambda k: sum(s[k] for s in stats) / len(stats)
         out = {
             "mag/beta": beta,
-            "mag/bias_absmax": abs(beta) * absmax,
+            "mag/bias_absmax": abs(beta) * max(s["gate_absmax"] for s in stats),
             "mag/c_tok_absmax": absmax,
             "mag/c_tok_fro": mean("c_tok_fro"),
             "mag/c_tok_trace": mean("c_tok_trace"),
@@ -3835,6 +3885,7 @@ class CompositeDecodeInjector:
         self.device = next(model.parameters()).device
         self.generated: list[int] = []
         self._c_tok = None          # [c, c] for the composite as of the last refresh
+        self._bias_m = None         # bias_block(_c_tok): what beta actually multiplies
         self._tau = None
         self._since = None          # tokens generated since that refresh
 
@@ -3859,6 +3910,9 @@ class CompositeDecodeInjector:
             self.graph, ids, injection_map, tau, self.device,
             permutation=self.permutation)
         self._c_tok = self.model.covariance_token_block(composite, c)
+        # Fold ONCE per rebuild, not per row: bias_block needs the whole diagonal (the
+        # correlation normaliser), and decode must apply the SAME function training does.
+        self._bias_m = self.model.bias_block(self._c_tok)
         self._tau, self._since = tau, 0
 
     def pre_hook(self, module, args, kwargs):
@@ -3893,5 +3947,5 @@ class CompositeDecodeInjector:
         row = torch.zeros(k_len, dtype=torch.float32, device=self.device)
         keys = min(c, k_len - self._tau)
         row[self._tau:self._tau + keys] = (
-            self.model.beta * self._c_tok[q_row, :keys]).float()
+            self.model.beta * self._bias_m[q_row, :keys]).float()
         self.model._decode_bias_row = row.view(1, 1, 1, k_len)

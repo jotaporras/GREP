@@ -33,7 +33,6 @@ import pytest
 import torch
 from torch import nn
 
-import prism.eval.callbacks as cbmod
 from prism.eval.callbacks import ChargeDegeneracyCallback as CDC
 
 
@@ -71,17 +70,6 @@ class StubMagNet(nn.Module):
         """Drive r directly by inverting the 0.25*sigmoid reparameterization."""
         with torch.no_grad():
             self.convs[0].r_logit.copy_(torch.tensor(value / 0.25).logit())
-
-
-class FakeWandb:
-    """Truthy .run + capturing .log() (from test_gradient_debug_callback.py)."""
-
-    def __init__(self):
-        self.run = object()
-        self.logged = []
-
-    def log(self, metrics, step=None):
-        self.logged.append((step, dict(metrics)))
 
 
 def _state(step=1):
@@ -174,12 +162,11 @@ def test_cond_proxy_and_warning_threshold():
     c = 64
     magnet = StubMagNet(r=(1.0 + 0.5) / (2 * c))     # s = 1.5 ⇒ delta = 1/2, safe
     cb = _cb(c=c, magnet=magnet)
-    fake = FakeWandb(); cbmod.wandb = fake
 
     with warnings.catch_warnings(record=True) as rec:
         warnings.simplefilter("always")
         cb.on_step_end(None, _state(1), None)
-        m = fake.logged[-1][1]
+        m = cb.pending
         assert abs(m["charge/delta"] - 0.5) < 1e-5
         assert abs(m["charge/cond_proxy"] - 0.637 / 0.5) < 1e-5
         assert not rec
@@ -190,7 +177,7 @@ def test_cond_proxy_and_warning_threshold():
         cb.on_step_end(None, _state(3), None)
         assert len(rec) == 1 and "Nearest safe charge" in str(rec[0].message)
 
-    m = fake.logged[-1][1]
+    m = cb.pending
     assert m["charge/delta"] < 1e-4
     assert m["charge/cond_proxy"] > 6000                 # 0.637 / max(delta, 1e-6)
     assert m["charge/delta_min_since_start"] < 1e-4
@@ -204,17 +191,16 @@ def test_crossings_increment_once_per_integer_of_s():
     c = 64
     magnet = StubMagNet(r=0.25 / (2 * c))            # s = 0.25
     cb = _cb(c=c, magnet=magnet)
-    fake = FakeWandb(); cbmod.wandb = fake
 
     cb.on_step_end(None, _state(0), None)
-    assert fake.logged[-1][1]["charge/crossings"] == 0
-    assert "charge/periods_per_step" not in fake.logged[-1][1]   # no predecessor yet
+    assert cb.pending["charge/crossings"] == 0
+    assert "charge/periods_per_step" not in cb.pending   # no predecessor yet
 
     # s: 0.25 → 1.25 → 2.25 → 3.25, one integer per step.
     for step, s_target in enumerate([1.25, 2.25, 3.25], start=1):
         magnet.set_r(s_target / (2 * c))
         cb.on_step_end(None, _state(step), None)
-        m = fake.logged[-1][1]
+        m = cb.pending
         assert m["charge/crossings"] == step
         assert abs(m["charge/periods_per_step"] - 1.0) < 1e-5
         assert abs(m["charge/dr_per_step"] - 1.0 / (2 * c)) < 1e-6
@@ -222,8 +208,8 @@ def test_crossings_increment_once_per_integer_of_s():
     # A multi-period jump counts every integer it spans, not just one.
     magnet.set_r(7.25 / (2 * c))
     cb.on_step_end(None, _state(4), None)
-    assert fake.logged[-1][1]["charge/crossings"] == 7
-    assert abs(fake.logged[-1][1]["charge/periods_per_step"] - 4.0) < 1e-5
+    assert cb.pending["charge/crossings"] == 7
+    assert abs(cb.pending["charge/periods_per_step"] - 4.0) < 1e-5
 
 
 def test_callback_never_writes_the_charge():
@@ -231,7 +217,6 @@ def test_callback_never_writes_the_charge():
     c = 128
     magnet = StubMagNet(r=0.126)
     cb = _cb(c=c, magnet=magnet)
-    cbmod.wandb = FakeWandb()
     before = magnet.convs[0].r_logit.detach().clone()
 
     for step in range(5):
@@ -247,29 +232,27 @@ def test_noop_when_learn_r_false():
     magnet = StubMagNet(r=0.126, learn_r=False)
     model = SimpleNamespace(pe_model=SimpleNamespace(pe_gcn=magnet))
     cb = CDC(cycle_length=c)
-    fake = FakeWandb(); cbmod.wandb = fake
 
     cb.on_train_begin(None, _state(0), None, model=model)
     assert cb._static
-    assert len(fake.logged) == 1
-    m = fake.logged[0][1]
+    m = cb.pending
+    assert set(m) == {"charge/r", "charge/s", "charge/delta", "charge/cond_proxy"}
     assert abs(m["charge/r"] - 0.126) < 1e-7             # float32 r_const roundtrip
     assert abs(m["charge/delta"] - _delta_oracle(0.126, c)) < 1e-5
 
     for step in range(3):
         cb.on_step_end(None, _state(step), None)
-    assert len(fake.logged) == 1                     # on_step_end stood down
+    assert "charge/c" not in cb.pending               # on_step_end stood down
 
 
 def test_noop_when_backbone_is_not_magnet():
     """directed=False (TAGConv): no charge ⇒ no resolution, no logs, no crash."""
     cb = CDC(cycle_length=64)
-    fake = FakeWandb(); cbmod.wandb = fake
     cb.on_train_begin(None, _state(0), None,
                       model=SimpleNamespace(pe_model=SimpleNamespace(pe_gcn=nn.Linear(2, 2))))
     assert cb._magnet is None
     cb.on_step_end(None, _state(1), None)
-    assert fake.logged == []
+    assert cb.pending == {}
 
 
 def test_realistic_step_scale_flags_unlearnable_delta():
@@ -277,12 +260,11 @@ def test_realistic_step_scale_flags_unlearnable_delta():
     c, dr = 8192, 3e-5
     magnet = StubMagNet(r=0.126)
     cb = _cb(c=c, magnet=magnet)
-    cbmod.wandb = FakeWandb()
 
     cb.on_step_end(None, _state(0), None)
     magnet.set_r(0.126 + dr)
     cb.on_step_end(None, _state(1), None)
-    periods = cbmod.wandb.logged[-1][1]["charge/periods_per_step"]
+    periods = cb.pending["charge/periods_per_step"]
     assert abs(periods - 2 * dr * c) < 1e-3
     assert periods >= 0.4                            # delta is not learnable at this lr
 
@@ -292,3 +274,32 @@ if __name__ == "__main__":
         if name.startswith("test_") and callable(fn):
             fn(); print(f"{name}: PASS")
     print("done")
+
+
+# --------------------------------------------------------------------------- #
+# REGRESSION: no prism callback may log to W&B with an explicit step.
+#
+# HF's evaluate() issues an extra STEPLESS wandb.log per epoch, so W&B's pointer
+# permanently outruns state.global_step and every stepped row after the FIRST eval is
+# rejected as non-monotonic. MEASURED over 600 steps with real wandb: charge/* accepted
+# on 200/600 steps (dead from step 201 on) and eval rows dropped at 400 and 600 —
+# "Tried to log to step 600 that is less than the current step 602". Rows must be
+# buffered on `.pending` and drained into the Trainer's own log row instead.
+# --------------------------------------------------------------------------- #
+def test_no_callback_logs_with_an_explicit_step():
+    import ast, inspect
+    from prism.eval import callbacks as _cb
+
+    tree = ast.parse(inspect.getsource(_cb))
+    bad = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "log"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "wandb"):
+            if any(k.arg == "step" for k in node.keywords) or len(node.args) > 1:
+                bad.append(node.lineno)
+    assert not bad, (
+        f"wandb.log(..., step=...) at callbacks.py line(s) {bad}: that row is dropped "
+        "for the rest of the run once HF's first epoch-end eval advances the pointer"
+    )

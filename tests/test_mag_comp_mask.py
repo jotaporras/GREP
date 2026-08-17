@@ -264,7 +264,7 @@ def test_beta_zero_reproduces_base_logits_exactly():
 
 
 def test_bias_is_zero_outside_the_scope_and_c_tok_inside():
-    """The system prompt gets NO bias; the scope block IS beta * C_tok; nothing is -inf.
+    """The system prompt gets NO bias; the scope block IS beta * bias_block(C_tok).
 
     ``decode_refresh >= c`` puts the whole scope in ONE segment, which is the only regime
     in which the block equals a single C_tok; the autoregressive schedule is the subject
@@ -282,7 +282,8 @@ def test_bias_is_zero_outside_the_scope_and_c_tok_inside():
     assert torch.isfinite(bias).all(), "this arm never hard-blocks"
     assert torch.equal(bias[0, 0, :SCOPE_START, :], torch.zeros(SCOPE_START, ids.shape[1]))
     assert torch.equal(bias[0, 0, :, :SCOPE_START], torch.zeros(ids.shape[1], SCOPE_START))
-    assert torch.allclose(bias[0, 0, SCOPE_START:, SCOPE_START:], 0.5 * c_tok, atol=1e-6)
+    assert torch.allclose(bias[0, 0, SCOPE_START:, SCOPE_START:],
+                          0.5 * model.bias_block(c_tok), atol=1e-6)
 
 
 def test_beta_has_gradient_at_zero_and_c_does_not():
@@ -310,7 +311,9 @@ def test_telemetry_reports_beta_and_the_realised_bias_scale():
     t = model.telemetry()
     assert t["mag/beta"] == pytest.approx(0.4)
     assert t["mag/c_tok_absmax"] > 0
-    assert t["mag/bias_absmax"] == pytest.approx(0.4 * t["mag/c_tok_absmax"])
+    # bias_absmax is beta * max|bias_block(C)|, NOT beta * max|C|: under bias_mode='log'
+    # the two differ by orders of magnitude and only the former is what hits the logits.
+    assert 0 < t["mag/bias_absmax"] < 0.4 * t["mag/c_tok_absmax"]
     assert t["mag/cycle_c"] == CYCLE                      # the REALISED c, not the cap
     assert t["mag/scope_start"] == SCOPE_START
     assert t["mag/num_nodes"] == CYCLE + 4 + 1
@@ -532,7 +535,10 @@ def test_decode_injector_grows_the_cycle_and_crosslinks():
 
 
 def test_decode_injector_bias_row_matches_c_tok_and_scope():
-    """The armed row is beta * C_tok[q, :] over [tau, tau + c) and zero outside it."""
+    """The armed row is beta * bias_block(C_tok)[q, :] over [tau, tau+c), zero outside.
+
+    Decode must apply the SAME fold training does; a raw C_tok row here would silently
+    make generation a different function from the one that was trained."""
     model = _model(beta_init=0.7)
     prompt = _ids(SCOPE_START + 8)[0].tolist()
     inj = CompositeDecodeInjector(model, _scene(), prompt, refresh=1)
@@ -543,7 +549,7 @@ def test_decode_injector_bias_row_matches_c_tok_and_scope():
     flat = row[0, 0, 0]
     assert torch.count_nonzero(flat[:SCOPE_START]) == 0, "the system prompt got a bias"
     q = len(prompt) + 1 - 1 - SCOPE_START
-    expected = float(model.beta) * inj._c_tok[q, : flat.shape[0] - SCOPE_START]
+    expected = float(model.beta) * inj._bias_m[q, : flat.shape[0] - SCOPE_START]
     assert torch.allclose(flat[SCOPE_START:], expected.float(), atol=1e-5)
 
 
@@ -857,3 +863,86 @@ def test_prune_is_a_noop_when_every_scene_node_has_a_neighbour():
         injection_map={0: [(2, 4)]}, context_window=10,
         crosslink_mention_to_node=False, crosslink_bidirectional=True, device='cpu')
     assert g.num_scene_nodes == 4, "a connected scene graph must be left untouched"
+
+
+# --------------------------------------------------------------------------- #
+# bias_mode='log' — the MULTIPLICATIVE fold, softmax(qᵀk + β·log g) ∝ g^β·exp(qᵀk).
+#
+# WHY: the linear bias β·C_tok has no bound on ‖C‖, and the SAME encoder produced
+# 6.7% with C at ~1e-8 of its fitted scale (β-projection on) and 10% with
+# max|C| = 3.8e4 / bias_absmax = 1.9e4, which saturated the softmax so hard that every
+# graph-side grad_norm logged as EXACTLY 0. Scale invariance is the property that kills
+# both failure modes, so it is what these tests pin.
+# --------------------------------------------------------------------------- #
+def _psd(n, seed=0, scale=1.0):
+    g = torch.Generator().manual_seed(seed)
+    a = torch.randn(n, n + 3, generator=g)
+    return (a @ a.t()) * scale
+
+
+class _BiasOnly:
+    """Just the bias_block contract — no LLM, no graph."""
+
+    def __init__(self, mode="log", alpha=0.7, eps=1e-6):
+        self._bias_mode, self._mask_alpha, self._mask_eps = mode, alpha, eps
+
+    bias_block = MagCompGraphLLM.bias_block
+
+
+def test_log_bias_is_invariant_to_the_scale_of_c():
+    """The whole point: rescaling C leaves the bias UNCHANGED."""
+    c = _psd(24, seed=1)
+    m = _BiasOnly("log")
+    base = m.bias_block(c)
+    for s in (1e-8, 1e-3, 1e3, 3.8e4):
+        assert torch.allclose(m.bias_block(c * s), base, atol=1e-5), \
+            f"log bias moved when C was scaled by {s:g} — not scale-invariant"
+
+
+def test_linear_bias_is_not_invariant():
+    """Control: the mode that failed twice DOES track ‖C‖, so the test above has teeth."""
+    c = _psd(24, seed=1)
+    m = _BiasOnly("linear")
+    assert not torch.allclose(m.bias_block(c * 1e3), m.bias_block(c), atol=1e-5)
+
+
+def test_log_bias_is_bounded_and_finite():
+    """β·log g must land near the attention-logit scale, not 1e4, for any ‖C‖."""
+    m = _BiasOnly("log")
+    for s in (1e-8, 1.0, 3.8e4):
+        b = m.bias_block(_psd(32, seed=2, scale=s))
+        assert torch.isfinite(b).all(), f"non-finite bias at scale {s:g}"
+        assert b.max() <= 1e-6, "gate is a probability-like factor: log g <= 0"
+        assert float(b.min()) > -20.0, f"bias unbounded below at scale {s:g}"
+
+
+def test_zero_variance_diagonal_does_not_produce_nan():
+    """A token node with identical probe responses has C_ii = 0 exactly; 0/0 would put
+    NaN into every logit of that row."""
+    c = _psd(12, seed=3)
+    c[4, :] = 0.0
+    c[:, 4] = 0.0                      # node 4 carries no variance at all
+    b = _BiasOnly("log").bias_block(c)
+    assert torch.isfinite(b).all(), "degenerate diagonal leaked NaN/inf into the bias"
+
+
+def test_log_bias_keeps_gradient_to_c():
+    """Saturation killed the channel before; the fold must still pass gradient."""
+    c = _psd(16, seed=4, scale=3.8e4).requires_grad_(True)
+    _BiasOnly("log").bias_block(c).sum().backward()
+    assert c.grad is not None and torch.isfinite(c.grad).all()
+    assert float(c.grad.abs().max()) > 0.0, "no gradient reaches C through the log fold"
+
+
+def test_bias_mode_is_validated_and_recorded_for_reload():
+    """A bad mode fails loudly; and the key must reach gnn_config or eval rebuilds the
+    checkpoint under the OTHER function (the enforce_beta_bound defect)."""
+    import re
+    from pathlib import Path
+    with pytest.raises(ValueError, match="bias_mode"):
+        MagCompGraphLLM(_llm(), _gt(), tokenizer=_Tokenizer(), cycle_size=CYCLE,
+                        bias_mode="sigmoid")
+    src = (Path(__file__).resolve().parent.parent
+           / "src/prism/training/train_v3.py").read_text()
+    block = re.search(r"_direct = \(\n(.*?)\n\s*gnn_config = \{", src, re.S).group(1)
+    assert '"mask_bias_mode"' in block, "mask_bias_mode not recorded in gnn_config"

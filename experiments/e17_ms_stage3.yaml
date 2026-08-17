@@ -35,7 +35,7 @@ gnn:
   #       the GT/MagNet train from step 1 instead of step 2.
   # In exchange the channel cannot sit at zero and report a clean run that trained
   # nothing. Watch mag/bias_absmax against the attention logit scale from the FIRST step.
-  mask_beta_init: 0.5
+  mask_beta_init: 1.0
 
   # Two-group LR (GraphSFTTrainer.create_optimizer): the graph channel — GT + MagNet +
   # beta, i.e. model.structural_parameters() — trains at 0.12x the LoRA's LR. At
