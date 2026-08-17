@@ -63,6 +63,14 @@ STAGE3_EPOCHS="${E17_STAGE3_EPOCHS:-3}"
 # one step in fifteen. trainer.sft is merged LAST over the computed SFTConfig, so this
 # needs no code change. charge/* is unaffected either way: it rides on_step_end.
 E17_LOGGING_STEPS="${E17_LOGGING_STEPS:-1}"
+# OFF, because the notebook pretrains WITHOUT it: base_config defaults it on, so Stage 3
+# projected the loaded MagE-GT at optimizer construction and divided all 5 MagChebConv
+# layers by their slack (MEASURED 4.18/5.93/6.04/6.04/5.95). That is 1/5378 on Phi and,
+# since C is quadratic in Phi, ~3.5e-8 on C: beta*C_tok reached the logits at ~5e-4, the
+# channel took no gradient (beta 0.5 -> 0.49980 in 400 steps, weights drifting a uniform
+# 4e-4 = bf16 noise) and Stage 3 scored 6.7% against Stage 1's 90%. Turn back ON only
+# together with a notebook that pretrains under the same bound, so the two agree.
+E17_BETA_BOUND="${E17_BETA_BOUND:-false}"
 # §3 keeps TWO M=320 autograd graphs alive per sample (probe_covariance for C_tok, plus
 # the detector's cached_pe), and c varies 270-808 across samples, so the caching allocator
 # fragments badly: the OOM that killed a full run reported 14.5 GiB allocated against 8.0
@@ -100,6 +108,7 @@ uv run -m prism.training.train_v3 --config-name=e17_ms_stage1 \
     ${E17_STAGE1_MAX_STEPS:+trainer.max_steps=$E17_STAGE1_MAX_STEPS} \
     ${E17_EVAL_GRAPHS:+eval.num_graphs=$E17_EVAL_GRAPHS} \
     +trainer.sft.logging_steps="$E17_LOGGING_STEPS" \
+    gnn.enforce_beta_bound="$E17_BETA_BOUND" \
     trainer.checkpoint_dir="outputs/e17_magnetic_composite_graphs/${SUITE}" \
     trainer.save_name="e17_ms_stage1_${SUITE}" \
     wandb.run_name="e17_ms_stage1_${SUITE}"
@@ -137,6 +146,7 @@ uv run -m prism.training.train_v3 --config-name=e17_ms_stage3 \
     ${E17_NUM_SAMPLES:+gnn.num_samples=$E17_NUM_SAMPLES} \
     ${E17_EVAL_GRAPHS:+eval.num_graphs=$E17_EVAL_GRAPHS} \
     +trainer.sft.logging_steps="$E17_LOGGING_STEPS" \
+    gnn.enforce_beta_bound="$E17_BETA_BOUND" \
     trainer.epochs="$STAGE3_EPOCHS" \
     trainer.checkpoint_dir="outputs/e17_magnetic_composite_graphs/${SUITE}" \
     trainer.save_name="e17_ms_stage3_${SUITE}" \
