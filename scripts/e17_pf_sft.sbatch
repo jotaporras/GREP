@@ -15,8 +15,10 @@
 # otherwise the e13f_alpha00_binary one verbatim (mask_alpha=0, binary
 # adjacency, decode_consistent, slr=0.012), so any delta vs the e13f numbers
 # is attributable to the post-fusion pathway. The pf modules (pf_proj /
-# pf_norm / pf_gain) are structural parameters and train in the same LR group
-# as the Psi tower.
+# pf_norm / pf_gain) train at the FULL base LR via base_lr_parameters() —
+# the structural 0.012 mult protects the pretrained tower, but the fresh
+# zero-gated pf modules never open at 3e-6 (e17 first round: pf_gain
+# absmax ~1e-4 after 3 epochs, post-fusion effectively off).
 #
 # Dataset is parameterized: DATA_SPLIT points at a split/ dir containing
 # formatted_all_new__{train,val}.json and test_graphs.

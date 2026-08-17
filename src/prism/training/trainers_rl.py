@@ -448,8 +448,12 @@ class MaskGRPOTrainer(GRPOTrainer):
 
         super().__init__(model, args=args, **kwargs)
         # PEFT froze every non-LoRA parameter; the GT training on the RL
-        # reward is the point — re-enable it.
+        # reward is the point — re-enable it (and the base-LR graph-side
+        # params, e.g. the post-fusion modules).
         for p in core.structural_parameters():
+            p.requires_grad = True
+        base_lr_fn = getattr(core, "base_lr_parameters", None)
+        for p in (base_lr_fn() if callable(base_lr_fn) else []):
             p.requires_grad = True
         self._core = core
         self._ensure_fp32_tower()

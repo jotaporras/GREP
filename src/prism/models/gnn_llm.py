@@ -952,14 +952,24 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         return sig
 
     def structural_parameters(self) -> list[nn.Parameter]:
-        """Graph-side parameters for the boosted-LR group: the standalone GT
-        (plus the post-fusion projection/norm/gains when enabled)."""
-        params = list(self.pe_model.parameters())
-        if self._post_fusion:
-            params += list(self.pf_proj.parameters())
-            params += list(self.pf_norm.parameters())
-            params.append(self.pf_gain)
-        return params
+        """Graph-side parameters for the boosted-LR group: the standalone GT.
+
+        The post-fusion modules deliberately do NOT belong here: the
+        ``structural_lr_mult`` damping protects the *pretrained* navigator
+        tower, but pf_proj/pf_norm/pf_gain are freshly initialised (gain at
+        zero) — at SFT's mult 0.012 they never open the gate (e17: pf_gain
+        absmax ~1e-4 after 3 epochs). They train at base LR via
+        :meth:`base_lr_parameters`."""
+        return list(self.pe_model.parameters())
+
+    def base_lr_parameters(self) -> list[nn.Parameter]:
+        """Post-fusion projection/norm/gains — fresh modules that need the
+        full base LR (see :meth:`structural_parameters`); [] when disabled."""
+        if not self._post_fusion:
+            return []
+        return (list(self.pf_proj.parameters())
+                + list(self.pf_norm.parameters())
+                + [self.pf_gain])
 
     def graph_token_position_ids(
         self,

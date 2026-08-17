@@ -80,9 +80,17 @@ def test_build_pf_signal_survives_autocast():
     assert torch.isfinite(out).all()
 
 
-def test_structural_parameters_include_pf():
+def test_pf_params_train_at_base_lr():
+    # The pf modules are fresh (zero-gated) and must NOT sit in the damped
+    # structural group — at SFT's structural_lr_mult 0.012 the gate never
+    # opens (e17: pf_gain absmax ~1e-4 after 3 epochs). They belong in
+    # base_lr_parameters(), which both trainers unfreeze and create_optimizer
+    # leaves at the full base LR.
     m = _model(post_fusion=True)
-    params = set(map(id, m.structural_parameters()))
-    assert id(m.pf_gain) in params
-    assert id(m.pf_proj.weight) in params
-    assert id(m.pf_norm.weight) in params
+    struct = set(map(id, m.structural_parameters()))
+    base = set(map(id, m.base_lr_parameters()))
+    for p in (m.pf_gain, m.pf_proj.weight, m.pf_norm.weight):
+        assert id(p) in base
+        assert id(p) not in struct
+    assert not (struct & base)
+    assert _model(post_fusion=False).base_lr_parameters() == []
