@@ -276,14 +276,14 @@ def test_bias_is_zero_outside_the_scope_and_c_tok_inside():
         bias = model.build_structural_mask(
             ids.shape[1], [_scene()], [_injection_map()], DEVICE,
             dtype=torch.float32, input_ids=ids)
-        c_tok = model.covariance_token_block(
-            model.composite_graph(_scene(), ids[0].tolist(), _injection_map(),
-                                  SCOPE_START, DEVICE), CYCLE)
+        comp = model.composite_graph(_scene(), ids[0].tolist(), _injection_map(),
+                                     SCOPE_START, DEVICE)
+        c_full = model.covariance_token_block(comp, comp.num_nodes)
     assert torch.isfinite(bias).all(), "this arm never hard-blocks"
     assert torch.equal(bias[0, 0, :SCOPE_START, :], torch.zeros(SCOPE_START, ids.shape[1]))
     assert torch.equal(bias[0, 0, :, :SCOPE_START], torch.zeros(ids.shape[1], SCOPE_START))
     assert torch.allclose(bias[0, 0, SCOPE_START:, SCOPE_START:],
-                          0.5 * model.bias_block(c_tok), atol=1e-6)
+                          0.5 * model.bias_block(c_full, comp), atol=1e-6)
 
 
 def test_beta_has_gradient_at_zero_and_c_does_not():
@@ -874,10 +874,23 @@ def test_prune_is_a_noop_when_every_scene_node_has_a_neighbour():
 # graph-side grad_norm logged as EXACTLY 0. Scale invariance is the property that kills
 # both failure modes, so it is what these tests pin.
 # --------------------------------------------------------------------------- #
-def _psd(n, seed=0, scale=1.0):
+def _psd(c, seed=0, scale=1.0, n_scene=4):
+    """Full-composite PSD covariance for `c` token rows (+ scene + anchor)."""
+    n = c + n_scene + 1
     g = torch.Generator().manual_seed(seed)
     a = torch.randn(n, n + 3, generator=g)
     return (a @ a.t()) * scale
+
+
+class _Comp:
+    """Composite stub: token rows first, then scene, then the anchor."""
+
+    def __init__(self, c, n_scene=4):
+        self.num_token_nodes, self.num_scene_nodes = c, n_scene
+        self.num_nodes = c + n_scene + 1
+        t = torch.full((c,), c + n_scene, dtype=torch.long)   # anchor for unmentioned
+        t[: c // 2] = c + (torch.arange(c // 2) % n_scene)    # first half mentions scene
+        self.tok2node = t
 
 
 class _BiasOnly:
@@ -891,26 +904,26 @@ class _BiasOnly:
 
 def test_log_bias_is_invariant_to_the_scale_of_c():
     """The whole point: rescaling C leaves the bias UNCHANGED."""
-    c = _psd(24, seed=1)
+    c, comp = _psd(24, seed=1), _Comp(24)
     m = _BiasOnly("log")
-    base = m.bias_block(c)
+    base = m.bias_block(c, comp)
     for s in (1e-8, 1e-3, 1e3, 3.8e4):
-        assert torch.allclose(m.bias_block(c * s), base, atol=1e-5), \
+        assert torch.allclose(m.bias_block(c * s, comp), base, atol=1e-5), \
             f"log bias moved when C was scaled by {s:g} — not scale-invariant"
 
 
 def test_linear_bias_is_not_invariant():
     """Control: the mode that failed twice DOES track ‖C‖, so the test above has teeth."""
-    c = _psd(24, seed=1)
+    c, comp = _psd(24, seed=1), _Comp(24)
     m = _BiasOnly("linear")
-    assert not torch.allclose(m.bias_block(c * 1e3), m.bias_block(c), atol=1e-5)
+    assert not torch.allclose(m.bias_block(c * 1e3, comp), m.bias_block(c, comp), atol=1e-5)
 
 
 def test_log_bias_is_bounded_and_finite():
     """β·log g must land near the attention-logit scale, not 1e4, for any ‖C‖."""
     m = _BiasOnly("log")
     for s in (1e-8, 1.0, 3.8e4):
-        b = m.bias_block(_psd(32, seed=2, scale=s))
+        b = m.bias_block(_psd(32, seed=2, scale=s), _Comp(32))
         assert torch.isfinite(b).all(), f"non-finite bias at scale {s:g}"
         assert b.max() <= 1e-6, "gate is a probability-like factor: log g <= 0"
         assert float(b.min()) > -20.0, f"bias unbounded below at scale {s:g}"
@@ -922,14 +935,14 @@ def test_zero_variance_diagonal_does_not_produce_nan():
     c = _psd(12, seed=3)
     c[4, :] = 0.0
     c[:, 4] = 0.0                      # node 4 carries no variance at all
-    b = _BiasOnly("log").bias_block(c)
+    b = _BiasOnly("log").bias_block(c, _Comp(12))
     assert torch.isfinite(b).all(), "degenerate diagonal leaked NaN/inf into the bias"
 
 
 def test_log_bias_keeps_gradient_to_c():
     """Saturation killed the channel before; the fold must still pass gradient."""
     c = _psd(16, seed=4, scale=3.8e4).requires_grad_(True)
-    _BiasOnly("log").bias_block(c).sum().backward()
+    _BiasOnly("log").bias_block(c, _Comp(16)).sum().backward()
     assert c.grad is not None and torch.isfinite(c.grad).all()
     assert float(c.grad.abs().max()) > 0.0, "no gradient reaches C through the log fold"
 

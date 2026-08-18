@@ -718,6 +718,12 @@ def build_composite_graph(scene, input_ids, injection_map, scope_start: int = 0,
         vals.append((torch.ones(scene_ei.shape[1]) if scene_ew is None else scene_ew)
                     .to(device=device, dtype=torch.float32))
 
+    # token -> composite row of the scene node it mentions, filled in the E_Cross loop
+    # below; the ANCHOR for unmentioned tokens, so MagCompGraphLLM.bias_block's
+    # four-factor form has an x and a y for EVERY token with no per-pair branching.
+    tok2node = torch.full((c,), c + n_scene if anchor else -1,
+                          dtype=torch.long, device=device)
+
     # E_Cross: the collator's injection map, clamped to the window and shifted into it.
     for node_idx, spans in injection_map.items():
         toks = sorted({t - scope_start for start, end in spans
@@ -727,6 +733,7 @@ def build_composite_graph(scene, input_ids, injection_map, scope_start: int = 0,
             continue
         tok = torch.tensor(toks, device=device, dtype=torch.long)
         node = torch.full_like(tok, c + int(perm[node_idx]))
+        tok2node[tok] = node
         if crosslink_mention_to_node:
             _add(tok, node, crosslink_weight)
         if crosslink_bidirectional:
@@ -749,6 +756,7 @@ def build_composite_graph(scene, input_ids, injection_map, scope_start: int = 0,
     composite.is_token = torch.zeros(num_nodes, dtype=torch.bool, device=device)
     composite.is_token[:c] = True
     composite.num_token_nodes, composite.num_scene_nodes = c, n_scene
+    composite.tok2node = tok2node
     return composite
 
 
@@ -3202,34 +3210,75 @@ class MagCompGraphLLM(LearnableGraphMaskLLM):
             self._ctok_graph, self._ctok_cache = composite, c_tok
         return c_tok
 
-    def bias_block(self, c_tok: torch.Tensor) -> torch.Tensor:
+    def bias_block(self, c_full: torch.Tensor, composite) -> torch.Tensor:
         r"""The per-entry matrix ``β`` scales into the logits — ``log`` or ``linear``.
 
-        ``log`` (DEFAULT) folds ``C_tok`` MULTIPLICATIVELY, the same way the parent's
-        ``ΨΨᵀ`` gate does (:meth:`LearnableGraphMaskLLM.build_structural_mask`,
-        ``gate.log()``): ``softmax(qᵀk + log g) ∝ g · exp(qᵀk)``. Two steps, both
-        load-bearing:
+        TWO-FACTOR form. With ``n, m`` token positions and ``x = ν(n)``, ``y = ν(m)``
+        their mentioned scene nodes (the ANCHOR for unmentioned tokens, so no branch)::
 
-        1. CORRELATION, ``C_ij / sqrt(C_ii C_jj)`` — the scale-free reading of a
-           covariance, and the exact analogue of the parent's row-normalized cosine.
-           This is what makes the bias invariant to ``‖C‖``, which nothing in this
-           architecture bounds: the SAME encoder scored 6.7% with ``C`` ~1e-8 of its
-           fitted scale (β-projection ON) and 10% with ``max|C| = 3.8e4`` and
-           ``bias_absmax = 1.9e4`` (projection OFF), the second saturating the softmax
-           so hard that grad_norm reached the graph channel as EXACTLY 0.
-        2. The parent's gate ``α + (1−α)·corr``, clamped at ``eps`` and logged. ``corr``
-           is in [−1, 1] like cosine, so ``α`` carries its usual meaning and the gate is
-           positive by construction; ``log`` then maps it to ``(log eps, 0]``.
+            P[n,m] = C[n,m] · C[x,y]
+            rho    = corr(P),  corr(P)[n,m] = P[n,m] / sqrt(P[n,n] P[m,m])
+            bias   = log( (1 + rho) / 2 )
 
-        ``linear`` is the original ``C_tok`` passed through, kept ONLY as the ablation
-        that shows why the fold is needed. It is not a supported training setting.
+        text-text coupling times scene-scene coupling, and NOTHING else. The mixed
+        C[n,y] / C[x,m] terms are deliberately omitted: they are the only ones with no
+        limit theorem in either axis (C[n,m] transfers in sequence length by the
+        circulant argument, C[x,y] in scene size by the MagE-GT result), and they are
+        also the only ones that are not symmetric PSD in (n,m) — which is why including
+        them cost boundedness and transferability together.
 
-        The diagonal is clamped before the square root: ``C`` is PSD so ``C_ii >= 0``,
-        but a token node whose probe responses are identical across draws has
-        ``C_ii = 0`` exactly, and ``0/0`` would put NaN into every logit of that row.
+        Two consequences, both MEASURED on the trained MagE-GT over 5 real n_30 graphs:
+          * C[:c,:c] and C[nu,nu] are both PSD (principal / V^T C V submatrices), so by
+            the SCHUR PRODUCT THEOREM P is PSD and rho is in [-1, 1] — measured range
+            [-0.774, 1.000], versus [-8.12, +11.84] for the four-factor form. The gate
+            therefore needs no alpha to stay positive and never reaches the eps floor.
+          * The diagonal factorises EXACTLY, P[n,n] = C[n,n]·C[x,x], so
+            corr(P) = corr(C)[n,m] · corr(C)[x,y] identically (verified to 3e-7): the
+            "corr of the product" vs "product of the corrs" ambiguity does not arise.
+
+        alpha is GONE. Over the observed rho range log(alpha + (1-alpha)rho) is affine in
+        rho to R^2 = 0.99 (alpha=0.7) / 0.9994 (alpha=0.9), and its intercept is
+        row-constant, which softmax cancels — so alpha was a second scale knob beta
+        already owned. (1 + rho)/2 maps [-1,1] onto [0,1] with no free parameter.
+
+        For an unmentioned pair x = y = a and corr(C)[a,a] = 1, so the scene factor is
+        exactly 1 and the bias collapses to log((1 + corr(C)[n,m])/2): the anchor
+        substitute is self-neutralising rather than an injected signal.
+
+        ``c_full`` is the covariance over ALL composite rows, not the token block:
+        ``N = c + n_scene + 1``, ~3% more memory than ``[c, c]`` at c = 7650.
+
+        ``log`` (DEFAULT) folds MULTIPLICATIVELY, the same way the parent's ``ΨΨᵀ`` gate
+        does (:meth:`LearnableGraphMaskLLM.build_structural_mask`, ``gate.log()``):
+        ``softmax(qᵀRk + β·log g) ∝ g^β · exp(qᵀRk)``. The CORRELATION step is what makes
+        the bias invariant to ``‖C‖``, which nothing in this architecture bounds: the
+        SAME encoder scored 6.7% with ``C`` at ~1e-8 of its fitted scale (β-projection
+        ON) and 10% with ``max|C| = 3.8e4`` and ``bias_absmax = 1.9e4`` (projection OFF),
+        the second saturating the softmax so hard that every graph-side grad_norm logged
+        as EXACTLY 0.
+
+        ``linear`` is the raw ``C_tok`` passed through, kept ONLY as the ablation that
+        shows why the fold is needed. It is not a supported training setting.
+
+        The diagonal is floored RELATIVELY before the square root: ``C`` is PSD so
+        ``C_ii >= 0``, but a token whose probe responses are identical across draws has
+        ``C_ii = 0`` exactly and ``0/0`` would put NaN into every logit of that row. An
+        ABSOLUTE floor would re-break scale invariance whenever all of ``C`` fell under
+        it — precisely the β-projection regime.
         """
+        c = composite.num_token_nodes
         if self._bias_mode == "linear":
-            return c_tok
+            return c_full[:c, :c]
+        t2n = composite.tok2node
+        if int(t2n.min()) < 0:
+            raise RuntimeError(
+                "composite.tok2node holds -1: the scene factor substitutes the ANCHOR "
+                "for unmentioned tokens, so mask_anchor_enabled must be true. Set it, "
+                "or use mask_bias_mode='linear'.")
+        # P[n,m] = C[n,m]·C[x,y], x = nu(n), y = nu(m). c_full[t2n][:, t2n] gathers the
+        # scene-scene block into token indexing. Two factors, not four: the mixed
+        # C[n,y] / C[x,m] terms are the ones that break both PSD-ness and transferability.
+        c_tok = c_full[:c, :c] * c_full[t2n, :][:, t2n]
         diag = c_tok.diagonal()
         # RELATIVE floor. An absolute clamp_min(eps) would re-break scale invariance the
         # moment the whole matrix falls under eps — exactly the beta-projection regime,
@@ -3238,8 +3287,10 @@ class MagCompGraphLLM(LearnableGraphMaskLLM):
         d = diag.clamp_min(diag.max() * self._mask_eps).sqrt()
         denom = d.unsqueeze(1) * d.unsqueeze(0)
         corr = c_tok / denom.clamp_min(torch.finfo(denom.dtype).tiny)
-        gate = (self._mask_alpha + (1.0 - self._mask_alpha) * corr).clamp_min(self._mask_eps)
-        return gate.log()
+        # No alpha. Schur puts corr in [-1, 1] (MEASURED [-0.774, 1.000] on the trained
+        # MagE-GT over 5 real graphs), so (1+corr)/2 lands in [0, 1] with no free
+        # parameter; eps binds only at corr = -1 exactly, which was never reached.
+        return ((1.0 + corr) * 0.5).clamp_min(self._mask_eps).log()
 
     def build_structural_mask(self, seq_len, graphs, injection_maps, device, dtype=None,
                               key_injection_maps=None, permutation=None,
@@ -3300,6 +3351,13 @@ class MagCompGraphLLM(LearnableGraphMaskLLM):
                 composite = self.composite_graph(
                     graphs[b], ids[:p_ref], injection_maps[b], start, device, permutation)
                 c_seg = composite.num_token_nodes
+
+                def _fold(_d=None, _g=composite, _c=c_seg):
+                    """C over ALL composite rows, folded to the bias. Returns the token
+                    block too, so telemetry still measures C_tok and not the full C."""
+                    cf = self.covariance_token_block(_g, _g.num_nodes)
+                    return self.bias_block(cf, _g), cf[:_c, :_c]
+
                 if torch.is_grad_enabled():
                     # Memory only: one segment's Phi' activations live at a time instead
                     # of all ceil(c / refresh) of them, recomputed in backward. Exactly
@@ -3307,13 +3365,12 @@ class MagCompGraphLLM(LearnableGraphMaskLLM):
                     # RNG state, so the recompute draws the SAME probes even under
                     # fixed_seed_mode=false. The dummy gives checkpoint a grad-carrying
                     # input (the composite is data and the block reads no tensor arg).
+                    # The FOLD is inside it too: its four [c, c] gathers are the largest
+                    # tensors here (234 MB each at c = 7650) and must not outlive forward.
                     dummy = torch.ones(1, device=device, requires_grad=True)
-                    c_tok = checkpoint(
-                        lambda _d, _g=composite, _c=c_seg: self.covariance_token_block(_g, _c),
-                        dummy, use_reentrant=False)
+                    m, c_tok = checkpoint(_fold, dummy, use_reentrant=False)
                 else:
-                    c_tok = self.covariance_token_block(composite, c_seg)
-                m = self.bias_block(c_tok)
+                    m, c_tok = _fold()
                 # Only the queries this graph actually has token nodes for get a row.
                 rows = min(q1, start + c_seg) - q0
                 if rows > 0:
@@ -3909,10 +3966,12 @@ class CompositeDecodeInjector:
         composite = self.model.composite_graph(
             self.graph, ids, injection_map, tau, self.device,
             permutation=self.permutation)
-        self._c_tok = self.model.covariance_token_block(composite, c)
-        # Fold ONCE per rebuild, not per row: bias_block needs the whole diagonal (the
-        # correlation normaliser), and decode must apply the SAME function training does.
-        self._bias_m = self.model.bias_block(self._c_tok)
+        # FULL composite covariance: the four-factor fold reads the token-scene and
+        # scene-scene blocks too. Fold ONCE per rebuild, not per row (bias_block needs
+        # the whole diagonal), and decode must apply the SAME function training does.
+        c_full = self.model.covariance_token_block(composite, composite.num_nodes)
+        self._c_tok = c_full[:c, :c]
+        self._bias_m = self.model.bias_block(c_full, composite)
         self._tau, self._since = tau, 0
 
     def pre_hook(self, module, args, kwargs):
