@@ -69,12 +69,16 @@ SCRIPT="scripts/e17_magnet_composite_graphs.py"
 # wrote. Set E17_PE_GT_FROM to consume a freshly trained one instead.
 CKPT="${E17_PE_GT_FROM:-outputs/e17_mag_gt/${MAGGT_LOAD_SUITE}/mag_gt.pt}"
 STAGE3_EPOCHS="${E17_STAGE3_EPOCHS:-3}"
-# train_v3 hard-codes logging_steps=15, and HF's on_log is the ONLY hook train/loss and
-# learning_rate fire on — at 15 they exist on one step in fifteen. trainer.sft is merged
-# LAST over the computed SFTConfig, so this needs no code change. The CALLBACK rows
-# (debug/*, mag/*, charge/*, eval/*, grep/*) ride the same cadence: they are drained into
-# the Trainer's own log row with wandb.log(commit=False), so 1 here means per-step.
-E17_LOGGING_STEPS="${E17_LOGGING_STEPS:-1}"
+# Matches train_v3's own logging_steps=15 — set explicitly so the cadence is visible at
+# the launch site rather than buried in a hard-coded SFTConfig default. HF's on_log is
+# the ONLY hook train/loss and learning_rate fire on, and the CALLBACK rows (debug/*,
+# mag/*, charge/*, eval/*, grep/*) ride the same cadence: they are drained into the
+# Trainer's own log row with wandb.log(commit=False). So this is the resolution of EVERY
+# W&B curve — 15 gives one point per fifteen steps; set 1 to debug a specific step.
+# Cumulative fields (charge/crossings, charge/delta_min_since_start) stay exact at any
+# value; the per-step ones are subsampled, not averaged. trainer.sft is merged LAST over
+# the computed SFTConfig, so this needs no code change.
+E17_LOGGING_STEPS="${E17_LOGGING_STEPS:-15}"
 # REDUNDANT belt-and-braces: base_config AND the trainers.py fallback both default this
 # to false now, so this line only stops a stray config from re-enabling it. Kept because
 # of what it cost. The projection divides all 5 MagChebConv layers by their slack
