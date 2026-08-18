@@ -386,6 +386,15 @@ def train_model(config: omegaconf.DictConfig):
 
     # Log all training config parameters to wandb
     if wandb.run is not None:
+        # X-AXIS = the TRAINING step, not W&B's internal counter. Every row this run logs
+        # is STEPLESS (HF's WandbCallback commits with no step=, and the callback drains
+        # ride that same row with commit=False), so `_step` counts LOG EVENTS: at
+        # logging_steps=15 the panels read 1, 2, 3 ... instead of 15, 30, 45. HF puts
+        # train/global_step into every row it logs, so pointing every metric at it fixes
+        # every panel at once. Stepless logging is deliberate — passing step= is what got
+        # rows rejected as non-monotonic once HF's per-epoch eval advanced the pointer.
+        wandb.define_metric("train/global_step")
+        wandb.define_metric("*", step_metric="train/global_step")
         wandb.config.update(
             omegaconf.OmegaConf.to_container(config, resolve=True),
             allow_val_change=True,
