@@ -34,7 +34,7 @@ from torch_geometric.data import Data
 
 from prism.models.gnn_llm import (CompositeDecodeInjector, MagCompGraphLLM,
                                   build_composite_graph, build_injection_map,
-                                  defer_open_mentions, node_token_variants)
+                                  defer_open_mentions, node_token_variants, tok2node_vector, node_adjacency)
 from prism.models.gt import GraphTransformer
 
 DEVICE = torch.device("cpu")
@@ -251,8 +251,14 @@ def test_pe_pool_and_gt_argument_must_agree():
 
 # ------------------------------------------------------------------------- the bias
 def test_beta_zero_reproduces_base_logits_exactly():
-    """beta = 0 => the bias is identically 0 => the base LLM, bit for bit."""
-    model = _model(beta_init=0.0)
+    """beta = 0 => the bias is identically 0 => the base LLM, bit for bit.
+
+    ACCEPTANCE A2, and it now requires mask_use_edges=False. With the hard adjacency
+    block armed the -inf on non-adjacent mention pairs is INDEPENDENT of beta, so beta=0
+    no longer reproduces the base logits — exactly as LearnableGraphMaskLLM, which gets
+    87% precisely by imposing structure the soft gate cannot scale away.
+    """
+    model = _model(beta_init=0.0, use_edges=False, psi_scale='inv_sqrt_d')
     ids = _ids().to(DEVICE)
     kw = dict(graphs=[_scene()], injection_maps=[_injection_map()])
     with torch.no_grad():
@@ -270,7 +276,8 @@ def test_bias_is_zero_outside_the_scope_and_c_tok_inside():
     in which the block equals a single C_tok; the autoregressive schedule is the subject
     of ``test_training_bias_grows_autoregressively``.
     """
-    model = _model(beta_init=0.5, decode_refresh=CYCLE)
+    model = _model(beta_init=0.5, decode_refresh=CYCLE, use_edges=False,
+                   psi_scale='inv_sqrt_d')
     ids = _ids().to(DEVICE)
     with torch.no_grad():
         bias = model.build_structural_mask(
@@ -279,7 +286,7 @@ def test_bias_is_zero_outside_the_scope_and_c_tok_inside():
         comp = model.composite_graph(_scene(), ids[0].tolist(), _injection_map(),
                                      SCOPE_START, DEVICE)
         c_full = model.covariance_token_block(comp, comp.num_nodes)
-    assert torch.isfinite(bias).all(), "this arm never hard-blocks"
+    assert torch.isfinite(bias).all(), "the SOFT term never hard-blocks (use_edges=False)"
     assert torch.equal(bias[0, 0, :SCOPE_START, :], torch.zeros(SCOPE_START, ids.shape[1]))
     assert torch.equal(bias[0, 0, :, :SCOPE_START], torch.zeros(ids.shape[1], SCOPE_START))
     assert torch.allclose(bias[0, 0, SCOPE_START:, SCOPE_START:],
@@ -720,14 +727,19 @@ def test_training_and_decode_bias_agree_position_by_position():
 
 
 def test_frozen_graph_ignores_the_answer_entirely():
-    """``decode_refresh=0`` pins every segment to the prompt.
+    """``decode_refresh=0`` pins every segment to the prompt (SOFT term only).
+
+    Stated with mask_use_edges=False: the hard adjacency block is deliberately NOT frozen
+    — it covers answer mentions as they are written, which is what constrains the route,
+    and it is recomputed from the scene adjacency rather than the frozen composite.
 
     The bias must then be a function of ``ids[:answer_start]`` alone: changing the answer
     tokens cannot move a single entry, and answer QUERIES carry no bias at all, because a
     prompt-only composite has no token node for them. That is exactly what decode does
     past its window, which is what makes the two identical.
     """
-    model = _model(beta_init=1.0, decode_refresh=0)
+    model = _model(beta_init=1.0, decode_refresh=0, use_edges=False,
+                   psi_scale='inv_sqrt_d')
     ids = _ids().to(DEVICE)
     answer = SCOPE_START + 4
     other = ids.clone()
@@ -959,3 +971,86 @@ def test_bias_mode_is_validated_and_recorded_for_reload():
            / "src/prism/training/train_v3.py").read_text()
     block = re.search(r"_direct = \(\n(.*?)\n\s*gnn_config = \{", src, re.S).group(1)
     assert '"mask_bias_mode"' in block, "mask_bias_mode not recorded in gnn_config"
+
+
+# --------------------------------------------------------------------------- #
+# HARD ADJACENCY BLOCK — the mechanism LearnableGraphMaskLLM gets 87% from.
+#
+# A soft beta*log gate measured AUC 0.73 at ranking scene-adjacent token pairs, far too
+# weak to reconstruct connectivity that data.text_edge_list=none removed from the prompt.
+# The block puts the TRUE edge_index back in as a constraint. These tests pin the three
+# ways it could silently be wrong: masking the wrong pairs, killing a row (NaN), or
+# disagreeing with what decode can know.
+# --------------------------------------------------------------------------- #
+def test_block_only_touches_genuine_mention_pairs():
+    """ONLY pairs where BOTH tokens mention a scene node may be -inf.
+
+    The composite substitutes the ANCHOR for unmentioned tokens so the soft term has a
+    uniform factor count; reusing that here would make every pair maskable and zero out
+    ordinary token-token attention.
+    """
+    model = _model(beta_init=1.0, decode_refresh=CYCLE)
+    ids = _ids().to(DEVICE)
+    imap = _injection_map()
+    with torch.no_grad():
+        bias = model.build_structural_mask(
+            ids.shape[1], [_scene()], [imap], DEVICE,
+            dtype=torch.float32, input_ids=ids)
+    t2n = tok2node_vector(imap, ids.shape[1], DEVICE)
+    mention = (t2n >= 0)
+    blocked = ~torch.isfinite(bias[0, 0]) | (bias[0, 0] <= torch.finfo(torch.float32).min / 2)
+    both = mention.unsqueeze(1) & mention.unsqueeze(0)
+    assert not bool((blocked & ~both).any()), (
+        "a pair with a non-mention endpoint was hard-blocked — ordinary token-token "
+        "attention must never be zeroed")
+
+
+def test_block_reproduces_the_true_adjacency():
+    """Where both endpoints are mentions AND both are decode-knowable, blocked iff the
+    scene nodes are non-adjacent — the constraint must BE the graph, not a proxy."""
+    model = _model(beta_init=1.0, decode_refresh=CYCLE)
+    ids = _ids().to(DEVICE)
+    imap = _injection_map()
+    scene = _scene()
+    with torch.no_grad():
+        bias = model.build_structural_mask(
+            ids.shape[1], [_scene()], [imap], DEVICE,
+            dtype=torch.float32, input_ids=ids)
+    t2n = tok2node_vector(imap, ids.shape[1], DEVICE)
+    adj = node_adjacency(scene, DEVICE, k_hops=1, symmetrize=True, use_edges=True)
+    pos = (t2n >= 0).nonzero(as_tuple=True)[0]
+    # only the tail of each span is decode-knowable at its own position; compare where
+    # BOTH endpoints have resolved by the query index.
+    resolve = {}
+    for n_, spans in imap.items():
+        for s_, e_ in spans:
+            for t in range(s_, min(e_, ids.shape[1])):
+                resolve[t] = e_ - 1
+    checked = 0
+    for qi in pos.tolist():
+        for ki in pos.tolist():
+            if resolve[qi] > qi or resolve[ki] > qi:
+                continue                      # not knowable to decode at this query
+            want_block = not bool(adj[t2n[qi], t2n[ki]])
+            got_block = float(bias[0, 0, qi, ki]) <= torch.finfo(torch.float32).min / 2
+            assert want_block == got_block, (
+                f"query {qi} (node {int(t2n[qi])}) vs key {ki} (node {int(t2n[ki])}): "
+                f"adjacency says block={want_block}, mask says {got_block}")
+            checked += 1
+    assert checked > 0, "no comparable pair — the test proved nothing"
+
+
+def test_no_query_row_is_fully_masked():
+    """A fully -inf row makes softmax return NaN and kills the run. Every mention row
+    must keep at least one finite key (its own diagonal via self-loops, plus every
+    non-mention token, which is never blocked)."""
+    model = _model(beta_init=1.0, decode_refresh=CYCLE)
+    ids = _ids().to(DEVICE)
+    with torch.no_grad():
+        bias = model.build_structural_mask(
+            ids.shape[1], [_scene()], [_injection_map()], DEVICE,
+            dtype=torch.float32, input_ids=ids)
+    finite_per_row = torch.isfinite(bias[0, 0]).sum(dim=1)
+    causal_ok = (bias[0, 0] > torch.finfo(torch.float32).min / 2)
+    assert int(finite_per_row.min()) > 0, "a query row is entirely non-finite -> NaN"
+    assert int(causal_ok.sum(dim=1).min()) > 0, "a query row has no usable key -> NaN"

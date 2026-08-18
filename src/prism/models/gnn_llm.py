@@ -3314,6 +3314,7 @@ class MagCompGraphLLM(LearnableGraphMaskLLM):
             dtype = self.llm.get_input_embeddings().weight.dtype
         bias = torch.zeros(len(injection_maps), 1, seq_len, seq_len,
                            device=device, dtype=dtype)
+        neg = torch.finfo(dtype).min
         stats = []
         refresh = self._decode_refresh
         for b in range(len(injection_maps)):
@@ -3377,6 +3378,50 @@ class MagCompGraphLLM(LearnableGraphMaskLLM):
                     bias[b, 0, q0:q0 + rows, start:start + c_seg] = (
                         self.beta * m[q0 - start:q0 - start + rows, :]).to(dtype)
                 q0 = q1
+            # HARD ADJACENCY BLOCK — the mechanism LearnableGraphMaskLLM gets 87% from,
+            # and the one this arm had discarded. `node_adjacency` reads the TRUE
+            # scene `edge_index`, so it survives data.text_edge_list=none: the structure
+            # comes from the graph object, never from the prompt. The soft beta*log gate
+            # alone measured only AUC 0.73 at ranking scene-adjacent token pairs, which
+            # is far too weak to reconstruct connectivity the text no longer carries.
+            #
+            # SCOPED TO GENUINE MENTIONS ONLY. `tok2node_vector` is -1 off a mention, and
+            # both endpoints must be >= 0 before anything is blocked — the composite's
+            # `tok2node` (which substitutes the ANCHOR for unmentioned tokens, for the
+            # soft term's uniform factor count) must NOT be reused here: anchoring would
+            # make every pair maskable and zero out ordinary token-token attention.
+            # Taken over the WHOLE injection map like the parent, so mentions in the task
+            # and in the answer as it is generated are constrained too — that is what
+            # makes the mask bind on the route rather than only on the scene block.
+            if self._mask_use_edges:
+                t2n_abs = tok2node_vector(injection_maps[b], seq_len, device)
+                pos = (t2n_abs >= 0).nonzero(as_tuple=True)[0]
+                if pos.numel():
+                    adj = self._node_adjacency(graphs[b], device, permutation=permutation)
+                    nid = t2n_abs[pos]
+                    blocked = ~adj[nid][:, nid]                       # [P, P] static
+                    # DECODE-KNOWABLE ONLY. A mention is not a mention until its LAST
+                    # token is emitted: build_injection_map cannot match `house_` before
+                    # the `1` arrives, so at query p decode sees -1 there while training,
+                    # reading the whole sequence, sees the node. MEASURED on a real
+                    # sequence: a span at [12,15) resolves for decode only at p=14, so
+                    # training blocking it at p=12 makes the two different functions on
+                    # exactly the tokens that write the route. `resolve` is that last
+                    # index; a row may use a span only once p has reached it.
+                    resolve = torch.full((seq_len,), seq_len, dtype=torch.long,
+                                         device=device)
+                    for node_idx, spans in injection_maps[b].items():
+                        for s_, e_ in spans:
+                            e_c = min(int(e_), seq_len)
+                            if int(s_) < e_c:
+                                resolve[int(s_):e_c] = e_c - 1
+                    r_pos = resolve[pos]                              # [P]
+                    key_ready = r_pos.unsqueeze(0) <= pos.unsqueeze(1)   # [P,P] key j @ row i
+                    q_ready = (r_pos <= pos).unsqueeze(1)                # [P,1] query itself
+                    apply = blocked & key_ready & q_ready
+                    sub = bias[b, 0, pos.unsqueeze(1), pos.unsqueeze(0)]
+                    bias[b, 0, pos.unsqueeze(1), pos.unsqueeze(0)] = torch.where(
+                        apply, torch.tensor(neg, dtype=dtype, device=device), sub)
             stats.append(self._measure(c_tok, composite, start, end,
                                        gated=None if c_tok is None else m))
         self._telemetry = stats
@@ -3991,20 +4036,46 @@ class CompositeDecodeInjector:
             self._since += 1
             if self.refresh and self._since >= self.refresh:
                 self._rebuild()
-        if self._c_tok is None:
-            self.model._decode_bias_row = None
-            return
-
-        # The query is the token just consumed; its composite row is its offset into the
-        # window. Past the last refresh's window it has no row yet, so it carries no bias.
         k_len = len(self.prompt_ids) + len(self.generated)
-        q_row = k_len - 1 - self._tau
-        c = self._c_tok.shape[0]
-        if not 0 <= q_row < c:
-            self.model._decode_bias_row = None
-            return
         row = torch.zeros(k_len, dtype=torch.float32, device=self.device)
-        keys = min(c, k_len - self._tau)
-        row[self._tau:self._tau + keys] = (
-            self.model.beta * self._bias_m[q_row, :keys]).float()
-        self.model._decode_bias_row = row.view(1, 1, 1, k_len)
+        armed = False
+
+        # SOFT TERM. The query's composite row is its offset into the window; past the
+        # last refresh's window it has no row yet, so it carries no soft bias. Frozen
+        # (refresh=0) that is every answer token — which is why the HARD block below
+        # must NOT be gated on this, or it would be inert exactly during generation.
+        if self._c_tok is not None:
+            q_row = k_len - 1 - self._tau
+            c = self._c_tok.shape[0]
+            if 0 <= q_row < c:
+                keys = min(c, k_len - self._tau)
+                row[self._tau:self._tau + keys] = (
+                    self.model.beta * self._bias_m[q_row, :keys]).float()
+                armed = True
+
+        # HARD ADJACENCY BLOCK, the decode half of build_structural_mask's, and
+        # INDEPENDENT of the composite and the refresh schedule: it needs only the scene
+        # adjacency and a token->node map, both available at every step. Recomputed over
+        # prompt + everything generated so far, so a route token the model has just
+        # written is constrained against the ones before it. Genuine mentions only —
+        # build_injection_map is silent off a mention, so a token with no scene node is
+        # never an endpoint, and ordinary token-token attention is never touched.
+        if self.model._mask_use_edges and self._tau is not None:
+            ids = self.prompt_ids + self.generated
+            seqs_ = self.model._node_seqs(self.graph)
+            # defer_open_mentions to match the COLLATOR, which training's injection_maps
+            # come from: a span ending at the last token that a longer name still extends
+            # is not yet a mention. Without this the two sides disagree on the final token.
+            imap = defer_open_mentions(
+                build_injection_map(ids, seqs_, scope_start=self._tau), seqs_, ids)
+            t2n = tok2node_vector(imap, k_len, self.device)
+            q_node = int(t2n[k_len - 1])
+            if q_node >= 0:
+                adj = self.model._node_adjacency(self.graph, self.device,
+                                                 permutation=self.permutation)
+                kpos = (t2n >= 0).nonzero(as_tuple=True)[0]
+                blocked = kpos[~adj[q_node][t2n[kpos]]]
+                if blocked.numel():
+                    row[blocked] = torch.finfo(torch.float32).min
+                    armed = True
+        self.model._decode_bias_row = row.view(1, 1, 1, k_len) if armed else None
