@@ -3,6 +3,9 @@
 #
 #   bash scripts/e17_pipeline.sh                      # full run
 #   E17_SMOKE=1 bash scripts/e17_pipeline.sh          # plumbing test, full strength
+#   E17_SMOKE=1 E17_STAGE1=0 bash scripts/e17_pipeline.sh \
+#       trainer.max_steps=1 eval.epoch_interval=100 +trainer.sft.eval_strategy=no
+#                                                     # ~80s end-to-end, no generation
 #   E17_STAGE1=1 bash scripts/e17_pipeline.sh         # (re)train the Stage-1 baseline
 #
 # THREE suites, because the MagE-GT and the LoRA have different lifecycles:
@@ -29,13 +32,21 @@ cd "$(dirname "$0")/.."
 REPO="$PWD"
 
 # E17_SMOKE=1 shortens the RUN, never the CONFIGURATION: one sample per split, one plan
-# each, one epoch per notebook stage, one gradient step, one eval graph. Everything that
-# defines the model — M=320, d_model, the composite-graph weights, beta_init — stays at
-# its experiments/ value, so a green smoke means the full-strength arm constructs, trains
-# and generates. It does NOT mean anything learned: at one epoch both notebook loops
-# validate at i=0, take that untrained snapshot as `best_state`, and restore it at the
-# end, so the mag_gt.pt a smoke writes holds UNTRAINED weights. Each knob is still
-# individually overridable — the assignments below only fill what the caller left unset.
+# each, one epoch per notebook stage. Everything that defines the model — M=320, d_model,
+# the composite-graph weights, beta_init, mask_bias_mode — stays at its experiments/
+# value, so a green smoke means the full-strength arm constructs, trains and generates. It
+# does NOT mean anything learned: at one epoch both notebook loops validate at i=0, take
+# that untrained snapshot as `best_state`, and restore it at the end, so the mag_gt.pt a
+# smoke writes holds UNTRAINED weights.
+# TWO THINGS THIS DOES NOT DO. It does NOT shorten Stage 3 — E17_STAGE3_MAX_STEPS below
+# is set but consumed by NOTHING (the consumer was removed deliberately, after leaving it
+# wired made a full training run silently stop at 1 step). Pass trainer.max_steps=N
+# positionally instead. And it does not cut eval: E17_EVAL_GRAPHS is 3, matching the
+# configs, and generation costs ~4 min PER GRAPH — the entire wall-clock of a smoke.
+# To skip generation add `eval.epoch_interval=100 +trainer.sft.eval_strategy=no` (~80s
+# total). Do NOT use E17_EVAL_GRAPHS=0: load_eval_samples_by_graph treats `<= 0` as ALL
+# graphs, so it makes the smoke far slower. Each knob is still individually overridable —
+# the assignments below only fill what the caller left unset.
 if [ "${E17_SMOKE:-0}" = "1" ]; then
   : "${E17_TRAIN_SAMPLES:=1}" "${E17_VAL_SAMPLES:=1}" "${E17_TEST_SAMPLES:=1}"
   : "${E17_PLANS_PER_GRAPH:=1}" "${E17_EDGE_EPOCHS:=1}" "${E17_RES_EPOCHS:=1}"
@@ -58,18 +69,23 @@ SCRIPT="scripts/e17_magnet_composite_graphs.py"
 # wrote. Set E17_PE_GT_FROM to consume a freshly trained one instead.
 CKPT="${E17_PE_GT_FROM:-outputs/e17_mag_gt/${MAGGT_LOAD_SUITE}/mag_gt.pt}"
 STAGE3_EPOCHS="${E17_STAGE3_EPOCHS:-3}"
-# train_v3 hard-codes logging_steps=15, and HF's on_log is the ONLY hook train/loss,
-# learning_rate and GradientDebugCallback (debug/*, mag/*) fire on — at 15 they exist on
-# one step in fifteen. trainer.sft is merged LAST over the computed SFTConfig, so this
-# needs no code change. charge/* is unaffected either way: it rides on_step_end.
+# train_v3 hard-codes logging_steps=15, and HF's on_log is the ONLY hook train/loss and
+# learning_rate fire on — at 15 they exist on one step in fifteen. trainer.sft is merged
+# LAST over the computed SFTConfig, so this needs no code change. The CALLBACK rows
+# (debug/*, mag/*, charge/*, eval/*, grep/*) ride the same cadence: they are drained into
+# the Trainer's own log row with wandb.log(commit=False), so 1 here means per-step.
 E17_LOGGING_STEPS="${E17_LOGGING_STEPS:-1}"
-# OFF, because the notebook pretrains WITHOUT it: base_config defaults it on, so Stage 3
-# projected the loaded MagE-GT at optimizer construction and divided all 5 MagChebConv
-# layers by their slack (MEASURED 4.18/5.93/6.04/6.04/5.95). That is 1/5378 on Phi and,
-# since C is quadratic in Phi, ~3.5e-8 on C: beta*C_tok reached the logits at ~5e-4, the
-# channel took no gradient (beta 0.5 -> 0.49980 in 400 steps, weights drifting a uniform
-# 4e-4 = bf16 noise) and Stage 3 scored 6.7% against Stage 1's 90%. Turn back ON only
-# together with a notebook that pretrains under the same bound, so the two agree.
+# REDUNDANT belt-and-braces: base_config AND the trainers.py fallback both default this
+# to false now, so this line only stops a stray config from re-enabling it. Kept because
+# of what it cost. The projection divides all 5 MagChebConv layers by their slack
+# (MEASURED 4.18/5.93/6.04/6.04/5.95) at optimizer construction — a scale the notebook
+# never pretrained under. Under the OLD linear bias that put beta*C_tok into the logits
+# at ~5e-4, the channel took no gradient (beta 0.5 -> 0.49980 over 400 steps, weights
+# drifting a uniform 4e-4 = bf16 noise) and Stage 3 scored 6.7% against Stage 1's 90%.
+# The arm now ships mask_bias_mode=log, whose correlation step makes the bias invariant
+# to ||C||, so a rescale of C is harmless — but the projection also changes C's SHAPE
+# (modReLU's deadzone is not homogeneous): MEASURED, it still moves the bias by 0.918.
+# Turn back ON only together with a notebook that pretrains under the same bound.
 E17_BETA_BOUND="${E17_BETA_BOUND:-false}"
 # §3 keeps TWO M=320 autograd graphs alive per sample (probe_covariance for C_tok, plus
 # the detector's cached_pe), and c varies 270-808 across samples, so the caching allocator

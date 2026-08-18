@@ -1175,16 +1175,25 @@ class GraphTokenAccuracyMixin:
 
     def log(self, logs, *args, **kwargs):
         # Drain any callback that buffered a row for this step (EvalCallback,
-        # ChargeDegeneracyCallback). They must NOT call wandb.log(step=global_step)
-        # themselves: HF's evaluate() adds an extra stepless wandb.log each epoch, so
-        # W&B's pointer outruns global_step and every stepped row after the first eval
-        # is rejected as non-monotonic. Both trainers inherit this method, so the
-        # baseline arm gets the same treatment.
+        # ChargeDegeneracyCallback). Two constraints, and commit=False is the only way to
+        # satisfy both:
+        #   * NO step= — HF's evaluate() adds an extra stepless wandb.log each epoch, so
+        #     W&B's pointer outruns global_step and every stepped row after the first
+        #     eval is rejected as non-monotonic (MEASURED: charge/* dead from step 201).
+        #   * NOT through `logs` — transformers' rewrite_logs prefixes every key that
+        #     does not start with "eval_"/"test_" with "train/", which buried these as
+        #     train/eval/accuracy and train/grep/path_*. The callbacks already own their
+        #     namespaces, so they must reach W&B verbatim.
+        # commit=False merges into the row HF is about to commit with its own stepless
+        # log, so the keys keep their names AND land on the same step.
+        rows = {}
         for cb in getattr(getattr(self, "callback_handler", None), "callbacks", ()):
             pending = getattr(cb, "pending", None)
             if pending:
-                logs.update(pending)
+                rows.update(pending)
                 pending.clear()
+        if rows and wandb.run is not None:
+            wandb.log(rows, commit=False)
         gta = getattr(self, "_gta", None)
         if gta is not None:
             # int64, not float64: these are exact token COUNTS, so an integer sum is

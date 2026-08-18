@@ -27,23 +27,34 @@ gnn:
   pe_gt_from: outputs/e17_mag_gt/suite2/mag_gt.pt
   semantic_gt_from: null
 
-  # beta = 0.5 at step 0: the channel is ARMED from the first forward, rather than the
+  # beta = 1.0 at step 0: the channel is ARMED from the first forward, rather than the
   # base config's cold start at 0. Two properties are given up deliberately —
   #   (a) step 0 no longer reproduces the base LLM's logits, so acceptance A2 does not
   #       hold at this setting (it still holds at beta_init = 0, which is what A2 tests);
   #   (b) there is no one-step stall: dL/dC = beta * dL/dbias is nonzero immediately, so
   #       the GT/MagNet train from step 1 instead of step 2.
-  # In exchange the channel cannot sit at zero and report a clean run that trained
-  # nothing. Watch mag/bias_absmax against the attention logit scale from the FIRST step.
+  # 1.0 is MEASURED, not chosen: under mask_bias_mode=log the bias is bounded by the
+  # gate, and on the trained MagE-GT over real graphs beta=1 realises
+  # mag/bias_absmax = 1.82 against attention logits of O(1-10) — informative without
+  # swamping content, and saturation is unreachable at any beta. Watch mag/beta over the
+  # run: free to grow or decay, and a run driving it to zero is the channel reporting it
+  # is not useful.
   mask_beta_init: 1.0
 
   # Two-group LR (GraphSFTTrainer.create_optimizer): the graph channel — GT + MagNet +
-  # beta, i.e. model.structural_parameters() — trains at 0.12x the LoRA's LR. At
-  # trainer.learning_rate 2.5e-4 that puts the structural group at 3e-5: slower than the
-  # adapter, but a rate the channel genuinely moves at, so beta is NOT expected to sit at
-  # its init. Watch mag/beta over the run — starting armed at 0.5, it is free to grow or
-  # decay, and a run that drives it toward zero is the channel reporting it is not useful.
-  structural_lr_mult: 0.12
+  # beta, i.e. model.structural_parameters() — trains at 0.012x the LoRA's LR. At
+  # trainer.learning_rate 2.5e-4 that puts the structural group at 3e-6.
+  # MEASURED, not chosen. Adam's per-element step is ~lr, so over 600 steps the drift is
+  # between sqrt(K)*lr and K*lr; against rms(W) = 0.0419 over the 20.07M structural
+  # params that is 0.18%-4.3% here. Applying that drift to the trained MagE-GT leaves the
+  # graph-adjacency AUC intact (0.7304 -> 0.7431) and rho's range unchanged.
+  #   3e-5 (0.12x)   drifts up to 42.9%: AUC 0.7304 -> 0.6617, rho_min -0.757 -> -0.635,
+  #                  and r traverses 17.2 degeneracy periods. Destroys the pretraining.
+  #   3e-7 (0.0012x) drifts 0.43%: dAUC +0.002, i.e. indistinguishable from freezing.
+  # 3e-6 is also the minimax choice: it is acceptable whether the graph gradient is
+  # consistent or noise-dominated, which 3e-5 is not. See
+  # data/docs/2026-08-17 e17_two_term_bias_property_verification.md.
+  structural_lr_mult: 0.012
 
 data:
   # Edge list REMOVED — connectivity must come from the graph channel now.
@@ -64,10 +75,11 @@ trainer:
   loss_target: responses
   epochs: 3
 
-  # The e13f command's 0.00025. beta does NOT have to travel from zero here (it starts at
-  # 0.5), and the structural group is at 0.12x this, so both the adapter and the channel
-  # move. CHOSEN, not measured: watch mag/bias_absmax stay within an order of magnitude of
-  # the attention logit scale, and mag/beta neither collapse nor run away.
+  # The e13f command's 0.00025 — the ADAPTER's rate. beta does NOT have to travel from
+  # zero here (it starts at 1.0), and the structural group is at 0.012x this (3e-6), so
+  # both the adapter and the channel move. This number is CHOSEN, not measured (the
+  # structural multiplier above IS measured): watch mag/bias_absmax stay within an order
+  # of magnitude of the attention logit scale, and mag/beta neither collapse nor run away.
   learning_rate: 0.00025
 
   bit4: true

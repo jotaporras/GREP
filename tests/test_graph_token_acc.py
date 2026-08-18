@@ -206,6 +206,10 @@ def test_graph_sft_trainer_log_merges_the_gradient_debug_row(monkeypatch):
     seen = {}
     monkeypatch.setattr(GraphTokenAccuracyMixin, "log",
                         lambda self, logs, *a, **k: seen.update(logs))
+    import prism.training.trainers as trmod
+    sent = {}
+    monkeypatch.setattr(trmod, "wandb", SimpleNamespace(
+        run=object(), log=lambda d, **kw: sent.update({**d, "_commit": kw.get("commit")})))
 
     bare = GraphSFTTrainer.__new__(GraphSFTTrainer)
     bare.model = inner
@@ -214,9 +218,12 @@ def test_graph_sft_trainer_log_merges_the_gradient_debug_row(monkeypatch):
 
     GraphSFTTrainer.log(bare, {"loss": 0.5})
 
-    assert seen["debug/grad_norm_gnn"] == approx(1.5), "debug row never reached logs"
-    assert seen["debug/lr"] == approx(1e-4)
-    assert seen["loss"] == approx(0.5), "the merge must not clobber the Trainer's keys"
+    # debug/* keeps its namespace: shipped by commit=False, never through `logs`.
+    assert sent["debug/grad_norm_gnn"] == approx(1.5), "debug row never reached wandb"
+    assert sent["debug/lr"] == approx(1e-4)
+    assert sent["_commit"] is False
+    assert "debug/grad_norm_gnn" not in seen, "debug row must not go via logs (train/ prefix)"
+    assert seen["loss"] == approx(0.5), "the Trainer's own keys must survive"
 
 
 def test_graph_sft_trainer_log_is_a_noop_without_the_callback(monkeypatch):
@@ -232,22 +239,32 @@ def test_graph_sft_trainer_log_is_a_noop_without_the_callback(monkeypatch):
     assert seen == {"loss": 0.5}
 
 
-def test_log_drains_callback_pending_rows():
-    """EvalCallback / ChargeDegeneracyCallback buffer their row on `.pending` instead of
-    calling wandb.log(step=global_step) — HF's per-epoch stepless log pushes W&B's
-    pointer past global_step, so a stepped row is rejected for the rest of the run
-    (MEASURED: charge/* dead from step 201 of 600). This mixin is the single drain."""
-    cb = SimpleNamespace(pending={"charge/delta": 0.25, "eval/accuracy": 0.9})
+def test_log_drains_callback_pending_rows(monkeypatch):
+    """`.pending` ships via wandb.log(commit=False) — NOT through `logs`.
+
+    No step=: HF's per-epoch stepless log pushes W&B's pointer past global_step, so a
+    stepped row is rejected for the rest of the run (MEASURED: charge/* dead from step
+    201 of 600). Not via `logs`: rewrite_logs prefixes every non-"eval_" key with
+    "train/", which buried these as train/eval/accuracy and train/grep/path_*."""
+    import prism.eval.evaluate as evmod
+    sent = {}
+    monkeypatch.setattr(evmod, "wandb", SimpleNamespace(
+        run=object(), log=lambda d, **kw: sent.update({**d, "_commit": kw.get("commit")})))
+    cb = SimpleNamespace(pending={"charge/delta": 0.25, "eval/accuracy": 0.9,
+                                  "grep/path_valid": 0.5})
     t = _Trainer()
     t.callback_handler = SimpleNamespace(callbacks=[cb])
     t._reset_token_acc()
 
     t.log({"loss": 0.5})
 
-    assert t.logged["charge/delta"] == approx(0.25)
-    assert t.logged["eval/accuracy"] == approx(0.9)
-    assert t.logged["loss"] == approx(0.5)      # existing keys preserved
-    assert cb.pending == {}                      # cleared, so rows are not duplicated
+    assert sent["charge/delta"] == approx(0.25)   # namespaces preserved verbatim
+    assert sent["eval/accuracy"] == approx(0.9)
+    assert sent["grep/path_valid"] == approx(0.5)
+    assert sent["_commit"] is False               # same row as HF's log, no step
+    assert "charge/delta" not in t.logged         # NOT via logs -> no train/ prefix
+    assert t.logged["loss"] == approx(0.5)
+    assert cb.pending == {}                       # cleared, so rows are not duplicated
 
 
 def test_log_without_callback_handler_is_unchanged():

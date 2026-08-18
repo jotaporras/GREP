@@ -13,6 +13,7 @@ import os
 import warnings
 
 import torch
+import wandb
 from trl import SFTTrainer
 
 from prism.eval import callbacks
@@ -262,9 +263,13 @@ class GraphSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
         # first, pushing W&B's pointer past state.global_step, so a wandb.log(step=...)
         # afterwards is dropped as non-monotonic — MEASURED as 100% loss of mag/beta and
         # every grad-norm split across runs augepp57 and 3hasg0sn.
+        # commit=False, not logs.update: rewrite_logs would rename these train/debug/*
+        # and train/mag/*, and the callback already owns the debug/ and mag/ namespaces.
         for cb in self.callback_handler.callbacks:
             if isinstance(cb, callbacks.GradientDebugCallback):
-                logs.update(cb.debug_metrics(self.model, self.state))
+                row = cb.debug_metrics(self.model, self.state)
+                if row and wandb.run is not None:
+                    wandb.log(row, commit=False)
                 break
         return super().log(logs, *args, **kwargs)
 
