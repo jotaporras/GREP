@@ -114,3 +114,11 @@ All in `src/prism/training/trainers_rl.py` unless noted.
 - `requirements-rl.txt` — the working plaza environment recipe (torch
   2.11/cu128, vllm 0.26.0+cu129 release wheel, transformers <5.15), which is
   also the recipe for the betty `GREP-PRISM-rl` env (M6).
+
+## Summary (2026-08-19, for the experiment log)
+
+- Implemented GRPO RL training for the `learnable_graph_mask` architecture (`MaskGRPOTrainer`): batched HF rollouts through the policy itself with decode-consistent Ψ injection, verifiable path-validity rewards, and the GT tower unfrozen so reward gradients reach it through the attention bias.
+- Warm-started from the best e13f SFT checkpoints ([nyvi1tww](https://wandb.ai/alelab/GREP-PRISM/runs/nyvi1tww) 66%, [ai8c2bm0](https://wandb.ai/alelab/GREP-PRISM/runs/ai8c2bm0) 84% on n30) and trained on both the n30 corpus and the harder n60_v3 corpus (42% at init, large headroom).
+- Result: a clean negative. Across five runs varying init, corpus, and a 10× learning-rate sweep (7e-6 → 7e-5), held-out accuracy and on-policy train success both stayed flat for 300 steps, with no instability even at the highest LR.
+- The flatness was not a signal problem: ~60% of GRPO groups had mixed success/failure and therefore carried nonzero advantage throughout training — the policy received usable gradient signal and still did not improve on its own training prompts.
+- Conclusion: the fusion point, not the optimizer, is the bottleneck. All architectures to date inject the graph signal inside self-attention, giving the reward a 40+-layer gradient path to the tower and only controlling attention routing rather than token selection. This motivated e17.

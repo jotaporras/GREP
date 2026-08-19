@@ -138,7 +138,17 @@ def build_planner_model(gnn, llm, tokenizer, *, disable_graph_token_rope=False,
             post_fusion=gnn.get("post_fusion", False),
             post_fusion_layer_scope=gnn.get("post_fusion_layer_scope",
                                             "dense_top_half"),
-            post_fusion_d_gt=gnn.d_model)
+            post_fusion_d_gt=gnn.d_model,
+            graph_lora=gnn.get("graph_lora", False),
+            graph_lora_rank=gnn.get("graph_lora_rank", 8),
+            graph_lora_targets=gnn.get("graph_lora_targets", "o_proj"),
+            graph_lora_layer_scope=gnn.get("graph_lora_layer_scope",
+                                           "dense_top_half"),
+            pointer_fusion=gnn.get("pointer_fusion", False),
+            cross_fusion=gnn.get("cross_fusion", False),
+            cross_fusion_heads=gnn.get("cross_fusion_heads", 8),
+            cross_fusion_dim=gnn.get("cross_fusion_dim"),
+            fusion_d_gt=gnn.d_model)
         collator = data.SpineDataCollator(tokenizer, mlm=False)
 
         if freeze_llm:

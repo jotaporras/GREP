@@ -271,6 +271,25 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
                         graph_model._pf_signal = graph_model.build_pf_signal(
                             input_ids.shape[1], [pyg_graph], [injection_map],
                             input_ids.device, permutation=self.permutation)
+                if getattr(graph_model, "_graph_lora", False):
+                    # e17-D: per-graph, static across decode — armed once.
+                    with torch.no_grad():
+                        graph_model._glora_A = graph_model.build_glora_signal(
+                            [pyg_graph], input_ids.device,
+                            permutation=self.permutation)
+                if getattr(graph_model, "_cross_fusion", False):
+                    # e17-C: Ψ K/V bank is static across decode — armed once.
+                    with torch.no_grad():
+                        graph_model._xf_kv = graph_model.build_xf_kv(
+                            [pyg_graph], input_ids.device,
+                            permutation=self.permutation)
+                if (getattr(graph_model, "_pointer_fusion", False)
+                        and self.injection_scope != "decode_consistent"):
+                    raise ValueError(
+                        "pointer_fusion decode needs the decode_consistent "
+                        "injector (per-step candidate tracking); "
+                        f"injection_scope={self.injection_scope!r} would "
+                        "silently drop the pointer bias at decode.")
                 # decode_consistent checkpoints extend the channel to generated
                 # mentions: a forward pre-hook arms a per-step bias row (span-end
                 # assignment, design note §2.2). Other scopes keep the historical
@@ -295,6 +314,13 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
                 if getattr(graph_model, "_post_fusion", False):
                     graph_model._pf_signal = None
                     graph_model._pf_decode_vec = None
+                if getattr(graph_model, "_graph_lora", False):
+                    graph_model._glora_A = None
+                if getattr(graph_model, "_cross_fusion", False):
+                    graph_model._xf_kv = None
+                if getattr(graph_model, "_pointer_fusion", False):
+                    graph_model._ptr_state = None
+                    graph_model._ptr_decode_cand = None
                 if hook_handle is not None:
                     hook_handle.remove()
                     graph_model._decode_bias_row = None

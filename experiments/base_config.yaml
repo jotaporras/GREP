@@ -104,11 +104,36 @@ gnn:
   mask_alpha: 0.7            # edge value = alpha + (1-alpha)*sim; non-edge = blocked (alpha in [0,1))
   mask_layer_scope: dense    # "all" = every layer | "dense" = all global layers | "dense_top_half" = deeper half of globals | "dense_first" = first global only
   mask_psi_scale: cosine     # "cosine" (row-normalized, sim in [-1,1]) | "inv_sqrt_d" (Gemma-style raw/sqrt(D))
-  # e17 post-fusion: gated residual injection of proj(Psi) at query-role node
-  # positions on the scoped layers. tanh(gain) zero-init => bitwise no-op at
-  # init, so pre-e17 mask checkpoints warm-start unchanged.
+  # e17 post-fusion (candidate A): gated residual injection of proj(Psi) at
+  # query-role node positions on the scoped layers. tanh(gain) zero-init =>
+  # bitwise no-op at init, so pre-e17 mask checkpoints warm-start unchanged.
   post_fusion: false
   post_fusion_layer_scope: dense_top_half   # same vocabulary as mask_layer_scope
+  # e17 candidate D — graph-generated LoRA: per-graph hypernetwork LoRA on the
+  # scoped target linears. The DOWN factor A(psi_bar) is emitted by the tower
+  # from pooled Psi (one generator head per target type, shared across layers);
+  # the free factor B is per-layer and ZERO-INIT => bitwise no-op with a live
+  # gradient (no gate needed). Static per graph: decode needs no per-step state.
+  graph_lora: false
+  graph_lora_rank: 8
+  graph_lora_targets: o_proj                # comma list of layer submodule names
+  graph_lora_layer_scope: dense_top_half    # same vocabulary as mask_layer_scope
+  # e17 candidate E — pointer fusion: the tower's node distribution
+  # p_gt(n|h_t) = softmax((W_q h_t . Psi_n)/sqrt(d)) becomes a logit bias on the
+  # lm_head over the tokens that start/continue each node name's spelling
+  # (prefix trie over node_token_variants). tanh(ptr_gain) zero-init => bitwise
+  # no-op. Logit-space ON PURPOSE: a probability-mixture gate cannot be both
+  # exactly zero at init and carry gradient (g=0 is the boundary of [0,1], so
+  # every smooth parametrization has dead gradient there). RL-only pathway:
+  # SFT forwards don't carry candidate sets and leave it inert.
+  pointer_fusion: false
+  # e17 candidate C — cross fusion: ONE gated cross-attention block after the
+  # last decoder layer (queries = LN(h), keys/values = Psi, every position can
+  # query every node). tanh(xf_gain) zero-init => bitwise no-op. Bottlenecked
+  # at cross_fusion_dim (null = d_model) to stay RL-trainable (~13M params).
+  cross_fusion: false
+  cross_fusion_heads: 8
+  cross_fusion_dim: null
 
   # --- wire_llm (WIRE: Psi enters as a ROTATION of q/k, not an added signal) ---
   # q_i -> R(theta_i) q_i, k_j -> R(theta_j) k_j with theta_n = omega_n . Psi_i, composed

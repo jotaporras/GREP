@@ -59,6 +59,7 @@ from prism.models.gnn_llm import (
     find_last_graph_scope,
     mask_node_values,
     node_token_variants,
+    pointer_candidate_pairs,
     tok2node_vector,
 )
 from prism.models.vllm_graph.psi import build_psi_transport
@@ -499,6 +500,8 @@ class MaskGRPOTrainer(GRPOTrainer):
         # (loss-side maps; token content fully determines them). Cleared with
         # the prompt cache — same lifetime, keeps memory bounded.
         self._row_map_cache: dict[tuple, tuple] = {}
+        # full-row tokens → pointer candidate triples (e17-E; token-determined).
+        self._ptr_pair_cache: dict[tuple, list] = {}
 
     def create_optimizer(self):
         opt = create_two_group_optimizer(self, self._core.structural_parameters())
@@ -527,10 +530,11 @@ class MaskGRPOTrainer(GRPOTrainer):
             prompt_ids, node_token_seqs, scope_start=scope_start)
         device = next(self._core.parameters()).device
         node_values = mask_node_values(self._core, pyg_graph, device)
-        # Post-fusion: snapshot raw Ψ for decode-step arming (rollouts run
-        # no-grad; the loss-side forward recomputes Ψ WITH grad itself).
+        # Post-fusion / pointer-fusion: snapshot raw Ψ for decode-step arming
+        # (rollouts run no-grad; the loss-side forward recomputes Ψ WITH grad).
         psi = None
-        if getattr(self._core, "_post_fusion", False):
+        if (getattr(self._core, "_post_fusion", False)
+                or getattr(self._core, "_pointer_fusion", False)):
             with torch.no_grad():
                 psi = self._core.pe_model(pyg_graph).float()
         entry = (prompt_ids, pyg_graph, injection_map, node_token_seqs,
@@ -554,14 +558,11 @@ class MaskGRPOTrainer(GRPOTrainer):
         if pe is not None and any(p.dtype != torch.float32
                                   for p in pe.parameters()):
             pe.float()
-        if getattr(self._core, "_post_fusion", False):
-            # Same contract for the post-fusion modules (fp32 tower side; the
-            # hook casts the signal to the hidden-state dtype at read time).
-            for mod in (self._core.pf_proj, self._core.pf_norm):
-                if any(p.dtype != torch.float32 for p in mod.parameters()):
-                    mod.float()
-            if self._core.pf_gain.dtype != torch.float32:
-                self._core.pf_gain.data = self._core.pf_gain.data.float()
+        # Same contract for every enabled fusion pathway (pf/glora/ptr/xf):
+        # fp32 modules, hooks cast to the hidden-state dtype at read time.
+        fp32_fn = getattr(self._core, "ensure_fp32_fusion", None)
+        if callable(fp32_fn):
+            fp32_fn()
 
     # --------------------------------------------------------------- rollouts
 
@@ -572,6 +573,7 @@ class MaskGRPOTrainer(GRPOTrainer):
             # stale. Rebuild so rollouts sample under the current tower.
             self._prompt_cache.clear()
             self._row_map_cache.clear()
+            self._ptr_pair_cache.clear()
             self._cache_step = self.state.global_step
 
         core = self._core
@@ -622,9 +624,11 @@ class MaskGRPOTrainer(GRPOTrainer):
                 row_states.append(_MaskDecodeRowState(
                     node_values, tok2node_vector(pmap, max_len, device), seqs))
             post_fusion = getattr(core, "_post_fusion", False)
+            pointer_fusion = getattr(core, "_pointer_fusion", False)
             injector = BatchedMaskDecodeInjector(
                 core, row_states, max_len,
-                psi_by_row=psi_by_row if post_fusion else None)
+                psi_by_row=(psi_by_row if post_fusion or pointer_fusion
+                            else None))
             handle = core.llm.register_forward_pre_hook(
                 injector.pre_hook, with_kwargs=True)
             try:
@@ -637,6 +641,11 @@ class MaskGRPOTrainer(GRPOTrainer):
                         # decode steps are armed by the injector).
                         core._pf_signal = core.build_pf_signal(
                             max_len, graphs, padded_maps, device)
+                    if getattr(core, "_graph_lora", False):
+                        # Per-graph, static across decode — armed once.
+                        core._glora_A = core.build_glora_signal(graphs, device)
+                    if getattr(core, "_cross_fusion", False):
+                        core._xf_kv = core.build_xf_kv(graphs, device)
                     out = core.llm.generate(
                         input_ids=batch_ids, attention_mask=attn,
                         max_new_tokens=self.max_completion_length,
@@ -653,6 +662,10 @@ class MaskGRPOTrainer(GRPOTrainer):
                 core._decode_bias_row = None
                 core._pf_signal = None
                 core._pf_decode_vec = None
+                core._glora_A = None
+                core._xf_kv = None
+                core._ptr_state = None
+                core._ptr_decode_cand = None
             completions = out[:, max_len:]
             if completions.shape[1] > 1 and injector.decode_steps == 0:
                 raise RuntimeError(
@@ -687,6 +700,16 @@ class MaskGRPOTrainer(GRPOTrainer):
                                            node_token_seqs)
         self._row_map_cache[key] = (query_map, full_map)
         return query_map, full_map
+
+    def _ptr_pairs_for_row(self, toks: list, prompt_len: int, entry) -> list:
+        """Teacher-forced pointer candidates (e17-E) for one unpadded row."""
+        key = tuple(toks)
+        hit = self._ptr_pair_cache.get(key)
+        if hit is None:
+            node_token_seqs = entry[3]
+            hit = pointer_candidate_pairs(toks, prompt_len, node_token_seqs)
+            self._ptr_pair_cache[key] = hit
+        return hit
 
     def _entries_for_rows(self, input_ids, attention_mask, logits_to_keep):
         """Per-row cache entries + full-row token lists, recovered from the
@@ -732,14 +755,19 @@ class MaskGRPOTrainer(GRPOTrainer):
                 "backward — silently wrong gradients. Disable chunking or "
                 "gradient checkpointing.")
         all_logps, all_ents = [], []
+        pointer_fusion = getattr(self._core, "_pointer_fusion", False)
         for start in range(0, B, chunk):
             sl = slice(start, start + chunk)
-            q_maps, k_maps, graphs = [], [], []
+            q_maps, k_maps, graphs, ptr_cands = [], [], [], []
             for entry, toks, prompt_len, off in rows[sl]:
                 qm, km = self._maps_for_row(toks, prompt_len, entry)
                 q_maps.append(self._offset_map(qm, off))
                 k_maps.append(self._offset_map(km, off))
                 graphs.append(entry[1])
+                if pointer_fusion:
+                    ptr_cands.append([
+                        (s + off, n, t) for s, n, t in
+                        self._ptr_pairs_for_row(toks, prompt_len, entry)])
             # Mirrors trl 0.27's inner loop exactly (slice, temperature,
             # selective_log_softmax) — reimplemented because its fixed
             # signature cannot carry the graph kwargs the mask forward needs.
@@ -747,6 +775,7 @@ class MaskGRPOTrainer(GRPOTrainer):
                 input_ids=input_ids[sl], attention_mask=attention_mask[sl],
                 graphs=graphs, injection_maps=q_maps,
                 key_injection_maps=k_maps,
+                **({"pointer_candidates": ptr_cands} if pointer_fusion else {}),
                 logits_to_keep=logits_to_keep + 1, use_cache=False,
             ).logits
             logits = logits[:, :-1, :][:, -logits_to_keep:, :]

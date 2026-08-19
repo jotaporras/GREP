@@ -378,22 +378,52 @@ def graph_augmented_llm_from_pretrained(
             post_fusion_layer_scope=gnn_cfg.get("post_fusion_layer_scope",
                                                 "dense_top_half"),
             post_fusion_d_gt=gnn_cfg["d_model"],
+            graph_lora=gnn_cfg.get("graph_lora", False),
+            graph_lora_rank=gnn_cfg.get("graph_lora_rank", 8),
+            graph_lora_targets=gnn_cfg.get("graph_lora_targets", "o_proj"),
+            graph_lora_layer_scope=gnn_cfg.get("graph_lora_layer_scope",
+                                               "dense_top_half"),
+            pointer_fusion=gnn_cfg.get("pointer_fusion", False),
+            cross_fusion=gnn_cfg.get("cross_fusion", False),
+            cross_fusion_heads=gnn_cfg.get("cross_fusion_heads", 8),
+            cross_fusion_dim=gnn_cfg.get("cross_fusion_dim"),
+            fusion_d_gt=gnn_cfg["d_model"],
         )
         gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
         _load_psi_producer_state(model.pe_model, gnn_weights["pe_model"], path, gnn_cfg)
-        if gnn_cfg.get("post_fusion", False):
-            # Fail loud: a post-fusion checkpoint whose pf weights are absent would
-            # silently reload as a zero-gain no-op (= plain mask arch).
-            missing = [k for k in ("pf_proj", "pf_norm", "pf_gain")
-                       if k not in gnn_weights]
+
+        def _require(flag: str, keys: tuple):
+            """Fail loud: a checkpoint recording a fusion flag whose weights are
+            absent would silently reload as a zero-gain no-op (= plain mask)."""
+            missing = [k for k in keys if k not in gnn_weights]
             if missing:
                 raise KeyError(
-                    f"{os.path.join(path, 'gnn_weights.pt')} records post_fusion=true "
-                    f"but is missing {missing} — the post-fusion weights were not "
+                    f"{os.path.join(path, 'gnn_weights.pt')} records {flag}=true "
+                    f"but is missing {missing} — the {flag} weights were not "
                     "checkpointed.")
+
+        if gnn_cfg.get("post_fusion", False):
+            _require("post_fusion", ("pf_proj", "pf_norm", "pf_gain"))
             model.pf_proj.load_state_dict(gnn_weights["pf_proj"])
             model.pf_norm.load_state_dict(gnn_weights["pf_norm"])
             model.pf_gain.data.copy_(gnn_weights["pf_gain"])
+        if gnn_cfg.get("graph_lora", False):
+            _require("graph_lora", ("glora_gen", "glora_B"))
+            model.glora_gen.load_state_dict(gnn_weights["glora_gen"])
+            model.glora_B.load_state_dict(gnn_weights["glora_B"])
+        if gnn_cfg.get("pointer_fusion", False):
+            _require("pointer_fusion", ("ptr_q", "ptr_gate", "ptr_gain",
+                                        "ptr_scale"))
+            model.ptr_q.load_state_dict(gnn_weights["ptr_q"])
+            model.ptr_gate.load_state_dict(gnn_weights["ptr_gate"])
+            model.ptr_gain.data.copy_(gnn_weights["ptr_gain"])
+            model.ptr_scale.data.copy_(gnn_weights["ptr_scale"])
+        if gnn_cfg.get("cross_fusion", False):
+            _require("cross_fusion", ("xf_ln", "xf_q", "xf_k", "xf_v", "xf_o",
+                                      "xf_gain"))
+            for name in ("xf_ln", "xf_q", "xf_k", "xf_v", "xf_o"):
+                getattr(model, name).load_state_dict(gnn_weights[name])
+            model.xf_gain.data.copy_(gnn_weights["xf_gain"])
     elif architecture in ("postfusion_graph_llm", "composite_graph_gt"):
         raise ValueError(
             f"architecture {architecture!r} was removed from the codebase (legacy "

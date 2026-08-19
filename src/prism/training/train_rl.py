@@ -86,6 +86,26 @@ def train_rl(config: omegaconf.DictConfig) -> None:
                 layer_scope=gnn_config.get("post_fusion_layer_scope",
                                            "dense_top_half"),
                 d_gt=gnn_config["d_model"])
+        # e17 candidates D/E/C: same warm-start pattern — a gnn_overrides flag
+        # on a checkpoint that predates the pathway attaches it fresh
+        # (zero-init => bitwise no-op at init; RL owns it from step 0).
+        if gnn_config.get("graph_lora", False) and not getattr(
+                model, "_graph_lora", False):
+            model.enable_graph_lora(
+                layer_scope=gnn_config.get("graph_lora_layer_scope",
+                                           "dense_top_half"),
+                targets=gnn_config.get("graph_lora_targets", "o_proj"),
+                rank=int(gnn_config.get("graph_lora_rank", 8)),
+                d_gt=gnn_config["d_model"])
+        if gnn_config.get("pointer_fusion", False) and not getattr(
+                model, "_pointer_fusion", False):
+            model.enable_pointer_fusion(d_gt=gnn_config["d_model"])
+        if gnn_config.get("cross_fusion", False) and not getattr(
+                model, "_cross_fusion", False):
+            model.enable_cross_fusion(
+                heads=int(gnn_config.get("cross_fusion_heads", 8)),
+                d_x=gnn_config.get("cross_fusion_dim"),
+                d_gt=gnn_config["d_model"])
         if hasattr(model.llm, "_prism_peft_handle"):
             # Under nf4 the checkpoint's LoRA stays ATTACHED inside the inner
             # .llm (merging would round it into the nf4 grid — see loaders,

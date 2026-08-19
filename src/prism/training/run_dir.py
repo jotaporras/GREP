@@ -50,6 +50,20 @@ def save_run_dir(model, gnn_config: dict, output_dir: str) -> None:
             weights["pf_proj"] = model.pf_proj.state_dict()
             weights["pf_norm"] = model.pf_norm.state_dict()
             weights["pf_gain"] = model.pf_gain.data
+        # e17 candidates D/E/C ride alongside the tower the same way; the
+        # loader fails loud if a recorded flag's weights are absent.
+        if getattr(model, "_graph_lora", False):
+            weights["glora_gen"] = model.glora_gen.state_dict()
+            weights["glora_B"] = model.glora_B.state_dict()
+        if getattr(model, "_pointer_fusion", False):
+            weights["ptr_q"] = model.ptr_q.state_dict()
+            weights["ptr_gate"] = model.ptr_gate.state_dict()
+            weights["ptr_gain"] = model.ptr_gain.data
+            weights["ptr_scale"] = model.ptr_scale.data
+        if getattr(model, "_cross_fusion", False):
+            for name in ("xf_ln", "xf_q", "xf_k", "xf_v", "xf_o"):
+                weights[name] = getattr(model, name).state_dict()
+            weights["xf_gain"] = model.xf_gain.data
         torch.save(weights, os.path.join(output_dir, "gnn_weights.pt"))
     elif gnn_config.get("architecture") == "wire_llm":
         # WIRE: the Ψ producer, the angle gate, and the frequency store. Which store

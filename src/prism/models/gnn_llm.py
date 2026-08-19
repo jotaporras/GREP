@@ -796,7 +796,16 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
                  buggy_causal_fold: bool = False, disable_graph_token_rope: bool = False,
                  post_fusion: bool = False,
                  post_fusion_layer_scope: str = "dense_top_half",
-                 post_fusion_d_gt: int | None = None):
+                 post_fusion_d_gt: int | None = None,
+                 graph_lora: bool = False,
+                 graph_lora_rank: int = 8,
+                 graph_lora_targets: str = "o_proj",
+                 graph_lora_layer_scope: str = "dense_top_half",
+                 pointer_fusion: bool = False,
+                 cross_fusion: bool = False,
+                 cross_fusion_heads: int = 8,
+                 cross_fusion_dim: int | None = None,
+                 fusion_d_gt: int | None = None):
         # Wrapper is not a registered HF architecture or MoE class; force "eager" so
         # PreTrainedModel doesn't reject SDPA/flash or expert-impl validation.
         config = copy.copy(llm.config)
@@ -850,9 +859,27 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         self._post_fusion: bool = False
         self._pf_signal: torch.Tensor | None = None       # [B, S, hidden] fp32
         self._pf_decode_vec: torch.Tensor | None = None   # [B, 1, hidden] fp32
+        # e17 candidate D — graph-generated LoRA (off unless enabled).
+        self._graph_lora: bool = False
+        self._glora_A: dict | None = None                 # {target: [B, r, d_in]} fp32
+        # e17 candidate E — pointer fusion, logit-space (off unless enabled).
+        self._pointer_fusion: bool = False
+        self._ptr_state: dict | None = None               # {"psi": [Tensor], "cand": ..., "seq_len": int}
+        self._ptr_decode_cand: list | None = None         # per-row [(node, tok)] for the current step
+        # e17 candidate C — post-LLM cross-attention (off unless enabled).
+        self._cross_fusion: bool = False
+        self._xf_kv: tuple | None = None                  # (psi_pad [B,N,d_gt] fp32, mask [B,N] bool)
         self._install_graph_mask()
         if post_fusion:
             self.enable_post_fusion(post_fusion_layer_scope, post_fusion_d_gt)
+        if graph_lora:
+            self.enable_graph_lora(graph_lora_layer_scope, graph_lora_targets,
+                                   graph_lora_rank, fusion_d_gt)
+        if pointer_fusion:
+            self.enable_pointer_fusion(fusion_d_gt)
+        if cross_fusion:
+            self.enable_cross_fusion(cross_fusion_heads, cross_fusion_dim,
+                                     fusion_d_gt)
 
     def enable_post_fusion(self, layer_scope: str, d_gt: int | None) -> None:
         """Install the e17-A post-fusion pathway: gated residual Ψ injection.
@@ -951,6 +978,288 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
                 sig[b, pos] = vec[tok2node[pos]]
         return sig
 
+    # ------------------------------------------------ e17 D: graph-generated LoRA
+
+    def enable_graph_lora(self, layer_scope: str, targets: str, rank: int,
+                          d_gt: int | None) -> None:
+        """Install the e17-D pathway: per-graph hypernetwork LoRA.
+
+        For each in-scope decoder layer ℓ and each target linear ``W`` named in
+        ``targets`` (comma list, e.g. ``"o_proj"``)::
+
+            ψ̄     = mean_n Ψ_n                              (pooled, per graph)
+            A(ψ̄)  = reshape(W_gen_t · ψ̄, [r, d_in])          (per target TYPE, shared across layers)
+            y      = W x + B_ℓt · (A(ψ̄) · x)                 (B_ℓt zero-init, per layer)
+
+        ``B = 0`` at init ⇒ the delta is a bitwise no-op with a live gradient
+        (∂L/∂B = g_out·(A x)ᵀ ≠ 0), so no gate is needed. The signal is
+        per-graph and static across decode steps — armed once per batch
+        (``_glora_A``), no per-step injector state. Callable post-hoc on a
+        loaded checkpoint (RL warm start) or from ``__init__``.
+        """
+        if self._graph_lora:
+            raise RuntimeError("graph_lora is already enabled on this model.")
+        if layer_scope not in MASK_LAYER_SCOPES:
+            raise ValueError(
+                f"graph_lora_layer_scope must be one of {MASK_LAYER_SCOPES}, "
+                f"got {layer_scope!r}")
+        if not d_gt:
+            raise ValueError(
+                "fusion_d_gt (the Ψ producer's output width, gnn.d_model) "
+                "is required to size the graph-LoRA generator heads.")
+        target_names = [t.strip() for t in targets.split(",") if t.strip()]
+        if not target_names:
+            raise ValueError("graph_lora_targets must name at least one module.")
+        layers = self._decoder_layers()
+        flags = resolve_mask_active_flags(layers, layer_scope)
+        active_idx = [i for i, f in enumerate(flags) if f]
+        device = next(self.llm.parameters()).device
+        self.glora_gen = nn.ModuleDict()
+        self.glora_B = nn.ParameterDict()
+        self._glora_handles = []
+        self._glora_targets = target_names
+        for tname in target_names:
+            d_in = d_out = None
+            for li in active_idx:
+                mod = self._find_named_linear(layers[li], tname)
+                if d_in is None:
+                    d_in, d_out = mod.in_features, mod.out_features
+                elif (mod.in_features, mod.out_features) != (d_in, d_out):
+                    raise ValueError(
+                        f"graph_lora target {tname!r} has inconsistent shapes "
+                        "across scoped layers; one generator head per target "
+                        "type requires identical shapes.")
+                bkey = f"{tname}_{li}"
+                self.glora_B[bkey] = nn.Parameter(
+                    torch.zeros(d_out, rank, dtype=torch.float32, device=device))
+                self._glora_handles.append(mod.register_forward_hook(
+                    self._make_glora_hook(tname, bkey)))
+            self.glora_gen[tname] = nn.Linear(
+                int(d_gt), rank * d_in).float().to(device)
+        self._glora_rank = int(rank)
+        self._glora_layer_scope = layer_scope
+        self._glora_d_gt = int(d_gt)
+        self._graph_lora = True
+
+    @staticmethod
+    def _find_named_linear(layer: nn.Module, tname: str) -> nn.Module:
+        """The unique submodule of ``layer`` whose qualified name ends in ``tname``."""
+        hits = [m for n, m in layer.named_modules()
+                if n == tname or n.endswith("." + tname)]
+        if len(hits) != 1:
+            raise ValueError(
+                f"graph_lora target {tname!r} matched {len(hits)} submodules "
+                f"of {type(layer).__name__} (need exactly 1).")
+        if not hasattr(hits[0], "in_features"):
+            raise ValueError(f"graph_lora target {tname!r} is not linear-like.")
+        return hits[0]
+
+    def _make_glora_hook(self, tname: str, bkey: str):
+        def hook(module, inputs, output):
+            if self._glora_A is None:
+                return None
+            x = inputs[0]
+            A = self._glora_A.get(tname)
+            if A is None:
+                return None
+            if x.shape[0] != A.shape[0]:
+                raise RuntimeError(
+                    f"graph_lora armed for batch {A.shape[0]} but "
+                    f"{tname} saw batch {x.shape[0]} — arming out of sync.")
+            B = self.glora_B[bkey]
+            # x [B,S,d_in] · A [B,r,d_in] -> [B,S,r] · Bᵀ -> [B,S,d_out], fp32.
+            with torch.autocast(device_type=x.device.type, enabled=False):
+                delta = torch.einsum("bsd,brd->bsr", x.float(), A) @ B.t()
+            return output + delta.to(dtype=output.dtype)
+        return hook
+
+    def build_glora_signal(self, graphs, device, permutation=None) -> dict:
+        """Per-row generated LoRA factors ``{target: [B, r, d_in]}`` (fp32, grad)."""
+        out = {}
+        with torch.autocast(device_type=torch.device(device).type, enabled=False):
+            pooled = torch.stack([
+                self.pe_model(g, permutation=permutation).float().mean(dim=0)
+                for g in graphs])                          # [B, d_gt]
+            for tname in self._glora_targets:
+                gen = self.glora_gen[tname]
+                d_in = gen.out_features // self._glora_rank
+                out[tname] = gen(pooled.to(gen.weight.device)).view(
+                    len(graphs), self._glora_rank, d_in).to(device)
+        return out
+
+    # ------------------------------------------------ e17 E: pointer fusion
+
+    def enable_pointer_fusion(self, d_gt: int | None) -> None:
+        """Install the e17-E pathway: GT node distribution → lm_head logit bias.
+
+        At each armed position t (with suffix state s_t)::
+
+            p_gt(n|t)   = softmax_n( (W_q h_t · Ψ_n) / √d_gt )
+            g_t         = σ(w_g · h_t + b_g)
+            logits(tok) += tanh(ptr_gain) · ptr_scale · g_t
+                            · Σ_n p_gt(n|t) · 1[tok ∈ next(n, s_t)]
+
+        ``next(n, s_t)`` = vocab tokens that start or continue a spelling of
+        node n's name given the current generated suffix (prefix matching over
+        ``node_token_variants``). Implemented as a forward hook on ``lm_head``
+        (its input IS h_t, its output IS the logits — one site serves the
+        teacher-forced loss, prefill, and cached decode). ``ptr_gain`` is
+        zero-init ⇒ bitwise no-op with live gradient; the design note explains
+        why the probability-mixture form cannot have both. RL-only pathway:
+        without armed candidates (SFT) the hook is inert.
+        """
+        if self._pointer_fusion:
+            raise RuntimeError("pointer_fusion is already enabled on this model.")
+        if not d_gt:
+            raise ValueError(
+                "fusion_d_gt (the Ψ producer's output width, gnn.d_model) "
+                "is required to size the pointer query head.")
+        hidden = self.llm.config.get_text_config().hidden_size
+        device = next(self.llm.parameters()).device
+        self.ptr_q = nn.Linear(hidden, int(d_gt)).float().to(device)
+        self.ptr_gate = nn.Linear(hidden, 1).float().to(device)
+        self.ptr_gain = nn.Parameter(
+            torch.zeros((), dtype=torch.float32, device=device))
+        self.ptr_scale = nn.Parameter(
+            torch.ones((), dtype=torch.float32, device=device))
+        head = self.llm.get_output_embeddings()
+        self._ptr_handle = head.register_forward_hook(self._ptr_hook)
+        self._ptr_d_gt = int(d_gt)
+        self._pointer_fusion = True
+
+    def _ptr_hook(self, module, inputs, output):
+        """Add the pointer bias to the lm_head logits (armed states only)."""
+        h = inputs[0]
+        if h.dim() != 3:
+            return None
+        decode = (self._ptr_decode_cand is not None and h.shape[1] == 1
+                  and h.shape[0] == len(self._ptr_decode_cand))
+        # h.shape[1] > 1 keeps a cached decode step (q_len 1) from matching the
+        # prefill candidate set via the logits_to_keep offset path.
+        full = (not decode and self._ptr_state is not None
+                and self._ptr_state.get("cand") is not None
+                and h.shape[0] == len(self._ptr_state["cand"])
+                and 1 < h.shape[1] <= self._ptr_state["seq_len"])
+        if not decode and not full:
+            return None
+        state = self._ptr_state
+        if state is None:
+            return None
+        out = output.clone()
+        with torch.autocast(device_type=h.device.type, enabled=False):
+            gain = torch.tanh(self.ptr_gain) * self.ptr_scale
+            for b in range(h.shape[0]):
+                if decode:
+                    pairs = [(0, n, t) for n, t in self._ptr_decode_cand[b]]
+                else:
+                    off = state["seq_len"] - h.shape[1]
+                    pairs = [(s - off, n, t) for s, n, t in state["cand"][b]
+                             if s >= off]
+                if not pairs:
+                    continue
+                psi = state["psi"][b]                       # [N, d_gt] fp32
+                hb = h[b].float()                           # [S, hidden]
+                q = self.ptr_q(hb) / (self._ptr_d_gt ** 0.5)
+                p = torch.softmax(q @ psi.t(), dim=-1)      # [S, N]
+                g = torch.sigmoid(self.ptr_gate(hb)).squeeze(-1)  # [S]
+                s_idx = torch.tensor([p_[0] for p_ in pairs], device=h.device)
+                n_idx = torch.tensor([p_[1] for p_ in pairs], device=h.device)
+                t_idx = torch.tensor([p_[2] for p_ in pairs], device=h.device)
+                vals = gain * g[s_idx] * p[s_idx, n_idx]
+                row = out[b]
+                out[b] = row.index_put(
+                    (s_idx, t_idx), vals.to(row.dtype), accumulate=True)
+        return out
+
+    # ------------------------------------------------ e17 C: cross fusion
+
+    def enable_cross_fusion(self, heads: int, d_x: int | None,
+                            d_gt: int | None) -> None:
+        """Install the e17-C pathway: gated cross-attention over Ψ after the
+        last decoder layer (before the final norm)::
+
+            u_t  = W_o · MHA( W_q·LN(h_t),  W_k·Ψ,  W_v·Ψ )
+            h_t += tanh(xf_gain) · u_t
+
+        Every position queries every node (unlike A, which writes each node
+        token its own ψ). The K/V come from Ψ and are static per prompt, so
+        decode needs no per-step state — arm ``_xf_kv`` once per batch.
+        ``xf_gain`` zero-init ⇒ bitwise no-op. The block is bottlenecked at
+        ``d_x`` (default d_gt) to stay RL-trainable (~13M params, not 100M+).
+        """
+        if self._cross_fusion:
+            raise RuntimeError("cross_fusion is already enabled on this model.")
+        if not d_gt:
+            raise ValueError(
+                "fusion_d_gt (the Ψ producer's output width, gnn.d_model) "
+                "is required to size the cross-attention block.")
+        d_x = int(d_x or d_gt)
+        if d_x % heads != 0:
+            raise ValueError(f"cross_fusion_dim {d_x} must divide by heads {heads}.")
+        hidden = self.llm.config.get_text_config().hidden_size
+        device = next(self.llm.parameters()).device
+        self.xf_ln = nn.RMSNorm(hidden).float().to(device)
+        self.xf_q = nn.Linear(hidden, d_x).float().to(device)
+        self.xf_k = nn.Linear(int(d_gt), d_x).float().to(device)
+        self.xf_v = nn.Linear(int(d_gt), d_x).float().to(device)
+        self.xf_o = nn.Linear(d_x, hidden).float().to(device)
+        self.xf_gain = nn.Parameter(
+            torch.zeros((), dtype=torch.float32, device=device))
+        layers = self._decoder_layers()
+        self._xf_handle = layers[-1].register_forward_hook(self._xf_hook)
+        self._xf_heads = int(heads)
+        self._xf_dim = d_x
+        self._xf_d_gt = int(d_gt)
+        self._cross_fusion = True
+
+    def _xf_hook(self, module, inputs, output):
+        if self._xf_kv is None:
+            return None
+        hs = output[0] if isinstance(output, tuple) else output
+        if not torch.is_tensor(hs) or hs.dim() != 3:
+            return None
+        psi_pad, mask = self._xf_kv                       # [B,N,d_gt], [B,N] bool
+        if hs.shape[0] != psi_pad.shape[0]:
+            raise RuntimeError(
+                f"cross_fusion armed for batch {psi_pad.shape[0]} but the last "
+                f"layer saw batch {hs.shape[0]} — arming out of sync.")
+        B, S, _ = hs.shape
+        H, dh = self._xf_heads, self._xf_dim // self._xf_heads
+        with torch.autocast(device_type=hs.device.type, enabled=False):
+            hf = self.xf_ln(hs.float())
+            q = self.xf_q(hf).view(B, S, H, dh).transpose(1, 2)      # [B,H,S,dh]
+            k = self.xf_k(psi_pad).view(B, -1, H, dh).transpose(1, 2)
+            v = self.xf_v(psi_pad).view(B, -1, H, dh).transpose(1, 2)
+            scores = (q @ k.transpose(-1, -2)) / (dh ** 0.5)         # [B,H,S,N]
+            scores = scores.masked_fill(
+                ~mask[:, None, None, :], torch.finfo(scores.dtype).min)
+            attn = torch.softmax(scores, dim=-1)
+            # A fully-padded row (no nodes) would softmax over -inf only; the
+            # arming site guarantees ≥1 node per row, but guard anyway.
+            attn = torch.nan_to_num(attn)
+            u = (attn @ v).transpose(1, 2).reshape(B, S, self._xf_dim)
+            delta = torch.tanh(self.xf_gain) * self.xf_o(u)
+        new_hs = hs + delta.to(dtype=hs.dtype)
+        if isinstance(output, tuple):
+            return (new_hs,) + tuple(output[1:])
+        return new_hs
+
+    def build_xf_kv(self, graphs, device, permutation=None) -> tuple:
+        """Padded Ψ bank for cross-fusion: ``([B, N_max, d_gt] fp32, [B, N_max] bool)``."""
+        with torch.autocast(device_type=torch.device(device).type, enabled=False):
+            psis = [self.pe_model(g, permutation=permutation).float().to(device)
+                    for g in graphs]
+        n_max = max(p.shape[0] for p in psis)
+        pad = torch.zeros(len(psis), n_max, psis[0].shape[1],
+                          device=device, dtype=torch.float32)
+        mask = torch.zeros(len(psis), n_max, device=device, dtype=torch.bool)
+        for b, p in enumerate(psis):
+            pad[b, :p.shape[0]] = p
+            mask[b, :p.shape[0]] = True
+        return pad, mask
+
+    # ------------------------------------------------ parameter groups / fp32
+
     def structural_parameters(self) -> list[nn.Parameter]:
         """Graph-side parameters for the boosted-LR group: the standalone GT.
 
@@ -962,14 +1271,49 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         :meth:`base_lr_parameters`."""
         return list(self.pe_model.parameters())
 
+    def _fusion_modules(self) -> list[nn.Module]:
+        """Every enabled fusion pathway's fresh modules (fp32 contract)."""
+        mods = []
+        if self._post_fusion:
+            mods += [self.pf_proj, self.pf_norm]
+        if self._graph_lora:
+            mods += [self.glora_gen]
+        if self._pointer_fusion:
+            mods += [self.ptr_q, self.ptr_gate]
+        if self._cross_fusion:
+            mods += [self.xf_ln, self.xf_q, self.xf_k, self.xf_v, self.xf_o]
+        return mods
+
+    def _fusion_scalars(self) -> list[nn.Parameter]:
+        params = []
+        if self._post_fusion:
+            params.append(self.pf_gain)
+        if self._graph_lora:
+            params += list(self.glora_B.values())
+        if self._pointer_fusion:
+            params += [self.ptr_gain, self.ptr_scale]
+        if self._cross_fusion:
+            params.append(self.xf_gain)
+        return params
+
     def base_lr_parameters(self) -> list[nn.Parameter]:
-        """Post-fusion projection/norm/gains — fresh modules that need the
-        full base LR (see :meth:`structural_parameters`); [] when disabled."""
-        if not self._post_fusion:
-            return []
-        return (list(self.pf_proj.parameters())
-                + list(self.pf_norm.parameters())
-                + [self.pf_gain])
+        """Fresh fusion modules (all e17 pathways) — full base LR (see
+        :meth:`structural_parameters`); [] when none is enabled."""
+        params = []
+        for m in self._fusion_modules():
+            params += list(m.parameters())
+        return params + self._fusion_scalars()
+
+    def ensure_fp32_fusion(self) -> None:
+        """Re-assert fp32 on every fusion module/param (the HF stack casts
+        leftover fp32 modules of a quantized policy to bf16). ``Module.float()``
+        casts ``param.data`` in place, so optimizer references survive."""
+        for m in self._fusion_modules():
+            if any(p.dtype != torch.float32 for p in m.parameters()):
+                m.float()
+        for p in self._fusion_scalars():
+            if p.dtype != torch.float32:
+                p.data = p.data.float()
 
     def graph_token_position_ids(
         self,
@@ -1145,6 +1489,7 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         """
         kwargs.pop("inputs_embeds", None)
         kwargs.pop("input_ids", None)
+        pointer_candidates = kwargs.pop("pointer_candidates", None)
         # Arm the learned structural bias for the patched attention layers. No graph
         # (e.g. a non-graph batch) ⇒ plain causal LLM.
         if graphs is not None and injection_maps is not None and input_ids is not None:
@@ -1156,9 +1501,27 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
                 # definition of "graph token" (see enable_post_fusion).
                 self._pf_signal = self.build_pf_signal(
                     input_ids.shape[1], graphs, injection_maps, input_ids.device)
+            if self._graph_lora:
+                self._glora_A = self.build_glora_signal(graphs, input_ids.device)
+            if self._cross_fusion:
+                self._xf_kv = self.build_xf_kv(graphs, input_ids.device)
+            if self._pointer_fusion and pointer_candidates is not None:
+                # Candidates are computed by the caller (they need the
+                # tokenizer's node-name variants, which the model doesn't
+                # have) — see pointer_candidate_pairs. Without them the
+                # pointer pathway is inert for this forward (e.g. SFT).
+                with torch.autocast(device_type=input_ids.device.type,
+                                    enabled=False):
+                    psis = [self.pe_model(g).float().to(input_ids.device)
+                            for g in graphs]
+                self._ptr_state = {"psi": psis, "cand": pointer_candidates,
+                                   "seq_len": input_ids.shape[1]}
         else:
             self._struct_bias = None
             self._pf_signal = None
+            self._glora_A = None
+            self._xf_kv = None
+            self._ptr_state = None
         # Identity-RoPE the injected spans when requested, unless the caller already
         # supplied position_ids (mirrors GraphAugmentedLLM.forward).
         if (self._disable_graph_token_rope and injection_maps is not None
@@ -1178,6 +1541,9 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             if not getattr(self.llm, "is_gradient_checkpointing", False):
                 self._struct_bias = None
                 self._pf_signal = None
+                self._glora_A = None
+                self._xf_kv = None
+                self._ptr_state = None
 
 
 class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
@@ -2555,6 +2921,64 @@ def node_token_variants(node_names, tokenizer) -> list[list[list[int]]]:
     ]
 
 
+def pointer_prefix_maps(node_token_seqs) -> tuple[list, dict, int]:
+    """Pointer-fusion (e17-E) candidate machinery for one graph.
+
+    Returns ``(first_starts, prefix_map, max_prefix)``:
+
+    - ``first_starts``: deduped ``[(node, first_tok)]`` — a fresh node mention
+      may start at ANY step, so these are candidates at every position.
+    - ``prefix_map``: ``{tuple(prefix_toks): [(node, next_tok)]}`` for every
+      strict prefix (length ≥ 1) of every node-name tokenization variant —
+      the "continue spelling this name" candidates.
+    - ``max_prefix``: longest prefix key (bounds the per-step suffix scan).
+    """
+    first, prefmap, maxp = set(), {}, 0
+    for nid, seqs in enumerate(node_token_seqs):
+        variants = seqs if seqs and isinstance(seqs[0], list) else [seqs]
+        for seq in variants:
+            if not seq:
+                continue
+            first.add((nid, seq[0]))
+            for k in range(1, len(seq)):
+                prefmap.setdefault(tuple(seq[:k]), set()).add((nid, seq[k]))
+                maxp = max(maxp, k)
+    return sorted(first), {k: sorted(v) for k, v in prefmap.items()}, maxp
+
+
+def pointer_step_candidates(generated: list, first_starts: list,
+                            prefix_map: dict, max_prefix: int) -> list:
+    """``[(node, next_tok)]`` candidates for the NEXT token given the generated
+    suffix: every fresh start plus every continuation whose variant prefix
+    matches a tail of ``generated``. Deterministic in the tokens alone."""
+    cand = set(first_starts)
+    n = len(generated)
+    for k in range(1, min(max_prefix, n) + 1):
+        hits = prefix_map.get(tuple(generated[n - k:]))
+        if hits:
+            cand.update(hits)
+    return sorted(cand)
+
+
+def pointer_candidate_pairs(tokens: list, prompt_len: int,
+                            node_token_seqs) -> list:
+    """Teacher-forced pointer candidates for one row: ``[(s, node, tok)]``.
+
+    Position ``s`` (whose logits predict token ``s+1``) gets the candidates of
+    the suffix state ``tokens[prompt_len:s+1]``. Continuation matches never
+    cross the prompt boundary — decode-side parity: the injectors' per-step
+    state sees only generated tokens. Positions before ``prompt_len - 1``
+    (prompt-side logits) get none.
+    """
+    first, prefmap, maxp = pointer_prefix_maps(node_token_seqs)
+    out = []
+    for s in range(prompt_len - 1, len(tokens)):
+        gen = tokens[prompt_len:s + 1]
+        for nid, tok in pointer_step_candidates(gen, first, prefmap, maxp):
+            out.append((s, nid, tok))
+    return out
+
+
 def has_match(input_ids_b: list[int], to_match:list[int],start_pos:int):
     """Check if `to_match` is present in `input_ids_b` at `start_pos`."""
     end_pos = min(start_pos + len(to_match),len(input_ids_b))
@@ -2844,10 +3268,26 @@ class BatchedMaskDecodeInjector:
             raise ValueError(
                 "post-fusion is enabled on the model but psi_by_row was not "
                 "supplied — decode steps would silently skip the residual write.")
+        if getattr(model, "_pointer_fusion", False) and psi_by_row is None:
+            raise ValueError(
+                "pointer-fusion is enabled on the model but psi_by_row was not "
+                "supplied — decode steps would silently skip the logit bias.")
         self.model = model
         self.rows = row_states
         self.prompt_len = padded_prompt_len
         self.psi_by_row = psi_by_row
+        # Pointer fusion (e17-E): per-row candidate machinery + the prefill
+        # candidate set (empty suffix ⇒ fresh starts at the last prompt
+        # position, whose logits sample the first completion token).
+        self._ptr_maps = None
+        if getattr(model, "_pointer_fusion", False):
+            self._ptr_maps = [pointer_prefix_maps(rs.node_token_seqs)
+                              for rs in row_states]
+            cand0 = [[(padded_prompt_len - 1, n, t)
+                      for n, t in pointer_step_candidates([], f, pm, mp)]
+                     for (f, pm, mp) in self._ptr_maps]
+            model._ptr_state = {"psi": psi_by_row, "cand": cand0,
+                                "seq_len": padded_prompt_len}
         self.device = next(model.parameters()).device
         # Counts single-token decode forwards. Cache-less generation (e.g.
         # gradient checkpointing left enabled in train mode) re-runs the full
@@ -2874,6 +3314,12 @@ class BatchedMaskDecodeInjector:
             any_tagged = any_tagged or row is not None
         if getattr(self.model, "_post_fusion", False):
             self._arm_pf([state.last_q_node for state in self.rows])
+        if self._ptr_maps is not None:
+            # Candidates for the NEXT token given the just-consumed suffix
+            # (state.step appended this step's token above).
+            self.model._ptr_decode_cand = [
+                pointer_step_candidates(state.generated, *maps)
+                for state, maps in zip(self.rows, self._ptr_maps)]
         if not any_tagged:
             self.model._decode_bias_row = None
             return
@@ -2948,6 +3394,20 @@ class MaskDecodeInjector:
             with torch.no_grad():
                 self._pf_psi = model.pe_model(
                     pyg_graph, permutation=permutation).float()
+        # Pointer fusion (e17-E): arm Ψ + the prefill candidate set (fresh
+        # starts at the last prompt position); per-step candidates in pre_hook.
+        self._ptr_maps = None
+        if getattr(model, "_pointer_fusion", False):
+            with torch.no_grad():
+                psi = model.pe_model(
+                    pyg_graph, permutation=permutation).float()
+            self._ptr_maps = pointer_prefix_maps(node_token_seqs)
+            f, pm, mp = self._ptr_maps
+            model._ptr_state = {
+                "psi": [psi],
+                "cand": [[(prompt_len - 1, n, t)
+                          for n, t in pointer_step_candidates([], f, pm, mp)]],
+                "seq_len": prompt_len}
         self.prompt_tok2node = tok2node_vector(prompt_injection_map, prompt_len,
                                                self.device)
         # Flattened variant list for the partial-mention ambiguity check.
@@ -2986,6 +3446,9 @@ class MaskDecodeInjector:
                 "MaskDecodeInjector supports batch-size-1 generation only "
                 f"(got batch {input_ids.shape[0]}; beam search is not wired).")
         self.generated.append(int(input_ids[0, 0]))
+        if self._ptr_maps is not None:
+            self.model._ptr_decode_cand = [
+                pointer_step_candidates(self.generated, *self._ptr_maps)]
         prev_committed = self._committed
         spans = self._suffix_spans()
         self._committed = {(nid, sp) for nid, sps in spans.items() for sp in sps}
