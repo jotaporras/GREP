@@ -405,7 +405,8 @@ class RandomGNNPositionalEncodings(nn.Module):
         # Learnable tanh(g) output gate.
         return result * torch.tanh(self.output_gain).to(result.dtype)
 
-    def covariance_token_block(self, data, c, pe_pool: str = "pe", gt=None):
+    def covariance_token_block(self, data, c, pe_pool: str = "pe", gt=None,
+                               project: int | None = None):
         """Sampled centered covariance ``C = E_q[Φ'Φ'ᵀ] − ΨΨᵀ`` and first-moment Gram
         ``Ψ̃ = ΨΨᵀ``, returned as the TOKEN blocks ``[c, c]`` (the matrices, not C·s).
 
@@ -429,6 +430,34 @@ class RandomGNNPositionalEncodings(nn.Module):
         tensor. Moving T ahead of that unwind would make Φ' complex and the Hermitian
         form the correct one — only ``Φ'Φ'ᴴ`` is invariant under the gauge z ↦ e^{iγ}z.
 
+        ``project=k`` returns a ``[c, k]`` FACTOR of C in place of C itself — the signal
+        WIRE needs, since RoPE rotates by a VECTOR per node while C is an operator on
+        PAIRS. Writing ``δ⁽ᵐ⁾ = Φ'⁽ᵐ⁾ − Ψ``, C is already a Gram matrix,
+        ``C = (1/M)·Σ_m δ⁽ᵐ⁾δ⁽ᵐ⁾ᵀ``, so its exact factor is the concatenated centered
+        probe stack ``Δ = (1/√M)[δ⁽¹⁾‖…‖δ⁽ᴹ⁾] ∈ ℝ^{c×MD}``, with ``ΔΔᵀ = C``. ``MD`` is
+        unusable as a rotation width (327 680 at M=320, D=1024), so Δ's rows are
+        projected by a per-probe Gaussian ``G⁽ᵐ⁾ ∈ ℝ^{D×k}``, ``G⁽ᵐ⁾_ab ~ N(0, 1/k)``::
+
+            r = (1/√M) · Σ_m δ⁽ᵐ⁾ G⁽ᵐ⁾ ∈ ℝ^{c×k}       E_G[r rᵀ] = ΔΔᵀ = C
+
+        exactly, since ``E[G⁽ᵐ⁾G⁽ᵐ⁾ᵀ] = I_D`` and the m ≠ m' cross terms have mean zero.
+        This is the Johnson-Lindenstrauss step arXiv:2509.22259 already leans on in its
+        Theorem 3 footnote, so it is the paper's own device, not an extra approximation:
+        ``‖r_i − r_j‖²`` estimates ``C_ii + C_jj − 2C_ij`` with relative error ``√(2/k)``
+        (4.4% at k=1024). Feeding the ROWS of C instead would give the resistance form of
+        C², not of C — the two agree only if C is idempotent, which a covariance is not.
+
+        ``G⁽ᵐ⁾`` is drawn FRESH per forward and never stored: at M=320, D=k=1024 a frozen
+        table would be 1.34 GB. The draw sits inside the checkpointed chunk, so the
+        backward recompute must see the same numbers — ``preserve_rng_state=True`` (the
+        default, passed explicitly below) is what guarantees that, and it is load-bearing
+        for gradient correctness, not a tidiness flag.
+
+        Transient cost of the projection pass, at c=1024, D=k=1024, chunk=62 probes:
+        ``G`` is ``[62, 1024, 1024]`` fp32 = 260 MB, alongside the ``[62, c, D]`` centered
+        block (260 MB) the Gram pass already allocates — so peak roughly doubles for that
+        pass and nothing else changes.
+
         Args:
             data: the composite-graph ``Data``, TOKEN rows first.
             c: number of leading token rows the returned blocks cover.
@@ -437,6 +466,8 @@ class RandomGNNPositionalEncodings(nn.Module):
                 only by — ``pe_pool="gt"``. Passed in rather than held as an attribute:
                 this module is that GT's own submodule, so storing it would close a
                 cycle in the module tree and duplicate every block in the state dict.
+            project: when set, return the ``[c, project]`` JL factor above instead of the
+                ``[c, c]`` covariance. The second return value is ``ΨΨᵀ`` either way.
         """
         if self.node_feature_dim is not None:
             raise NotImplementedError(
@@ -452,6 +483,15 @@ class RandomGNNPositionalEncodings(nn.Module):
                 "not be handed one — it would be ignored, and C would silently be the "
                 "PRE-block covariance under a config that says otherwise."
             )
+        if project is not None:
+            if int(project) <= 0:
+                raise ValueError(f"project must be a positive rank, got {project}")
+            if self.fixed_seed_mode:
+                raise ValueError(
+                    "project=k draws a fresh G per probe per forward, so pinning the probes "
+                    "with fixed_seed_mode=True gives neither the deterministic nor the "
+                    "stochastic estimator — half the randomness would be frozen and half "
+                    "not. Set gnn.fixed_seed_mode=false to use the WIRE covariance factor.")
         try:
             device = next(self.parameters()).device
         except StopIteration:
@@ -493,7 +533,10 @@ class RandomGNNPositionalEncodings(nn.Module):
                 Qc = Q[:, start:start + chunk]
                 if torch.is_grad_enabled():
                     dummy = Qc.new_ones(1, requires_grad=True)
-                    part = checkpoint(fn, Qc, *args, dummy, use_reentrant=False)
+                    # preserve_rng_state is REQUIRED by project=k: _sum_proj draws G
+                    # inline, and the backward recompute must redraw the same G.
+                    part = checkpoint(fn, Qc, *args, dummy, use_reentrant=False,
+                                      preserve_rng_state=True)
                 else:
                     part = fn(Qc, *args)
                 acc = part if acc is None else acc + part
@@ -513,7 +556,17 @@ class RandomGNNPositionalEncodings(nn.Module):
             Ct = _phi_tok(Qc) - p.unsqueeze(0)                      # centered [mc, c, F]
             return torch.einsum("mtf,muf->tu", Ct, Ct)              # [c, c]
 
+        def _sum_proj(Qc, p, _dummy=None):
+            """Σ over this chunk of ``δ⁽ᵐ⁾G⁽ᵐ⁾`` — the JL factor's chunk term, [c, k]."""
+            Ct = _phi_tok(Qc) - p.unsqueeze(0)                      # centered [mc, c, F]
+            G = torch.randn(Ct.shape[0], Ct.shape[2], int(project),
+                            device=Ct.device, dtype=Ct.dtype) * (int(project) ** -0.5)
+            return torch.einsum("mtf,mfk->tk", Ct, G)               # [c, k]
+
         psi = _chunked(_sum_phi) / m                                # Ψ token rows [c, F]
-        C_tok = _chunked(_sum_outer, psi) / m                       # PSD covariance [c, c]
         Psi_tok = psi @ psi.transpose(0, 1)                         # ΨΨᵀ token block [c, c]
+        if project is not None:
+            # 1/√m, not 1/m: the factor carries HALF the covariance's normalisation.
+            return _chunked(_sum_proj, psi) / (m ** 0.5), Psi_tok   # JL factor [c, k]
+        C_tok = _chunked(_sum_outer, psi) / m                       # PSD covariance [c, c]
         return C_tok, Psi_tok

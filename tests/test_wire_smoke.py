@@ -246,18 +246,27 @@ def test_config_switch_matrix():
     c = _wrap(sigma_init=0.07)
     k = next(iter(a._wire_sigma))
     same_eps = torch.equal(getattr(a._wire_eps, k), getattr(b._wire_eps, k))
+    # omega_seed is INERT: WIRE draws are unseeded, so changing it must change NOTHING.
+    # (The fixture re-seeds torch before each build, which is what makes both draws
+    # comparable at all — that ambient seeding is the test's control, not the model's.)
     d = _wrap(sigma_init=0.02, omega_seed=999)
-    diff_eps = not torch.equal(getattr(a._wire_eps, k), getattr(d._wire_eps, k))
-    # σ is stored as an fp32 Parameter, so a config float does NOT round-trip exactly
-    # (0.02 -> 0.019999999552965164). Compare to fp32 tolerance, not with ==.
-    sig_ok = (abs(float(a._wire_sigma[k]) - 0.02) < 1e-7
-              and abs(float(c._wire_sigma[k]) - 0.07) < 1e-7)
+    seed_inert = torch.equal(getattr(a._wire_eps, k), getattr(d._wire_eps, k))
+    # σ is a PER-PLANE vector on the exponential decay σ[n] = sigma_init·10000^(−2n/P),
+    # so the config value is its MAX (attained at plane 0). Stored fp32, so a config float
+    # does NOT round-trip exactly (0.02 -> 0.019999999552965164): compare to fp32 tol.
+    sa, sc = a._wire_sigma[k].detach(), c._wire_sigma[k].detach()
+    P = sa.numel()
+    decay = 10.0 ** (-8.0 * torch.arange(P, dtype=torch.float32) / P)
+    sig_ok = (sa.dim() == 1
+              and abs(float(sa.max()) - 0.02) < 1e-7
+              and abs(float(sc.max()) - 0.07) < 1e-7
+              and torch.allclose(sa, 0.02 * decay, atol=1e-9))
     rec("wire_sigma_init / wire_omega_seed",
-        "sigma set (fp32 tol); eps reproducible by seed",
-        f"sigma={float(a._wire_sigma[k]):.9f}/{float(c._wire_sigma[k]):.9f} "
-        f"(fp32, not exact) same_seed_same_eps={same_eps} diff_seed_diff_eps={diff_eps}",
-        "PASS" if (sig_ok and same_eps and diff_eps) else "FAIL")
-    assert sig_ok and same_eps and diff_eps
+        "sigma per-plane exponential, max == sigma_init (fp32 tol); omega_seed inert",
+        f"sigma_max={float(sa.max()):.9f}/{float(sc.max()):.9f} (fp32, not exact) "
+        f"P={P} same_ambient_same_eps={same_eps} seed_inert={seed_inert}",
+        "PASS" if (sig_ok and same_eps and seed_inert) else "FAIL")
+    assert sig_ok and same_eps and seed_inert
 
     # --- wire_decode: every accepted value generates --------------------------
     # Both live modes decode ('rotate' re-rotates the cached prompt keys, 'skip' runs
@@ -331,7 +340,9 @@ def test_public_methods_numeric():
     li = idxs[0]
     s = w.layer_scale_factor(li)
     om = w.layer_omega(li)
-    expect = w._wire_sigma[str(li)].detach() * s * getattr(w._wire_eps, str(li))
+    # σ is [P] and ε is [P, m]: the unsqueeze scales each PLANE, not each coordinate.
+    expect = (w._wire_sigma[str(li)].detach().unsqueeze(-1) * s
+              * getattr(w._wire_eps, str(li)))
     rec("layer_scale_factor / layer_omega", "factor in (0,1]; omega == sigma*s*eps",
         f"s={s:.6g} shape={tuple(om.shape)} max|omega-expected|="
         f"{float((om.detach() - expect).abs().max()):.2e}",

@@ -241,14 +241,23 @@ gnn:
   #   exponential RoPE-style rand(P, m) / 10000^(2i/P). Reproduced verbatim including two
   #               quirks of the source: the exponent denominator is P (twice standard
   #               RoPE's decay rate) and the decay is constant along the spectral axis.
-  # wire_sigma_init is INERT when wire_vanilla=true; wire_omega_seed seeds the uniform /
-  # exponential draws and is inert for "zero".
+  # wire_sigma_init is INERT when wire_vanilla=true. wire_omega_seed is INERT EVERYWHERE:
+  # all WIRE draws are unseeded by decision (see below).
   wire_vanilla_omega_init: zero
   # --- the following apply when wire_vanilla=false (the expectation arm) ---
-  # Frequencies are reparameterised as omega = sigma_l * eps_l: eps is drawn ONCE from
-  # N(0, I) (seeded below, frozen, checkpointed) and sigma_l is a LEARNABLE per-layer
-  # scalar. So omega stays a genuine Gaussian sample (Theorem 3's hypothesis) while the
-  # trained quantity is exactly the omega in q^T k (1 - omega^2 R(i,j)/2). ONE table per
+  # Frequencies are reparameterised as omega_n = sigma_l[n] * eps_l[n]: eps is drawn ONCE
+  # from N(0, I) (frozen, checkpointed) and sigma_l is a LEARNABLE PER-PLANE vector. So
+  # omega stays a genuine Gaussian sample (Theorem 3's hypothesis) while the trained
+  # quantity is exactly the omega in q^T k (1 - omega^2 R(i,j)/2).
+  # sigma_l[n] = wire_sigma_init * 10000^(-2n/P) — RoPE's own exponential decay (Su et al.
+  # theta_i = beta^(-2i/d)) on the learnable scale, matching the reference omega init this
+  # arm replaces. max_n sigma_l[n] = wire_sigma_init, so wire_max_angle keeps the meaning
+  # it had when sigma was a single scalar per layer.
+  # eps is drawn PER HEAD and AVERAGED to the one table the layer broadcasts. Head sharing
+  # is not a saving here, it is required: Gemma's GQA lets several query heads read one key
+  # head, and Eq. (3) is exact only if both sides rotate by the same omega. The mean of H
+  # iid Normals is Normal, so eps is still Gaussian — at variance 1/H, i.e. one draw scaled
+  # by 1/sqrt(H). ONE table per
   # LAYER, shared by all heads: the modulation is computed once per layer (H x less
   # work) and each head keeps its own q^T k. Monte-Carlo samples come from the P rotary
   # planes in the shared table, so the count DIFFERS BY LAYER TYPE (31B: 256 planes on
@@ -263,7 +272,10 @@ gnn:
   # and training may move it. wire_max_angle below is the actual guarantee.
   wire_sigma_init: 0.01
   wire_freeze_sigma: false     # true pins sigma = the literal-Theorem-3 A/B arm
-  wire_omega_seed: 0           # seed for the frozen eps draw (eps itself is saved in gnn_weights.pt)
+  # INERT. WIRE draws (eps, and the vanilla omega table) are UNSEEDED by decision; eps is
+  # a checkpointed buffer, so a resumed run reloads its own draw rather than regenerating
+  # it. Kept only so configs and checkpoints recorded before that decision still load.
+  wire_omega_seed: 0
   # Gemma global layers use rope_type=proportional with partial_rotary_factor=0.25: only
   # int(0.25*head_dim/2) planes carry text RoPE, the rest are NoPE. true also rotates
   # those position-free channels.
@@ -313,6 +325,20 @@ gnn:
   wire_crosslink_weight: 0.1
   wire_crosslink_bidirectional: true
   wire_anchor_weight: 10.0
+  # What r_i IS, i.e. the vector Eq. (2) of arXiv:2509.22259 rotates by. wire_composite only.
+  #   psi         (DEFAULT) the composite first moment Psi. One row per node, no result
+  #               relating ||Psi_i - Psi_j|| to any structural distance.
+  #   cov_factor  a JL factor r of the probe covariance C = E_q[Phi' Phi'^T] - Psi Psi^T,
+  #               with E_G[r r^T] = C, so ||r_i - r_j||^2 estimates C_ii + C_jj - 2C_ij.
+  #               C is a Gram matrix and therefore plays L-dagger's role in Theorem 3,
+  #               whose r is a SQUARE ROOT of it — C's own rows are the resistance form of
+  #               C^2 and are NOT the signal. Rank = d_model, so omega keeps its shape and
+  #               wire_max_angle keeps its calibration. REQUIRES pe_pool=gt (Phi' = T(Phi)
+  #               inside E_q) and wire_vanilla=false (Theorem 3 needs Gaussian omega);
+  #               both are asserted in CompositeWireGraphLLM.__init__. Incompatible with
+  #               fixed_seed_mode — G is redrawn per forward and pinning the probes alone
+  #               would freeze half the estimator.
+  wire_signal: psi
 
   # Two-group LR: structural (GT/PE) params train at structural_lr_mult x base LR
   # (GraphSFTTrainer.create_optimizer). 1.0 = no boost.

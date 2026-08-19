@@ -312,7 +312,10 @@ def train_model(config: omegaconf.DictConfig):
             **({k: config.gnn[k] for k in (
                 "wire_composite", "wire_magnet_r", "wire_context_window",
                 "wire_cycle_weight", "wire_cycle_causal", "wire_crosslink_weight",
-                "wire_crosslink_bidirectional", "wire_anchor_weight", "learn_r")}
+                "wire_crosslink_bidirectional", "wire_anchor_weight", "learn_r",
+                # wire_signal picks WHAT is rotated by (Ψ vs a factor of C) and is
+                # invisible in the weights — an absent key reloads as a different model.
+                "wire_signal")}
                if config.gnn.arch == "wire_llm" and config.gnn.get("wire_composite")
                else {}),
             # Navigator Ψ producer (learnable_graph_mask / wire_llm): record BOTH sources.
@@ -648,6 +651,28 @@ def _validate_config(config: omegaconf.DictConfig) -> None:
             raise ValueError(
                 "arch='wire_llm' requires gnn.pe_node_features='random' "
                 f"(word-embedding feature prep is not wired). Got {config.gnn.pe_node_features!r}.")
+        _signal = config.gnn.get("wire_signal", "psi")
+        if _signal not in gnn_llm.WIRE_SIGNALS:
+            raise ValueError(
+                f"gnn.wire_signal must be one of {gnn_llm.WIRE_SIGNALS}, got {_signal!r}")
+        if _signal != "psi" and not config.gnn.get("wire_composite"):
+            raise ValueError(
+                f"gnn.wire_signal={_signal!r} is read only by the composite arm; set "
+                "gnn.wire_composite=true or leave wire_signal='psi'.")
+        if _signal == "cov_factor":
+            # CompositeWireGraphLLM.__init__ asserts these too; checked here so a mis-set
+            # value fails at compose time rather than after the 31B load.
+            for key, want in (("directed", True), ("learn_r", True), ("pe_pool", "gt"),
+                              ("wire_vanilla", False), ("fixed_seed_mode", False)):
+                if config.gnn.get(key) != want:
+                    raise ValueError(
+                        f"gnn.wire_signal='cov_factor' requires gnn.{key}={want!r}, got "
+                        f"{config.gnn.get(key)!r}: the signal is a JL factor r of "
+                        "C = E_q[Φ'Φ'ᵀ] − ΨΨᵀ over Φ' = T(Φ(q; L̄^(r), H)), which needs the "
+                        "magnetic backbone (directed), its charge as a free parameter "
+                        "(learn_r), the blocks INSIDE the probe expectation (pe_pool='gt'), "
+                        "Theorem 3's Gaussian ω (wire_vanilla=false), and an unpinned probe "
+                        "draw (fixed_seed_mode=false — G resamples every forward).")
     if config.gnn.get("pe_pool", "pe") != "pe" and config.gnn.arch not in _PSI_PRODUCER_ARCHS:
         raise ValueError(
             f"gnn.pe_pool={config.gnn.pe_pool!r} is read ONLY by gt.build_psi_producer, "

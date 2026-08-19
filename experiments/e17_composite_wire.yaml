@@ -44,25 +44,39 @@ gnn:
   wire_crosslink_bidirectional: true
   wire_anchor_weight: 10.0
 
-  # The rotation must be non-trivial at step 0 (RoPE is off where it applies), so both of
-  # WIRE's cold starts are replaced: the RoPE-style exponential omega decay, and an open
-  # gate. wire_max_angle still clamps the effective angle unconditionally.
-  wire_vanilla: true
+  # r_i is a JL FACTOR of the probe covariance C = E_q[Phi' Phi'^T] - Psi Psi^T, not Psi.
+  # C is a Gram matrix, so it plays L-dagger's role in Theorem 3 and the theorem's r is a
+  # SQUARE ROOT of it: E_G[r r^T] = C gives ||r_i - r_j||^2 = C_ii + C_jj - 2C_ij, the
+  # quantity notebook section 3 regresses onto alpha*R_eff. Feeding C's ROWS instead would
+  # give the resistance form of C^2 and is rejected in CompositeWireGraphLLM.
+  wire_signal: cov_factor
+  # REQUIRED by wire_signal=cov_factor: Phi' = T(Phi(q)), i.e. the GT blocks run PER PROBE
+  # inside E_q, so both moments are taken over the block outputs. Asserted at construction.
+  pe_pool: gt
+  # The expectation arm, and cov_factor asserts it. Theorem 3's hypothesis is omega ~
+  # N(0, sigma I); vanilla mode takes one non-Gaussian learnable table and no expectation,
+  # so the resistance reading would not hold. omega_n = sigma[n]*eps[n] with eps drawn per
+  # HEAD and averaged per layer, and sigma[n] = wire_sigma_init * 10000^(-2n/P) — RoPE's
+  # exponential decay, now on the learnable scale rather than on the frozen table.
+  # wire_vanilla_omega_init is INERT here; kept so the vanilla A/B needs no other edit.
+  wire_vanilla: false
   wire_vanilla_omega_init: exponential
+  # The rotation must be non-trivial at step 0 (RoPE is off where it applies): sigma[0] =
+  # wire_sigma_init > 0 and the gate is open, so there is no identity cold start.
   pe_gain_init: 1.0
   wire_layer_scope: dense
   wire_decode: rotate
-  # RAISED from base_config's 1.0, and this is load-bearing. MEASURED at this exact
-  # config (d_model=1024, c=1024, n=30, pe_gain_init=1.0): max||Psi_i - Psi_j|| = 13.3
-  # and the exponential omega's scale is 0.579, so the angle at INIT is 7.72 rad. Under
-  # wire_max_angle=1.0 the clamp would engage at scale 0.13 on step 0 — pinning the
-  # rotation at the bound and making omega's reported gradient an artifact (see
-  # WireGraphLLM.layer_scale_factor) before a single step. 16.0 is ~2x the init angle:
-  # the guard stays a backstop with room to train into, not the operating point.
-  # Large angles are CORRECT here in a way they are not for the scene-graph arm: this
-  # rotation REPLACES RoPE, which itself wraps many times over 1024 positions, and
-  # vanilla mode takes no expectation, so there is no small-angle Taylor premise to
-  # protect — only periodicity. Watch wire/clamp_engaged; it should read 0.
+  # UNRESOLVED — carried over from the wire_signal=psi / wire_vanilla=true arm, and the
+  # rationale that set it NO LONGER APPLIES. It was raised to 16.0 because vanilla mode
+  # takes no expectation, so only periodicity constrained the angle; that measurement
+  # (max||Psi_i - Psi_j|| = 13.3, omega scale 0.579, init angle 7.72 rad) was on Psi.
+  # Under wire_signal=cov_factor there IS a small-angle premise: Theorem 3 is an O(sigma^2)
+  # expansion with O(sigma^4) error, and it wants sigma*span << 1, which 16.0 does not
+  # enforce. The span of the FACTOR (span = sqrt(max_ij d^2), d^2 = C_ii + C_jj - 2C_ij)
+  # has NOT been measured, so the correct clamp cannot be set from theory alone.
+  # Left at 16.0 deliberately: as a backstop it can only over-clamp, never under-clamp, so
+  # it cannot invalidate a run. Read wire/psi_span and wire/angle_eff_max off the FIRST
+  # logged step and set this from the measurement before treating a result as a baseline.
   wire_max_angle: 16.0
 
   # The notebook's create_gnn sizing (e17 cell 41), which is also e13f's: base_config's

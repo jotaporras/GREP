@@ -565,10 +565,14 @@ def test_no_parameter_or_buffer_shape_depends_on_node_count():
         attn = list(wrap._decoder_layers())[li].self_attn
         planes = wire_rope_planes(attn, rotate_nope=False)
         assert shp == (planes, wrap._wire_d_model), f"{k}: {shp} is not [P, m]"
-    # σ is a scalar per layer — nothing here is N- or N²-shaped either.
+    # σ is [P] per layer — a PLANE count, not a node count. Nothing here is N- or
+    # N²-shaped either, which is the property this test exists to pin.
     for k, v in wrap.named_parameters():
         if "_wire_sigma" in k:
-            assert v.shape == (), f"{k}: σ must be a scalar, got {tuple(v.shape)}"
+            li = int(k.split(".")[-1])
+            attn = list(wrap._decoder_layers())[li].self_attn
+            planes = wire_rope_planes(attn, rotate_nope=False)
+            assert v.shape == (planes,), f"{k}: σ must be [P], got {tuple(v.shape)}"
 
     # Running two very different graph sizes through the same wrapper must not create
     # or resize anything.
@@ -737,8 +741,12 @@ def test_omega_is_shared_across_heads_and_reparameterised():
     sigma = wrap._wire_sigma[str(li)]
     assert eps.shape == (planes, wrap._wire_d_model), f"eps is {tuple(eps.shape)}, not [P, m]"
     assert not eps.requires_grad, "eps must be frozen (it is the fixed Gaussian draw)"
-    assert sigma.shape == (), "sigma must be a per-layer SCALAR"
+    assert sigma.shape == (planes,), "sigma must be a per-layer PER-PLANE vector"
     assert sigma.requires_grad, "sigma must be learnable by default"
+    # Exponential decay across planes, RoPE's own: sigma[n] = sigma[0]*10000^(-2n/P).
+    want = float(sigma[0]) * 10000.0 ** (
+        -2.0 * torch.arange(planes, dtype=torch.float32) / planes)
+    assert torch.allclose(sigma.detach(), want, atol=1e-9), "sigma is not the RoPE decay"
     # eps is a persistent BUFFER, not a parameter.
     assert any(k.endswith(f"_wire_eps.{li}") for k in wrap.state_dict()), \
         "eps missing from state_dict"
@@ -746,7 +754,9 @@ def test_omega_is_shared_across_heads_and_reparameterised():
         "eps registered as a parameter rather than a buffer"
 
     omega = wrap.layer_omega(li)
-    assert torch.allclose(omega, sigma.detach() * eps, atol=1e-6), "omega != sigma * eps"
+    # σ is [P] and ε is [P, m]: one scale PER PLANE, broadcast across the m coordinates.
+    assert torch.allclose(omega, sigma.detach().unsqueeze(-1) * eps, atol=1e-6), \
+        "omega != sigma[n] * eps[n]"
 
     # Rotation applied to q and k uses the SAME angles, broadcast over all heads.
     ids = torch.randint(0, 64, (1, 6))
@@ -838,7 +848,9 @@ def test_clamp_is_exact_unconditional_and_never_raises():
             w2.build_wire_signal([g], [inj], seq_len=8, device=torch.device("cpu"))
         span = w2._wire_psi_span
         for li in w2.active_layer_indices():
-            sig_eff = float(w2._wire_sigma[str(li)].detach().abs()) * w2.layer_scale_factor(li)
+            # max_n|σ[n]| is the clamp's convention now that σ is per-plane.
+            sig_eff = (float(w2._wire_sigma[str(li)].detach().abs().max())
+                       * w2.layer_scale_factor(li))
             assert sig_eff * span <= w2._wire_max_angle * (1 + 1e-6), (
                 f"mult={mult}: post-clamp angle {sig_eff * span:.6f} > "
                 f"max_angle {w2._wire_max_angle}")
@@ -1583,7 +1595,12 @@ def test_vanilla_zero_init_is_exact_identity_but_still_trainable():
 
 
 def test_vanilla_omega_init_strategies():
-    """All three reference values construct, are finite, and the random ones are seeded."""
+    """All three reference values construct and are finite; omega_seed is INERT.
+
+    WIRE draws are unseeded by decision, so ``omega_seed`` must change nothing. The
+    fixture re-seeds torch before each build, and THAT ambient state is what makes two
+    draws comparable — it is the control here, not a property of the model.
+    """
     llm = _gemma4()
     if llm is None:
         return _skip("gemma4 unavailable")
@@ -1596,12 +1613,12 @@ def test_vanilla_omega_init_strategies():
         k = next(iter(a._wire_omega))
         assert torch.isfinite(a._wire_omega[k]).all(), f"{init}: non-finite omega"
         assert torch.equal(a._wire_omega[k], b._wire_omega[k]), \
-            f"{init}: same seed gave a different draw"
+            f"{init}: same ambient RNG gave a different draw"
         if init != "zero":
             assert float(a._wire_omega[k].abs().max()) > 0, f"{init}: drew all zeros"
             d = _vanilla(_gemma4(), vanilla_omega_init=init, omega_seed=999)
-            assert not torch.equal(a._wire_omega[k], d._wire_omega[k]), \
-                f"{init}: omega_seed has no effect"
+            assert torch.equal(a._wire_omega[k], d._wire_omega[k]), \
+                f"{init}: omega_seed still reaches the draw (it must be inert)"
     # Invalid value rejected, naming the knob.
     try:
         _vanilla(_gemma4(), vanilla_omega_init="nope")

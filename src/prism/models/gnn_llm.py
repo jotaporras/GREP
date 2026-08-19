@@ -164,6 +164,15 @@ WIRE_DECODE_LEGACY = {"error": "rotate"}
 #                 every one of the m coordinates shares one profile.
 WIRE_VANILLA_OMEGA_INITS = ("zero", "uniform", "exponential")
 
+# What CompositeWireGraphLLM rotates by — the r_i of arXiv:2509.22259 Eq. (2).
+#   "psi"        Ψ = Φ(E_q[Φ(q; L̄^(r), H)], T), the composite first moment (one row per
+#                node, the parent's signal). No result ties ‖Ψ_i − Ψ_j‖ to a resistance.
+#   "cov_factor" a JL factor r of the probe covariance C = E_q[Φ'Φ'ᵀ] − ΨΨᵀ, i.e.
+#                E_G[r rᵀ] = C, so ‖r_i − r_j‖² estimates C_ii + C_jj − 2C_ij. C plays
+#                L†'s role in Theorem 3, and the theorem's r is a SQUARE ROOT of that —
+#                which is why the factor, and never C's own rows, is the signal.
+WIRE_SIGNALS = ("psi", "cov_factor")
+
 
 def wire_rope_planes(attn, rotate_nope: bool) -> int:
     """Number of 2-D planes WIRE rotates on ``attn`` (out of ``head_dim // 2``).
@@ -195,6 +204,23 @@ def wire_rope_planes(attn, rotate_nope: bool) -> int:
         params = params[layer_type] or {}
     factor = (params or {}).get("partial_rotary_factor", 1.0)
     return int(factor * head_dim // 2)
+
+
+def wire_head_count(attn) -> int:
+    """Query-head count of one attention module — the ``H`` of WIRE's per-head ε draw.
+
+    Read off the module first (``num_attention_heads`` is a config field, but a module
+    that caches it locally is the more specific answer), then the config it carries.
+    Falls back to 1, which makes the per-head average a single draw rather than an error:
+    a wrong H rescales ε by √(H'/H) and is caught by the clamp, whereas raising here
+    would take out every base whose attention module names the field differently.
+    """
+    for src in (attn, getattr(attn, "config", None)):
+        for name in ("num_attention_heads", "num_heads"):
+            h = getattr(src, name, None)
+            if isinstance(h, int) and h > 0:
+                return h
+    return 1
 
 
 def wire_cos_sin(r, omega, head_dim: int):
@@ -2112,8 +2138,12 @@ class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         stated in, so both modes are directly comparable and ``max_angle`` means the
         same thing on either side of the switch::
 
-            vanilla=False   |σ_ℓ|                     (ω = σ_ℓ·ε_ℓ, ε ~ N(0, I))
+            vanilla=False   max_n|σ_ℓ[n]|            (ω_n = σ_ℓ[n]·ε_n, ε ~ N(0, I))
             vanilla=True    max_n‖ω_ℓ[n]‖₂ / √m       (ω_ℓ is the table itself)
+
+        σ is a PER-PLANE vector on the exponential decay, so the summary is its max —
+        attained at plane 0, where σ[0] = sigma_init. That is the same number the old
+        scalar σ reported, which is what keeps existing ``wire_max_angle`` values valid.
 
         The ``√m`` in the vanilla form is what makes the two agree rather than differ by
         a factor of √m: under the reparameterisation ‖ε_n‖₂ ≈ √m, so
@@ -2129,13 +2159,13 @@ class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         if self._wire_vanilla:
             om = self._wire_omega[str(layer_idx)].detach()
             return float(om.norm(dim=-1).max()) * (self._wire_d_model ** -0.5)
-        return float(self._wire_sigma[str(layer_idx)].detach().abs())
+        return float(self._wire_sigma[str(layer_idx)].detach().abs().max())
 
     def layer_omega(self, layer_idx: int, device=None):
         """The clamped frequencies actually used. Shape ``[P, m]`` in BOTH modes::
 
-            vanilla=True    ω_ℓ = s_ℓ · Ω_ℓ        (Ω_ℓ the learnable table)
-            vanilla=False   ω_ℓ = σ_ℓ · s_ℓ · ε_ℓ
+            vanilla=True    ω_ℓ = s_ℓ · Ω_ℓ              (Ω_ℓ the learnable table)
+            vanilla=False   ω_ℓ[n] = σ_ℓ[n] · s_ℓ · ε_ℓ[n]   (σ_ℓ a learnable [P] vector)
 
         ONE table for the whole layer, shared by every head, so the angles are computed
         once per layer and broadcast (see :func:`_wire_rotate`). Head sharing is not
@@ -2159,7 +2189,8 @@ class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         if device is not None:
             eps = eps.to(device)
             sigma = sigma.to(device)
-        return (sigma * self.layer_scale_factor(layer_idx)) * eps
+        # σ is [P], ε is [P, m] — unsqueeze scales each PLANE, never each coordinate.
+        return (sigma.unsqueeze(-1) * self.layer_scale_factor(layer_idx)) * eps
 
     def decode_cos_sin(self, layer_idx: int, omega, head_dim: int, device):
         """Cached ``(cos, sin)`` of the PROMPT positions' WIRE angles for ``layer_idx``.
@@ -2336,7 +2367,10 @@ class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         self._wire_modeling_module = mod
 
         active_flags = resolve_mask_active_flags(layers, self._wire_layer_scope)
-        gen = torch.Generator(device="cpu").manual_seed(self._wire_omega_seed)
+        # UNSEEDED by decision: e17 runs WIRE without fixed seeds, so `omega_seed` is
+        # inert and kept only so old configs and checkpoints still construct. ε and ω are
+        # persistent buffers/parameters, so a resumed run reloads its own draw regardless.
+        gen = None
         device = self.pe_gain.device
         for idx, (layer, active) in enumerate(zip(layers, active_flags)):
             attn = layer.self_attn
@@ -2366,16 +2400,28 @@ class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
                     self._init_vanilla_omega(planes, gen).to(device),
                     requires_grad=not self._wire_freeze_sigma)
                 continue
-            # Reparameterized frequencies: ω = σ_ℓ · ε with ε ~ N(0, I) FROZEN and σ_ℓ
-            # a learnable per-layer scalar. ω is then a genuine Gaussian sample (the
-            # direction is fixed by the draw, Theorem 3's hypothesis) while the learned
-            # quantity is exactly the σ that appears in qᵀk(1 − σ²R(i,j)/2). ε is a
-            # persistent buffer so it is checkpointed rather than regenerated.
-            eps = torch.randn(planes, self._wire_d_model, generator=gen)
+            # Reparameterized frequencies: ω_n = σ_n · ε_n with ε ~ N(0, I) FROZEN. ω is
+            # then a genuine Gaussian sample (Theorem 3's hypothesis) while the learned
+            # quantity is exactly the σ in qᵀk(1 − σ²R(i,j)/2). ε is a persistent buffer
+            # so it is checkpointed rather than regenerated.
+            #
+            # ε is drawn PER HEAD and averaged to the ONE [P, m] table the layer
+            # broadcasts. Head sharing is not optional: Gemma's GQA lets several query
+            # heads read one key head, and Eq. 3 is exact only if both sides rotate by the
+            # same ω. The mean of H iid Normals is Normal, so ε is still Gaussian — at
+            # variance 1/H, i.e. one draw scaled by 1/√H.
+            heads = wire_head_count(attn)
+            eps = torch.randn(heads, planes, self._wire_d_model,
+                              generator=gen).mean(dim=0)
             self._wire_eps.register_buffer(str(idx), eps.to(device), persistent=True)
+            # σ is PER-PLANE and exponential — RoPE's own decay (Su et al.'s
+            # ϑ_i = β^(−2i/d)) carried onto the learnable scale, matching the reference
+            # ω init this arm replaces. max_n σ[n] = sigma_init, so layer_omega_scale and
+            # every shipped wire_max_angle keep the meaning they had under a scalar σ.
+            plane_idx = torch.arange(planes, dtype=torch.float32)
+            sigma = self._wire_sigma_init * 10000.0 ** (-2.0 * plane_idx / planes)
             self._wire_sigma[str(idx)] = nn.Parameter(
-                torch.tensor(self._wire_sigma_init, device=device),
-                requires_grad=not self._wire_freeze_sigma)
+                sigma.to(device), requires_grad=not self._wire_freeze_sigma)
 
     def _init_vanilla_omega(self, planes: int, gen) -> torch.Tensor:
         """Draw one ``[P, m]`` vanilla-mode ω table per :data:`WIRE_VANILLA_OMEGA_INITS`.
@@ -2423,6 +2469,17 @@ class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         store = self._wire_omega if self._wire_vanilla else self._wire_sigma
         return sorted(int(k) for k in store.keys())
 
+    def node_rows(self, graph, permutation=None) -> torch.Tensor:
+        """The ``[N, m]`` per-node vectors WIRE rotates by — Ψ here, UNGATED.
+
+        The one seam :meth:`build_wire_signal` reads the signal through, so a subclass
+        can change WHAT is rotated by without restating the gating, the span measurement
+        or the ``max_angle`` clamp that follow it (:class:`CompositeWireGraphLLM` swaps in
+        a factor of the probe covariance). Everything downstream is written against the
+        ``[N, m]`` contract alone and must stay that way.
+        """
+        return self.pe_model(graph, permutation=permutation).float()
+
     def build_wire_signal(self, graphs, injection_maps, seq_len: int, device,
                           permutation=None) -> torch.Tensor:
         """Assemble ``r`` ``[B, seq, m]`` — the gated Ψ placed at node-token spans.
@@ -2467,7 +2524,7 @@ class WireGraphLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         worst_pair = 0.0
         worst_row = 0.0
         for b in range(B):
-            pe = self.pe_model(graphs[b], permutation=permutation).float()   # [N, m]
+            pe = self.node_rows(graphs[b], permutation)                      # [N, m]
             pe = pe * torch.tanh(self.pe_gain)
             with torch.no_grad():
                 worst_row = max(worst_row, float(pe.norm(dim=-1).max()))
@@ -2666,7 +2723,10 @@ class CompositeWireGraphLLM(WireGraphLLM):
 
     **Caching.** ``pe_model.cache_pe`` is forced on and the composite graph is memoized
     in one slot, so a repeat forward over the same prompt (prefill then decode, an
-    injection/permutation sweep) pays for Ψ once. BOTH caches fill only under
+    injection/permutation sweep) pays for Ψ once. NOT under ``signal='cov_factor'``: that
+    path reads the probe covariance directly and MUST recompute, because ``G`` is redrawn
+    every forward by design. The composite-graph cache still applies, and decode still
+    pays once per ``generate`` (:meth:`_arm` runs once, then ``decode_cos_sin`` caches). BOTH caches fill only under
     ``no_grad``: a cached Ψ carries its autograd graph, and reusing it across steps would
     raise "backward through the graph a second time" or silently reuse stale gradients.
     :meth:`_arm` drops them whenever gradients are live. Same rule the parent's
@@ -2691,12 +2751,35 @@ class CompositeWireGraphLLM(WireGraphLLM):
       answer-derived topology into the prefill Ψ — use ``prompt_only`` unless that is the
       experiment.
 
-    **Deliberately omitted — do not add**: the second-moment readout ``C = E_q[ΦΦᴴ] −
-    ΨΨᴴ`` (WIRE rotates by a VECTOR per token; ``C`` is a ``[c, c]`` operator, i.e. a
-    relative position encoding, the class of method WIRE exists to replace); a Ψ row for
-    generated tokens (the composite graph is fixed at prefill and extending the cycle
-    mid-rollout would change every token's phase); anything from the parent's own
-    omitted list.
+    **The covariance signal (**``signal='cov_factor'``**).** ``r_i = Ψ_i`` has no result
+    tying ``‖Ψ_i − Ψ_j‖`` to anything structural. Theorem 3 does, but its hypothesis is
+    ``r_i = [u_k[i]/√λ_k]`` — a SQUARE ROOT of ``L†``, the only form for which
+    ``‖r_i − r_j‖² = L†_ii + L†_jj − 2L†_ij = R(i,j)``. The probe covariance
+    ``C = E_q[Φ'Φ'ᵀ] − ΨΨᵀ`` is itself a Gram matrix, so it plays ``L†``'s role, and the
+    signal is a FACTOR of it (:meth:`node_rows`, ``project=`` in
+    :meth:`~prism.models.r_pearl.RandomGNNPositionalEncodings.covariance_token_block`)::
+
+        r ∈ ℝ^{c×k},  E_G[r rᵀ] = C     ⟹  ‖r_i − r_j‖² ≈ C_ii + C_jj − 2C_ij
+        E[⟨q_i, k_j⟩] = qᵀk · (1 − σ²‖r_i − r_j‖²/2) + O(σ⁴)
+
+    and if the notebook's §3 stage has made ``C_ii + C_jj − 2C_ij = α·R_eff``, that reads
+    ``qᵀk(1 − ασ²R_eff/2)`` — attention decaying in resistance on the composite graph.
+
+    Three hypotheses this does NOT establish, stated because the theorem does not
+    transfer silently: Theorem 3 assumes an UNDIRECTED graph and Eq. (5)'s ``L†``, while
+    this backbone is magnetic by construction; §3.1 warns that exact eigenvectors rather
+    than an MLP's output are what secure the resistance result, and ``Φ' = T(Φ(q))`` puts
+    the GT's blocks inside ``E_q``; and the expansion is ``O(σ²)`` with ``O(σ⁴)`` error,
+    which ``wire_max_angle`` bounds but does not make small. The first is a genuine gap
+    in the theory, the second and third are measurable — see the acceptance tests.
+
+    **Deliberately omitted — do not add**: ``C`` ITSELF as the signal. ``C`` is a
+    ``[c, c]`` operator on PAIRS, i.e. a relative position encoding, the class of method
+    WIRE exists to replace; and its rows are the wrong object even numerically, since
+    ``‖C[i,:] − C[j,:]‖²`` is the resistance form of ``C²``, which equals that of ``C``
+    only if ``C`` is idempotent. Also omitted: a Ψ row for generated tokens (the
+    composite graph is fixed at prefill and extending the cycle mid-rollout would change
+    every token's phase); anything from the parent's own omitted list.
 
     Args:
         llm, pe_model, d_model: as :class:`WireGraphLLM`. ``pe_model`` must be a
@@ -2709,6 +2792,9 @@ class CompositeWireGraphLLM(WireGraphLLM):
         cycle_weight, cycle_causal, crosslink_weight, crosslink_bidirectional,
             anchor_weight: the composite-graph edge families
             (:func:`build_composite_graph`).
+        signal: what ``r_i`` IS, one of :data:`WIRE_SIGNALS`. ``"psi"`` (default) is the
+            parent's Ψ row; ``"cov_factor"`` is the covariance factor above, which
+            REQUIRES ``pe_pool='gt'`` and ``vanilla=False`` and says so at construction.
         vanilla_omega_init: defaults to ``"exponential"`` here, not ``"zero"``.
         **kwargs: forwarded to :class:`WireGraphLLM` (``layer_scope``, ``max_angle``,
             ``decode``, ``pe_gain_init``, ``vanilla``, ...).
@@ -2718,10 +2804,28 @@ class CompositeWireGraphLLM(WireGraphLLM):
                  magnet_r: float = 0.1250305176, context_window: int = 1024,
                  cycle_weight: float = 1.0, cycle_causal: bool = False,
                  crosslink_weight: float = 0.1, crosslink_bidirectional: bool = True,
-                 anchor_weight: float = 10.0,
+                 anchor_weight: float = 10.0, signal: str = "psi",
                  vanilla_omega_init: str = "exponential", **kwargs):
         super().__init__(llm, pe_model, d_model,
                          vanilla_omega_init=vanilla_omega_init, **kwargs)
+        if signal not in WIRE_SIGNALS:
+            raise ValueError(f"signal must be one of {WIRE_SIGNALS}, got {signal!r}")
+        self._wire_signal_source = signal
+        if signal == "cov_factor":
+            # The factor's rank IS the rotation width, so ω keeps the shape (and the
+            # max_angle calibration) it has under Ψ. Nothing else may set the two apart.
+            if getattr(pe_model, "pe_pool", None) != "gt":
+                raise ValueError(
+                    "signal='cov_factor' requires gnn.pe_pool='gt': the factor must be "
+                    "of C = E_q[Φ'Φ'ᵀ] − ΨΨᵀ with Φ' = T(Φ(q)), i.e. the GT blocks INSIDE "
+                    f"the expectation. Got pe_pool={getattr(pe_model, 'pe_pool', None)!r}, "
+                    "which would factor the PRE-block covariance instead.")
+            if self._wire_vanilla:
+                raise ValueError(
+                    "signal='cov_factor' requires gnn.wire_vanilla=false. The point of the "
+                    "factor is Theorem 3's qᵀk(1 − σ²R(i,j)/2), whose hypothesis is "
+                    "ω ~ N(0, σI); vanilla mode takes one non-Gaussian learnable table and "
+                    "no expectation, so the resistance reading would not hold.")
         if not 0.0 < float(magnet_r) < 0.25:
             raise ValueError(
                 f"magnet_r must be in (0, 0.25) — r is sigmoid-reparameterized into that "
@@ -2825,6 +2929,35 @@ class CompositeWireGraphLLM(WireGraphLLM):
         return unpadded_row(input_ids, attention_mask, b, type(self).__name__)
 
     # ------------------------------------------------------------------- signal
+
+    def node_rows(self, graph, permutation=None) -> torch.Tensor:
+        r"""The ``r_i`` of Eq. (2) — Ψ, or a JL FACTOR of the probe covariance.
+
+        Under ``signal='cov_factor'`` this returns ``r ∈ ℝ^{c×k}`` with
+        ``E_G[r rᵀ] = C``, ``C = E_q[Φ'Φ'ᵀ] − ΨΨᵀ`` the covariance of the composite's
+        TOKEN block, so that::
+
+            ‖r_i − r_j‖²  ≈  C_ii + C_jj − 2C_ij
+
+        which is the quantity Theorem 3 reads as a resistance. The rank is
+        ``self._wire_d_model``, i.e. the factor's width IS the rotation width, so ω keeps
+        its shape and ``max_angle`` keeps its calibration.
+
+        Rows are the TOKEN block only (``c`` of the composite's ``c + n + 1`` nodes).
+        Those are the only rows :meth:`build_wire_signal`'s identity span map places, and
+        restricting the factor to them makes the parent's ``cdist`` span exactly the span
+        of the angles actually applied rather than a bound including unplaced scene rows.
+
+        ``permutation`` is ignored here and that is deliberate, not an oversight: it was
+        already applied to the SCENE half when :func:`build_composite_graph` built this
+        object, so re-applying it would relabel the token cycle too.
+        """
+        if self._wire_signal_source == "psi":
+            return super().node_rows(graph, permutation)
+        r, _ = self.pe_model.pe_model.covariance_token_block(
+            graph, int(graph.num_token_nodes), pe_pool=self.pe_model.pe_pool,
+            gt=self.pe_model, project=self._wire_d_model)
+        return r.float()
 
     def build_wire_signal(self, graphs, injection_maps, seq_len: int, device,
                           permutation=None, input_ids=None, attention_mask=None):

@@ -192,7 +192,10 @@ def build_planner_model(gnn, llm, tokenizer, *, disable_graph_token_rope=False,
                 "cycle_causal": gnn.get("wire_cycle_causal", False),
                 "crosslink_weight": gnn.get("wire_crosslink_weight", 0.1),
                 "crosslink_bidirectional": gnn.get("wire_crosslink_bidirectional", True),
-                "anchor_weight": gnn.get("wire_anchor_weight", 10.0)} if _composite else {}),
+                "anchor_weight": gnn.get("wire_anchor_weight", 10.0),
+                # "psi" = the parent's first-moment signal; "cov_factor" = the JL factor
+                # of the probe covariance (Theorem 3's square-root form).
+                "signal": gnn.get("wire_signal", "psi")} if _composite else {}),
             layer_scope=gnn.wire_layer_scope,
             sigma_init=gnn.wire_sigma_init,
             freeze_sigma=gnn.wire_freeze_sigma,

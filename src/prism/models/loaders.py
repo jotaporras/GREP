@@ -319,7 +319,10 @@ def graph_augmented_llm_from_pretrained(
                 "cycle_causal": gnn_cfg.get("wire_cycle_causal", False),
                 "crosslink_weight": gnn_cfg.get("wire_crosslink_weight", 0.1),
                 "crosslink_bidirectional": gnn_cfg.get("wire_crosslink_bidirectional", True),
-                "anchor_weight": gnn_cfg.get("wire_anchor_weight", 10.0)} if _composite else {}),
+                "anchor_weight": gnn_cfg.get("wire_anchor_weight", 10.0),
+                # Absent key = a run predating the covariance signal, i.e. Psi. The two
+                # are different functions of the same state_dict, so never default it on.
+                "signal": gnn_cfg.get("wire_signal", "psi")} if _composite else {}),
             layer_scope=gnn_cfg.get("wire_layer_scope", "dense"),
             sigma_init=gnn_cfg.get("wire_sigma_init", 0.01),
             freeze_sigma=gnn_cfg.get("wire_freeze_sigma", False),
