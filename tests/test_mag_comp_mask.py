@@ -758,6 +758,51 @@ def test_frozen_graph_ignores_the_answer_entirely():
         "for them; decode cannot reproduce that")
 
 
+def test_frozen_training_and_decode_agree_with_the_hard_block_on():
+    """refresh=0 AND mask_use_edges=True — the SHIPPED e17 Stage-3 configuration.
+
+    test_training_and_decode_bias_agree_position_by_position covers refresh=1 with the
+    block on; test_frozen_graph_ignores_the_answer_entirely covers refresh=0 with it OFF.
+    Neither covers the combination the run ocw1jjkj actually trained under, which is the
+    one where the two halves interact: the SOFT term is inert for every answer query (a
+    prompt-only composite has no node for them) while the HARD block is live for all of
+    them, so any train/decode disagreement here is pure hard-block disagreement.
+    """
+    model = _model(beta_init=1.0, decode_refresh=0, use_edges=True)
+    ids = _ids().to(DEVICE)
+    prompt_len = SCOPE_START + 6
+    prompt = ids[0, :prompt_len].tolist()
+    seqs = _node_seqs()
+    imap = build_injection_map(ids[0].tolist(), seqs, scope_start=SCOPE_START)
+
+    with torch.no_grad():
+        trained = model.build_structural_mask(
+            ids.shape[1], [_scene()], [imap], DEVICE,
+            dtype=torch.float32, input_ids=ids, answer_starts=[prompt_len])
+        inj = CompositeDecodeInjector(model, _scene(), prompt, refresh=0)
+        seen_block = False
+        for t in ids[0, prompt_len:].tolist():
+            inj.pre_hook(None, (), {"input_ids": torch.tensor([[t]])})
+            p = prompt_len + len(inj.generated) - 1
+            row = model._decode_bias_row
+            if row is None:
+                # None is the representation of an ALL-ZERO bias (the attention hook adds
+                # nothing), which is correct for a query that mentions no scene node.
+                # Training must then also be zero at p, or the two genuinely disagree.
+                assert float(trained[0, 0, p, :].abs().max()) == 0.0, (
+                    f"decode armed nothing at position {p} but training has a bias there")
+                continue
+            k = row.shape[-1]
+            got, want = row[0, 0, 0], trained[0, 0, p, :k]
+            seen_block |= bool((want <= torch.finfo(torch.float32).min / 2).any())
+            assert torch.allclose(got, want, atol=1e-5), (
+                f"training and decode disagree at position {p}: "
+                f"max|delta|={float((got - want).abs().max()):.3e}")
+    assert seen_block, (
+        "no -inf appeared anywhere in the answer rows — the test never exercised the "
+        "hard block, so its agreement is unproven")
+
+
 def test_frozen_decode_never_rebuilds_and_uses_the_prompt_alone():
     """The injector at ``refresh=0`` builds once, from the prompt, and stops."""
     model = _model(beta_init=1.0, decode_refresh=0)

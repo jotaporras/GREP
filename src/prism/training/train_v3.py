@@ -470,7 +470,7 @@ def train_model(config: omegaconf.DictConfig):
         eval_model, eval_tokenizer, _ = checkpoint.load_checkpoint(
             sft_args.output_dir, four_bit=config.trainer.bit4, device=config.trainer.device
         )
-        evaluate.evaluate_model(
+        post_results = evaluate.evaluate_model(
             eval_model,
             eval_tokenizer,
             samples_by_graph,
@@ -483,6 +483,35 @@ def train_model(config: omegaconf.DictConfig):
             edge_weights=config.data.edge_weights,
             injection_scope=config.data.injection_scope,
         )
+        # Report the post-train cross-eval to W&B. evaluate_model writes JSONs, a figure
+        # and a printed table but logs NOTHING, so without this the numbers reach W&B
+        # only as captured console text and cannot be plotted or compared across runs.
+        # SUMMARY, not wandb.log: training is over, so a logged row would land at
+        # whatever step pointer HF left behind — the non-monotonic-step hazard the
+        # define_metric block above exists to avoid. Summary fields carry no step.
+        # NAMESPACE is deliberately `posteval/`, never `eval/`: eval/accuracy is the
+        # IN-TRAINING metric over config.eval.data, a different graph set entirely, and
+        # collapsing the two under one key would silently overwrite a training curve's
+        # final value with a number measured on other data.
+        # The aggregation is evaluate._aggregate_multi_graph_eval — the SAME
+        # sample-weighted micro-average and path-metric fold EvalCallback uses — so the
+        # two namespaces stay directly comparable rather than each inventing a headline.
+        if wandb.run is not None and post_results:
+            agg = evaluate._aggregate_multi_graph_eval(
+                post_results, step=trainer.state.global_step, epoch=trainer.state.epoch)
+            wandb.run.summary["posteval/accuracy"] = agg["accuracy"]
+            wandb.run.summary["posteval/num_graphs"] = agg["num_graphs"]
+            wandb.run.summary["posteval/num_samples"] = agg["num_samples"]
+            wandb.run.summary["posteval/num_correct"] = agg["num_correct"]
+            wandb.run.summary["posteval/data"] = str(config.eval.post_train_graphs)
+            for name, r in agg["per_graph"].items():
+                wandb.run.summary[f"posteval/acc/{name}"] = r["accuracy"]
+            for k, v in (agg["path_metrics"] or {}).items():
+                if v is not None:
+                    wandb.run.summary[f"posteval/path_{k}"] = v
+            print(f"[posteval] accuracy={agg['accuracy']:.4f} over "
+                  f"{agg['num_graphs']} graph(s) / {agg['num_samples']} samples "
+                  f"-> wandb.summary['posteval/*']")
 
     return trainer
 
