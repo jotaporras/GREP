@@ -135,7 +135,7 @@ def test_mask_grpo_two_steps(tmp_path):
         "GT params missing from the optimizer"
     row = _dataset()[0]
     entry = trainer._entry_for_prompt(row["prompt"])
-    pids, pyg_graph, imap, _seqs, _nv = entry
+    pids, pyg_graph, imap, _seqs, _nv, _psi = entry
     device = next(trainer._core.parameters()).device
     bias = trainer._core.build_structural_mask(
         len(pids), [pyg_graph], [imap], device)
