@@ -52,4 +52,11 @@ def gemma4_31b_shaped(seed: int = 0, dtype=torch.float32, num_kv_shared_layers: 
     )
     for k, v in config_overrides.items():
         setattr(cfg, k, v)
-    return Gemma4ForCausalLM(cfg).to(dtype)
+    model = Gemma4ForCausalLM(cfg).to(dtype)
+    # The real -it checkpoint's generation_config declares BOTH <eos> (1) and
+    # the turn-end token "<turn|>" (106) as stop ids; the hand-built config
+    # defaults to eos=1 only, which breaks the RL trainer's turn-end
+    # detection (it requires the chat template's post-content id in the
+    # model's declared stop set).
+    model.generation_config.eos_token_id = [1, 106]
+    return model
