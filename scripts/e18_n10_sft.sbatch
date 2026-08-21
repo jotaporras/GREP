@@ -43,7 +43,7 @@ CHECKPOINT_DIR=${CHECKPOINT_DIR:-$PROJ/outputs/e18_identity}
 PE_DIR=$PROJ/pretrained_pe
 STAGE1_LORA=$PROJ/outputs/e9_multistage_training/e9_ms_stage1/e9_ms_stage1_sqgk4o3j/checkpoint-100
 
-ARM="${ARM:?set ARM=mask|mask_a|mask_b|mask_ab|mask_bind|mask_b_bind|mask_d|text_edges}"
+ARM="${ARM:?set ARM=mask|mask_a|mask_b|mask_ab|mask_bind|mask_b_bind|mask_d|text_edges (scripts/e18_arms.sh)}"
 DATA_SPLIT=${DATA_SPLIT:-$PROJ/data/n_10_vllm/gen/nav_n10_gemma_data/split}
 MAX_STEPS=${MAX_STEPS:-300}
 RUN_NAME=${RUN_NAME:-e18_n10_${ARM}}
@@ -61,38 +61,10 @@ export PATH="$ENV_NAME/bin:$PATH"
 
 test -f "$DATA_SPLIT/formatted_all_new__train.json" || { echo "missing $DATA_SPLIT/formatted_all_new__train.json"; exit 2; }
 
-# --- the e17 mask recipe (shared by every mask arm) ---------------------------
-MASK_ARGS=(
-    gnn.arch=learnable_graph_mask
-    gnn.d_model=1024 gnn.dropout=0.1 gnn.pe_hidden_channels=256 gnn.pe_num_layers=5
-    gnn.num_samples=320 gnn.k_pe=3 gnn.gt_num_layers=3 gnn.gt_heads=8 gnn.k_gt=2
-    gnn.eps=1e-6 gnn.use_layer_norm=true gnn.pe_node_features=random
-    gnn.mask_alpha=0.0 gnn.mask_layer_scope=dense gnn.mask_psi_scale=cosine
-    gnn.mask_k_hops=1 gnn.mask_symmetrize=true gnn.mask_use_edges=true
-    gnn.pe_gt_from="$PE_DIR/path_navigator_gt.pt"
-    gnn.semantic_gt_from=null
-    gnn.structural_lr_mult=0.012
-    data.text_edge_list=none
-    data.injection_scope=decode_consistent
-    trainer.init_lora_from="$STAGE1_LORA"
-)
-A_ARGS=(gnn.decision_gating=true gnn.decision_gain_init=3.0)
-B_ARGS=(gnn.struct_keys=true gnn.struct_keys_dim=64 gnn.struct_keys_layer_scope=dense
-        gnn.struct_keys_gain_init=1.0)
-BIND_ARGS=(gnn.binding_head=true gnn.binding_temperature=0.1 gnn.binding_loss_weight=0.1)
-D_ARGS=(gnn.soft_edges=true)
-
-case "$ARM" in
-  mask)        ARM_ARGS=("${MASK_ARGS[@]}") ;;
-  mask_a)      ARM_ARGS=("${MASK_ARGS[@]}" "${A_ARGS[@]}") ;;
-  mask_b)      ARM_ARGS=("${MASK_ARGS[@]}" "${B_ARGS[@]}") ;;
-  mask_ab)     ARM_ARGS=("${MASK_ARGS[@]}" "${A_ARGS[@]}" "${B_ARGS[@]}") ;;
-  mask_bind)   ARM_ARGS=("${MASK_ARGS[@]}" "${BIND_ARGS[@]}") ;;
-  mask_b_bind) ARM_ARGS=("${MASK_ARGS[@]}" "${B_ARGS[@]}" "${BIND_ARGS[@]}") ;;
-  mask_d)      ARM_ARGS=("${MASK_ARGS[@]}" "${D_ARGS[@]}") ;;
-  text_edges)  ARM_ARGS=(gnn.arch=llm data.text_edge_list=present) ;;
-  *) echo "unknown ARM=$ARM"; exit 2 ;;
-esac
+# Arm table lives in scripts/e18_arms.sh (shared with the plaza runner).
+PE_GT="$PE_DIR/path_navigator_gt.pt"
+source scripts/e18_arms.sh          # cwd is the repo root (cd above)
+e18_arm_args "$ARM"
 
 echo "[$(date --iso-8601=seconds)] $RUN_NAME arm=$ARM data=$DATA_SPLIT max_steps=$MAX_STEPS tag=$TAG"
 echo "=== python: $(which python) ==="

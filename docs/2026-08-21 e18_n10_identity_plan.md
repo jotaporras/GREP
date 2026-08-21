@@ -68,6 +68,12 @@ writing. Outputs:
 
 ### 1.4 Runner — `scripts/e18_n10_sft.sbatch`
 
+Arm table (flags per ARM) lives in `scripts/e18_arms.sh`, shared with the
+plaza twin `scripts/e18_n10_plaza.sh` (same recipe but **4-bit** base —
+the 31B bf16 does not fit a 48 GB A6000 — so plaza runs are a pipeline/probe
+smoke test, not an s/step calibration for the B200 fleet; `GPU=<0|1> ARM=…
+MAX_STEPS=… RUN_NAME=…_plaza4b nohup scripts/e18_n10_plaza.sh > logs/… &`).
+
 `ARM=<arm> sbatch scripts/e18_n10_sft.sbatch`. e17 mask recipe verbatim
 (`e17_pf_sft.sbatch`: 31B-it, stage-1 LoRA warm start, navigator-GT tower,
 mask_alpha 0, binary, decode_consistent, slr 0.012, lr 2.5e-4) + arm flags,
