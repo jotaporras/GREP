@@ -437,13 +437,14 @@ class MaskGRPOTrainer(GRPOTrainer):
             raise ValueError(
                 "use_vllm must be False: mask archs have no vLLM analog — "
                 "rollouts run through the policy's own generate().")
-        if getattr(core, "_decision_gating", False) or getattr(core, "_struct_keys", False):
+        if (getattr(core, "_decision_gating", False) or getattr(core, "_struct_keys", False)
+                or getattr(core, "_soft_edges", False)):
             # e18 A/B are SFT-only so far: _rollout_chunks builds the row states
             # without decision_values / sk_banks and the loss-side forward passes
             # no decision_maps, so the rollouts and the loss would see a plain
             # mask. Fail here, not at the first rollout.
             raise ValueError(
-                "decision_gating / struct_keys checkpoints are not wired for mask "
+                "decision_gating / struct_keys / soft_edges checkpoints are not wired for mask "
                 "RL (rollout row states need decision_values / sk_banks and the "
                 "loss forward needs decision_maps). SFT-only for now.")
         if args.gradient_checkpointing:

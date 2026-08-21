@@ -32,16 +32,18 @@ without re-deriving anything.
 | **A** decision gating | `gnn.decision_gating`, `gnn.decision_gain_init` | At every *untagged* answer-side position (separator after a mention, mid-name tokens) the attention bias row gets `decision_gain · gate(current, j)` on the name tokens of the current node's neighbours (gate = α+(1−α)cos ∈ [ε,1]), 0 elsewhere — goal mention stays visible. "Current node" = last completed mention. Teacher-forced via `decision_query_map` (collator), decode via `MaskDecodeInjector`/`_MaskDecodeRowState.current_node`. | scalar `decision_gain` (base LR) |
 | **B** structural keys | `gnn.struct_keys`, `struct_keys_dim`, `struct_keys_layer_scope`, `struct_keys_gain_init` | At every in-scope (dense) attention layer, every query position t and node-token key j: `logits += tanh(sk_gain_ℓ)·(W_q^ℓ h_t · W_k Ψ_j)/√d_s`. h = post-input-layernorm attention input (pre-hook stash). Values/residual untouched. The LLM computes its own structural query (the mask is the id-lookup special case). | `sk_k` (d_gt→d_s, shared), `sk_q[ℓ]` (hidden→d_s), `sk_gain[ℓ]` — all base LR |
 | binding head | `gnn.binding_head`, `binding_temperature`, `binding_loss_weight` | InfoNCE at the final token of every node mention over the graph's nodes: `CE(softmax_n cos(W_b h_p, Ψ_n)/τ, node(p))`, added to the LM loss × weight. Logged as `binding_loss` (wandb). Inert at generation. | `bind_proj` (hidden→d_gt), base LR |
+| **D** soft edge tokens | `gnn.soft_edges` | One learned embedding per *directed* edge (u→v), `MLP([emb(u); emb(v); Ψ_u; Ψ_v])` (emb = mean input embedding of the node's first name mention), rescaled to the name-token embedding norm, spliced into `inputs_embeds` right after BOS. Every position map / label / attention mask is shifted by E = #directed edges; logits are sliced back so callers see the original frame. The edge list is thus *in context* as graph-side tokens — the graph-side upper bound the direction note asked for. Batch size 1 only (prefix length varies); decode = `generate(inputs_embeds=…)` prefill (`inference.py`). | `se_mlp` (2·hidden+2·d_gt → hidden → hidden), base LR |
 
-All three: fail-loud loaders (`loaders.py` requires the weights when the flag is
+All four: fail-loud loaders (`loaders.py` requires the weights when the flag is
 on), saved by `run_dir.py`, recorded in `train_config.json` `gnn` block
 (`train_v3.py` provenance now also records post_fusion/graph_lora/pointer/cross
 flags — closes the e17 hole where pf runs reloaded as plain masks).
 
-Tests: `tests/test_e18_identity.py` (15 tests: decision map, soft-row placement,
-gain-0 bitwise no-ops for A and B, gradient reach, **decode parity of A, B, A+B**
-against teacher forcing, bf16 autocast, binding loss = LM + w·aux, inert without
-labels, save keys). `tests/test_neighbour_probe.py` (scoring contract).
+Tests: `tests/test_e18_identity.py` (23 tests: decision map, soft-row placement,
+gain-0 bitwise no-ops for A and B, gradient reach, **decode parity of A, B, A+B,
+D, D+A+B** against teacher forcing, bf16 autocast, binding loss = LM + w·aux,
+inert without labels, D no-edge identity / batch>1 rejection / HF
+`generate(inputs_embeds=…)` returns new tokens only, save keys). `tests/test_neighbour_probe.py` (scoring contract).
 
 ### 1.2 Probe — `scripts/neighbour_probe.py`
 
@@ -84,6 +86,7 @@ wandb tag `e18_identity`.
 | `mask_ab` | A + B | |
 | `mask_bind` | binding w 0.1 | does explicit name↔Ψ supervision alone help? |
 | `mask_b_bind` | B + binding | |
+| `mask_d` | D (soft edge tokens) | graph-side upper bound: if even this doesn't beat `mask`, the bottleneck is not the pathway |
 | `text_edges` | `gnn.arch=llm`, edge list in text, fresh LoRA | upper bound / sanity: the probe must be ≈100% here |
 
 ## 2. Runbook (in order)
@@ -150,9 +153,9 @@ Sanity from the calibration run (it is a real, if short, `mask` arm):
 
 ### Step 3 — the fleet
 
-Submit all seven (they queue; 1 GPU each):
+Submit all eight (they queue; 1 GPU each):
 ```
-ssh betty 'bash -lc "cd ~/sourcecode/GREP && for a in mask mask_a mask_b mask_ab mask_bind mask_b_bind text_edges; do ARM=\$a MAX_STEPS=<calibrated> sbatch scripts/e18_n10_sft.sbatch; done"'
+ssh betty 'bash -lc "cd ~/sourcecode/GREP && for a in mask mask_a mask_b mask_ab mask_bind mask_b_bind mask_d text_edges; do ARM=\$a MAX_STEPS=<calibrated> sbatch scripts/e18_n10_sft.sbatch; done"'
 ```
 Then `/monitor-job all`. Per-arm watch list:
 
@@ -163,6 +166,7 @@ Then `/monitor-job all`. Per-arm watch list:
 | `e18/decision_gain` (A arms) | wandb (GradientDebugCallback) | moves from 3.0 (either way); `e18/grad_norm_decision_gain` > 0 | frozen at exactly 3.0 ⇒ not in the optimizer (param-group bug) |
 | `e18/sk_gain_mean`, `e18/sk_gain_absmax`, `e18/grad_norm_sk` (B arms) | wandb | gains move from 1.0; grad norm > 0 | frozen ⇒ same bug |
 | `e18/grad_norm_bind_proj` (bind arms) | wandb | > 0 | 0 ⇒ head not in the loss graph |
+| `e18/grad_norm_se_mlp` (`mask_d`) | wandb | > 0 | 0 ⇒ soft tokens not in the loss graph |
 | post-train eval | `eval_logs/cross_eval/` + log "accuracy" | `text_edges` ≳ 95% on n10; `mask` should be high too (n10 is tiny) | any arm < `mask` by > 10 pts ⇒ the flag hurts, note it |
 | probe | `results/e18_probe/<run>_test.json` `aggregate` | see §3 | NaN / 0 queries |
 | exit | sacct | COMPLETED | FAILED/OOM ⇒ handoff to fable-debugger with the last 80 log lines |
@@ -199,9 +203,11 @@ the 5 test graphs; the log prints it as the summary table).
 5. **Nothing beats `mask`, `text_edges` ≈ 1.0** ⇒ the pathways reach the
    decision step but the LLM doesn't exploit them in 300 SFT steps. Before
    concluding: (a) check `sk_gain`/`decision_gain` actually moved; (b) one
-   longer run (`MAX_STEPS=600`) of `mask_b_bind`; (c) then the conceptual upper
-   bound D (soft edge tokens) is the next thing to build — it is *not*
-   implemented.
+   longer run (`MAX_STEPS=600`) of `mask_b_bind`; (c) read `mask_d`: if the
+   soft-edge upper bound beats `mask` on the probe, the LLM *can* use graph-side
+   edge information and A/B are the wrong pathway (keep iterating on pathways);
+   if `mask_d` ≈ `mask` too while `text_edges` ≈ 1.0, the graph-side route
+   itself is the problem at this SFT budget — report, don't iterate.
 6. **`mask_bind` alone helps** ⇒ binding was the missing supervision; combine
    with whichever pathway is best and carry the loss forward.
 
@@ -222,6 +228,13 @@ the 5 test graphs; the log prints it as the summary table).
 - **Decision gain init 3.0 / sk gain init 1.0** — chosen so the channels are open
   from step 0 (the e17 pf lesson: zero-init gates at structural LR never opened;
   these are at base LR, but 300 steps is short). Not tuned.
+- **D scale** — soft tokens are normalised to the mean name-token embedding
+  norm (Gemma's embeddings are pre-scaled by √hidden, so this is the right
+  frame); not tuned. D at batch 1 only — the e17 recipe already trains at
+  batch 1, but if `trainer.sft.per_device_train_batch_size` > 1 the run fails
+  loud at the first step.
+- **D + gradient checkpointing** — `build_soft_edges` runs outside the
+  checkpointed blocks, so the splice happens once; untested on GPU.
 - **RL path**: `BatchedMaskDecodeInjector` carries A/B state, but the RL prefill
   (`rl/` rollouts) does not build `decision_maps` — A/B are SFT-only until that
   is wired. Not needed for this loop.

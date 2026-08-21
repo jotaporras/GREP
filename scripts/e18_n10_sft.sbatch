@@ -25,6 +25,8 @@
 #   ARM=mask_ab      + both
 #   ARM=mask_bind    + binding auxiliary loss only
 #   ARM=mask_b_bind  + B + binding
+#   ARM=mask_d       + soft edge tokens (D; graph-side upper bound — one learned
+#                      embedding per directed edge spliced in after BOS)
 #   ARM=text_edges   plain-LLM upper bound: edge list in text, fresh LoRA
 #
 # Submit:  ARM=mask_b sbatch scripts/e18_n10_sft.sbatch
@@ -41,7 +43,7 @@ CHECKPOINT_DIR=${CHECKPOINT_DIR:-$PROJ/outputs/e18_identity}
 PE_DIR=$PROJ/pretrained_pe
 STAGE1_LORA=$PROJ/outputs/e9_multistage_training/e9_ms_stage1/e9_ms_stage1_sqgk4o3j/checkpoint-100
 
-ARM="${ARM:?set ARM=mask|mask_a|mask_b|mask_ab|mask_bind|mask_b_bind|text_edges}"
+ARM="${ARM:?set ARM=mask|mask_a|mask_b|mask_ab|mask_bind|mask_b_bind|mask_d|text_edges}"
 DATA_SPLIT=${DATA_SPLIT:-$PROJ/data/n_10_vllm/gen/nav_n10_gemma_data/split}
 MAX_STEPS=${MAX_STEPS:-300}
 RUN_NAME=${RUN_NAME:-e18_n10_${ARM}}
@@ -78,6 +80,7 @@ A_ARGS=(gnn.decision_gating=true gnn.decision_gain_init=3.0)
 B_ARGS=(gnn.struct_keys=true gnn.struct_keys_dim=64 gnn.struct_keys_layer_scope=dense
         gnn.struct_keys_gain_init=1.0)
 BIND_ARGS=(gnn.binding_head=true gnn.binding_temperature=0.1 gnn.binding_loss_weight=0.1)
+D_ARGS=(gnn.soft_edges=true)
 
 case "$ARM" in
   mask)        ARM_ARGS=("${MASK_ARGS[@]}") ;;
@@ -86,6 +89,7 @@ case "$ARM" in
   mask_ab)     ARM_ARGS=("${MASK_ARGS[@]}" "${A_ARGS[@]}" "${B_ARGS[@]}") ;;
   mask_bind)   ARM_ARGS=("${MASK_ARGS[@]}" "${BIND_ARGS[@]}") ;;
   mask_b_bind) ARM_ARGS=("${MASK_ARGS[@]}" "${B_ARGS[@]}" "${BIND_ARGS[@]}") ;;
+  mask_d)      ARM_ARGS=("${MASK_ARGS[@]}" "${D_ARGS[@]}") ;;
   text_edges)  ARM_ARGS=(gnn.arch=llm data.text_edge_list=present) ;;
   *) echo "unknown ARM=$ARM"; exit 2 ;;
 esac

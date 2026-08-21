@@ -246,6 +246,8 @@ class GradientDebugCallback(TrainerCallback):
                 [inner.sk_gain, *inner.sk_k.parameters(), *inner.sk_q.parameters()])
         if getattr(inner, "_binding_head", False):
             self._captured_grad_norms["bind_proj"] = self._grad_norm(inner.bind_proj.parameters())
+        if getattr(inner, "_soft_edges", False):
+            self._captured_grad_norms["se_mlp"] = self._grad_norm(inner.se_mlp.parameters())
         if hasattr(inner.pe_model, "blocks"):
             self._captured_grad_norms["gt_blocks"] = self._grad_norm(inner.pe_model.blocks.parameters())
             # rpearl_gt_llm wraps an R-PEARL inside the GT; gt_llm (SemanticGraphTransformer)
@@ -319,6 +321,8 @@ class GradientDebugCallback(TrainerCallback):
             metrics["e18/grad_norm_sk"] = g.get("sk", 0.0)
         if getattr(inner, "_binding_head", False):
             metrics["e18/grad_norm_bind_proj"] = g.get("bind_proj", 0.0)
+        if getattr(inner, "_soft_edges", False):
+            metrics["e18/grad_norm_se_mlp"] = g.get("se_mlp", 0.0)
 
         if wandb.run is not None:
             wandb.log(metrics, step=state.global_step)

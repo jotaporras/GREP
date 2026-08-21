@@ -397,6 +397,7 @@ def graph_augmented_llm_from_pretrained(
             binding_head=gnn_cfg.get("binding_head", False),
             binding_temperature=gnn_cfg.get("binding_temperature", 0.1),
             binding_loss_weight=gnn_cfg.get("binding_loss_weight", 0.1),
+            soft_edges=gnn_cfg.get("soft_edges", False),
         )
         gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
         _load_psi_producer_state(model.pe_model, gnn_weights["pe_model"], path, gnn_cfg)
@@ -445,6 +446,9 @@ def graph_augmented_llm_from_pretrained(
         if gnn_cfg.get("binding_head", False):
             _require("binding_head", ("bind_proj",))
             model.bind_proj.load_state_dict(gnn_weights["bind_proj"])
+        if gnn_cfg.get("soft_edges", False):
+            _require("soft_edges", ("se_mlp",))
+            model.se_mlp.load_state_dict(gnn_weights["se_mlp"])
     elif architecture in ("postfusion_graph_llm", "composite_graph_gt"):
         raise ValueError(
             f"architecture {architecture!r} was removed from the codebase (legacy "

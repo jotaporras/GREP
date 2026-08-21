@@ -16,6 +16,8 @@ from prism.models.gnn_llm import (
     WireGraphLLM,
     build_injection_map,
     decision_query_map,
+    shift_spans,
+    splice_prefix,
     find_last_graph_scope,
     node_token_variants,
 )
@@ -263,6 +265,19 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
                 # build_structural_mask, so --permutation-seed actually relabels the graph
                 # the mask is computed on (it was silently ignored here before).
                 prompt_len = input_ids.shape[1]
+                gen_inputs = {"input_ids": input_ids}
+                if getattr(graph_model, "_soft_edges", False):
+                    # e18-D: the prompt is the embeddings with the edge prefix spliced
+                    # in; everything position-indexed below lives in that frame.
+                    # generate(inputs_embeds=...) returns ONLY the new tokens.
+                    with torch.no_grad():
+                        inputs_embeds, se_offset = graph_model.build_soft_edges(
+                            input_ids, [pyg_graph], [injection_map],
+                            permutation=self.permutation)
+                    injection_map = shift_spans(injection_map, se_offset)
+                    prompt_len += se_offset
+                    attention_mask = splice_prefix(attention_mask, se_offset, 1)
+                    gen_inputs = {"inputs_embeds": inputs_embeds}
                 e18_on = (getattr(graph_model, "_decision_gating", False)
                           or getattr(graph_model, "_struct_keys", False))
                 if e18_on and self.injection_scope != "decode_consistent":
@@ -291,7 +306,7 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
                     # residual signal manually (decode steps: MaskDecodeInjector).
                     with torch.no_grad():
                         graph_model._pf_signal = graph_model.build_pf_signal(
-                            input_ids.shape[1], [pyg_graph], [injection_map],
+                            prompt_len, [pyg_graph], [injection_map],
                             input_ids.device, permutation=self.permutation)
                 if getattr(graph_model, "_graph_lora", False):
                     # e17-D: per-graph, static across decode — armed once.
@@ -319,17 +334,19 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
                 if self.injection_scope == "decode_consistent":
                     injector = MaskDecodeInjector(
                         graph_model, pyg_graph, injection_map,
-                        input_ids.shape[1], node_token_seqs,
+                        prompt_len, node_token_seqs,
                         permutation=self.permutation)
                     hook_handle = graph_model.llm.register_forward_pre_hook(
                         injector.pre_hook, with_kwargs=True)
                 outputs = graph_model.llm.generate(
-                    input_ids=input_ids, attention_mask=attention_mask,
+                    **gen_inputs, attention_mask=attention_mask,
                     max_new_tokens=max_new_tokens, **DECODE_KWARGS,
                     pad_token_id=self.tokenizer.eos_token_id,
                     **_identity_rope_kwargs(graph_model, injection_map,
-                                            input_ids.shape[1], input_ids.device),
+                                            prompt_len, input_ids.device),
                 )
+                if "inputs_embeds" in gen_inputs:
+                    return outputs                        # new tokens only
                 return outputs[:, input_ids.shape[-1]:]
             finally:
                 graph_model._struct_bias = None

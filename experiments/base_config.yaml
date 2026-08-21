@@ -158,6 +158,11 @@ gnn:
   binding_head: false
   binding_temperature: 0.1
   binding_loss_weight: 0.1
+  # D — soft edge tokens (upper-bound control): one soft prefix position per
+  # DIRECTED edge, MLP([emb(u); emb(v); Psi_u; Psi_v]) spliced into the input
+  # embeddings after BOS; the LLM processes them as tokens (each neighbour is a
+  # position again, 2E positions vs ~8E text tokens). Batch size 1 only; SFT+eval.
+  soft_edges: false
 
   # --- wire_llm (WIRE: Psi enters as a ROTATION of q/k, not an added signal) ---
   # q_i -> R(theta_i) q_i, k_j -> R(theta_j) k_j with theta_n = omega_n . Psi_i, composed

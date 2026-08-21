@@ -851,7 +851,8 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
                  struct_keys_gain_init: float = 0.0,
                  binding_head: bool = False,
                  binding_temperature: float = 0.1,
-                 binding_loss_weight: float = 0.1):
+                 binding_loss_weight: float = 0.1,
+                 soft_edges: bool = False):
         # Wrapper is not a registered HF architecture or MoE class; force "eager" so
         # PreTrainedModel doesn't reject SDPA/flash or expert-impl validation.
         config = copy.copy(llm.config)
@@ -928,7 +929,12 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         self._bind_state: dict | None = None              # {"psi": [Tensor], "pos": [(b, p, node)]}
         self._bind_hidden: torch.Tensor | None = None     # lm_head input of the current forward
         self.last_binding_loss: torch.Tensor | None = None
+        # e18-D — soft edge tokens (off unless enabled): one prefix position per
+        # directed edge, spliced into the input embeddings after BOS.
+        self._soft_edges: bool = False
         self._install_graph_mask()
+        if soft_edges:
+            self.enable_soft_edges(fusion_d_gt)
         if struct_keys:
             self.enable_struct_keys(struct_keys_layer_scope, struct_keys_dim,
                                     fusion_d_gt, struct_keys_gain_init)
@@ -945,6 +951,87 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         if cross_fusion:
             self.enable_cross_fusion(cross_fusion_heads, cross_fusion_dim,
                                      fusion_d_gt)
+
+    # ------------------------------------------------ e18 D: soft edge tokens
+
+    def enable_soft_edges(self, d_gt: int | None) -> None:
+        """Install the e18-D pathway: one SOFT TOKEN per directed edge as prefix memory.
+
+        For every ordered adjacent pair (u, v) of the graph an embedding
+        ``MLP([emb(u); emb(v); Ψ_u; Ψ_v])`` (``emb`` = mean input embedding of the
+        node's first prompt mention) is spliced into the input embeddings right
+        after BOS, rescaled to the mean text-embedding norm. The LLM processes
+        them through its own layers like tokens, so each neighbour is again a
+        POSITION the copy circuit can read (the text-edge-list mechanism) at
+        2·E positions instead of ~8·E text tokens. Upper-bound control for the
+        Ψ-compressed pathways (docs/2026-08-21 e18_n10_identity_plan.md).
+
+        Batch size 1 only (no padding of variable-length prefixes). The forward
+        shifts every injection/decision map by the prefix length and slices the
+        prefix off the returned logits, so callers see the usual ``[B, S, V]``.
+        """
+        if self._soft_edges:
+            raise RuntimeError("soft_edges is already enabled on this model.")
+        if not d_gt:
+            raise ValueError(
+                "fusion_d_gt (the Ψ producer's output width, gnn.d_model) "
+                "is required to size the soft-edge MLP.")
+        if self._disable_graph_token_rope:
+            raise ValueError(
+                "soft_edges and disable_graph_token_rope cannot be combined: the "
+                "identity-RoPE position ids are built in the unshifted frame.")
+        hidden = self.llm.config.get_text_config().hidden_size
+        device = next(self.llm.parameters()).device
+        self.se_mlp = nn.Sequential(
+            nn.Linear(2 * hidden + 2 * int(d_gt), hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden),
+        ).float().to(device)
+        self._se_d_gt = int(d_gt)
+        self._soft_edges = True
+
+    def build_soft_edges(self, input_ids, graphs, key_injection_maps,
+                         permutation=None) -> tuple[torch.Tensor, int]:
+        """``(inputs_embeds [1, S + E, H], E)`` — the text embeddings with the
+        soft edge tokens spliced in after BOS; ``E`` = number of directed edges."""
+        if input_ids.shape[0] != 1:
+            raise ValueError(
+                f"soft_edges supports batch size 1 (got {input_ids.shape[0]}): the "
+                "per-graph prefix length varies and is not padded.")
+        device = input_ids.device
+        emb = self.llm.get_input_embeddings()(input_ids)            # [1, S, H] (scaled)
+        g = graphs[0]
+        kmap = key_injection_maps[0]
+        n = int(g.num_nodes)
+        node_emb = torch.zeros(n, emb.shape[-1], dtype=torch.float32, device=device)
+        name_tok_norms = []
+        for nid in range(n):
+            spans = kmap.get(nid)
+            if not spans:
+                raise ValueError(
+                    f"soft_edges: node {nid} has no mention in the KEY-role map; every "
+                    "node needs a prompt mention to embed its name.")
+            s, e = min(spans)
+            name_tok = emb[0, s:e].float()
+            node_emb[nid] = name_tok.mean(dim=0)
+            name_tok_norms.append(name_tok.norm(dim=-1))
+        adj = self._node_adjacency(g, device, permutation=permutation)
+        adj = adj & ~torch.eye(n, dtype=torch.bool, device=device)
+        src, dst = adj.nonzero(as_tuple=True)
+        if src.numel() == 0:
+            return emb, 0
+        with torch.autocast(device_type=device.type, enabled=False):
+            psi = self.pe_model(g, permutation=permutation).float().to(device)
+            feat = torch.cat([node_emb[src], node_emb[dst], psi[src], psi[dst]], dim=-1)
+            soft = self.se_mlp(feat)                                  # [E, H] fp32
+            # Scale to the typical token-embedding norm. Measured on the name
+            # tokens only (present in prompt AND full training sequence) so the
+            # scale is identical at train and decode time — the whole-sequence
+            # mean would differ between the two and break decode parity.
+            target = torch.cat(name_tok_norms).mean().detach()
+            soft = soft / soft.norm(dim=-1, keepdim=True).clamp_min(self._mask_eps) * target
+        soft = soft.to(emb.dtype).unsqueeze(0)
+        return torch.cat([emb[:, :1], soft, emb[:, 1:]], dim=1), int(src.numel())
 
     # ------------------------------------------------ e18 B: structural key channel
 
@@ -1520,6 +1607,8 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             mods += [self.sk_k, self.sk_q]
         if self._binding_head:
             mods += [self.bind_proj]
+        if self._soft_edges:
+            mods += [self.se_mlp]
         return mods
 
     def _fusion_scalars(self) -> list[nn.Parameter]:
@@ -1770,16 +1859,37 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         kwargs.pop("inputs_embeds", None)
         kwargs.pop("input_ids", None)
         pointer_candidates = kwargs.pop("pointer_candidates", None)
+        inputs_embeds = None
+        se_offset = 0
         # Arm the learned structural bias for the patched attention layers. No graph
         # (e.g. a non-graph batch) ⇒ plain causal LLM.
         if graphs is not None and injection_maps is not None and input_ids is not None:
-            self._struct_bias = self.build_structural_mask(
-                input_ids.shape[1], graphs, injection_maps, input_ids.device,
-                key_injection_maps=key_injection_maps, decision_maps=decision_maps)
             key_maps = injection_maps if key_injection_maps is None else key_injection_maps
+            if self._soft_edges:
+                # e18-D: splice the edge prefix in and move EVERY position-indexed
+                # input into the shifted frame; the logits are sliced back below.
+                if pointer_candidates is not None:
+                    raise ValueError("soft_edges + pointer_fusion candidates are not wired "
+                                     "(candidate positions are in the unshifted frame).")
+                inputs_embeds, se_offset = self.build_soft_edges(
+                    input_ids, graphs, key_maps)
+                if se_offset:
+                    injection_maps = [shift_spans(m, se_offset) for m in injection_maps]
+                    key_maps = [shift_spans(m, se_offset) for m in key_maps]
+                    key_injection_maps = key_maps
+                    if decision_maps is not None:
+                        decision_maps = [shift_positions(m, se_offset) for m in decision_maps]
+                    if labels is not None:
+                        labels = splice_prefix(labels, se_offset, -100)
+                    if attention_mask is not None:
+                        attention_mask = splice_prefix(attention_mask, se_offset, 1)
+            seq_len = input_ids.shape[1] + se_offset
+            self._struct_bias = self.build_structural_mask(
+                seq_len, graphs, injection_maps, input_ids.device,
+                key_injection_maps=key_injection_maps, decision_maps=decision_maps)
             if self._struct_keys:
                 self._sk_keys = self.build_sk_keys(
-                    input_ids.shape[1], graphs, key_maps, input_ids.device)
+                    seq_len, graphs, key_maps, input_ids.device)
             if self._binding_head and labels is not None:
                 self._bind_state = self.build_bind_targets(
                     graphs, key_maps, input_ids.device)
@@ -1787,7 +1897,7 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
                 # Same QUERY-role spans as the mask/identity-RoPE — one
                 # definition of "graph token" (see enable_post_fusion).
                 self._pf_signal = self.build_pf_signal(
-                    input_ids.shape[1], graphs, injection_maps, input_ids.device)
+                    seq_len, graphs, injection_maps, input_ids.device)
             if self._graph_lora:
                 self._glora_A = self.build_glora_signal(graphs, input_ids.device)
             if self._cross_fusion:
@@ -1818,16 +1928,28 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             kwargs["position_ids"] = graph_token_position_ids(
                 injection_maps, input_ids.shape[1], input_ids.device)
         try:
-            out = self.llm(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-                **kwargs,
-            )
+            if inputs_embeds is not None:
+                out = self.llm(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    **kwargs,
+                )
+            else:
+                out = self.llm(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    **kwargs,
+                )
             if self._bind_state is not None:
                 aux = self.binding_loss()
                 self.last_binding_loss = aux.detach()
                 out.loss = out.loss + self.binding_loss_weight * aux.to(out.loss.dtype)
+            if se_offset:
+                # Back to the caller's frame: logits[p] predicts original token p+1.
+                # Original token q>=1 sits at q+E, predicted by row q+E-1 = (q-1)+E.
+                out.logits = out.logits[:, se_offset:]
             return out
         finally:
             # Disarm unless under gradient checkpointing (backward recomputes the
@@ -3428,6 +3550,42 @@ def decision_vector(decision_map: dict[int, int], seq_len: int, device) -> torch
     for p, nid in decision_map.items():
         vec[p] = nid
     return vec
+
+
+def shift_spans(injection_map: dict[int, list[tuple[int, int]]], offset: int,
+                insert_at: int = 1) -> dict[int, list[tuple[int, int]]]:
+    """Injection map in the frame where ``offset`` positions were spliced in at
+    ``insert_at`` (e18-D soft edge prefix after BOS). Spans must start at or after
+    the splice point — node tokens never sit before BOS."""
+    out = {}
+    for nid, spans in injection_map.items():
+        shifted = []
+        for s, e in spans:
+            if s < insert_at:
+                raise ValueError(
+                    f"shift_spans: span ({s}, {e}) of node {nid} starts before the "
+                    f"splice point {insert_at}.")
+            shifted.append((s + offset, e + offset))
+        out[nid] = shifted
+    return out
+
+
+def shift_positions(position_map: dict[int, int], offset: int,
+                    insert_at: int = 1) -> dict[int, int]:
+    """Same frame shift for a ``{position: value}`` map (decision maps)."""
+    out = {}
+    for p, v in position_map.items():
+        if p < insert_at:
+            raise ValueError(f"shift_positions: position {p} is before the splice point.")
+        out[p + offset] = v
+    return out
+
+
+def splice_prefix(x: torch.Tensor, length: int, fill, insert_at: int = 1) -> torch.Tensor:
+    """``[B, S] -> [B, S + length]`` with ``fill`` inserted at ``insert_at``
+    (labels: -100, attention mask: 1)."""
+    pad = torch.full((x.shape[0], length), fill, dtype=x.dtype, device=x.device)
+    return torch.cat([x[:, :insert_at], pad, x[:, insert_at:]], dim=1)
 
 
 def clamp_injection_map(

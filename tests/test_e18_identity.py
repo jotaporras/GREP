@@ -27,6 +27,9 @@ from prism.models.gnn_llm import (
     build_injection_map,
     decision_query_map,
     decode_style_query_map,
+    shift_positions,
+    shift_spans,
+    splice_prefix,
 )
 from test_learnable_graph_mask import _tiny_llm, _StubPE, _graph, DEVICE
 
@@ -149,18 +152,26 @@ def _parity(model):
     with torch.no_grad():
         tf = model(input_ids=ids, graphs=[g], injection_maps=[qmap],
                    key_injection_maps=[imap_full], decision_maps=[dmap]).logits[0]
-    # step-wise decode
+    # step-wise decode (mirrors inference.py: soft-edge prefix => embeds prefill
+    # in the shifted frame)
     pmap = build_injection_map(prompt, seqs)
     pids = torch.tensor([prompt], device=DEVICE)
-    pdmap = decision_query_map(pmap, len(prompt), len(prompt))
+    plen = len(prompt)
+    prefill = {"input_ids": pids}
     with torch.no_grad():
+        if getattr(model, "_soft_edges", False):
+            embeds, off = model.build_soft_edges(pids, [g], [pmap])
+            pmap = shift_spans(pmap, off)
+            plen += off
+            prefill = {"inputs_embeds": embeds}
+        pdmap = decision_query_map(pmap, plen, plen)
         model._struct_bias = model.build_structural_mask(
-            len(prompt), [g], [pmap], DEVICE, decision_maps=[pdmap])
+            plen, [g], [pmap], DEVICE, decision_maps=[pdmap])
         if model._struct_keys:
-            model._sk_keys = model.build_sk_keys(len(prompt), [g], [pmap], DEVICE)
-        inj = MaskDecodeInjector(model, g, pmap, len(prompt), seqs)
+            model._sk_keys = model.build_sk_keys(plen, [g], [pmap], DEVICE)
+        inj = MaskDecodeInjector(model, g, pmap, plen, seqs)
         h = model.llm.register_forward_pre_hook(inj.pre_hook, with_kwargs=True)
-        out = model.llm(input_ids=pids, use_cache=True)
+        out = model.llm(**prefill, use_cache=True)
         logits = [out.logits[0, -1]]
         past = out.past_key_values
         for t in answer[:-1]:
@@ -297,3 +308,94 @@ def test_run_dir_saves_and_loader_requires_e18_weights(tmp_path):
     w = torch.load(tmp_path / "gnn_weights.pt", map_location="cpu")
     for k in ("pe_model", "decision_gain", "sk_k", "sk_q", "sk_gain", "bind_proj"):
         assert k in w, k
+
+
+# ---------------------------------------------------------------------------
+# D — soft edge tokens
+# ---------------------------------------------------------------------------
+
+def test_shift_helpers():
+    assert shift_spans({0: [(1, 3)], 2: [(5, 6)]}, 4) == {0: [(5, 7)], 2: [(9, 10)]}
+    assert shift_positions({3: 1, 7: 2}, 2) == {5: 1, 9: 2}
+    x = torch.tensor([[9, 8, 7]])
+    assert splice_prefix(x, 2, -100).tolist() == [[9, -100, -100, 8, 7]]
+    try:
+        shift_spans({0: [(0, 1)]}, 1)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a span at BOS must be rejected")
+
+
+def test_soft_edges_shapes_loss_and_grads():
+    m = _model(soft_edges=True)
+    ids, gs, qm, km, _ = _inputs()
+    out = m(input_ids=ids, graphs=gs, injection_maps=qm, key_injection_maps=km,
+            labels=ids.clone())
+    assert out.logits.shape == (1, ids.shape[1], m.llm.config.vocab_size)
+    assert torch.isfinite(out.loss)
+    out.loss.backward()
+    assert all(p.grad is not None and p.grad.abs().sum() > 0 for p in m.se_mlp.parameters())
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in m.pe_model.parameters())
+    assert id(m.se_mlp[0].weight) in set(map(id, m.base_lr_parameters()))
+
+
+def test_soft_edges_change_logits_and_no_edges_is_identity():
+    m = _model(soft_edges=True)
+    base = _model()
+    ids, gs, qm, km, _ = _inputs()
+    with torch.no_grad():
+        a = m(input_ids=ids, graphs=gs, injection_maps=qm, key_injection_maps=km).logits
+        b = base(input_ids=ids, graphs=gs, injection_maps=qm, key_injection_maps=km).logits
+    assert not torch.allclose(a, b, atol=1e-5)
+    # a graph with no edges adds no prefix: the embeds path must equal the ids path
+    g0 = _graph(3, [])
+    with torch.no_grad():
+        a0 = m(input_ids=ids, graphs=[g0], injection_maps=qm, key_injection_maps=km).logits
+        b0 = base(input_ids=ids, graphs=[g0], injection_maps=qm, key_injection_maps=km).logits
+    assert torch.allclose(a0, b0, atol=1e-6)
+
+
+def test_soft_edges_reject_batch_gt1():
+    m = _model(soft_edges=True)
+    ids, gs, qm, km, _ = _inputs()
+    ids2 = torch.cat([ids, ids])
+    try:
+        m(input_ids=ids2, graphs=gs * 2, injection_maps=qm * 2, key_injection_maps=km * 2)
+    except ValueError as e:
+        assert "batch size 1" in str(e)
+    else:
+        raise AssertionError("batch > 1 must be rejected")
+
+
+def test_decode_parity_soft_edges():
+    m = _model(soft_edges=True)
+    tf, dec = _parity(m)
+    assert torch.allclose(tf, dec, atol=1e-4), (tf - dec).abs().max()
+
+
+def test_decode_parity_soft_edges_with_b_and_a():
+    m = _model(soft_edges=True, struct_keys=True, struct_keys_dim=4,
+               struct_keys_gain_init=0.5, decision_gating=True, decision_gain_init=1.0)
+    tf, dec = _parity(m)
+    assert torch.allclose(tf, dec, atol=1e-4), (tf - dec).abs().max()
+
+
+def test_generate_with_inputs_embeds_returns_new_tokens_only():
+    """inference.py relies on this HF contract for the soft-edge prefill."""
+    m = _model(soft_edges=True)
+    ids, gs, qm, km, _ = _inputs()
+    with torch.no_grad():
+        embeds, off = m.build_soft_edges(ids, gs, km)
+        assert off == 4                                   # path 0-1-2: 2 edges x 2 directions
+        out = m.llm.generate(inputs_embeds=embeds, max_new_tokens=3, do_sample=False,
+                             pad_token_id=0)
+    assert out.shape == (1, 3)
+
+
+def test_run_dir_saves_soft_edges(tmp_path):
+    from prism.training import run_dir
+    m = _model(soft_edges=True)
+    run_dir.save_run_dir(m, {"architecture": "learnable_graph_mask"}, str(tmp_path))
+    w = torch.load(tmp_path / "gnn_weights.pt", map_location="cpu")
+    assert "se_mlp" in w

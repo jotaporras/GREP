@@ -313,7 +313,8 @@ def train_model(config: omegaconf.DictConfig):
                 "decision_gating", "decision_gain_init",
                 "struct_keys", "struct_keys_dim", "struct_keys_layer_scope",
                 "struct_keys_gain_init",
-                "binding_head", "binding_temperature", "binding_loss_weight")}
+                "binding_head", "binding_temperature", "binding_loss_weight",
+                "soft_edges")}
                if config.gnn.arch == "learnable_graph_mask" else {}),
         }
         trainer = GraphSFTTrainer(

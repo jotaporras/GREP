@@ -158,7 +158,8 @@ def build_planner_model(gnn, llm, tokenizer, *, disable_graph_token_rope=False,
             struct_keys_gain_init=gnn.get("struct_keys_gain_init", 0.0),
             binding_head=gnn.get("binding_head", False),
             binding_temperature=gnn.get("binding_temperature", 0.1),
-            binding_loss_weight=gnn.get("binding_loss_weight", 0.1))
+            binding_loss_weight=gnn.get("binding_loss_weight", 0.1),
+            soft_edges=gnn.get("soft_edges", False))
         collator = data.SpineDataCollator(tokenizer, mlm=False)
 
         if freeze_llm:

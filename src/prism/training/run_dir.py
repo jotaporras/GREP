@@ -74,6 +74,8 @@ def save_run_dir(model, gnn_config: dict, output_dir: str) -> None:
             weights["sk_gain"] = model.sk_gain.data
         if getattr(model, "_binding_head", False):
             weights["bind_proj"] = model.bind_proj.state_dict()
+        if getattr(model, "_soft_edges", False):
+            weights["se_mlp"] = model.se_mlp.state_dict()
         torch.save(weights, os.path.join(output_dir, "gnn_weights.pt"))
     elif gnn_config.get("architecture") == "wire_llm":
         # WIRE: the Ψ producer, the angle gate, and the frequency store. Which store
