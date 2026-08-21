@@ -100,8 +100,12 @@ export BITSANDBYTES_NOWELCOME=1
 # SKEL_DIR/RUN_DIR are derived from GRAPH_LABEL below.
 DATA_ROOT="${DATA_ROOT:-data/n_100}"
 
-INTRA_PROB=0.6
-INTER_PROB=0.05
+# SBM edge probabilities. Overridable because INTER_PROB=0.05 only connects
+# communities at n>=30: a 2x4 (n~10) skeleton expects 0.05*16 = 0.8 cross edges
+# and exhausts generate_region_graph's connectivity retries (e18 small-graph corpora
+# pass INTER_PROB=0.25; see scripts/nav_small_vllm_generate.sbatch).
+INTRA_PROB="${INTRA_PROB:-0.6}"
+INTER_PROB="${INTER_PROB:-0.05}"
 OBJECT_RATE=0.3
 DESC_PROB=0.05
 # Tasks per graph; N_LONGHOP reserves the LAST k of them as fixed-endpoint
