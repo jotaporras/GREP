@@ -120,13 +120,13 @@ _EXAMPLE = {
 
 
 def test_extract_graph_full_sequence_includes_answer_mentions():
-    _, imap, _ = _make_collator("full_sequence")._extract_graph(_EXAMPLE)
+    _, imap, _, _ = _make_collator("full_sequence")._extract_graph(_EXAMPLE)
     starts = sorted(s for spans in imap.values() for s, _ in spans)
     assert starts == [4, 6, 8, 10]  # scene mentions AND answer mentions
 
 
 def test_extract_graph_prompt_only_clamps_at_answer_start():
-    _, imap, _ = _make_collator("prompt_only")._extract_graph(_EXAMPLE)
+    _, imap, _, _ = _make_collator("prompt_only")._extract_graph(_EXAMPLE)
     starts = sorted(s for spans in imap.values() for s, _ in spans)
     assert starts == [4, 6]  # answer-side spans (8, 10) removed
     ends = [e for spans in imap.values() for _, e in spans]
@@ -134,7 +134,7 @@ def test_extract_graph_prompt_only_clamps_at_answer_start():
 
 
 def test_extract_graph_prompt_only_keeps_all_nodes_covered():
-    pyg_graph, imap, _ = _make_collator("prompt_only")._extract_graph(_EXAMPLE)
+    pyg_graph, imap, _, _ = _make_collator("prompt_only")._extract_graph(_EXAMPLE)
     # Every graph node keeps at least one prompt-side span (needed e.g. by
     # gt_llm's word_embeddings feature mode).
     assert set(imap.keys()) == set(range(pyg_graph.num_nodes))
@@ -204,7 +204,7 @@ def _make_edges_collator(scope, key=None):
 
 def test_extract_graph_exclude_supervised_removes_edge_bullet_spans():
     collator = _make_edges_collator("exclude_supervised", key="edge_list_idx")
-    pyg_graph, imap, _ = collator._extract_graph(_EXAMPLE_EDGES)
+    pyg_graph, imap, _, _ = collator._extract_graph(_EXAMPLE_EDGES)
     starts = sorted(s for spans in imap.values() for s, _ in spans)
     # Edge-bullet mentions (8, 10) removed; scene (4, 6) and answer (12, 14) kept.
     assert starts == [4, 6, 12, 14]
@@ -228,14 +228,14 @@ def test_extract_graph_exclude_supervised_requires_key():
 
 def test_extract_graph_full_sequence_keeps_edge_bullet_spans():
     collator = _make_edges_collator("full_sequence")
-    _, imap, _ = collator._extract_graph(_EXAMPLE_EDGES)
+    _, imap, _, _ = collator._extract_graph(_EXAMPLE_EDGES)
     starts = sorted(s for spans in imap.values() for s, _ in spans)
     assert starts == [4, 6, 8, 10, 12, 14]
 
 
 def test_extract_graph_decode_consistent_query_and_key_maps():
-    pyg_graph, imap, kmap = _make_collator("decode_consistent")._extract_graph(_EXAMPLE)
-    _, full, _ = _make_collator("full_sequence")._extract_graph(_EXAMPLE)
+    pyg_graph, imap, kmap, _ = _make_collator("decode_consistent")._extract_graph(_EXAMPLE)
+    _, full, _, _ = _make_collator("full_sequence")._extract_graph(_EXAMPLE)
     # Key role keeps the FULL map; query role reduces answer spans to their final token.
     assert kmap == full
     a = _EXAMPLE["answer_start"]

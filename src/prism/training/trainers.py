@@ -17,6 +17,7 @@ from trl import SFTTrainer
 
 from prism.eval import callbacks
 from prism.eval import evaluate
+from prism.models import gnn_llm
 
 
 # Maps loss_target values to their precomputed per-example index column. "all" is
@@ -170,6 +171,7 @@ class GraphSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
         super().__init__(*args, **kwargs)
         self.gnn_config = gnn_config
         self.freeze_pe = freeze_pe
+        self._binding_losses = []
         self._set_loss_target(loss_target)
         if freeze_pe:
             # Stage-1 SFT: PE stays at init (gate closed); only LoRA trains.
@@ -217,12 +219,23 @@ class GraphSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
         loss = super().training_step(
             model, inputs, num_items_in_batch=num_items_in_batch, **kwargs
         )
+        # e18 binding head: the model adds the weighted auxiliary loss inside
+        # forward and exposes the unweighted value; collect it for the next log().
+        core = gnn_llm.core_graph_model(model)
+        if getattr(core, "_binding_head", False):
+            self._binding_losses.append(core.last_binding_loss.item())
         # Capture grad norms before zero_grad() (backward already ran in super).
         for cb in self.callback_handler.callbacks:
             if isinstance(cb, callbacks.GradientDebugCallback):
                 cb._capture_grad_norms(model)
                 break
         return loss
+
+    def log(self, logs, *args, **kwargs):
+        if self._binding_losses:
+            logs["binding_loss"] = sum(self._binding_losses) / len(self._binding_losses)
+            self._binding_losses = []
+        return super().log(logs, *args, **kwargs)
 
     def save_model(self, output_dir=None, _internal_call=False):
         output_dir = output_dir or self.args.output_dir

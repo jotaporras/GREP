@@ -238,6 +238,14 @@ class GradientDebugCallback(TrainerCallback):
             self._captured_grad_norms["pe_proj"] = self._grad_norm(inner.pe_proj.parameters())
         if hasattr(inner, "pe_gain"):
             self._captured_grad_norms["pe_gain"] = self._grad_norm([inner.pe_gain])
+        # e18 pathways (LearnableGraphMaskLLM flags).
+        if getattr(inner, "_decision_gating", False):
+            self._captured_grad_norms["decision_gain"] = self._grad_norm([inner.decision_gain])
+        if getattr(inner, "_struct_keys", False):
+            self._captured_grad_norms["sk"] = self._grad_norm(
+                [inner.sk_gain, *inner.sk_k.parameters(), *inner.sk_q.parameters()])
+        if getattr(inner, "_binding_head", False):
+            self._captured_grad_norms["bind_proj"] = self._grad_norm(inner.bind_proj.parameters())
         if hasattr(inner.pe_model, "blocks"):
             self._captured_grad_norms["gt_blocks"] = self._grad_norm(inner.pe_model.blocks.parameters())
             # rpearl_gt_llm wraps an R-PEARL inside the GT; gt_llm (SemanticGraphTransformer)
@@ -299,6 +307,18 @@ class GradientDebugCallback(TrainerCallback):
         # wire/sigma_eff_max is the signature.
         if hasattr(inner, "wire_telemetry"):
             metrics.update(inner.wire_telemetry())
+        # e18 node-identity pathways: the gate values are the "did it open" check
+        # (the e17 pf_gain lesson — a zero-init gate that never moves is invisible
+        # in the loss curve). Grad norms say whether the modules are in the graph.
+        if getattr(inner, "_decision_gating", False):
+            metrics["e18/decision_gain"] = inner.decision_gain.item()
+            metrics["e18/grad_norm_decision_gain"] = g.get("decision_gain", 0.0)
+        if getattr(inner, "_struct_keys", False):
+            metrics["e18/sk_gain_mean"] = inner.sk_gain.mean().item()
+            metrics["e18/sk_gain_absmax"] = inner.sk_gain.abs().max().item()
+            metrics["e18/grad_norm_sk"] = g.get("sk", 0.0)
+        if getattr(inner, "_binding_head", False):
+            metrics["e18/grad_norm_bind_proj"] = g.get("bind_proj", 0.0)
 
         if wandb.run is not None:
             wandb.log(metrics, step=state.global_step)

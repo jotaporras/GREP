@@ -134,6 +134,30 @@ gnn:
   cross_fusion: false
   cross_fusion_heads: 8
   cross_fusion_dim: null
+  # --- e18 node-identity pathways (docs/2026-08-21 e18_direction_discussion.md) ---
+  # A — decision gating: the steps that CHOOSE the next node name (separator after
+  # a mention, mid-name tokens) carry a SOFT row of the node last mentioned
+  # (SFT + eval only; the mask RL trainer rejects A/B checkpoints — not wired):
+  # +decision_gain * gate (gate = alpha + (1-alpha) cos in [eps, 1]) on its
+  # neighbours' name tokens, 0 elsewhere (goal mention stays visible). Learnable
+  # scalar; init 0 => bitwise no-op; e18 arms start at ~3.
+  decision_gating: false
+  decision_gain_init: 0.0
+  # B — structural key channel: at every query position t and node-token key j,
+  # logits += tanh(gain_l) * (W_q^l h_t . W_k Psi_j) / sqrt(d). The LLM computes the
+  # structural query from its own state (the mask is the id-lookup special case).
+  # Values/residual untouched. Scope must lie within mask_layer_scope. SFT + eval
+  # only (mask RL not wired, see decision_gating).
+  struct_keys: false
+  struct_keys_dim: 64
+  struct_keys_layer_scope: dense
+  struct_keys_gain_init: 0.0
+  # Binding auxiliary loss (SFT only): the last hidden state at every mention's
+  # final token must identify its node among the graph's nodes (InfoNCE over
+  # cos(W_b h, Psi_n)/T). Added to the LM loss with binding_loss_weight.
+  binding_head: false
+  binding_temperature: 0.1
+  binding_loss_weight: 0.1
 
   # --- wire_llm (WIRE: Psi enters as a ROTATION of q/k, not an added signal) ---
   # q_i -> R(theta_i) q_i, k_j -> R(theta_j) k_j with theta_n = omega_n . Psi_i, composed

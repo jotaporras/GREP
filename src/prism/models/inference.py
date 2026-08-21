@@ -15,6 +15,7 @@ from prism.models.gnn_llm import (
     LearnableGraphMaskLLM,
     WireGraphLLM,
     build_injection_map,
+    decision_query_map,
     find_last_graph_scope,
     node_token_variants,
 )
@@ -261,9 +262,30 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
                 # `permutation` reaches BOTH the Ψ producer and the adjacency inside
                 # build_structural_mask, so --permutation-seed actually relabels the graph
                 # the mask is computed on (it was silently ignored here before).
+                prompt_len = input_ids.shape[1]
+                e18_on = (getattr(graph_model, "_decision_gating", False)
+                          or getattr(graph_model, "_struct_keys", False))
+                if e18_on and self.injection_scope != "decode_consistent":
+                    raise ValueError(
+                        "decision_gating / struct_keys decode needs the "
+                        "decode_consistent injector (per-step current node and key "
+                        f"bank); injection_scope={self.injection_scope!r} would "
+                        "silently drop the channel at decode.")
+                # e18-A: the prefill's last position chooses the first answer token —
+                # decision_query_map gives it the prompt's last mention as current node
+                # (answer_start = prompt_len); the injector continues from there.
+                decision_maps = None
+                if getattr(graph_model, "_decision_gating", False):
+                    decision_maps = [decision_query_map(injection_map, prompt_len,
+                                                        prompt_len)]
                 graph_model._struct_bias = graph_model.build_structural_mask(
-                    input_ids.shape[1], [pyg_graph], [injection_map], input_ids.device,
-                    permutation=self.permutation)
+                    prompt_len, [pyg_graph], [injection_map], input_ids.device,
+                    permutation=self.permutation, decision_maps=decision_maps)
+                if getattr(graph_model, "_struct_keys", False):
+                    with torch.no_grad():
+                        graph_model._sk_keys = graph_model.build_sk_keys(
+                            prompt_len, [pyg_graph], [injection_map], input_ids.device,
+                            permutation=self.permutation)
                 if getattr(graph_model, "_post_fusion", False):
                     # generate() bypasses the wrapper forward — arm the prefill
                     # residual signal manually (decode steps: MaskDecodeInjector).
@@ -321,6 +343,8 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
                 if getattr(graph_model, "_pointer_fusion", False):
                     graph_model._ptr_state = None
                     graph_model._ptr_decode_cand = None
+                if getattr(graph_model, "_struct_keys", False):
+                    graph_model._sk_keys = None
                 if hook_handle is not None:
                     hook_handle.remove()
                     graph_model._decode_bias_row = None

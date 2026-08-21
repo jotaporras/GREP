@@ -122,6 +122,40 @@ def _graph_mask_attention_forward(module, query, key, value, attention_mask,
             else:
                 am = am.to(device=query.device, dtype=query.dtype)
             attention_mask = am + bias
+    # e18-B structural key channel: a query-dependent term at EVERY query position,
+    # computed from the layer's attention input h (stashed by _sk_capture_hook) and
+    # the armed structural keys W_k Ψ (prefill: [B, S, d_s]; decode: [B, K, d_s],
+    # re-armed per step by the mask injectors). Head-shared, added to the mask.
+    sk_keys = None if (model is None or not active) else getattr(model, "_sk_keys", None)
+    sk_slot = getattr(module, "_sk_slot", None)
+    if (sk_keys is not None and sk_slot is not None and sk_keys.shape[0] == query.shape[0]
+            and sk_keys.shape[1] == k_len):
+        h = module._sk_h
+        if h.shape[1] != q_len:
+            raise RuntimeError(
+                f"struct_keys: stashed attention input has {h.shape[1]} positions, "
+                f"query has {q_len} — the capture hook and attention fn disagree.")
+        with torch.autocast(device_type=query.device.type, enabled=False):
+            q_s = model.sk_q[sk_slot](h.float())                     # [B, S, d_s]
+            sk_bias = torch.einsum("bsd,bkd->bsk", q_s,
+                                   sk_keys.to(device=q_s.device).float())
+            sk_bias = (torch.tanh(model.sk_gain[sk_slot]) * sk_bias
+                       / (q_s.shape[-1] ** 0.5)).unsqueeze(1)         # [B, 1, S, K]
+        sk_bias = sk_bias.to(device=query.device, dtype=query.dtype)
+        if attention_mask is None:
+            neg = torch.finfo(query.dtype).min
+            causal = torch.triu(
+                torch.full((q_len, k_len), neg, device=query.device, dtype=query.dtype),
+                diagonal=k_len - q_len + 1)
+            attention_mask = sk_bias + causal[None, None]
+        else:
+            am = attention_mask[..., :k_len]
+            if am.dtype == torch.bool:
+                am = torch.zeros_like(am, dtype=query.dtype).masked_fill(
+                    ~am, torch.finfo(query.dtype).min)
+            else:
+                am = am.to(device=query.device, dtype=query.dtype)
+            attention_mask = am + sk_bias
     return module._graph_mask_orig_attn_fn(
         module, query, key, value, attention_mask,
         scaling=scaling, dropout=dropout, **kwargs)
@@ -720,10 +754,13 @@ class GraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         graphs: Batch | None = None,
         injection_maps: list[dict[int, list[tuple[int, int]]]] | None = None,
         key_injection_maps: list[dict[int, list[tuple[int, int]]]] | None = None,
+        decision_maps: list[dict[int, int]] | None = None,
         **kwargs,
     ):
         kwargs.pop("inputs_embeds", None)
         kwargs.pop("input_ids", None)
+        # decision_maps (e18-A) is a LearnableGraphMaskLLM feature; the parameter-free
+        # mask has no soft rows, so the collator's map is accepted and ignored here.
         # Arm the structural bias for the patched attention layers. No graph (e.g. a
         # non-graph batch) ⇒ plain causal LLM.
         if graphs is not None and injection_maps is not None and input_ids is not None:
@@ -805,7 +842,16 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
                  cross_fusion: bool = False,
                  cross_fusion_heads: int = 8,
                  cross_fusion_dim: int | None = None,
-                 fusion_d_gt: int | None = None):
+                 fusion_d_gt: int | None = None,
+                 decision_gating: bool = False,
+                 decision_gain_init: float = 0.0,
+                 struct_keys: bool = False,
+                 struct_keys_dim: int = 64,
+                 struct_keys_layer_scope: str = "dense",
+                 struct_keys_gain_init: float = 0.0,
+                 binding_head: bool = False,
+                 binding_temperature: float = 0.1,
+                 binding_loss_weight: float = 0.1):
         # Wrapper is not a registered HF architecture or MoE class; force "eager" so
         # PreTrainedModel doesn't reject SDPA/flash or expert-impl validation.
         config = copy.copy(llm.config)
@@ -869,7 +915,26 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         # e17 candidate C — post-LLM cross-attention (off unless enabled).
         self._cross_fusion: bool = False
         self._xf_kv: tuple | None = None                  # (psi_pad [B,N,d_gt] fp32, mask [B,N] bool)
+        # e18-A — decision gating: soft neighbour rows at the steps that choose a name.
+        self._decision_gating: bool = bool(decision_gating)
+        if self._decision_gating:
+            self.decision_gain = nn.Parameter(
+                torch.tensor(float(decision_gain_init), dtype=torch.float32))
+        # e18-B — structural key channel (off unless enabled).
+        self._struct_keys: bool = False
+        self._sk_keys: torch.Tensor | None = None         # [B, K, d_s] fp32 for the current forward
+        # e18 — binding auxiliary head (off unless enabled).
+        self._binding_head: bool = False
+        self._bind_state: dict | None = None              # {"psi": [Tensor], "pos": [(b, p, node)]}
+        self._bind_hidden: torch.Tensor | None = None     # lm_head input of the current forward
+        self.last_binding_loss: torch.Tensor | None = None
         self._install_graph_mask()
+        if struct_keys:
+            self.enable_struct_keys(struct_keys_layer_scope, struct_keys_dim,
+                                    fusion_d_gt, struct_keys_gain_init)
+        if binding_head:
+            self.enable_binding_head(fusion_d_gt, binding_temperature,
+                                     binding_loss_weight)
         if post_fusion:
             self.enable_post_fusion(post_fusion_layer_scope, post_fusion_d_gt)
         if graph_lora:
@@ -880,6 +945,175 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         if cross_fusion:
             self.enable_cross_fusion(cross_fusion_heads, cross_fusion_dim,
                                      fusion_d_gt)
+
+    # ------------------------------------------------ e18 B: structural key channel
+
+    def enable_struct_keys(self, layer_scope: str, d_s: int, d_gt: int | None,
+                           gain_init: float) -> None:
+        """Install the e18-B pathway: a query-dependent structural attention term.
+
+        At every in-scope self-attention layer ℓ, for EVERY query position t and
+        every node-token key position j (zero at non-node keys)::
+
+            logits[t, j] += tanh(sk_gain_ℓ) · ( W_q^ℓ h_t · W_k Ψ_node(j) ) / √d_s
+
+        ``h_t`` is the layer's attention input (post input-layernorm). The mask
+        is the special case where the query is LOOKED UP by the query token's
+        node id and only node-token queries carry it; here the LLM computes the
+        structural query from its own state, so the separator and mid-name
+        positions that choose the next name can ask "which names are around
+        the node I am on" (docs/2026-08-21 e18_direction_discussion.md §4).
+        Nothing enters values or the residual stream — the lexical identity the
+        copy circuit reads is untouched (the e12 failure mode). Head-shared bias.
+
+        ``sk_q`` is per layer (hidden → d_s); ``sk_k`` (d_gt → d_s) is shared.
+        ``gain_init=0`` ⇒ bitwise no-op with a live gradient (tanh slope 1).
+        Callable post-hoc on a loaded checkpoint or from ``__init__``.
+        """
+        if self._struct_keys:
+            raise RuntimeError("struct_keys is already enabled on this model.")
+        if layer_scope not in MASK_LAYER_SCOPES:
+            raise ValueError(
+                f"struct_keys_layer_scope must be one of {MASK_LAYER_SCOPES}, "
+                f"got {layer_scope!r}")
+        if not d_gt:
+            raise ValueError(
+                "fusion_d_gt (the Ψ producer's output width, gnn.d_model) "
+                "is required to size sk_k.")
+        hidden = self.llm.config.get_text_config().hidden_size
+        device = next(self.llm.parameters()).device
+        layers = self._decoder_layers()
+        flags = resolve_mask_active_flags(layers, layer_scope)
+        active_idx = [i for i, f in enumerate(flags) if f]
+        if not active_idx:
+            raise ValueError(f"struct_keys_layer_scope={layer_scope!r} selects no layer.")
+        mask_flags = resolve_mask_active_flags(layers, self._mask_layer_scope)
+        if any(not mask_flags[i] for i in active_idx):
+            # The term is applied inside the mask attention fn, which only runs on
+            # mask-active layers (and only dense layers keep a full KV cache at decode).
+            raise ValueError(
+                f"struct_keys_layer_scope={layer_scope!r} selects layers outside "
+                f"mask_layer_scope={self._mask_layer_scope!r}; the channel would be "
+                "silently inactive there.")
+        self.sk_k = nn.Linear(int(d_gt), int(d_s), bias=False).float().to(device)
+        self.sk_q = nn.ModuleList(
+            [nn.Linear(hidden, int(d_s), bias=False).float().to(device)
+             for _ in active_idx])
+        self.sk_gain = nn.Parameter(
+            torch.full((len(active_idx),), float(gain_init), dtype=torch.float32,
+                       device=device))
+        self._sk_handles = []
+        for slot, layer_i in enumerate(active_idx):
+            attn = layers[layer_i].self_attn
+            attn._sk_slot = slot
+            self._sk_handles.append(attn.register_forward_pre_hook(
+                self._sk_capture_hook, with_kwargs=True))
+        self._sk_layer_scope = layer_scope
+        self._sk_dim = int(d_s)
+        self._sk_d_gt = int(d_gt)
+        self._struct_keys = True
+
+    @staticmethod
+    def _sk_capture_hook(module, args, kwargs):
+        """Stash the attention input h (post input-layernorm) for the structural query."""
+        hs = kwargs.get("hidden_states")
+        if hs is None and args:
+            hs = args[0]
+        module._sk_h = hs
+        return None
+
+    def sk_key_bank(self, g, device, permutation=None) -> torch.Tensor:
+        """``W_k Ψ`` for one graph: ``[N, d_s]`` fp32 (carries grad to the tower)."""
+        with torch.autocast(device_type=torch.device(device).type, enabled=False):
+            psi = self.pe_model(g, permutation=permutation).float()
+            return self.sk_k(psi).to(device)
+
+    def build_sk_keys(self, seq_len, graphs, key_injection_maps, device,
+                      permutation=None) -> torch.Tensor:
+        """Structural keys ``[B, seq, d_s]`` (fp32): ``W_k Ψ_node(j)`` at every
+        KEY-role node-token position, zero elsewhere."""
+        keys = torch.zeros(len(key_injection_maps), seq_len, self._sk_dim,
+                           device=device, dtype=torch.float32)
+        for b, kmap in enumerate(key_injection_maps):
+            tok2node = tok2node_vector(kmap, seq_len, device)
+            pos = (tok2node >= 0).nonzero(as_tuple=True)[0]
+            if pos.numel() == 0:
+                continue
+            bank = self.sk_key_bank(graphs[b], device, permutation=permutation)
+            keys[b, pos] = bank[tok2node[pos]]
+        return keys
+
+    # ------------------------------------------------ e18: binding auxiliary head
+
+    def enable_binding_head(self, d_gt: int | None, temperature: float,
+                            weight: float) -> None:
+        """Install the node-identity binding head (auxiliary SFT loss).
+
+        At the final token of every node mention (KEY-role spans, prompt and
+        answer), the LLM's last hidden state (the ``lm_head`` input) must
+        identify its node among the graph's nodes::
+
+            loss = CE( softmax_n  cos(W_b h_p, Ψ_n) / τ ,  node(p) )
+
+        This supervises name↔node binding explicitly instead of hoping the LM
+        loss induces it (e18 direction note §5). Inert at generation; the head
+        is checkpointed for provenance only.
+        """
+        if self._binding_head:
+            raise RuntimeError("binding head is already enabled on this model.")
+        if not d_gt:
+            raise ValueError(
+                "fusion_d_gt (the Ψ producer's output width, gnn.d_model) "
+                "is required to size bind_proj.")
+        hidden = self.llm.config.get_text_config().hidden_size
+        device = next(self.llm.parameters()).device
+        self.bind_proj = nn.Linear(hidden, int(d_gt)).float().to(device)
+        self._bind_temperature = float(temperature)
+        self.binding_loss_weight = float(weight)
+        head = self.llm.get_output_embeddings()
+        self._bind_handle = head.register_forward_pre_hook(self._bind_capture_hook)
+        self._binding_head = True
+
+    def _bind_capture_hook(self, module, args):
+        self._bind_hidden = args[0]
+        return None
+
+    def build_bind_targets(self, graphs, key_injection_maps, device) -> dict:
+        """Mention-final positions + Ψ per row for the binding loss."""
+        pos = []
+        for b, kmap in enumerate(key_injection_maps):
+            for nid, spans in kmap.items():
+                for s, e in spans:
+                    pos.append((b, e - 1, nid))
+        with torch.autocast(device_type=torch.device(device).type, enabled=False):
+            psis = [self.pe_model(g).float().to(device) for g in graphs]
+        return {"psi": psis, "pos": pos}
+
+    def binding_loss(self) -> torch.Tensor:
+        """InfoNCE over the graph's nodes at every mention-final position (fp32)."""
+        h = self._bind_hidden
+        state = self._bind_state
+        if not state["pos"]:
+            raise ValueError(
+                "binding_head: no node mention in the whole batch (every "
+                "key_injection_map is empty) — the loss is undefined; check the "
+                "injection maps / node_token_seqs for this batch.")
+        losses = []
+        with torch.autocast(device_type=h.device.type, enabled=False):
+            by_row: dict[int, list[tuple[int, int]]] = {}
+            for b, p, nid in state["pos"]:
+                by_row.setdefault(b, []).append((p, nid))
+            for b, items in by_row.items():
+                p_idx = torch.tensor([p for p, _ in items], device=h.device)
+                tgt = torch.tensor([n for _, n in items], device=h.device)
+                z = self.bind_proj(h[b, p_idx].float())                  # [P, d_gt]
+                z = z / z.norm(dim=-1, keepdim=True).clamp_min(self._mask_eps)
+                psi = state["psi"][b].to(h.device)
+                psi = psi / psi.norm(dim=-1, keepdim=True).clamp_min(self._mask_eps)
+                logits = (z @ psi.t()) / self._bind_temperature       # [P, N]
+                losses.append(nn.functional.cross_entropy(logits, tgt, reduction="sum"))
+            total = sum(len(v) for v in by_row.values())
+        return torch.stack(losses).sum() / total
 
     def enable_post_fusion(self, layer_scope: str, d_gt: int | None) -> None:
         """Install the e17-A post-fusion pathway: gated residual Ψ injection.
@@ -1282,6 +1516,10 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             mods += [self.ptr_q, self.ptr_gate]
         if self._cross_fusion:
             mods += [self.xf_ln, self.xf_q, self.xf_k, self.xf_v, self.xf_o]
+        if self._struct_keys:
+            mods += [self.sk_k, self.sk_q]
+        if self._binding_head:
+            mods += [self.bind_proj]
         return mods
 
     def _fusion_scalars(self) -> list[nn.Parameter]:
@@ -1294,6 +1532,10 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             params += [self.ptr_gain, self.ptr_scale]
         if self._cross_fusion:
             params.append(self.xf_gain)
+        if self._decision_gating:
+            params.append(self.decision_gain)
+        if self._struct_keys:
+            params.append(self.sk_gain)
         return params
 
     def base_lr_parameters(self) -> list[nn.Parameter]:
@@ -1398,8 +1640,32 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
                               symmetrize=self._mask_symmetrize, use_edges=self._mask_use_edges,
                               permutation=permutation)
 
+    def _node_mask_logits(self, g, device, permutation=None):
+        """``(adj [N,N] bool, node_M [N,N] fp32 log-gate)`` — the per-node-pair values
+        every mask row (prefill, decode, decision) is assembled from."""
+        adj = self._node_adjacency(g, device, permutation=permutation)
+        psi = self.pe_model(g, permutation=permutation).float()   # GT runs fp32
+        if self._mask_psi_scale == "cosine":
+            psi = psi / psi.norm(dim=-1, keepdim=True).clamp_min(self._mask_eps)
+            sim = psi @ psi.t()                            # cosine ∈ [−1, 1]
+        else:  # inv_sqrt_d
+            sim = (psi @ psi.t()) / (psi.shape[-1] ** 0.5)
+        gate = (self._mask_alpha + (1.0 - self._mask_alpha) * sim).clamp_min(self._mask_eps)
+        return adj, gate.log()
+
+    def decision_node_values(self, adj, node_M) -> torch.Tensor:
+        """Soft decision row values ``[N, N]`` (e18-A): ``decision_gain · gate`` on
+        adjacent / self pairs (``gate = exp(log-gate) ∈ [ε, 1]``), 0 elsewhere —
+        the goal mention and the rest of the prompt stay visible, neighbours of the
+        current node are boosted by a NON-NEGATIVE amount. Multiplicative rather
+        than ``gain + log-gate`` so ``gain=0`` is an exact no-op and a low-cosine
+        neighbour can never sit below a non-neighbour (which has no bias)."""
+        soft = self.decision_gain.to(node_M.device) * node_M.exp()
+        return torch.where(adj, soft, torch.zeros_like(soft))
+
     def build_structural_mask(self, seq_len, graphs, injection_maps, device, dtype=None,
-                              key_injection_maps=None, permutation=None):
+                              key_injection_maps=None, permutation=None,
+                              decision_maps=None):
         """Additive attention bias ``[B, 1, seq, seq]`` with the learned relative-PE mask.
 
         For token pairs (i, j) where BOTH tokens map to graph nodes::
@@ -1416,6 +1682,12 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         from ``injection_maps``, keys from ``key_injection_maps`` — decode-consistency
         rule, decode-time design note §3). Default None = same map for both roles.
 
+        ``decision_maps`` (e18-A, only read when ``decision_gating`` is on): per row
+        ``{position: current_node}`` from :func:`decision_query_map`. Those
+        positions — untagged steps that choose the next name — get the SOFT row
+        :meth:`decision_node_values` of their current node over the key-role
+        node tokens (no hard block). Ignored otherwise, so callers may always pass it.
+
         ``permutation``: eval-time node relabelling (``--permutation-seed``), threaded to
         BOTH halves of the mask — ``pe_model`` (Ψ) and ``node_adjacency`` (A) — exactly as
         ``GraphAugmentedLLM.build_pe_signal`` / ``WireGraphLLM.build_wire_signal`` thread
@@ -1429,7 +1701,7 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         B = len(injection_maps)
         neg = torch.finfo(dtype).min
         bias = torch.zeros(B, 1, seq_len, seq_len, device=device, dtype=dtype)
-        alpha = self._mask_alpha
+        use_decision = self._decision_gating and decision_maps is not None
         for b in range(B):
             g = graphs[b]
             tok2node_q = tok2node_vector(injection_maps[b], seq_len, device)
@@ -1439,15 +1711,7 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             k_pos = (tok2node_k >= 0).nonzero(as_tuple=True)[0]
             if q_pos.numel() == 0 or k_pos.numel() == 0:
                 continue
-            adj = self._node_adjacency(g, device, permutation=permutation)   # [N, N] bool
-            psi = self.pe_model(g, permutation=permutation).float()   # [N, D] (GT runs fp32)
-            if self._mask_psi_scale == "cosine":
-                psi = psi / psi.norm(dim=-1, keepdim=True).clamp_min(self._mask_eps)
-                sim = psi @ psi.t()                            # cosine ∈ [−1, 1]
-            else:  # inv_sqrt_d
-                sim = (psi @ psi.t()) / (psi.shape[-1] ** 0.5)
-            gate = (alpha + (1.0 - alpha) * sim).clamp_min(self._mask_eps)
-            node_M = gate.log()                                # [N, N] log-gate (fp32)
+            adj, node_M = self._node_mask_logits(g, device, permutation=permutation)
             q_nid = tok2node_q[q_pos]                          # node id per query node-token
             k_nid = tok2node_k[k_pos]                          # node id per key node-token
             allowed = adj[q_nid][:, k_nid]                     # [Pq, Pk] bool
@@ -1455,6 +1719,14 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             neg_t = torch.tensor(neg, dtype=dtype, device=device)
             block = torch.where(allowed, block, neg_t)         # hard-block non-edges
             bias[b, 0, q_pos.unsqueeze(1), k_pos.unsqueeze(0)] = block
+            if use_decision:
+                dvec = decision_vector(decision_maps[b], seq_len, device)
+                d_pos = (dvec >= 0).nonzero(as_tuple=True)[0]
+                if d_pos.numel() == 0:
+                    continue
+                soft = self.decision_node_values(adj, node_M)   # [N, N] fp32
+                bias[b, 0, d_pos.unsqueeze(1), k_pos.unsqueeze(0)] = (
+                    soft[dvec[d_pos]][:, k_nid].to(dtype))
         return bias
 
     def forward(
@@ -1465,9 +1737,17 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         graphs: Batch | None = None,
         injection_maps: list[dict[int, list[tuple[int, int]]]] | None = None,
         key_injection_maps: list[dict[int, list[tuple[int, int]]]] | None = None,
+        decision_maps: list[dict[int, int]] | None = None,
         **kwargs,
     ):
         """Arm the structural bias, then run the LLM.
+
+        ``decision_maps`` (e18-A) is consumed only when ``decision_gating`` is on;
+        the e18-B structural keys and the binding head read the KEY-role map
+        (``key_injection_maps`` when given, else ``injection_maps``). With the
+        binding head on and ``labels`` given, ``binding_loss()`` is added to the
+        returned ``loss`` (weighted by ``self.binding_loss_weight``) and exposed
+        unweighted as ``self.last_binding_loss`` for logging.
 
         ``_disable_graph_token_rope`` additionally zeroes the RoPE positions of the
         QUERY-role spans (``injection_maps``) — the same rule
@@ -1495,7 +1775,14 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         if graphs is not None and injection_maps is not None and input_ids is not None:
             self._struct_bias = self.build_structural_mask(
                 input_ids.shape[1], graphs, injection_maps, input_ids.device,
-                key_injection_maps=key_injection_maps)
+                key_injection_maps=key_injection_maps, decision_maps=decision_maps)
+            key_maps = injection_maps if key_injection_maps is None else key_injection_maps
+            if self._struct_keys:
+                self._sk_keys = self.build_sk_keys(
+                    input_ids.shape[1], graphs, key_maps, input_ids.device)
+            if self._binding_head and labels is not None:
+                self._bind_state = self.build_bind_targets(
+                    graphs, key_maps, input_ids.device)
             if self._post_fusion:
                 # Same QUERY-role spans as the mask/identity-RoPE — one
                 # definition of "graph token" (see enable_post_fusion).
@@ -1522,6 +1809,8 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             self._glora_A = None
             self._xf_kv = None
             self._ptr_state = None
+            self._sk_keys = None
+            self._bind_state = None
         # Identity-RoPE the injected spans when requested, unless the caller already
         # supplied position_ids (mirrors GraphAugmentedLLM.forward).
         if (self._disable_graph_token_rope and injection_maps is not None
@@ -1529,12 +1818,17 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             kwargs["position_ids"] = graph_token_position_ids(
                 injection_maps, input_ids.shape[1], input_ids.device)
         try:
-            return self.llm(
+            out = self.llm(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 labels=labels,
                 **kwargs,
             )
+            if self._bind_state is not None:
+                aux = self.binding_loss()
+                self.last_binding_loss = aux.detach()
+                out.loss = out.loss + self.binding_loss_weight * aux.to(out.loss.dtype)
+            return out
         finally:
             # Disarm unless under gradient checkpointing (backward recomputes the
             # attention forwards and must see the same bias; every forward rebuilds it).
@@ -1544,6 +1838,9 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
                 self._glora_A = None
                 self._xf_kv = None
                 self._ptr_state = None
+                self._sk_keys = None
+            self._bind_state = None
+            self._bind_hidden = None
 
 
 class GraphAugmentedLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
@@ -3081,6 +3378,58 @@ def decode_style_query_map(
     return out
 
 
+def decision_query_map(
+    query_map: dict[int, list[tuple[int, int]]],
+    answer_start: int,
+    seq_len: int,
+) -> dict[int, int]:
+    """Decision-step map ``{position: current_node}`` (e18-A decision gating).
+
+    The structural mask is a function of (query node, key node), so the steps that
+    actually CHOOSE the next node name — the separator after a mention, and every
+    mid-name token — have no query node and receive no bias (see
+    ``docs/2026-08-21 e18_direction_discussion.md``). This map assigns each such
+    untagged position ``p >= answer_start - 1`` the node of the most recent
+    knowable mention strictly before it ("the node you are standing on"): the
+    reference position of a span in ``query_map`` is its last token (prompt spans
+    are whole; answer spans are already reduced to their single knowable position
+    by :func:`decode_style_query_map`). Tagged query positions are excluded (the
+    hard row wins there). ``answer_start - 1`` is included because that prefill
+    position's logits pick the first answer token.
+
+    Reproduced step-by-step at decode by the mask injectors (``current_node``
+    updated whenever a query is tagged), so training and generation expose the
+    same channel.
+    """
+    refs: list[tuple[int, int]] = []
+    tagged: set[int] = set()
+    for nid, spans in query_map.items():
+        for s, e in spans:
+            refs.append((e - 1, nid))
+            tagged.update(range(s, e))
+    refs.sort()
+    out: dict[int, int] = {}
+    if not refs:
+        return out
+    i = 0
+    current = -1
+    for p in range(max(answer_start - 1, 0), seq_len):
+        while i < len(refs) and refs[i][0] < p:
+            current = refs[i][1]
+            i += 1
+        if current >= 0 and p not in tagged:
+            out[p] = current
+    return out
+
+
+def decision_vector(decision_map: dict[int, int], seq_len: int, device) -> torch.Tensor:
+    """``[seq_len]`` long tensor: current node per decision position, −1 elsewhere."""
+    vec = torch.full((seq_len,), -1, dtype=torch.long, device=device)
+    for p, nid in decision_map.items():
+        vec[p] = nid
+    return vec
+
+
 def clamp_injection_map(
     injection_map: dict[int, list[tuple[int, int]]],
     scope_end: int,
@@ -3164,21 +3513,33 @@ def mask_node_values(model, pyg_graph, device, permutation=None) -> torch.Tensor
     ``build_structural_mask`` folds into the prefill bias, computed once per
     (graph, tower state) and reused for every decode step.
     """
-    adj = model._node_adjacency(pyg_graph, device, permutation=permutation)
     if hasattr(model, "pe_model"):
         with torch.no_grad():
-            psi = model.pe_model(pyg_graph, permutation=permutation).float()
-            if model._mask_psi_scale == "cosine":
-                psi = psi / psi.norm(dim=-1, keepdim=True).clamp_min(model._mask_eps)
-                sim = psi @ psi.t()
-            else:
-                sim = (psi @ psi.t()) / (psi.shape[-1] ** 0.5)
-        gate = (model._mask_alpha + (1.0 - model._mask_alpha) * sim).clamp_min(model._mask_eps)
-        node_m = gate.log()  # log-gate: matches build_structural_mask's multiplicative fold
+            adj, node_m = model._node_mask_logits(pyg_graph, device, permutation=permutation)
     else:
+        adj = model._node_adjacency(pyg_graph, device, permutation=permutation)
         node_m = torch.zeros_like(adj, dtype=torch.float32)
     neg = torch.finfo(torch.float32).min
     return torch.where(adj, node_m, torch.full_like(node_m, neg))
+
+
+def mask_decision_values(model, pyg_graph, device, permutation=None) -> torch.Tensor | None:
+    """``[N, N]`` soft decision rows (e18-A) for decode, or None when the model has
+    no decision gating — the same values ``build_structural_mask`` writes at
+    decision positions (``decision_node_values``), computed once per graph."""
+    if not getattr(model, "_decision_gating", False):
+        return None
+    with torch.no_grad():
+        adj, node_m = model._node_mask_logits(pyg_graph, device, permutation=permutation)
+        return model.decision_node_values(adj, node_m)
+
+
+def struct_key_bank(model, pyg_graph, device, permutation=None) -> torch.Tensor | None:
+    """``[N, d_s]`` structural keys ``W_k Ψ`` (e18-B) for decode, or None."""
+    if not getattr(model, "_struct_keys", False):
+        return None
+    with torch.no_grad():
+        return model.sk_key_bank(pyg_graph, device, permutation=permutation)
 
 
 class _MaskDecodeRowState:
@@ -3191,10 +3552,21 @@ class _MaskDecodeRowState:
     ``prompt_tok2node`` of length ``padded_prompt_len`` (pad positions −1).
     """
 
-    def __init__(self, node_values, prompt_tok2node, node_token_seqs):
+    def __init__(self, node_values, prompt_tok2node, node_token_seqs,
+                 decision_values=None):
         self.node_values = node_values
         self.prompt_tok2node = prompt_tok2node
         self.node_token_seqs = node_token_seqs
+        # e18-A: soft rows [N, N] (None = no decision gating). The current node
+        # starts as the prompt's last mention and follows every tagged query —
+        # the same rule decision_query_map applies in training.
+        self.decision_values = decision_values
+        known = (prompt_tok2node >= 0).nonzero(as_tuple=True)[0]
+        self.current_node = int(prompt_tok2node[known[-1]]) if known.numel() else -1
+        self.last_q_node = -1
+        # Key-role node id per key position for the CURRENT step ([k_len] long),
+        # refreshed every step (e18-B structural keys need it on untagged steps too).
+        self.tok2node_k: torch.Tensor | None = None
         self.generated: list[int] = []
         self._committed: set = set()
 
@@ -3227,8 +3599,6 @@ class _MaskDecodeRowState:
         # Exposed for the post-fusion decode extension (BatchedMaskDecodeInjector
         # arms the residual vector for exactly the query-tagged steps).
         self.last_q_node = q_node
-        if q_node < 0:
-            return None
         device = self.node_values.device
         k_len = prompt_len + len(self.generated)
         tok2node_k = torch.full((k_len,), -1, dtype=torch.long, device=device)
@@ -3236,8 +3606,18 @@ class _MaskDecodeRowState:
         for nid, sps in spans.items():
             for start, end in sps:
                 tok2node_k[prompt_len + start:prompt_len + end] = nid
-        row = torch.zeros(k_len, dtype=torch.float32, device=device)
+        self.tok2node_k = tok2node_k
         k_pos = (tok2node_k >= 0).nonzero(as_tuple=True)[0]
+        if q_node < 0:
+            # Untagged step = a decision position: the soft row of the node we are
+            # standing on (decision_query_map's rule), or nothing without gating.
+            if self.decision_values is None or self.current_node < 0:
+                return None
+            row = torch.zeros(k_len, dtype=torch.float32, device=device)
+            row[k_pos] = self.decision_values[self.current_node, tok2node_k[k_pos]]
+            return row
+        self.current_node = q_node
+        row = torch.zeros(k_len, dtype=torch.float32, device=device)
         row[k_pos] = self.node_values[q_node, tok2node_k[k_pos]]
         return row
 
@@ -3259,11 +3639,21 @@ class BatchedMaskDecodeInjector:
     """
 
     def __init__(self, model, row_states: list, padded_prompt_len: int,
-                 psi_by_row: list | None = None):
+                 psi_by_row: list | None = None, sk_banks: list | None = None):
         if getattr(model, "_disable_graph_token_rope", False):
             raise ValueError(
                 "BatchedMaskDecodeInjector does not support identity-RoPE "
                 "checkpoints: the decode-step position_ids rewrite is per-row.")
+        if getattr(model, "_struct_keys", False) and sk_banks is None:
+            raise ValueError(
+                "struct_keys is enabled on the model but sk_banks was not supplied "
+                "— decode steps would silently drop the structural key term.")
+        if getattr(model, "_decision_gating", False) and any(
+                rs.decision_values is None for rs in row_states):
+            raise ValueError(
+                "decision_gating is enabled on the model but a row state has no "
+                "decision_values — decode steps would silently skip the soft rows.")
+        self.sk_banks = sk_banks
         if getattr(model, "_post_fusion", False) and psi_by_row is None:
             raise ValueError(
                 "post-fusion is enabled on the model but psi_by_row was not "
@@ -3314,6 +3704,8 @@ class BatchedMaskDecodeInjector:
             any_tagged = any_tagged or row is not None
         if getattr(self.model, "_post_fusion", False):
             self._arm_pf([state.last_q_node for state in self.rows])
+        if self.sk_banks is not None:
+            self._arm_sk()
         if self._ptr_maps is not None:
             # Candidates for the NEXT token given the just-consumed suffix
             # (state.step appended this step's token above).
@@ -3330,6 +3722,19 @@ class BatchedMaskDecodeInjector:
             if row is not None:
                 bias[b, 0, 0] = row
         self.model._decode_bias_row = bias
+
+    def _arm_sk(self):
+        """Arm the e18-B structural keys ``[B, k_len, d_s]`` for this step from
+        each row's key-role node vector (every step, tagged or not)."""
+        k_len = self.prompt_len + len(self.rows[0].generated)
+        d_s = self.sk_banks[0].shape[-1]
+        keys = torch.zeros(len(self.rows), k_len, d_s, dtype=torch.float32,
+                           device=self.device)
+        for b, state in enumerate(self.rows):
+            t2n = state.tok2node_k
+            pos = (t2n >= 0).nonzero(as_tuple=True)[0]
+            keys[b, pos] = self.sk_banks[b].to(self.device)[t2n[pos]]
+        self.model._sk_keys = keys
 
     def _arm_pf(self, q_nodes: list):
         """Arm the post-fusion decode vector [B, 1, hidden] for tagged rows.
@@ -3410,6 +3815,14 @@ class MaskDecodeInjector:
                 "seq_len": prompt_len}
         self.prompt_tok2node = tok2node_vector(prompt_injection_map, prompt_len,
                                                self.device)
+        # e18-A soft rows + current node (None/−1 without decision gating); e18-B
+        # structural key bank. Same rule as _MaskDecodeRowState / decision_query_map.
+        self.decision_values = mask_decision_values(model, pyg_graph, self.device,
+                                                    permutation=permutation)
+        self.sk_bank = struct_key_bank(model, pyg_graph, self.device,
+                                       permutation=permutation)
+        known = (self.prompt_tok2node >= 0).nonzero(as_tuple=True)[0]
+        self.current_node = int(self.prompt_tok2node[known[-1]]) if known.numel() else -1
         # Flattened variant list for the partial-mention ambiguity check.
         self._all_variants = [seq for seqs in node_token_seqs
                               for seq in (seqs if seqs and isinstance(seqs[0], list)
@@ -3465,23 +3878,35 @@ class MaskDecodeInjector:
                     q_node = nid
                 elif end - 1 == p_suffix - 1 and (nid, (start, end)) not in prev_committed:
                     q_node = nid
-        if q_node < 0:
-            self.model._decode_bias_row = None    # untagged query: bias row is all-zero
-            if self._pf_psi is not None:
-                self.model._pf_decode_vec = None
-            return
-        if self._pf_psi is not None:
-            with torch.no_grad():
-                self.model._pf_decode_vec = self.model._pf_project(
-                    self._pf_psi[q_node]).view(1, 1, -1)
         k_len = self.prompt_len + len(self.generated)
         tok2node_k = torch.full((k_len,), -1, dtype=torch.long, device=self.device)
         tok2node_k[:self.prompt_len] = self.prompt_tok2node
         for nid, sps in spans.items():
             for start, end in sps:
                 tok2node_k[self.prompt_len + start:self.prompt_len + end] = nid
-        row = torch.zeros(k_len, dtype=torch.float32, device=self.device)
         k_pos = (tok2node_k >= 0).nonzero(as_tuple=True)[0]
+        if self.sk_bank is not None:
+            keys = torch.zeros(k_len, self.sk_bank.shape[-1], dtype=torch.float32,
+                               device=self.device)
+            keys[k_pos] = self.sk_bank[tok2node_k[k_pos]]
+            self.model._sk_keys = keys.unsqueeze(0)
+        if q_node < 0:
+            if self._pf_psi is not None:
+                self.model._pf_decode_vec = None
+            if self.decision_values is None or self.current_node < 0:
+                self.model._decode_bias_row = None    # untagged query: bias row is all-zero
+                return
+            # e18-A: decision position — soft row of the node we are standing on.
+            row = torch.zeros(k_len, dtype=torch.float32, device=self.device)
+            row[k_pos] = self.decision_values[self.current_node, tok2node_k[k_pos]]
+            self.model._decode_bias_row = row.view(1, 1, 1, k_len)
+            return
+        self.current_node = q_node
+        if self._pf_psi is not None:
+            with torch.no_grad():
+                self.model._pf_decode_vec = self.model._pf_project(
+                    self._pf_psi[q_node]).view(1, 1, -1)
+        row = torch.zeros(k_len, dtype=torch.float32, device=self.device)
         row[k_pos] = self.node_values[q_node, tok2node_k[k_pos]]
         self.model._decode_bias_row = row.view(1, 1, 1, k_len)
         # Identity-RoPE parity: under decode_consistent, training zeroes the position of

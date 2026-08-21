@@ -16,6 +16,7 @@ from prism.models.gnn_llm import (
     build_injection_map,
     clamp_injection_map,
     decode_style_query_map,
+    decision_query_map,
     exclude_positions_from_injection_map,
     find_last_graph_scope,
     node_token_variants,
@@ -486,7 +487,8 @@ class SpineDataCollator(TokenIndexCollator):
     edge_weights = "gaussian"
 
     def _extract_graph(self, example):
-        """Build PyG graph, injection map, and (decode_consistent only) key map."""
+        """Build PyG graph, injection map, (decode_consistent only) key map and
+        decision map (e18-A: untagged answer-side positions → current node)."""
         pyg_graph = utils.scene_graph_dict_to_pyg(
             example["scene_graph_dict"], edge_weights=self.edge_weights
         )
@@ -497,6 +499,7 @@ class SpineDataCollator(TokenIndexCollator):
             example["input_ids"], node_token_seqs, scope_start=scope_start
         )
         key_injection_map = None
+        decision_map = None
         if self.injection_scope == "prompt_only":
             injection_map = clamp_injection_map(injection_map, example["answer_start"])
         elif self.injection_scope == "exclude_supervised":
@@ -513,22 +516,29 @@ class SpineDataCollator(TokenIndexCollator):
             injection_map = decode_style_query_map(
                 injection_map, example["answer_start"],
                 example["input_ids"], node_token_seqs)
-        return pyg_graph, injection_map, key_injection_map
+            decision_map = decision_query_map(
+                injection_map, example["answer_start"], len(example["input_ids"]))
+        return pyg_graph, injection_map, key_injection_map, decision_map
 
     def __call__(self, features, return_tensors: Optional[str] = None):
         """Extract PyG graphs and injection maps, then delegate to TokenIndexCollator for padding."""
         pyg_graphs = []
         injection_maps = []
         key_injection_maps = []
+        decision_maps = []
         for example in features:
-            pyg_graph, injection_map, key_injection_map = self._extract_graph(example)
+            pyg_graph, injection_map, key_injection_map, decision_map = (
+                self._extract_graph(example))
             pyg_graphs.append(pyg_graph)
             injection_maps.append(injection_map)
             key_injection_maps.append(key_injection_map)
+            decision_maps.append(decision_map)
 
         batch = super().__call__(features)
         batch["graphs"] = Batch.from_data_list(pyg_graphs)
         batch["injection_maps"] = injection_maps
         if self.injection_scope == "decode_consistent":
             batch["key_injection_maps"] = key_injection_maps
+            # Consumed only by decision-gating models; others ignore it.
+            batch["decision_maps"] = decision_maps
         return batch

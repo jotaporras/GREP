@@ -388,6 +388,15 @@ def graph_augmented_llm_from_pretrained(
             cross_fusion_heads=gnn_cfg.get("cross_fusion_heads", 8),
             cross_fusion_dim=gnn_cfg.get("cross_fusion_dim"),
             fusion_d_gt=gnn_cfg["d_model"],
+            decision_gating=gnn_cfg.get("decision_gating", False),
+            decision_gain_init=gnn_cfg.get("decision_gain_init", 0.0),
+            struct_keys=gnn_cfg.get("struct_keys", False),
+            struct_keys_dim=gnn_cfg.get("struct_keys_dim", 64),
+            struct_keys_layer_scope=gnn_cfg.get("struct_keys_layer_scope", "dense"),
+            struct_keys_gain_init=gnn_cfg.get("struct_keys_gain_init", 0.0),
+            binding_head=gnn_cfg.get("binding_head", False),
+            binding_temperature=gnn_cfg.get("binding_temperature", 0.1),
+            binding_loss_weight=gnn_cfg.get("binding_loss_weight", 0.1),
         )
         gnn_weights = torch.load(os.path.join(path, "gnn_weights.pt"), map_location="cpu")
         _load_psi_producer_state(model.pe_model, gnn_weights["pe_model"], path, gnn_cfg)
@@ -424,6 +433,18 @@ def graph_augmented_llm_from_pretrained(
             for name in ("xf_ln", "xf_q", "xf_k", "xf_v", "xf_o"):
                 getattr(model, name).load_state_dict(gnn_weights[name])
             model.xf_gain.data.copy_(gnn_weights["xf_gain"])
+        # e18 node-identity pathways.
+        if gnn_cfg.get("decision_gating", False):
+            _require("decision_gating", ("decision_gain",))
+            model.decision_gain.data.copy_(gnn_weights["decision_gain"])
+        if gnn_cfg.get("struct_keys", False):
+            _require("struct_keys", ("sk_k", "sk_q", "sk_gain"))
+            model.sk_k.load_state_dict(gnn_weights["sk_k"])
+            model.sk_q.load_state_dict(gnn_weights["sk_q"])
+            model.sk_gain.data.copy_(gnn_weights["sk_gain"])
+        if gnn_cfg.get("binding_head", False):
+            _require("binding_head", ("bind_proj",))
+            model.bind_proj.load_state_dict(gnn_weights["bind_proj"])
     elif architecture in ("postfusion_graph_llm", "composite_graph_gt"):
         raise ValueError(
             f"architecture {architecture!r} was removed from the codebase (legacy "

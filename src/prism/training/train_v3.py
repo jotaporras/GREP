@@ -300,6 +300,21 @@ def train_model(config: omegaconf.DictConfig):
             # learnable_graph_mask extra params (read back by loaders for eval).
             **({k: config.gnn[k] for k in ("mask_alpha", "mask_psi_scale")}
                if config.gnn.arch == "learnable_graph_mask" else {}),
+            # Fusion / identity pathways on learnable_graph_mask. LOAD-BEARING at
+            # reload: loaders `.get(flag, False)`, so an unrecorded flag rebuilds a
+            # plain mask and silently ignores the checkpointed module weights (the
+            # e17 SFT pf runs 7639051-53 were evaluated that way — pf was SFT-inert,
+            # so no result changed, but the hole is real). Record every switch.
+            **({k: config.gnn[k] for k in (
+                "post_fusion", "post_fusion_layer_scope",
+                "graph_lora", "graph_lora_rank", "graph_lora_targets",
+                "graph_lora_layer_scope", "pointer_fusion",
+                "cross_fusion", "cross_fusion_heads", "cross_fusion_dim",
+                "decision_gating", "decision_gain_init",
+                "struct_keys", "struct_keys_dim", "struct_keys_layer_scope",
+                "struct_keys_gain_init",
+                "binding_head", "binding_temperature", "binding_loss_weight")}
+               if config.gnn.arch == "learnable_graph_mask" else {}),
         }
         trainer = GraphSFTTrainer(
             model=model,

@@ -64,6 +64,16 @@ def save_run_dir(model, gnn_config: dict, output_dir: str) -> None:
             for name in ("xf_ln", "xf_q", "xf_k", "xf_v", "xf_o"):
                 weights[name] = getattr(model, name).state_dict()
             weights["xf_gain"] = model.xf_gain.data
+        # e18 node-identity pathways (A decision gating, B structural keys,
+        # binding head) — same fail-loud contract in loaders.
+        if getattr(model, "_decision_gating", False):
+            weights["decision_gain"] = model.decision_gain.data
+        if getattr(model, "_struct_keys", False):
+            weights["sk_k"] = model.sk_k.state_dict()
+            weights["sk_q"] = model.sk_q.state_dict()
+            weights["sk_gain"] = model.sk_gain.data
+        if getattr(model, "_binding_head", False):
+            weights["bind_proj"] = model.bind_proj.state_dict()
         torch.save(weights, os.path.join(output_dir, "gnn_weights.pt"))
     elif gnn_config.get("architecture") == "wire_llm":
         # WIRE: the Ψ producer, the angle gate, and the frequency store. Which store

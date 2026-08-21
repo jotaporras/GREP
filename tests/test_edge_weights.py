@@ -132,12 +132,12 @@ _EXAMPLE = {
 
 
 def test_collator_threads_edge_weights_binary():
-    pyg_graph, imap, _ = _make_collator("binary")._extract_graph(_EXAMPLE)
+    pyg_graph, imap, _, _ = _make_collator("binary")._extract_graph(_EXAMPLE)
     assert getattr(pyg_graph, "edge_weight", None) is None
     assert imap  # injection map still built
 
 def test_collator_threads_edge_weights_gaussian():
-    pyg_graph, _, _ = _make_collator("gaussian")._extract_graph(_EXAMPLE)
+    pyg_graph, _, _, _ = _make_collator("gaussian")._extract_graph(_EXAMPLE)
     assert pyg_graph.edge_weight is not None
     # Single edge → σ = its own length → weight = exp(-1/2) on every copy.
     assert torch.allclose(
