@@ -399,3 +399,24 @@ def test_run_dir_saves_soft_edges(tmp_path):
     run_dir.save_run_dir(m, {"architecture": "learnable_graph_mask"}, str(tmp_path))
     w = torch.load(tmp_path / "gnn_weights.pt", map_location="cpu")
     assert "se_mlp" in w
+
+
+# ---------------------------------------------------------------------------
+# graphs arrive from the training collator as a PyG Batch (regression: 7731161)
+# ---------------------------------------------------------------------------
+
+def test_forward_accepts_collator_batch_for_every_e18_flag():
+    from torch_geometric.data import Batch
+    ids, gs, qm, km, _ = _inputs()
+    for kw in ({"binding_head": True},
+               {"struct_keys": True, "struct_keys_dim": 4},
+               {"decision_gating": True, "decision_gain_init": 1.0},
+               {"soft_edges": True}):
+        m = _model(**kw)
+        with torch.no_grad():
+            a = m(input_ids=ids, graphs=gs, injection_maps=qm, key_injection_maps=km,
+                  labels=ids.clone())
+            b = m(input_ids=ids, graphs=Batch.from_data_list(gs), injection_maps=qm,
+                  key_injection_maps=km, labels=ids.clone())
+        assert torch.allclose(a.logits, b.logits, atol=1e-6), kw
+        assert torch.allclose(a.loss, b.loss, atol=1e-6), kw

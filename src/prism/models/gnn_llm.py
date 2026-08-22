@@ -1864,6 +1864,7 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         # Arm the learned structural bias for the patched attention layers. No graph
         # (e.g. a non-graph batch) ⇒ plain causal LLM.
         if graphs is not None and injection_maps is not None and input_ids is not None:
+            graphs = as_graph_list(graphs)
             key_maps = injection_maps if key_injection_maps is None else key_injection_maps
             if self._soft_edges:
                 # e18-D: splice the edge prefix in and move EVERY position-indexed
@@ -3550,6 +3551,19 @@ def decision_vector(decision_map: dict[int, int], seq_len: int, device) -> torch
     for p, nid in decision_map.items():
         vec[p] = nid
     return vec
+
+
+def as_graph_list(graphs) -> list:
+    """Per-graph list from whatever the caller passed.
+
+    The training collator emits a PyG ``Batch`` (data.py ``Batch.from_data_list``).
+    ``batch[b]`` returns the b-th ``Data``, but iterating a ``Batch`` iterates it
+    like a ``Data`` — over ``(key, value)`` pairs — so any ``for g in graphs`` loop
+    sees tuples (e18 mask_bind 7731161: ``'tuple' object has no attribute 'x'``).
+    Every per-graph loop in this module goes through this."""
+    if isinstance(graphs, Batch):
+        return graphs.to_data_list()
+    return list(graphs)
 
 
 def shift_spans(injection_map: dict[int, list[tuple[int, int]]], offset: int,
