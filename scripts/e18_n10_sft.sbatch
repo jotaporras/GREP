@@ -25,6 +25,7 @@
 #   ARM=mask_ab      + both
 #   ARM=mask_bind    + binding auxiliary loss only
 #   ARM=mask_b_bind  + B + binding
+#   ARM=mask_a_bind  + A + binding
 #   ARM=mask_d       + soft edge tokens (D; graph-side upper bound — one learned
 #                      embedding per directed edge spliced in after BOS)
 #   ARM=text_edges   plain-LLM upper bound: edge list in text, fresh LoRA
@@ -43,7 +44,7 @@ CHECKPOINT_DIR=${CHECKPOINT_DIR:-$PROJ/outputs/e18_identity}
 PE_DIR=$PROJ/pretrained_pe
 STAGE1_LORA=$PROJ/outputs/e9_multistage_training/e9_ms_stage1/e9_ms_stage1_sqgk4o3j/checkpoint-100
 
-ARM="${ARM:?set ARM=mask|mask_a|mask_b|mask_ab|mask_bind|mask_b_bind|mask_d|text_edges (scripts/e18_arms.sh)}"
+ARM="${ARM:?set ARM=mask|mask_a|mask_b|mask_ab|mask_bind|mask_b_bind|mask_a_bind|mask_d|text_edges (scripts/e18_arms.sh)}"
 DATA_SPLIT=${DATA_SPLIT:-$PROJ/data/n_10_vllm/gen/nav_n10_gemma_data/split}
 MAX_STEPS=${MAX_STEPS:-300}
 RUN_NAME=${RUN_NAME:-e18_n10_${ARM}}

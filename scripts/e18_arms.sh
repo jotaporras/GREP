@@ -12,10 +12,11 @@
 #   mask_ab      + both
 #   mask_bind    + binding auxiliary loss only
 #   mask_b_bind  + B + binding
+#   mask_a_bind  + A + binding (fleet 2026-08-21: A and bind were the two arms above the control)
 #   mask_d       + soft edge tokens (D; graph-side upper bound)
 #   text_edges   plain-LLM upper bound: edge list in text, fresh LoRA
 
-E18_ARMS="mask|mask_a|mask_b|mask_ab|mask_bind|mask_b_bind|mask_d|text_edges"
+E18_ARMS="mask|mask_a|mask_b|mask_ab|mask_bind|mask_b_bind|mask_a_bind|mask_d|text_edges"
 
 e18_arm_args() {
     local arm="$1"
@@ -48,6 +49,7 @@ e18_arm_args() {
       mask_ab)     ARM_ARGS=("${MASK_ARGS[@]}" "${A_ARGS[@]}" "${B_ARGS[@]}") ;;
       mask_bind)   ARM_ARGS=("${MASK_ARGS[@]}" "${BIND_ARGS[@]}") ;;
       mask_b_bind) ARM_ARGS=("${MASK_ARGS[@]}" "${B_ARGS[@]}" "${BIND_ARGS[@]}") ;;
+      mask_a_bind) ARM_ARGS=("${MASK_ARGS[@]}" "${A_ARGS[@]}" "${BIND_ARGS[@]}") ;;
       mask_d)      ARM_ARGS=("${MASK_ARGS[@]}" "${D_ARGS[@]}") ;;
       text_edges)  ARM_ARGS=(gnn.arch=llm data.text_edge_list=present) ;;
       *) echo "unknown ARM=$arm (one of $E18_ARMS)" >&2; exit 2 ;;
