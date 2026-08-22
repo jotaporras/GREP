@@ -60,7 +60,10 @@ python -m prism.training.train_v3 \
     eval.data="$DATA_SPLIT/test_graphs" eval.num_graphs=-1 eval.epoch_interval=999 \
     eval.post_train_graphs="$DATA_SPLIT/test_graphs"
 
-RUN_DIR=$(ls -dt "$CHECKPOINT_DIR/${RUN_NAME}"_* | head -1)
+# Exactly <RUN_NAME>_<8-char wandb id> — see e18_n10_sft.sbatch (a bare "_*" glob
+# matches sibling arms and picks whichever was written last).
+RUN_DIR=$(ls -dt "$CHECKPOINT_DIR/${RUN_NAME}"_???????? | head -1)
+test -n "$RUN_DIR" || { echo "no run dir ${RUN_NAME}_<wandb id> under $CHECKPOINT_DIR"; exit 2; }
 echo "[$(date --iso-8601=seconds)] run dir: $RUN_DIR"
 
 mkdir -p "$PROBE_OUT"

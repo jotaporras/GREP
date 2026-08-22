@@ -90,7 +90,11 @@ srun python -m prism.training.train_v3 \
 
 # The run dir is <CHECKPOINT_DIR>/<RUN_NAME>_<wandb_id>/ (train_v3
 # _construct_output_dir) — take the newest one matching this run name.
-RUN_DIR=$(ls -dt "$CHECKPOINT_DIR/${RUN_NAME}"_* | head -1)
+# Exactly <RUN_NAME>_<8-char wandb id>: a bare "${RUN_NAME}_*" also matches sibling
+# arms (e18_n10_mask_* ⊃ e18_n10_mask_d_*, mask_b_* ⊃ mask_b_bind_*) and picks
+# whichever was written last — 7731157 probed the mask_d checkpoint as "mask".
+RUN_DIR=$(ls -dt "$CHECKPOINT_DIR/${RUN_NAME}"_???????? | head -1)
+test -n "$RUN_DIR" || { echo "no run dir ${RUN_NAME}_<wandb id> under $CHECKPOINT_DIR"; exit 2; }
 echo "[$(date --iso-8601=seconds)] run dir: $RUN_DIR"
 
 # --- neighbour-naming probe: held-out graphs, then a few TRAIN graphs ---------
