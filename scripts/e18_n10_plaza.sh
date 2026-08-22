@@ -17,7 +17,7 @@ cd "$(dirname "$0")/.."
 PROJ=$PWD
 
 GPU=${GPU:-0}
-ARM="${ARM:?set ARM=mask|mask_a|mask_b|mask_ab|mask_bind|mask_b_bind|mask_d|text_edges (scripts/e18_arms.sh)}"
+ARM="${ARM:?set ARM=mask|mask_a|mask_b|mask_ab|mask_bind|mask_b_bind|mask_a_bind|mask_d|text_edges (scripts/e18_arms.sh)}"
 DATA_SPLIT=${DATA_SPLIT:-$PROJ/data/n_10_vllm/gen/nav_n10_gemma_data/split}
 MAX_STEPS=${MAX_STEPS:-300}
 RUN_NAME=${RUN_NAME:-e18_n10_${ARM}_plaza4b}
