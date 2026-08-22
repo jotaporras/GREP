@@ -33,6 +33,14 @@
 # Submit:  ARM=mask_b sbatch scripts/e18_n10_sft.sbatch
 #          ARM=mask MAX_STEPS=40 RUN_NAME=e18_calib sbatch scripts/e18_n10_sft.sbatch   # s/step calibration
 # Override DATA_SPLIT for the n15 corpus.
+#
+# Full-scale n60_v3 (the e17 control cn7ub88q: 3 epochs = 936 steps, per-epoch
+# built-in eval on 7 test graphs x 12 tasks, 72.6% at epoch 3, ~3 h):
+#   ARM=mask_a MAX_STEPS=-1 EVAL_EPOCH_INTERVAL=1 PROBE_TEST_GRAPHS=3 \
+#     DATA_SPLIT=$PROJ/data/n_60_vllm_v3/gen/nav_n60_gemma_data/split RUN_NAME=e18_n60_mask_a \
+#     sbatch --time=08:00:00 scripts/e18_n10_sft.sbatch
+# MAX_STEPS=-1 = no cap (trainer.epochs governs). PROBE_TEST_GRAPHS caps the
+# test-graph probe (48 rooms x 7 graphs = 336 queries at ~12 s each otherwise).
 
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/..}"
@@ -50,6 +58,8 @@ MAX_STEPS=${MAX_STEPS:-300}
 RUN_NAME=${RUN_NAME:-e18_n10_${ARM}}
 TAG=${TAG:-e18_identity}
 PROBE_TRAIN_GRAPHS=${PROBE_TRAIN_GRAPHS:-3}
+PROBE_TEST_GRAPHS=${PROBE_TEST_GRAPHS:--1}      # -1 = every test graph
+EVAL_EPOCH_INTERVAL=${EVAL_EPOCH_INTERVAL:-999} # 1 = built-in generation eval at each epoch end (e17 harness)
 PROBE_OUT=${PROBE_OUT:-$PROJ/results/e18_probe}
 
 export WANDB_ENTITY=${WANDB_ENTITY:-alelab}
@@ -70,9 +80,11 @@ e18_arm_args "$ARM"
 echo "[$(date --iso-8601=seconds)] $RUN_NAME arm=$ARM data=$DATA_SPLIT max_steps=$MAX_STEPS tag=$TAG"
 echo "=== python: $(which python) ==="
 
-# eval.epoch_interval=999: no in-training generation eval (the step-based HF
-# eval at max_steps//2 is the cheap val loss only). The held-out navigation
-# eval runs once post-training from the saved checkpoint (post_train_graphs).
+# eval.epoch_interval=999 (default): no in-training generation eval (the
+# step-based HF eval at max_steps//2 is the cheap val loss only); the held-out
+# navigation eval runs once post-training from the saved checkpoint
+# (post_train_graphs). EVAL_EPOCH_INTERVAL=1 adds the per-epoch generation eval
+# the e17 n60 control used, so epoch-3 numbers are directly comparable.
 srun python -m prism.training.train_v3 \
     --config-name=e9_base_config \
     model.path="google/gemma-4-31B-it" \
@@ -86,7 +98,7 @@ srun python -m prism.training.train_v3 \
     trainer.checkpoint_dir="$CHECKPOINT_DIR" \
     trainer.save_name="$RUN_NAME" \
     wandb.run_name="$RUN_NAME" wandb.tag="$TAG" \
-    eval.data="$DATA_SPLIT/test_graphs" eval.num_graphs=-1 eval.epoch_interval=999 \
+    eval.data="$DATA_SPLIT/test_graphs" eval.num_graphs=-1 eval.epoch_interval="$EVAL_EPOCH_INTERVAL" \
     eval.post_train_graphs="$DATA_SPLIT/test_graphs"
 
 # The run dir is <CHECKPOINT_DIR>/<RUN_NAME>_<wandb_id>/ (train_v3
@@ -101,7 +113,7 @@ echo "[$(date --iso-8601=seconds)] run dir: $RUN_DIR"
 # --- neighbour-naming probe: held-out graphs, then a few TRAIN graphs ---------
 mkdir -p "$PROBE_OUT"
 srun python scripts/neighbour_probe.py --checkpoint "$RUN_DIR" \
-    --graphs "$DATA_SPLIT/test_graphs" \
+    --graphs "$DATA_SPLIT/test_graphs" --max-graphs "$PROBE_TEST_GRAPHS" \
     --output "$PROBE_OUT/${RUN_NAME}_test.json"
 srun python scripts/neighbour_probe.py --checkpoint "$RUN_DIR" \
     --graphs "$DATA_SPLIT/train_graphs" --max-graphs "$PROBE_TRAIN_GRAPHS" \
