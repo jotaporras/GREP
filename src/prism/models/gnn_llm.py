@@ -702,8 +702,14 @@ class GraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
                               permutation=permutation)
 
     def build_structural_mask(self, seq_len, graphs, injection_maps, device, dtype=None,
-                              key_injection_maps=None, permutation=None):
+                              key_injection_maps=None, permutation=None,
+                              decision_maps=None):
         """Additive attention bias ``[B, 1, seq, seq]`` — 0 allowed, ``finfo.min`` blocked.
+
+        ``decision_maps`` is accepted and ignored, like in :meth:`forward`: the
+        parameter-free mask has no decision rows (e18-A lives on
+        ``LearnableGraphMaskLLM``), and ``inference._generate_tokens`` passes the
+        keyword to every mask arch.
 
         ``bias[b,0,i,j] = finfo.min`` iff tokens i and j BOTH belong to graph nodes
         AND those nodes are non-adjacent (within ``k_hops``). Every other entry
