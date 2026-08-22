@@ -28,10 +28,26 @@ Paired vs `mask` (readout) on the same 50 tasks — wins / losses / exact binomi
 mask_a **9 / 3** (0.15) · mask_bind 6 / 2 (0.29) · mask_ab 5 / 3 · mask_d 3 / 5 ·
 mask_b_bind 4 / 9 · mask_b 3 / **10** (0.09) · text_edges 18 / 0 (<0.001).
 
-Telemetry: `decision_gain` 3.0 → 2.986 (mask_a, mask_ab), `sk_gain` 1.0 → 0.988 —
-at lr 2.5e-4 × 400 steps the gains sit at their inits; A's effect is the
-LoRA/tower training *under* a fixed-gain soft decision row. `binding_loss`
-2.4 → 1.97 (mask_bind) and → 1.41 (mask_b_bind) vs log 10 = 2.30 chance.
+Telemetry: `decision_gain` 3.0 → 2.986 (mask_a, mask_ab), `sk_gain` 1.0 → 0.988.
+**This is by construction, not a finding**: the schedule is linear decay to 0
+over `max_steps` (5 warmup steps) and Adam moves a scalar ≈ LR per step, so the
+total drift available to any gain is ∫LR ≈ ½·2.5e-4·400 = 0.05 (0.12 even at
+936 steps). The gains are effectively fixed hyperparameters at base LR: sweep
+the inits, or give the scalars their own LR group, rather than reading their
+stillness as "the model didn't want them". A's effect is therefore the LoRA/tower
+training *under* a fixed-gain soft decision row. `binding_loss` (chance
+ln 10 = 2.30): 2.40 → **0.88** at step 400 (mask_bind), 2.46 → **0.69**
+(mask_b_bind) — binding is learned well within the budget. Caveat: mask_bind's
+composite eval loss rose 0.375 → 0.391 between steps 200 and 400 while train
+fell; the logged eval does not split LM vs binding terms.
+
+Budget (wandb train/loss, window means): every n10 arm was still descending
+when the LR hit zero (mask 0.110 at steps 201–300 → 0.102 at 301–400), and the
+n60 control at 936 steps reached train 0.079 / eval 0.114 vs n10's ~0.10 / 0.13
+while still descending in its last window. 400 steps was short; the 30-min rule
+allows ~1200 at 1.42 s/step. mask_a's loss is within 0.002 of the control's —
+A's gain is a decode-time effect invisible to teacher-forced loss. B arms are
+worse on loss too (0.108 / 0.111 vs 0.102).
 
 ## Noise floor — read before the table
 
@@ -110,8 +126,10 @@ LoRA/tower training *under* a fixed-gain soft decision row. `binding_loss`
 
 * Whether 8 pts of same-checkpoint eval noise is typical or this corpus is
   unusually knife-edge; the permutation-seed readout would tell.
-* `decision_gain_init=3.0` is untuned and did not move; the A effect may be
-  sensitive to it (a 1.0 / 6.0 sweep is cheap).
+* `decision_gain_init=3.0` is untuned and *cannot* move under this schedule
+  (see Telemetry); the A effect may be sensitive to it (a 1.0 / 6.0 sweep is cheap).
+* B's failure is confounded by `sk_gain` pinned at 1.0 for the same reason —
+  `struct_keys_gain_init=0.0` is the fair test.
 * D's failure to beat the control may be the 400-step budget, the scale rule
   (soft tokens at mean name-token norm), or the splice-after-BOS position — not
   separated.
