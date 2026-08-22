@@ -919,8 +919,14 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         # e18-A — decision gating: soft neighbour rows at the steps that choose a name.
         self._decision_gating: bool = bool(decision_gating)
         if self._decision_gating:
+            # On the LLM's device like every other gain: this is the wrapper's FIRST
+            # direct parameter, and ``next(model.parameters()).device`` is what the
+            # eval loader / inference client take as the model device. A CPU gain
+            # here made the e18 mask_a / mask_ab post-train eval and probe build
+            # every decode-time tensor on CPU (7731158 / 7731160).
             self.decision_gain = nn.Parameter(
-                torch.tensor(float(decision_gain_init), dtype=torch.float32))
+                torch.tensor(float(decision_gain_init), dtype=torch.float32,
+                             device=device))
         # e18-B — structural key channel (off unless enabled).
         self._struct_keys: bool = False
         self._sk_keys: torch.Tensor | None = None         # [B, K, d_s] fp32 for the current forward

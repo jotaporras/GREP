@@ -420,3 +420,39 @@ def test_forward_accepts_collator_batch_for_every_e18_flag():
                   key_injection_maps=km, labels=ids.clone())
         assert torch.allclose(a.logits, b.logits, atol=1e-6), kw
         assert torch.allclose(a.loss, b.loss, atol=1e-6), kw
+
+
+# ---------------------------------------------------------------------------
+# device placement — the eval loader / inference client never call .to() on the
+# wrapper; they take next(model.parameters()).device as THE model device.
+# ---------------------------------------------------------------------------
+
+def _accelerator():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return None
+
+
+def test_every_e18_flag_constructs_on_the_llm_device():
+    """Regression for e18 mask_a / mask_ab (7731158 / 7731160): ``decision_gain`` was
+    built on CPU, became the wrapper's first parameter, and the probe / post-train
+    eval — which derive the device from ``next(model.parameters())`` and never
+    ``.to()`` the wrapper — ran every decode-time tensor on CPU."""
+    import pytest
+    dev = _accelerator()
+    if dev is None:
+        pytest.skip("needs a non-CPU device to tell wrapper placement from LLM placement")
+    for flags in ({"decision_gating": True, "decision_gain_init": 3.0},
+                  {"struct_keys": True, "struct_keys_dim": 4},
+                  {"binding_head": True},
+                  {"soft_edges": True}):
+        torch.manual_seed(0)
+        llm = _tiny_llm().to(dev)
+        model = LearnableGraphMaskLLM(         # NO trailing .to(): the loader's path
+            llm, _StubPE(d=8), alpha=0.7, layer_scope="all", fusion_d_gt=8, **flags)
+        first = next(model.parameters()).device
+        assert first.type == dev.type, (flags, first)
+        off = [n for n, p in model.named_parameters() if p.device.type != dev.type]
+        assert not off, (flags, off)
