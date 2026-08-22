@@ -82,6 +82,16 @@ post-train held-out navigation eval on `test_graphs`, then the probe on
 `test_graphs` and 3 `train_graphs`. Outputs under
 `$ALELAB_DRIVE/GREP-PRISM/outputs/e18_identity/<RUN_NAME>_<wandb_id>/` and
 `$ALELAB_DRIVE/GREP-PRISM/results/e18_probe/<RUN_NAME>_{test,train}.json`.
+
+**Readout without retraining** — `RUN_DIR=<run dir> sbatch
+scripts/e18_n10_readout.sbatch` re-runs the post-train half on an existing run
+dir: `scalability_evaluation` (same `evaluate_model` and the same
+`eval_logs/cross_eval/` location as the in-process eval — it overwrites) and both
+probes; `RUN_NAME` defaults to the dir name minus the wandb id so the probe
+JSONs land where the training job would have put them. Use it when a job
+trained but died in eval/probe (2026-08-21: the A arms, `decision_gain` built on
+CPU → every decode tensor on CPU after reload; fixed d33e350), or to re-probe
+after a probe change. ~8 min of GPU vs ~25 min + 2.3 GB for a retrain.
 wandb tag `e18_identity`.
 
 | ARM | flags | role |
