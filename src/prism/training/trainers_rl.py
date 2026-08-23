@@ -543,8 +543,12 @@ class MaskGRPOTrainer(GRPOTrainer):
         # Post-fusion / pointer-fusion: snapshot raw Ψ for decode-step arming
         # (rollouts run no-grad; the loss-side forward recomputes Ψ WITH grad).
         psi = None
-        if (getattr(self._core, "_post_fusion", False)
-                or getattr(self._core, "_pointer_fusion", False)):
+        if getattr(self._core, "_post_fusion", False):
+            # pf_psi = classic Ψ, or the e19 hop stack [N, K, d_gt]; hop modes
+            # reject pointer_fusion (enable_post_fusion), so the slot is unambiguous.
+            with torch.no_grad():
+                psi = self._core.pf_psi(pyg_graph)
+        elif getattr(self._core, "_pointer_fusion", False):
             with torch.no_grad():
                 psi = self._core.pe_model(pyg_graph).float()
         entry = (prompt_ids, pyg_graph, injection_map, node_token_seqs,

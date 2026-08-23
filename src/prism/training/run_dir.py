@@ -50,6 +50,12 @@ def save_run_dir(model, gnn_config: dict, output_dir: str) -> None:
             weights["pf_proj"] = model.pf_proj.state_dict()
             weights["pf_norm"] = model.pf_norm.state_dict()
             weights["pf_gain"] = model.pf_gain.data
+            # e19 hop-separated channels: per-channel gains always; the
+            # codebook-GT producer only in shift mode (depth taps reuse pe_model).
+            if getattr(model, "_pf_hop_mode", "none") != "none":
+                weights["pf_ch_gain"] = model.pf_ch_gain.data
+            if getattr(model, "_pf_hop_mode", "none") == "shift":
+                weights["pf_hop_gt"] = model.pf_hop_gt.state_dict()
         # e17 candidates D/E/C ride alongside the tower the same way; the
         # loader fails loud if a recorded flag's weights are absent.
         if getattr(model, "_graph_lora", False):

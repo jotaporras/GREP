@@ -378,6 +378,16 @@ def graph_augmented_llm_from_pretrained(
             post_fusion_layer_scope=gnn_cfg.get("post_fusion_layer_scope",
                                                 "dense_top_half"),
             post_fusion_d_gt=gnn_cfg["d_model"],
+            # e19 hop-separated channels — load-bearing at rebuild like every
+            # other fusion switch (an unrecorded mode would rebuild classic pf
+            # and mis-shape pf_proj against the checkpointed ModuleList).
+            post_fusion_hop_mode=gnn_cfg.get("post_fusion_hop_mode", "none"),
+            post_fusion_hop_k=gnn_cfg.get("post_fusion_hop_k", 3),
+            post_fusion_gain_init=gnn_cfg.get("post_fusion_gain_init", 0.0),
+            post_fusion_codebook_size=gnn_cfg.get("post_fusion_codebook_size", 256),
+            post_fusion_hop_gt_layers=gnn_cfg.get("post_fusion_hop_gt_layers", 3),
+            post_fusion_hop_gt_heads=gnn_cfg.get("post_fusion_hop_gt_heads", 8),
+            post_fusion_hop_gt_k=gnn_cfg.get("post_fusion_hop_gt_k", 1),
             graph_lora=gnn_cfg.get("graph_lora", False),
             graph_lora_rank=gnn_cfg.get("graph_lora_rank", 8),
             graph_lora_targets=gnn_cfg.get("graph_lora_targets", "o_proj"),
@@ -417,6 +427,14 @@ def graph_augmented_llm_from_pretrained(
             model.pf_proj.load_state_dict(gnn_weights["pf_proj"])
             model.pf_norm.load_state_dict(gnn_weights["pf_norm"])
             model.pf_gain.data.copy_(gnn_weights["pf_gain"])
+            # e19 hop-separated channels ride the post_fusion flag.
+            hop_mode = gnn_cfg.get("post_fusion_hop_mode", "none")
+            if hop_mode != "none":
+                _require(f"post_fusion_hop_mode={hop_mode}", ("pf_ch_gain",))
+                model.pf_ch_gain.data.copy_(gnn_weights["pf_ch_gain"])
+            if hop_mode == "shift":
+                _require("post_fusion_hop_mode=shift", ("pf_hop_gt",))
+                model.pf_hop_gt.load_state_dict(gnn_weights["pf_hop_gt"])
         if gnn_cfg.get("graph_lora", False):
             _require("graph_lora", ("glora_gen", "glora_B"))
             model.glora_gen.load_state_dict(gnn_weights["glora_gen"])

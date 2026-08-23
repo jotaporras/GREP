@@ -109,6 +109,19 @@ gnn:
   # bitwise no-op at init, so pre-e17 mask checkpoints warm-start unchanged.
   post_fusion: false
   post_fusion_layer_scope: dense_top_half   # same vocabulary as mask_layer_scope
+  # e19 hop-separated post-fusion channels (docs/2026-08-23 e19 design note):
+  # hop_mode "shift" = codebook-feature GT (no R-PEARL), channels = k-step
+  # diffusion Ŝ^k·H, K = hop_k+1; "depth" = shared pe_model taps per GT block,
+  # K = gt_num_layers+1. Each channel gets its OWN Linear+RMSNorm and a
+  # tanh(pf_ch_gain[k]) gate. gain_init != 0 starts gates OPEN (e17/e18 lesson:
+  # zero-init gates never open).
+  post_fusion_hop_mode: none        # none | shift | depth
+  post_fusion_hop_k: 3              # shift mode: number of diffusion steps (channels = hop_k+1)
+  post_fusion_gain_init: 0.0        # init for pf_gain AND pf_ch_gain (tanh-squashed)
+  post_fusion_codebook_size: 256    # shift mode: learned node-ID embedding table size (>= max n)
+  post_fusion_hop_gt_layers: 3      # shift mode: SparseTransformerBlock stack depth
+  post_fusion_hop_gt_heads: 8       # shift mode: attention heads
+  post_fusion_hop_gt_k: 1           # shift mode: k-hop attention expansion inside the GT
   # e17 candidate D — graph-generated LoRA: per-graph hypernetwork LoRA on the
   # scoped target linears. The DOWN factor A(psi_bar) is emitted by the tower
   # from pooled Psi (one generator head per target type, shared across layers);

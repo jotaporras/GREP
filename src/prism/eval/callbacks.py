@@ -323,6 +323,16 @@ class GradientDebugCallback(TrainerCallback):
             metrics["e18/grad_norm_bind_proj"] = g.get("bind_proj", 0.0)
         if getattr(inner, "_soft_edges", False):
             metrics["e18/grad_norm_se_mlp"] = g.get("se_mlp", 0.0)
+        # e19 post-fusion gates: per-layer pf_gain and (hop modes) per-channel
+        # pf_ch_gain — the "did the write path engage" telemetry the e17 runs
+        # lacked. Per-channel values are logged individually so a single dead
+        # hop channel is visible, not averaged away.
+        if getattr(inner, "_post_fusion", False):
+            metrics["e19/pf_gain_mean"] = inner.pf_gain.mean().item()
+            metrics["e19/pf_gain_absmax"] = inner.pf_gain.abs().max().item()
+            if getattr(inner, "_pf_hop_mode", "none") != "none":
+                for k, v in enumerate(inner.pf_ch_gain.detach().tolist()):
+                    metrics[f"e19/pf_ch_gain_{k}"] = v
 
         if wandb.run is not None:
             wandb.log(metrics, step=state.global_step)

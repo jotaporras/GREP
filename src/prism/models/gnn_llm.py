@@ -840,6 +840,13 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
                  post_fusion: bool = False,
                  post_fusion_layer_scope: str = "dense_top_half",
                  post_fusion_d_gt: int | None = None,
+                 post_fusion_hop_mode: str = "none",
+                 post_fusion_hop_k: int = 3,
+                 post_fusion_gain_init: float = 0.0,
+                 post_fusion_codebook_size: int = 256,
+                 post_fusion_hop_gt_layers: int = 3,
+                 post_fusion_hop_gt_heads: int = 8,
+                 post_fusion_hop_gt_k: int = 1,
                  graph_lora: bool = False,
                  graph_lora_rank: int = 8,
                  graph_lora_targets: str = "o_proj",
@@ -954,7 +961,14 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             self.enable_binding_head(fusion_d_gt, binding_temperature,
                                      binding_loss_weight)
         if post_fusion:
-            self.enable_post_fusion(post_fusion_layer_scope, post_fusion_d_gt)
+            self.enable_post_fusion(
+                post_fusion_layer_scope, post_fusion_d_gt,
+                hop_mode=post_fusion_hop_mode, hop_k=post_fusion_hop_k,
+                gain_init=post_fusion_gain_init,
+                codebook_size=post_fusion_codebook_size,
+                hop_gt_layers=post_fusion_hop_gt_layers,
+                hop_gt_heads=post_fusion_hop_gt_heads,
+                hop_gt_k=post_fusion_hop_gt_k)
         if graph_lora:
             self.enable_graph_lora(graph_lora_layer_scope, graph_lora_targets,
                                    graph_lora_rank, fusion_d_gt)
@@ -1214,20 +1228,39 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             total = sum(len(v) for v in by_row.values())
         return torch.stack(losses).sum() / total
 
-    def enable_post_fusion(self, layer_scope: str, d_gt: int | None) -> None:
+    def enable_post_fusion(self, layer_scope: str, d_gt: int | None, *,
+                           hop_mode: str = "none", hop_k: int = 3,
+                           gain_init: float = 0.0, codebook_size: int = 256,
+                           hop_gt_layers: int = 3, hop_gt_heads: int = 8,
+                           hop_gt_k: int = 1) -> None:
         """Install the e17-A post-fusion pathway: gated residual Ψ injection.
 
-        At each in-scope decoder layer, node-token hidden states receive::
+        Classic mode (``hop_mode="none"``): at each in-scope decoder layer,
+        node-token hidden states receive::
 
             h[p] += tanh(pf_gain_l) · pf_norm(pf_proj(Ψ[node(p)]))
 
-        ``pf_gain`` is zero-initialised, so an enabled-but-untrained pathway is a
-        bitwise no-op — the SFT warm start's behaviour is unchanged at init. The
+        ``pf_gain`` starts at ``gain_init`` (default 0 — bitwise no-op, the SFT
+        warm start's behaviour is unchanged at init; e19 fresh runs start it
+        OPEN, the e17/e18 zero-init-gates-never-open lesson). The
         projection/norm are SHARED across layers (one per-layer scalar gain), so
         the added capacity stays ~d_gt·hidden. Positions are the QUERY-role
         injection-map spans — the same single definition of "graph token" the
         mask and identity-RoPE use. Callable post-hoc on a loaded checkpoint
         (the RL warm-start path) or from ``__init__`` (rebuilds/from-scratch).
+
+        Hop modes (e19 — hop-SEPARATED channels, ``docs/2026-08-23 e19`` note)::
+
+            h[p] += tanh(pf_gain_l) · Σ_k tanh(pf_ch_gain_k)
+                                        · pf_norm_k(pf_proj_k(Ψ_k[node(p)]))
+
+        with a per-CHANNEL projection/norm (separate matrices per hop — the
+        experiment's point) and the Ψ stack from :meth:`pf_psi`:
+
+        - ``"depth"``: channels are the shared pe_model GraphTransformer's
+          per-block taps (``forward_taps``; K = num_layers+1, no new tower);
+        - ``"shift"``: channels are a NO-R-PEARL :class:`gt.HopShiftPsi` tower's
+          output under graph-shift powers (K = hop_k+1).
         """
         if self._post_fusion:
             raise RuntimeError("post-fusion is already enabled on this model.")
@@ -1235,6 +1268,14 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             raise ValueError(
                 f"post_fusion_layer_scope must be one of {MASK_LAYER_SCOPES}, "
                 f"got {layer_scope!r}")
+        if hop_mode not in ("none", "shift", "depth"):
+            raise ValueError(
+                f"post_fusion_hop_mode must be 'none', 'shift' or 'depth', "
+                f"got {hop_mode!r}")
+        if hop_mode != "none" and self._pointer_fusion:
+            raise ValueError(
+                "post_fusion hop modes and pointer_fusion are not wired together "
+                "(they share the rollout ψ snapshot slot).")
         if not d_gt:
             raise ValueError(
                 "post_fusion_d_gt (the Ψ producer's output width, gnn.d_model) "
@@ -1242,19 +1283,45 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         hidden = self.llm.config.get_text_config().hidden_size
         device = next(self.llm.parameters()).device
         # fp32 like the tower (build_structural_mask contract); hooks cast per use.
-        self.pf_proj = nn.Linear(int(d_gt), hidden).float().to(device)
-        self.pf_norm = nn.RMSNorm(hidden).float().to(device)
+        if hop_mode == "none":
+            self.pf_proj = nn.Linear(int(d_gt), hidden).float().to(device)
+            self.pf_norm = nn.RMSNorm(hidden).float().to(device)
+        else:
+            if hop_mode == "depth":
+                if not hasattr(self.pe_model, "forward_taps"):
+                    raise ValueError(
+                        "post_fusion_hop_mode='depth' taps the pe_model's blocks; "
+                        f"{type(self.pe_model).__name__} has no forward_taps "
+                        "(legacy TwoStagePE / stub producers are not supported).")
+                n_ch = int(self.pe_model.num_layers) + 1
+            else:                                          # "shift"
+                from prism.models import gt as _gt_module
+                self.pf_hop_gt = _gt_module.HopShiftPsi(
+                    int(d_gt), num_layers=hop_gt_layers, heads=hop_gt_heads,
+                    k_gt=hop_gt_k, hop_k=hop_k,
+                    codebook_size=codebook_size).float().to(device)
+                n_ch = int(hop_k) + 1
+            self.pf_proj = nn.ModuleList(
+                [nn.Linear(int(d_gt), hidden) for _ in range(n_ch)]
+            ).float().to(device)
+            self.pf_norm = nn.ModuleList(
+                [nn.RMSNorm(hidden) for _ in range(n_ch)]).float().to(device)
+            self.pf_ch_gain = nn.Parameter(torch.full(
+                (n_ch,), float(gain_init), dtype=torch.float32, device=device))
         layers = self._decoder_layers()
         flags = resolve_mask_active_flags(layers, layer_scope)
         active_idx = [i for i, f in enumerate(flags) if f]
-        self.pf_gain = nn.Parameter(
-            torch.zeros(len(active_idx), dtype=torch.float32, device=device))
+        self.pf_gain = nn.Parameter(torch.full(
+            (len(active_idx),), float(gain_init), dtype=torch.float32,
+            device=device))
         self._pf_handles = []
         for slot, layer_i in enumerate(active_idx):
             self._pf_handles.append(layers[layer_i].register_forward_pre_hook(
                 self._make_pf_hook(slot), with_kwargs=True))
         self._pf_layer_scope = layer_scope
         self._pf_d_gt = int(d_gt)
+        self._pf_hop_mode = hop_mode
+        self.pf_out_features = hidden
         self._post_fusion = True
 
     def _make_pf_hook(self, slot: int):
@@ -1281,9 +1348,37 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             return args, {**kwargs, "hidden_states": hs}
         return hook
 
+    def pf_psi(self, g, permutation=None) -> torch.Tensor:
+        """The post-fusion pathway's node representation, fp32.
+
+        ``[N, d_gt]`` classic; ``[N, K, d_gt]`` in the e19 hop modes (``"depth"``:
+        pe_model block taps; ``"shift"``: the HopShiftPsi tower's shift stack).
+        The ONE producer every pf consumer goes through — build_pf_signal, both
+        decode injectors, and the RL rollout snapshot — so hop modes cannot
+        drift between prefill and decode.
+        """
+        mode = getattr(self, "_pf_hop_mode", "none")
+        if mode == "depth":
+            return self.pe_model.forward_taps(g, permutation=permutation).float()
+        if mode == "shift":
+            return self.pf_hop_gt(g, permutation=permutation).float()
+        return self.pe_model(g, permutation=permutation).float()
+
     def _pf_project(self, psi: torch.Tensor) -> torch.Tensor:
-        """``pf_norm(pf_proj(Ψ))`` in fp32; Ψ is ``[*, d_gt]``."""
-        return self.pf_norm(self.pf_proj(psi.float()))
+        """``pf_norm(pf_proj(Ψ))`` in fp32 → ``[*, hidden]``.
+
+        Classic: Ψ is ``[*, d_gt]``. Hop modes: Ψ is ``[*, K, d_gt]`` and each
+        channel goes through its OWN projection/norm, summed under the
+        per-channel ``tanh(pf_ch_gain)`` gates (hop-separated fusion, e19).
+        """
+        psi = psi.float()
+        if getattr(self, "_pf_hop_mode", "none") == "none":
+            return self.pf_norm(self.pf_proj(psi))
+        out = None
+        for k, (proj, norm) in enumerate(zip(self.pf_proj, self.pf_norm)):
+            term = torch.tanh(self.pf_ch_gain[k]) * norm(proj(psi[..., k, :]))
+            out = term if out is None else out + term
+        return out
 
     def build_pf_signal(self, seq_len, graphs, injection_maps, device,
                         permutation=None) -> torch.Tensor:
@@ -1293,7 +1388,7 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         projected Ψ of their node. The per-layer ``tanh(pf_gain)`` gate is applied
         at the hook, not here, so one signal serves every in-scope layer.
         """
-        hidden = self.pf_proj.out_features
+        hidden = self.pf_out_features
         sig = torch.zeros(len(injection_maps), seq_len, hidden,
                           device=device, dtype=torch.float32)
         # The loss forward runs under accelerate's bf16 autocast, which would
@@ -1306,7 +1401,7 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
                 pos = (tok2node >= 0).nonzero(as_tuple=True)[0]
                 if pos.numel() == 0:
                     continue
-                psi = self.pe_model(graphs[b], permutation=permutation).float()
+                psi = self.pf_psi(graphs[b], permutation=permutation)
                 vec = self._pf_project(psi).to(device)     # [N, hidden]
                 sig[b, pos] = vec[tok2node[pos]]
         return sig
@@ -1443,6 +1538,10 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         """
         if self._pointer_fusion:
             raise RuntimeError("pointer_fusion is already enabled on this model.")
+        if getattr(self, "_pf_hop_mode", "none") != "none":
+            raise ValueError(
+                "pointer_fusion and post_fusion hop modes are not wired together "
+                "(they share the rollout ψ snapshot slot).")
         if not d_gt:
             raise ValueError(
                 "fusion_d_gt (the Ψ producer's output width, gnn.d_model) "
@@ -1609,6 +1708,8 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         mods = []
         if self._post_fusion:
             mods += [self.pf_proj, self.pf_norm]
+            if getattr(self, "_pf_hop_mode", "none") == "shift":
+                mods.append(self.pf_hop_gt)
         if self._graph_lora:
             mods += [self.glora_gen]
         if self._pointer_fusion:
@@ -1627,6 +1728,8 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         params = []
         if self._post_fusion:
             params.append(self.pf_gain)
+            if getattr(self, "_pf_hop_mode", "none") != "none":
+                params.append(self.pf_ch_gain)
         if self._graph_lora:
             params += list(self.glora_B.values())
         if self._pointer_fusion:
@@ -3929,7 +4032,7 @@ class BatchedMaskDecodeInjector:
         if all(q < 0 for q in q_nodes):
             self.model._pf_decode_vec = None
             return
-        hidden = self.model.pf_proj.out_features
+        hidden = self.model.pf_out_features
         vec = torch.zeros(len(q_nodes), 1, hidden, dtype=torch.float32,
                           device=self.device)
         with torch.no_grad():
@@ -3977,12 +4080,12 @@ class MaskDecodeInjector:
         self.node_values = mask_node_values(model, pyg_graph, self.device,
                                             permutation=permutation)
         # Post-fusion: keep the raw Ψ rows so tagged decode steps can arm the
-        # residual vector with the SAME tower output the prefill signal used.
+        # residual vector with the SAME tower output the prefill signal used
+        # (pf_psi = classic Ψ or the e19 hop stack; _pf_project matches).
         self._pf_psi = None
         if getattr(model, "_post_fusion", False):
             with torch.no_grad():
-                self._pf_psi = model.pe_model(
-                    pyg_graph, permutation=permutation).float()
+                self._pf_psi = model.pf_psi(pyg_graph, permutation=permutation)
         # Pointer fusion (e17-E): arm Ψ + the prefill candidate set (fresh
         # starts at the last prompt position); per-step candidates in pre_hook.
         self._ptr_maps = None

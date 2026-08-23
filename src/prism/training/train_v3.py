@@ -307,6 +307,10 @@ def train_model(config: omegaconf.DictConfig):
             # so no result changed, but the hole is real). Record every switch.
             **({k: config.gnn[k] for k in (
                 "post_fusion", "post_fusion_layer_scope",
+                "post_fusion_hop_mode", "post_fusion_hop_k",
+                "post_fusion_gain_init", "post_fusion_codebook_size",
+                "post_fusion_hop_gt_layers", "post_fusion_hop_gt_heads",
+                "post_fusion_hop_gt_k",
                 "graph_lora", "graph_lora_rank", "graph_lora_targets",
                 "graph_lora_layer_scope", "pointer_fusion",
                 "cross_fusion", "cross_fusion_heads", "cross_fusion_dim",

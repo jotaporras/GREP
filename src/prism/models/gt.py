@@ -440,6 +440,133 @@ class GraphTransformer(nn.Module):
                 x = x * torch.tanh(self.output_gain).to(x.dtype)
         return x
 
+    def forward_taps(self, data, permutation=None) -> Tensor:
+        """Per-depth Ψ stack ``[N, num_layers+1, d_model]`` (e19 depth-mode channels).
+
+        Channel 0 is the R-PEARL PE (pre-blocks); channel ℓ is the output of
+        sparse-attention block ℓ, so channels are ordered by receptive-field depth
+        (k_gt hops per block). Pure-PE path only — the LAST channel is bitwise the
+        pure-PE ``forward(data)`` output (no output_gain there either), so a
+        consumer reading only the final tap sees exactly the classic Ψ.
+        """
+        if self.pe_pool != "pe":
+            raise ValueError(
+                "forward_taps requires pe_pool='pe': the probe stack of pe_pool='gt' "
+                "has no per-block node representation to tap before E_q.")
+        try:
+            device = next(self.parameters()).device
+        except StopIteration:
+            device = data.x.device
+        data.x = data.x.to(device)
+        data.edge_index = data.edge_index.to(device)
+        edge_index = data.edge_index
+        if permutation is not None:
+            edge_index = permutation.apply(edge_index, data.x.size(0), device=device)
+            pe_data = Data(x=data.x, edge_index=edge_index)
+            if getattr(data, "edge_weight", None) is not None:
+                pe_data.edge_weight = data.edge_weight
+        else:
+            pe_data = data
+        num_nodes = pe_data.x.size(0)
+        x = self.pe_model(pe_data)                                 # [N, d_model] fp32
+        if permutation is not None:
+            khop_edge_index = self._expand_edge_index(edge_index, num_nodes)
+        else:
+            if not hasattr(data, '_khop_edge_index'):
+                data._khop_edge_index = self._expand_edge_index(edge_index, num_nodes)
+            khop_edge_index = data._khop_edge_index
+        taps = [x]
+        for block in self.blocks:
+            if self.training and torch.is_grad_enabled():
+                x = checkpoint(block, x, khop_edge_index, use_reentrant=False)
+            else:
+                x = block(x, khop_edge_index)
+            taps.append(x)
+        return torch.stack(taps, dim=1)                            # [N, L+1, d_model]
+
+
+class HopShiftPsi(nn.Module):
+    """e19 V1 Ψ-stack producer: NO R-PEARL — a graph transformer over learned
+    codebook node features, its output stacked under powers of the graph shift.
+
+    ``forward(data) -> [N, hop_k+1, d_model]`` fp32:
+
+    - channel 0 = ``H`` = the block stack over codebook features (one learned
+      embedding per node INDEX — "random features": random at init, learnable
+      after; deterministic at eval, and a distinct ID per node, which is the
+      point for the sibling-identity failure),
+    - channel k = ``Ŝᵏ·H`` with ``Ŝ`` the row-normalised symmetrised adjacency
+      WITHOUT self-loops, so channel k is each node's k-shift neighbourhood
+      mixture, kept SEPARATE for the per-channel fusion matrices downstream.
+
+    Blocks attend over the ≤k_gt-hop edge set (k_gt=1 default keeps one hop per
+    block; the shift stack, not block depth, carries the hop separation).
+    """
+
+    def __init__(self, d_model: int, num_layers: int = 3, heads: int = 8,
+                 dropout: float = 0.1, k_gt: int = 1, hop_k: int = 3,
+                 codebook_size: int = 256):
+        super().__init__()
+        if hop_k < 1:
+            raise ValueError(f"hop_k must be >= 1, got {hop_k}")
+        self.d_model = d_model
+        self.hop_k = int(hop_k)
+        self.k_gt = int(k_gt)
+        self.codebook = nn.Embedding(codebook_size, d_model)
+        # Same normalize pattern as GraphTransformer: final block norm-free so the
+        # output magnitude survives for the downstream gates.
+        self.blocks = nn.ModuleList([
+            SparseTransformerBlock(d_model, heads=heads, dropout=dropout,
+                                   normalize=(i < num_layers - 1))
+            for i in range(num_layers)])
+
+    @torch.no_grad()
+    def _khop(self, edge_index: Tensor, num_nodes: int) -> Tensor:
+        """≤k_gt-hop attention edge set via sparse (A+I)^k (GraphTransformer's rule)."""
+        edge_idx_self, _ = add_self_loops(edge_index, num_nodes=num_nodes)
+        if self.k_gt <= 1:
+            return coalesce(edge_idx_self, num_nodes=num_nodes)
+        values = torch.ones(edge_idx_self.shape[1], device=edge_idx_self.device)
+        adj = torch.sparse_coo_tensor(
+            edge_idx_self, values, (num_nodes, num_nodes)).coalesce()
+        reachable = adj
+        for _ in range(self.k_gt - 1):
+            reachable = torch.sparse.mm(reachable, adj).coalesce()
+            reachable = torch.sparse_coo_tensor(
+                reachable.indices(),
+                torch.ones(reachable._nnz(), device=reachable.device),
+                reachable.shape).coalesce()
+        return coalesce(reachable.indices(), num_nodes=num_nodes)
+
+    def forward(self, data, permutation=None) -> Tensor:
+        device = next(self.parameters()).device
+        num_nodes = int(data.num_nodes if data.num_nodes is not None
+                        else data.x.size(0))
+        if num_nodes > self.codebook.num_embeddings:
+            raise ValueError(
+                f"graph has {num_nodes} nodes but the hop codebook holds only "
+                f"{self.codebook.num_embeddings} — raise gnn.post_fusion_codebook_size.")
+        edge_index = data.edge_index.to(device)
+        if permutation is not None:
+            edge_index = permutation.apply(edge_index, num_nodes, device=device)
+        sym = coalesce(torch.cat([edge_index, edge_index.flip(0)], dim=1),
+                       num_nodes=num_nodes)
+        x = self.codebook(torch.arange(num_nodes, device=device)).float()
+        khop = self._khop(sym, num_nodes)
+        for block in self.blocks:
+            if self.training and torch.is_grad_enabled():
+                x = checkpoint(block, x, khop, use_reentrant=False)
+            else:
+                x = block(x, khop)
+        # Ŝ dense (graph nodes only, N ≈ tens): row-normalised, no self-loops.
+        A = torch.zeros(num_nodes, num_nodes, device=device, dtype=torch.float32)
+        A[sym[0], sym[1]] = 1.0
+        A = A / A.sum(dim=1, keepdim=True).clamp(min=1.0)
+        taps = [x]
+        for _ in range(self.hop_k):
+            taps.append(A @ taps[-1])
+        return torch.stack(taps, dim=1)                        # [N, hop_k+1, d_model]
+
 
 class SemanticGraphTransformer(nn.Module):
     """Graph Transformer over semantic node features — NO R-PEARL, no random probes.
