@@ -70,14 +70,17 @@ injection-map positions, same decode injectors):
 
 ## Fleet (up to 3 runs per variant, betty dgx-b200, ~4–8 h each)
 
-| arm | base | pf config |
-|---|---|---|
-| `hop_shift`       | mask_a        | shift, K=3 (4 ch), gain_init 1.0 |
-| `hop_shift_k5`    | mask_a        | shift, K=5 (6 ch), gain_init 1.0 |
-| `hop_shift_bind`  | mask_a_bind   | shift, K=3, gain_init 1.0 |
-| `hop_depth`       | mask_a        | depth (4 ch: PE + 3 blocks), gain_init 1.0 |
-| `hop_depth_bind`  | mask_a_bind   | depth, gain_init 1.0 |
-| `hop_depth_gain3` | mask_a        | depth, gain_init 3.0 (gain-sensitivity arm) |
+| arm | base | pf config | job (2026-08-23) |
+|---|---|---|---|
+| `hop_shift`       | mask_a        | shift, K=3 (4 ch), gain_init 1.0 | 7817490 |
+| `hop_shift_k5`    | mask_a        | shift, K=5 (6 ch), gain_init 1.0 | 7817491 |
+| `hop_shift_bind`  | mask_a_bind   | shift, K=3, gain_init 1.0 | 7817492 |
+| `hop_depth`       | mask_a        | depth (4 ch: PE + 3 blocks), gain_init 1.0 | 7817493 |
+| `hop_depth_bind`  | mask_a_bind   | depth, gain_init 1.0 | 7817494 |
+| `hop_depth_gain3` | mask_a        | depth, gain_init 3.0 (gain-sensitivity arm) | 7817495 |
+
+Submitted at commit `bad6f16` (tests: 21 hop/pf + 47 mask/e18 + 14 pointer/RoPE
+all green on the betty login node).
 
 Submit: `ARM=hop_shift sbatch scripts/e19_n60_sft.sbatch` (defaults: n60_v3 split,
 3 epochs, per-epoch built-in eval, probe on 3 test graphs, tag `e19_hopfusion`,
