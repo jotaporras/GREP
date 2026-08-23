@@ -205,3 +205,28 @@ path/probe metrics, which pool hundreds of events per arm.
 * The reload harness and the built-in harness disagree by up to 9 points on the
   same weights (cn7ub88q); I used both here and report which is which, but the
   field still lacks a single canonical n60 number per checkpoint.
+
+## Addendum (2026-08-23) — the e17 no-ICL rerun resolves proposals 5 and the 14-point gap
+
+The 08-22 e17 suite (Addendum 2 of `docs/2026-08-19 e17_analysis_n60.md`, jobs
+7771539–64) evaluated cn7ub88q's checkpoint **through the post-refactor code**
+(cfbb3cf) and scored 63.1 % (53/84) — squarely in its expected band, not ~56.
+That answers proposal 5 without a dedicated job: the refactored mask forward
+computes the same function for a pre-refactor checkpoint, so the 14-point
+built-in gap is not a code regression. Paired per task on the same 84
+(reload-level evals; cn7ub88q's is the 4-bit scalability harness, ours bf16
+in-process):
+
+* cn7ub88q 53/84 vs fresh control 45/84 — 16 W / 8 L, **p = .152**
+* cn7ub88q 53/84 vs mask_a 49/84 — 18 W / 14 L, **p = .597**
+
+So neither fresh run is statistically distinguishable from the best e17 control
+at the reload level; the "gap" was cn7ub88q's built-in 72.6 sitting at the top
+of the ±10-point band. This retires two "unsure" items above (bit-equivalence;
+variance vs regression) and leaves the substantive conclusions unchanged:
+A ties on accuracy, halves hallucinated edges, and the open failure is
+sibling/set identity. Two e17 numbers worth carrying forward: the text-edges
+ceiling is 97.6 % no-ICL on n60 (the latent channel is ~35–45 points below a
+solvable task), and n60_v3-trained RL (rw7eg7b6, 41.7→60.7) remains the one
+real RL gain — RL on top of an e18 SFT winner is a live option, but only where
+the SFT init leaves headroom.
