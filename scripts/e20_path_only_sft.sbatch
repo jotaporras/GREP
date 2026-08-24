@@ -48,16 +48,24 @@ DATASET="${DATASET:?set DATASET=pathonly|oracle}"
 case "$DATASET" in
   pathonly) DATA_SPLIT=${DATA_SPLIT:-$PROJ/data/n_60_pathonly_v1/gen/nav_n60_gemma_data/split} ;;
   oracle)   DATA_SPLIT=${DATA_SPLIT:-$PROJ/data/n_60_oracle_v1/gen/nav_n60_gemma_data/split} ;;
-  *) echo "unknown DATASET=$DATASET (pathonly|oracle)"; exit 2 ;;
+  # CONTROL cell: the ORIGINAL v3 reasoning corpus. Pair with
+  # RESPONSE_FORMAT=think_route to reproduce the e19 regime inside this exact
+  # harness — the missing arm of the 2x2 (corpus x response_format) needed to
+  # tell "route_only unlocked the baseline" from "the baseline always won".
+  v3)       DATA_SPLIT=${DATA_SPLIT:-$PROJ/data/n_60_vllm_v3/gen/nav_n60_gemma_data/split} ;;
+  *) echo "unknown DATASET=$DATASET (pathonly|oracle|v3)"; exit 2 ;;
 esac
 # Comparable eval: ALWAYS the frozen n60_v3 test graphs (same 7 graphs / 84
 # questions as e18/e19), regardless of which corpus trains the run.
 EVAL_GRAPHS=${EVAL_GRAPHS:-$PROJ/data/n_60_vllm_v3/gen/nav_n60_gemma_data/split/test_graphs}
 
 MAX_STEPS=${MAX_STEPS:--1}
-RUN_NAME=${RUN_NAME:-e20_${DATASET}_${ARM}}
+RESPONSE_FORMAT=${RESPONSE_FORMAT:-route_only}
+RUN_NAME=${RUN_NAME:-e20_${DATASET}_${ARM}_${RESPONSE_FORMAT}}
 TAG=${TAG:-e20_path_only_pred}
 EVAL_EPOCH_INTERVAL=${EVAL_EPOCH_INTERVAL:-1}
+# route_only (default, e20) | think_route (the e19/historical format).
+case "$RESPONSE_FORMAT" in route_only|think_route) ;; *) echo "unknown RESPONSE_FORMAT=$RESPONSE_FORMAT"; exit 2 ;; esac
 
 export WANDB_ENTITY=${WANDB_ENTITY:-alelab}
 export HF_HOME=${HF_HOME:-$ALELAB/hf_cache}
@@ -92,7 +100,7 @@ srun python -m prism.training.train_v3 \
     data.train_files="$DATA_SPLIT/formatted_all_new__train.json" \
     data.val_files="$DATA_SPLIT/formatted_all_new__val.json" \
     data.edge_weights=binary \
-    data.response_format=route_only \
+    data.response_format="$RESPONSE_FORMAT" \
     data.spine_tools=none data.icl_examples=0 \
     trainer.freeze_lora=false trainer.freeze_pe=false \
     trainer.learning_rate=0.00025 trainer.epochs=3 trainer.max_steps="$MAX_STEPS" \
