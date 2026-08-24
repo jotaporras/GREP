@@ -827,7 +827,8 @@ def extract_route(text: str) -> Optional[str]:
 
 
 def _format_assistant(
-    assistant_content: str, include_tools: bool, route_only: bool = False
+    assistant_content: str, include_tools: bool, route_only: bool = False,
+    strict_route: bool = True,
 ) -> str:
     """Render the assistant JSON answer as the compact target content.
 
@@ -846,17 +847,35 @@ def _format_assistant(
     ``route_only=True`` (e20 path-only) renders NO think block at all: the target is
     the bare arrow route alone, extracted from the unwrapped plan (longest arrow
     chain, so an ``answer(...)`` whose argument is prose containing the route still
-    yields a clean ``a -> b -> c``). A rollout with no extractable route raises
-    RuntimeError — deliberately NOT one of the exception types
-    ``spine_to_compact_messages`` tolerates, so a target that cannot be converted
-    fails the run loudly instead of silently training on scaffolding.
+    yields a clean ``a -> b -> c``).
+
+    ``strict_route`` selects what happens when no route can be extracted, and the
+    two callers genuinely need opposite behaviour:
+
+    * ``True`` (default — the TRAINING/preprocess path): raise RuntimeError.
+      Deliberately NOT one of the exception types ``spine_to_compact_messages``
+      tolerates, so a corpus target that cannot be converted fails the run loudly
+      instead of silently training on scaffolding.
+    * ``False`` (the LIVE INFERENCE path): return the unwrapped plan verbatim.
+      Here the assistant turns are the MODEL'S OWN prior outputs, re-rendered to
+      build the next prompt. A degenerate answer such as ``[answer(kitchen_1)]``
+      (a single node, no arrow) is a WRONG ANSWER, not a corrupt dataset —
+      raising would abort the whole eval sample mid-rollout and score it False
+      before SPINE could re-query, which both loses the model's chance to
+      self-correct and biases the arm under test downward. Observed in e20a: 8 of
+      84 samples crashed this way in the epoch-1 eval, zero by epoch 3 once the
+      model had learned the format.
     """
     # strict=False tolerates literal control chars inside JSON strings, matching
     # SPINE's own try_parse (some rollouts embed raw newlines/tabs in reasoning).
     answer = json.loads(_strip_code_fence(assistant_content), strict=False)
     if route_only:
-        route = extract_route(_unwrap_plan(_as_text(answer["plan"])))
+        unwrapped = _unwrap_plan(_as_text(answer["plan"]))
+        route = extract_route(unwrapped)
         if route is None:
+            if not strict_route:
+                # Live inference: the model's own malformed answer, kept verbatim.
+                return unwrapped
             raise RuntimeError(
                 "route_only target has no extractable 'a -> b' route in its plan: "
                 f"{_as_text(answer['plan'])[:200]!r}"
@@ -940,6 +959,7 @@ def spine_to_compact_messages(
     include_tools: bool,
     icl_examples: int,
     route_only: bool = False,
+    strict_route: bool = True,
 ) -> List[Dict[str, str]]:
     """FORWARD translator: a SPINE ``messages`` list -> compact ``messages``.
 
@@ -1037,7 +1057,8 @@ def spine_to_compact_messages(
         content = m.get("content", "")
         try:
             content = _format_assistant(content, include_tools=include_tools,
-                                        route_only=route_only)
+                                        route_only=route_only,
+                                        strict_route=strict_route)
         except (json.JSONDecodeError, KeyError, TypeError, AttributeError, ValueError):
             pass  # not a parseable 4-key SPINE answer — keep the turn verbatim
         out.append({"role": "assistant", "content": content})

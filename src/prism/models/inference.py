@@ -121,7 +121,10 @@ class InMemoryLLM(spine_models.InMemoryLLM):
         llm_msg = compact_prompt.spine_to_compact_messages(
             msg, include_edges=self.include_edges, include_tools=self.include_tools,
             icl_examples=self.icl_examples,
-            route_only=(self.response_format == "route_only"))
+            route_only=(self.response_format == "route_only"),
+            # Live rollout: assistant turns are the model's OWN prior outputs, so a
+            # malformed answer must grade as wrong, not abort the eval sample.
+            strict_route=False)
         input = self.tokenizer.apply_chat_template(
             llm_msg, tokenize=True, add_generation_prompt=True, return_tensors="pt"
         )
@@ -194,7 +197,10 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
         llm_msg = compact_prompt.spine_to_compact_messages(
             msg, include_edges=self.include_edges, include_tools=self.include_tools,
             icl_examples=self.icl_examples,
-            route_only=(self.response_format == "route_only"))
+            route_only=(self.response_format == "route_only"),
+            # Live rollout: assistant turns are the model's OWN prior outputs, so a
+            # malformed answer must grade as wrong, not abort the eval sample.
+            strict_route=False)
 
         input = self.tokenizer.apply_chat_template(
             llm_msg, tokenize=True, add_generation_prompt=True, return_tensors="pt"

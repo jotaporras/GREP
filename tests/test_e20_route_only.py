@@ -118,6 +118,30 @@ class TestRouteOnlyTargets:
         with pytest.raises(RuntimeError):
             compact_prompt._format_assistant(bad, include_tools=False, route_only=True)
 
+    def test_strict_route_false_keeps_malformed_answer_verbatim(self):
+        # Live-inference seam: the model's own degenerate answer (e.g. a bare
+        # single node — no "a -> b" route) must re-render as-is and grade
+        # wrong, NOT abort the eval sample (e20 epoch-1 crash bug).
+        bad = json.dumps({"primary_goal": "g", "relevant_graph": "",
+                          "reasoning": "", "plan": "[answer(ship_berth_1)]"})
+        out = compact_prompt._format_assistant(
+            bad, include_tools=False, route_only=True, strict_route=False)
+        assert out == "ship_berth_1"
+
+    def test_strict_route_default_is_loud(self):
+        # Training/preprocess callers that do not pass strict_route keep the
+        # fail-loud contract: a corrupt dataset must never be silently kept.
+        bad = json.dumps({"primary_goal": "g", "relevant_graph": "",
+                          "reasoning": "", "plan": "[answer(ship_berth_1)]"})
+        with pytest.raises(RuntimeError):
+            compact_prompt._format_assistant(bad, include_tools=False, route_only=True)
+
+    def test_strict_route_false_still_extracts_good_routes(self):
+        out = compact_prompt._format_assistant(
+            _rollout()[-1]["content"], include_tools=False, route_only=True,
+            strict_route=False)
+        assert out == "kitchen_1 -> hall_2 -> lab_3"
+
     def test_training_messages_route_only(self):
         msgs = compact_prompt.format_training_messages(
             _rollout(), include_edges=True, include_tools=False, route_only=True)
