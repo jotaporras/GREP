@@ -31,7 +31,9 @@ cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/..}"
 
 ALELAB=/vast/projects/aribeiro/alelab/jporras
 PROJ=$ALELAB/GREP-PRISM
-ENV_NAME=${ENV_NAME:-$ALELAB/envs/GREP-PRISM-v3}
+# GREP-PRISM-vllm, not -v3: the rollout backend needs vllm (same env the v3
+# corpus generation used).
+ENV_NAME=${ENV_NAME:-$ALELAB/envs/GREP-PRISM-vllm}
 
 SRC=${SRC:-$PROJ/data/n_60_vllm_v3/gen/nav_n60_gemma_data}
 OUT=${OUT:-$PROJ/data/n_60_spine_v1/gen/nav_n60_spine_data}
@@ -45,6 +47,8 @@ MAX_GRAPHS_ARGS=()
 [ -n "$MAX_GRAPHS" ] && MAX_GRAPHS_ARGS=(--max-graphs "$MAX_GRAPHS")
 
 export PRISM_LLM_BACKEND=vllm
+# Compute nodes have no nvcc; flashinfer's JIT sampler dies on CUDA_HOME.
+export VLLM_USE_FLASHINFER_SAMPLER=0
 export PRISM_HF_MODEL=${PRISM_HF_MODEL:-google/gemma-4-31B-it}
 export PRISM_VLLM_MAX_LEN=${PRISM_VLLM_MAX_LEN:-32768}
 export HF_HOME=${HF_HOME:-$ALELAB/hf_cache}
