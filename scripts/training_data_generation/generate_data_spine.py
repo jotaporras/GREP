@@ -223,6 +223,17 @@ if __name__ == "__main__":
         default=2,
         help="Fake shortcut edges added per corrupted rollout (default 2).",
     )
+    parser.add_argument(
+        "--nav-walk-directive",
+        action="store_true",
+        help=(
+            "Append a 'physically navigate with goto before answering' "
+            "directive to nav-task prompts in SPINE rollouts. Without it the "
+            "teacher answers route tasks straight from the graph text with "
+            "zero tool calls, so no tool trajectories (or rejection-recovery "
+            "turns) are generated. SPINE rollout mode only."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -234,6 +245,9 @@ if __name__ == "__main__":
                      "--path-only/--oracle-paths modes — drop one of them")
     if args.path_only_thinking and not args.path_only:
         parser.error("--path-only-thinking requires --path-only")
+    if args.nav_walk_directive and (args.path_only or args.oracle_paths):
+        parser.error("--nav-walk-directive is a SPINE-rollout knob; it has no "
+                     "effect in --path-only/--oracle-paths modes")
     rollout_mode = (
         "path_only" if args.path_only
         else "oracle" if args.oracle_paths
@@ -263,6 +277,7 @@ if __name__ == "__main__":
         n_longhop_tasks=args.n_longhop_tasks,
         fake_edge_frac=args.fake_edge_frac,
         fake_edges_n=args.fake_edges_n,
+        nav_walk_directive=args.nav_walk_directive,
     )
 
     if args.skip_populate:

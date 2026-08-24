@@ -242,11 +242,20 @@ class GraphSim:
             self.have_updates = True
 
         elif action == "goto":
+            # SPINE semantics (per the ICL prompt): goto(target) runs a graph
+            # search over the agent's OBSERVED map and the robot follows that
+            # route until an edge turns out not to exist in the true graph.
+            # Success reports the traversed route (grounded pathfinding is the
+            # tool's contribution); failure stops the robot at the last node
+            # actually reached, retracts the bogus edge from the observed map,
+            # and interrupts the plan so the planner replans from there.
             location = argument
             if _goto_ratify_disabled():
                 self.updator.update(location_updates=[location])
                 self.partial_graph.update_location(location)
             else:
+                import networkx as nx
+
                 here = self.partial_graph.current_location
                 if location == here:
                     pass  # already there — silent no-op, plan continues
@@ -256,23 +265,48 @@ class GraphSim:
                         f"{location} exists. You are still at {here}. Replan "
                         f"using only regions and edges that exist."])
                     self.have_updates = True
-                elif not self.graph.graph.has_edge(here, location):
-                    # Correct the observed map too: if the agent believed this
-                    # edge existed (e.g. a corrupted/hallucinated shortcut),
-                    # retract it with the update grammar the prompts teach.
-                    if self.partial_graph.graph.has_edge(here, location):
-                        self.partial_graph.graph.remove_edge(here, location)
-                        self.updator.update(
-                            removed_connections=[[here, location]])
-                    self.updator.update(freeform_updates=[
-                        f"goto({location}) rejected: there is no edge between "
-                        f"{here} and {location}. You are still at {here}. "
-                        f"Your route is invalid — replan from {here} using "
-                        f"only edges that exist."])
-                    self.have_updates = True
                 else:
-                    self.updator.update(location_updates=[location])
-                    self.partial_graph.update_location(location)
+                    try:
+                        bpath = nx.shortest_path(
+                            self.partial_graph.graph, here, location)
+                    except (nx.NetworkXNoPath, nx.NodeNotFound):
+                        bpath = None
+                        self.updator.update(freeform_updates=[
+                            f"goto({location}) rejected: your map has no "
+                            f"route from {here} to {location}. You are still "
+                            f"at {here}."])
+                        self.have_updates = True
+                    if bpath is not None:
+                        reached, failed = bpath[0], None
+                        for a, b in zip(bpath, bpath[1:]):
+                            if self.graph.graph.has_edge(a, b):
+                                reached = b
+                            else:
+                                failed = (a, b)
+                                break
+                        if failed is None:
+                            self.partial_graph.update_location(location)
+                            self.updator.update(location_updates=[location])
+                            if len(bpath) > 2:
+                                self.updator.update(freeform_updates=[
+                                    f"goto({location}): traversed "
+                                    + " -> ".join(bpath) + "."])
+                        else:
+                            a, b = failed
+                            # Correct the observed map: the believed edge
+                            # (e.g. a corrupted/hallucinated shortcut) is
+                            # retracted with the update grammar the prompts
+                            # teach.
+                            self.partial_graph.graph.remove_edge(a, b)
+                            self.updator.update(removed_connections=[[a, b]])
+                            self.partial_graph.update_location(reached)
+                            self.updator.update(location_updates=[reached])
+                            self.updator.update(freeform_updates=[
+                                f"goto({location}) failed en route: there is "
+                                f"no edge between {a} and {b}. You are now at "
+                                f"{reached}. Replan from {reached} using only "
+                                f"edges that exist."])
+                            self.have_updates = True
 
         # Valid routes are goto-chains, so the repeat-action nag (meant for
         # explore spam) would fire on every step of a normal route once

@@ -91,6 +91,7 @@ class DataGenerator:
         n_longhop_tasks: int = 0,
         fake_edge_frac: float = 0.0,
         fake_edges_n: int = 2,
+        nav_walk_directive: bool = False,
     ):
         self.unknown_pcts = graph_unknown
         self.task_proportions = task_proportions
@@ -102,6 +103,12 @@ class DataGenerator:
         # turns. Seeded per (seed, graph, task) so resume reruns are stable.
         self.fake_edge_frac = fake_edge_frac
         self.fake_edges_n = fake_edges_n
+        # Route tasks are otherwise answered straight from the graph text
+        # without any tool call (smoke2 7827252: every corrupted rollout
+        # answered with the fake shortcut, zero goto executed). The directive
+        # makes the teacher walk the route first, so tool trajectories — and
+        # rejection-recovery turns on corrupted maps — actually happen.
+        self.nav_walk_directive = nav_walk_directive
         self._seed_base = 0 if seed is None else seed
         self.rng = np.random.default_rng(seed)
         self.context_gen = graph_gen.TaskGraphGen()
@@ -433,6 +440,17 @@ class DataGenerator:
             graph_data_gen = graph_sim.GraphSim(graph_handle)
             unknown_pct = self.unknown_pcts[task_idx % len(self.unknown_pcts)]
             graph_data_gen.randomly_remove_nodes(pct=unknown_pct)
+            route_str = None
+            if self.fake_edge_frac > 0 or self.nav_walk_directive:
+                route_str, _reason = self._oracle_route(graph, task_entry)
+            if self.nav_walk_directive and route_str:
+                # Nav task: without this the teacher answers the route straight
+                # from the graph text with zero tool calls (see __init__ note).
+                task = (
+                    f"{task} First physically navigate to the destination "
+                    "using goto (the robot walks your route and reports what "
+                    "actually happens), then answer with the route you "
+                    "traversed.")
             if self.fake_edge_frac > 0:
                 fe_rng = np.random.default_rng(
                     [self._seed_base, idx, task_idx])
@@ -443,7 +461,6 @@ class DataGenerator:
                     # takes the bait and no recovery turn happens (smoke
                     # 7826590: 1 rejection / 11 corrupted rollouts).
                     preferred = []
-                    route_str, _reason = self._oracle_route(graph, task_entry)
                     if route_str:
                         route = route_str.split(" -> ")
                         preferred = [(route[i], route[i + 2])

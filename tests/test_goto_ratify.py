@@ -1,14 +1,18 @@
 """e19 SPINE closed loop: goto path ratification + per-turn have_updates.
 
-Invariants locked here:
+Invariants locked here (SPINE goto semantics: graph search over the OBSERVED
+map, robot follows the route until an edge is missing in the true graph):
 
-- A goto over an edge that EXISTS is silent: no update, no interruption, the
-  location advances (route chains execute in one turn, as before).
-- A goto over an edge that does NOT exist in the ground-truth graph is
-  REJECTED: the agent stays put, corrective feedback lands in the updator, and
-  ``have_updates`` interrupts the plan so the model gets a replan turn.
-- goto to an unknown region is rejected the same way; goto to the current
-  location is a silent no-op.
+- A goto whose believed route exists in the true graph is silent: no
+  interruption, the location advances; a multi-hop goto also reports the
+  traversed route (grounded pathfinding is the tool's contribution).
+- A goto whose believed route uses an edge that does NOT exist in the
+  ground-truth graph FAILS at that edge: the robot stops at the last node it
+  reached, the bogus edge is retracted from the observed map, corrective
+  feedback lands in the updator, and ``have_updates`` interrupts the plan so
+  the model gets a replan turn.
+- goto to an unknown region, or with no route in the observed map, is rejected
+  outright; goto to the current location is a silent no-op.
 - ``PRISM_GOTO_RATIFY=0`` restores the legacy (teleporting) behavior.
 - The repeat-action nag never fires for goto while ratifying (valid routes ARE
   goto-chains).
@@ -44,13 +48,34 @@ def test_valid_goto_chain_is_silent_and_advances():
     assert "rejected" not in sim.get_updator().form_updates()
 
 
-def test_invalid_goto_is_rejected_and_interrupts():
+def test_multihop_goto_walks_true_path_and_reports_traversal():
     sim = make_graph_sim()
+    assert sim.take_action("goto", "field_3") is False
+    assert sim.partial_graph.current_location == "field_3"
+    feedback = sim.get_updator().form_updates()
+    assert "traversed field_1 -> field_2 -> field_3" in feedback
+    assert "rejected" not in feedback and "failed" not in feedback
+
+
+def test_goto_over_fake_edge_fails_en_route_and_interrupts():
+    import numpy as np
+    sim = make_graph_sim()
+    sim.corrupt_with_fake_edges(1, np.random.default_rng(0))  # fake f1--f3
+    assert sim.take_action("goto", "field_3") is True
+    # believed shortest path used the fake direct edge; robot never left f1
+    assert sim.partial_graph.current_location == INIT_NODE
+    assert not sim.partial_graph.graph.has_edge("field_1", "field_3")
+    feedback = sim.get_updator().form_updates()
+    assert "failed en route" in feedback
+    assert "field_1" in feedback and "field_3" in feedback
+
+
+def test_goto_with_no_route_in_map_is_rejected():
+    sim = make_graph_sim()
+    sim.partial_graph.graph.remove_edge("field_1", "field_2")
     assert sim.take_action("goto", "field_3") is True
     assert sim.partial_graph.current_location == INIT_NODE
-    feedback = sim.get_updator().form_updates()
-    assert "rejected" in feedback
-    assert "field_1" in feedback and "field_3" in feedback
+    assert "no route" in sim.get_updator().form_updates()
 
 
 def test_unknown_region_is_rejected():
@@ -125,7 +150,7 @@ def test_rejected_goto_retracts_fake_edge_from_observed_map():
     assert not sim.partial_graph.graph.has_edge("field_1", "field_3")
     feedback = sim.get_updator().form_updates()
     assert "remove_connections" in feedback
-    assert "rejected" in feedback
+    assert "failed en route" in feedback
 
 
 class _ScriptedClient:
@@ -148,9 +173,14 @@ def _spine_json(plan):
 
 
 def test_run_planning_rejection_then_recovery():
+    import numpy as np
     sim = make_graph_sim()
+    # corrupt the observed map with the fake field_1--field_3 shortcut so the
+    # first believed route fails en route (an uncorrupted multi-hop goto now
+    # simply walks the true path)
+    sim.corrupt_with_fake_edges(1, np.random.default_rng(0))
     client = _ScriptedClient([
-        # hallucinated shortcut: field_1 -> field_3 has no edge
+        # believed shortcut: the fake direct field_1 -> field_3 edge
         _spine_json(["goto(field_3)", "answer(field_1 -> field_3)"]),
         # corrected route after the rejection feedback
         _spine_json(["goto(field_2)", "goto(field_3)",
@@ -163,9 +193,9 @@ def test_run_planning_rejection_then_recovery():
 
     assert result.terminated_by == "answer"
     assert len(result.trace) == 2
-    # turn 1 broke at the rejected goto, before reaching answer
+    # turn 1 broke at the failed goto, before reaching answer
     assert result.trace[0].actions_executed == [("goto", "field_3")]
-    assert "rejected" in result.trace[1].planner_input
+    assert "failed en route" in result.trace[1].planner_input
     # per-turn have_updates reset: turn 2 executed its FULL corrected plan
     assert [a for a, _ in result.trace[1].actions_executed] == [
         "goto", "goto", "answer"]

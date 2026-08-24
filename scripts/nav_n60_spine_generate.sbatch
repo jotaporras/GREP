@@ -69,6 +69,7 @@ python scripts/training_data_generation/generate_data_spine.py \
     --rollout-workers "$ROLLOUT_WORKERS" \
     --fake-edge-frac "$FAKE_EDGE_FRAC" \
     --fake-edges-n "$FAKE_EDGES_N" \
+    --nav-walk-directive \
     --seed "$GEN_SEED" \
     ${MAX_GRAPHS_ARGS[@]+"${MAX_GRAPHS_ARGS[@]}"}
 
