@@ -111,3 +111,41 @@ train_config.json (train_v3 passthrough) and load-bearing at eval rebuild
 - If shift ≈ depth ≈ mask_a everywhere → hop separation is not the binding
   constraint; fold e19 into the e18 conclusion and proceed to the closed-loop
   SPINE stage on the best existing arm.
+
+## 2026-08-24 — v1 → v2, sweep, results, replication wave
+
+**v1 fleet (7817653-59) killed ~step 300** (user request): open gates + unit
+RMSNorm pinned the write at unit RMS → loss stalled ~0.49 EMA vs mask_a 0.16.
+**v2 = ControlNet-style init** (commit 9d52836): gates stay OPEN, `pf_norm`
+scales ZERO-init → bitwise no-op at step 0 (verified: step-0 loss 0.274-0.285 =
+mask_a 0.27), full-strength grad to the scale. v2 fleet **7822640-45**
+(`e19_n60_<arm>_v2`): hop_shift 42o7anmc · hop_shift_k5 · hop_shift_bind
+xwwqep8a · hop_depth · hop_depth_bind · hop_depth_gain3.
+
+**mask_a hparam sweep** (9 runs, tag `e19_mask_a_sweep`, commit f8c9fb2/ac71ac0):
+7822668/69 seed replicas · 70 lr_low · 79 lr_high · 80 slr_005 · 81 slr_02 ·
+82 alpha_03 · 84 dg_6 · 7823159 scope_top_half. **All 8 six-hour jobs TIMEOUT
+mid-epoch-3** (6h wall clock + node contention; solo runs take ~4h15) — ep1/ep2
+evals + last checkpoints exist, no ep3 evals/probes except scope_top_half
+(completed, final 50.0%). Ep2 ranking: slr_005 66.7% > slr_02 64.3% >
+replicas ~54.8%; lr_high 60.7% at ep1.
+
+**Built-in eval results (84 questions, 7 test graphs):** hop_depth **73.8%
+final** (ties the cn7ub88q built-in record 72.6%); hop_shift 73.8% ep2 →
+**60.7% final**, halluc 0.00-0.04/file (record low); baseline replicas ~54.8%,
+9a6lwgfj final 56.0%. Probe (hop_depth vs mask_a): sibling_err/query
+0.375 vs 0.507, halluc/query 1.326 vs 1.715, first_ok 0.979 =. Bind arms dead
+again (binding_loss ~0.89 plateau, eval_loss 0.467). pf_norm_scale ~0.003 —
+channels open barely yet the deltas are real; attribution needs the post-load
+harness (pending).
+
+**Replication wave (the one authorized overnight launch, jobs 7825460-65,
+commit fdd9a24):** hop_depth s17 / s1031, hop_shift s17 / s1031,
+hop_depth×slr0.05, hop_shift×slr0.05 — SEED/SLR knobs added to
+`e19_n60_sft.sbatch`, wall clock 10h. Purpose: is hop_depth 73.8% real or the
+top of the ±10 pt band, and does the sweep's best knob (slr_005) stack with
+hop channels? Monitor bkkan13g9.
+
+**TODO (morning):** post-load scalability evals on hop_depth/hop_shift/mask_a
+checkpoints (canonical harness); rescue ep3 evals+probes for the 8 timed-out
+sweep arms from their last checkpoints if the knob ranking matters.
