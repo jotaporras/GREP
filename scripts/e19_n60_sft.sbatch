@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=e19-n60
 #SBATCH --output=/vast/projects/aribeiro/alelab/jporras/GREP-PRISM/slurm-%x-%j.out
-#SBATCH --time=08:00:00
+#SBATCH --time=10:00:00
 #SBATCH --partition=dgx-b200
 #SBATCH --gpus=1
 # betty's SLURM cli_filter (2026-08-03) enforces EXACTLY 28 CPUs / 224 GB per
@@ -19,6 +19,12 @@
 #
 #   ARM=hop_shift | hop_shift_k5 | hop_shift_bind        V1 (no-R-PEARL codebook GT)
 #   ARM=hop_depth | hop_depth_bind | hop_depth_gain3     V2 (shared-GT block taps)
+#
+# Optional replication knobs (e19 second wave, 2026-08-24):
+#   SEED=17       -> +trainer.sft.seed=17 (base seed is train_v3's hard-coded
+#                    3407; trainer.sft dict overrides SFTConfig kwargs)
+#   SLR=0.05      -> swaps gnn.structural_lr_mult=0.012 in place (the mask_a
+#                    literal from e18_arms.sh — keep patterns in sync)
 #
 # Submit:  ARM=hop_shift sbatch scripts/e19_n60_sft.sbatch
 
@@ -61,13 +67,18 @@ source scripts/e18_arms.sh          # cwd is the repo root (cd above)
 source scripts/e19_arms.sh
 e19_arm_args "$ARM"
 
-echo "[$(date --iso-8601=seconds)] $RUN_NAME arm=$ARM data=$DATA_SPLIT max_steps=$MAX_STEPS tag=$TAG"
+SEED_ARGS=()
+[ -n "${SEED:-}" ] && SEED_ARGS=(+trainer.sft.seed="$SEED")
+[ -n "${SLR:-}" ] && ARM_ARGS=("${ARM_ARGS[@]/gnn.structural_lr_mult=0.012/gnn.structural_lr_mult=$SLR}")
+
+echo "[$(date --iso-8601=seconds)] $RUN_NAME arm=$ARM seed=${SEED:-3407} slr=${SLR:-0.012} data=$DATA_SPLIT max_steps=$MAX_STEPS tag=$TAG"
 echo "=== python: $(which python) ==="
 
 srun python -m prism.training.train_v3 \
     --config-name=e9_base_config \
     model.path="google/gemma-4-31B-it" \
     "${ARM_ARGS[@]}" \
+    ${SEED_ARGS[@]+"${SEED_ARGS[@]}"} \
     data.train_files="$DATA_SPLIT/formatted_all_new__train.json" \
     data.val_files="$DATA_SPLIT/formatted_all_new__val.json" \
     data.edge_weights=binary \
