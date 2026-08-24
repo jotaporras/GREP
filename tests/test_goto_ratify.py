@@ -93,6 +93,30 @@ def test_corrupt_with_fake_edges_touches_only_partial_graph():
     assert "field_3" in sim.partial_graph.as_json_str
 
 
+def test_corrupt_preferred_pairs_used_first_and_validated():
+    import numpy as np
+    sim = make_graph_sim()
+    # invalid preferred pairs (true edge exists / unknown node) are skipped;
+    # the valid one is taken without touching the random pool
+    picks = sim.corrupt_with_fake_edges(
+        1, np.random.default_rng(0),
+        preferred_pairs=[("field_1", "field_2"),      # real edge — skip
+                         ("field_1", "nowhere"),      # unknown node — skip
+                         ("field_3", "field_1")])     # valid — normalized
+    assert picks == [("field_1", "field_3")]
+    assert sim.partial_graph.graph.has_edge("field_1", "field_3")
+    assert not sim.graph.graph.has_edge("field_1", "field_3")
+
+
+def test_corrupt_all_preferred_invalid_falls_back_to_random_pool():
+    import numpy as np
+    sim = make_graph_sim()
+    picks = sim.corrupt_with_fake_edges(
+        1, np.random.default_rng(0),
+        preferred_pairs=[("field_1", "field_2")])     # real edge — skip
+    assert picks == [("field_1", "field_3")]          # from the random pool
+
+
 def test_rejected_goto_retracts_fake_edge_from_observed_map():
     import numpy as np
     sim = make_graph_sim()

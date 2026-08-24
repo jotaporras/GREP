@@ -92,7 +92,8 @@ class GraphSim:
 
         self.partial_graph.as_json_str = self.partial_graph.to_json_str()
 
-    def corrupt_with_fake_edges(self, n_edges: int, rng) -> list:
+    def corrupt_with_fake_edges(self, n_edges: int, rng,
+                                preferred_pairs=None) -> list:
         """Add plausible-but-fake shortcut edges to the OBSERVED graph only.
 
         Samples region pairs at ground-truth distance exactly 2 that have no
@@ -101,22 +102,41 @@ class GraphSim:
         checks the ground truth. This mirrors the dominant navigator failure
         mode (hallucinated 2-hop shortcut edges), making the planner walk into
         rejections and produce recovery turns. Returns the fake edges added.
+
+        ``preferred_pairs`` (optional list of (u, v)) are used FIRST after
+        validation (both nodes exist, no true edge): pass shortcut pairs that
+        lie ON the task's ground-truth route so the planner is actually
+        tempted to take the bait — random 2-hop shortcuts rarely intersect
+        the planned route (smoke 7826590: 1 rejection in 11 corrupted
+        rollouts). Any remaining budget is filled from the random pool.
         """
         regions = [n for n, d in self.graph.graph.nodes(data=True)
                    if d.get("type") == "region"]
-        candidates = set()
-        for u in regions:
-            for mid in self.graph.get_neighbors(u):
-                for v in self.graph.get_neighbors(mid):
-                    if (v != u and v in regions
-                            and not self.graph.graph.has_edge(u, v)):
-                        candidates.add(tuple(sorted((u, v))))
-        candidates = sorted(candidates)
-        if not candidates:
+        picks = []
+        for u, v in preferred_pairs or []:
+            pair = tuple(sorted((u, v)))
+            if (pair not in picks and u in self.graph.graph.nodes
+                    and v in self.graph.graph.nodes
+                    and not self.graph.graph.has_edge(u, v)):
+                picks.append(pair)
+            if len(picks) >= n_edges:
+                break
+        if len(picks) < n_edges:
+            candidates = set()
+            for u in regions:
+                for mid in self.graph.get_neighbors(u):
+                    for v in self.graph.get_neighbors(mid):
+                        if (v != u and v in regions
+                                and not self.graph.graph.has_edge(u, v)):
+                            candidates.add(tuple(sorted((u, v))))
+            candidates = sorted(candidates - set(picks))
+            if candidates:
+                picks += [candidates[i] for i in rng.choice(
+                    len(candidates),
+                    size=min(n_edges - len(picks), len(candidates)),
+                    replace=False)]
+        if not picks:
             return []
-        picks = [candidates[i] for i in rng.choice(
-            len(candidates), size=min(n_edges, len(candidates)),
-            replace=False)]
         for u, v in picks:
             cu = np.array(self.graph.graph.nodes[u]["coords"], dtype=float)
             cv = np.array(self.graph.graph.nodes[v]["coords"], dtype=float)

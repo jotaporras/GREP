@@ -437,8 +437,20 @@ class DataGenerator:
                 fe_rng = np.random.default_rng(
                     [self._seed_base, idx, task_idx])
                 if fe_rng.random() < self.fake_edge_frac:
+                    # Prefer shortcuts that skip an intermediate node of the
+                    # task's ground-truth route: a random 2-hop shortcut is
+                    # rarely on the planned route, so the planner almost never
+                    # takes the bait and no recovery turn happens (smoke
+                    # 7826590: 1 rejection / 11 corrupted rollouts).
+                    preferred = []
+                    route_str, _reason = self._oracle_route(graph, task_entry)
+                    if route_str:
+                        route = route_str.split(" -> ")
+                        preferred = [(route[i], route[i + 2])
+                                     for i in range(len(route) - 2)]
+                        fe_rng.shuffle(preferred)
                     fake = graph_data_gen.corrupt_with_fake_edges(
-                        self.fake_edges_n, fe_rng)
+                        self.fake_edges_n, fe_rng, preferred_pairs=preferred)
                     if fake:
                         print(
                             f"sample_{idx:03d}_{task_idx:03d}: prompt graph "
