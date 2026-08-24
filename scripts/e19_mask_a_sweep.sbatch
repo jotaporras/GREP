@@ -22,7 +22,9 @@
 #   SWEEP=slr_005     structural_lr_mult 0.012 -> 0.05
 #   SWEEP=slr_02      structural_lr_mult 0.012 -> 0.2
 #   SWEEP=alpha_03    mask_alpha 0.0 -> 0.3
-#   SWEEP=scope_all   mask_layer_scope dense -> all
+#   SWEEP=scope_top_half  mask_layer_scope dense -> dense_top_half (scope_all is
+#                  INVALID: decode_consistent needs a dense-family scope — the
+#                  sliding-window KV crop guard in train_v3 rejects it, job 7822683)
 #   SWEEP=dg_6        decision_gain_init 3.0 -> 6.0
 #
 # Submit:  SWEEP=slr_005 sbatch scripts/e19_mask_a_sweep.sbatch
@@ -37,7 +39,7 @@ CHECKPOINT_DIR=${CHECKPOINT_DIR:-$PROJ/outputs/e19_mask_a_sweep}
 PE_DIR=$PROJ/pretrained_pe
 STAGE1_LORA=$PROJ/outputs/e9_multistage_training/e9_ms_stage1/e9_ms_stage1_sqgk4o3j/checkpoint-100
 
-SWEEP="${SWEEP:?set SWEEP=base_rep1|base_rep2|lr_low|lr_high|slr_005|slr_02|alpha_03|scope_all|dg_6}"
+SWEEP="${SWEEP:?set SWEEP=base_rep1|base_rep2|lr_low|lr_high|slr_005|slr_02|alpha_03|scope_top_half|dg_6}"
 DATA_SPLIT=${DATA_SPLIT:-$PROJ/data/n_60_vllm_v3/gen/nav_n60_gemma_data/split}
 RUN_NAME=${RUN_NAME:-e19_swp_${SWEEP}}
 TAG=${TAG:-e19_mask_a_sweep}
@@ -73,7 +75,7 @@ case "$SWEEP" in
   slr_005)   ARM_ARGS=("${ARM_ARGS[@]/gnn.structural_lr_mult=0.012/gnn.structural_lr_mult=0.05}") ;;
   slr_02)    ARM_ARGS=("${ARM_ARGS[@]/gnn.structural_lr_mult=0.012/gnn.structural_lr_mult=0.2}") ;;
   alpha_03)  ARM_ARGS=("${ARM_ARGS[@]/gnn.mask_alpha=0.0/gnn.mask_alpha=0.3}") ;;
-  scope_all) ARM_ARGS=("${ARM_ARGS[@]/gnn.mask_layer_scope=dense/gnn.mask_layer_scope=all}") ;;
+  scope_top_half) ARM_ARGS=("${ARM_ARGS[@]/gnn.mask_layer_scope=dense/gnn.mask_layer_scope=dense_top_half}") ;;
   dg_6)      ARM_ARGS=("${ARM_ARGS[@]/gnn.decision_gain_init=3.0/gnn.decision_gain_init=6.0}") ;;
   *) echo "unknown SWEEP=$SWEEP" >&2; exit 2 ;;
 esac
