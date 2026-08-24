@@ -83,6 +83,10 @@ class PlanningSim:
         out = {}
 
         for iteration in range(max_iterations):
+            # have_updates is otherwise sticky for the whole episode: after the
+            # first reveal/rejection every later turn would break on its first
+            # action. Updates must interrupt only the turn that produced them.
+            graph_data_gen.have_updates = False
             out = self.query_planner(planner_input, llm_planner)
 
             step = PlanningStep(

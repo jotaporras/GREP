@@ -1,9 +1,22 @@
+import os
 from copy import deepcopy
 from typing import Optional
 
 import numpy as np
 from spine.mapping.graph_util import GraphHandler
 from spine.spine_util import UpdatePromptFormer
+
+
+def _goto_ratify_disabled() -> bool:
+    """Kill-switch for goto path ratification (e19 SPINE closed loop).
+
+    Ratification is ON by default: a goto over an edge that does not exist in
+    the ground-truth graph is rejected with corrective feedback instead of
+    silently teleporting the agent. Set PRISM_GOTO_RATIFY=0 to restore the
+    legacy (non-validating) behavior for A/B comparisons.
+    """
+    return os.environ.get("PRISM_GOTO_RATIFY", "1").strip().lower() in (
+        "0", "false", "no", "off")
 
 
 class GraphSim:
@@ -177,10 +190,36 @@ class GraphSim:
 
         elif action == "goto":
             location = argument
-            self.updator.update(location_updates=[location])
-            self.partial_graph.update_location(location)
+            if _goto_ratify_disabled():
+                self.updator.update(location_updates=[location])
+                self.partial_graph.update_location(location)
+            else:
+                here = self.partial_graph.current_location
+                if location == here:
+                    pass  # already there — silent no-op, plan continues
+                elif location not in self.graph.graph.nodes:
+                    self.updator.update(freeform_updates=[
+                        f"goto({location}) rejected: no region named "
+                        f"{location} exists. You are still at {here}. Replan "
+                        f"using only regions and edges that exist."])
+                    self.have_updates = True
+                elif not self.graph.graph.has_edge(here, location):
+                    self.updator.update(freeform_updates=[
+                        f"goto({location}) rejected: there is no edge between "
+                        f"{here} and {location}. You are still at {here}. "
+                        f"Your route is invalid — replan from {here} using "
+                        f"only edges that exist."])
+                    self.have_updates = True
+                else:
+                    self.updator.update(location_updates=[location])
+                    self.partial_graph.update_location(location)
 
-        if len(self.action_history) > 0 and action in self.action_history[-3:]:
+        # Valid routes are goto-chains, so the repeat-action nag (meant for
+        # explore spam) would fire on every step of a normal route once
+        # ratification can interrupt plans; exempt goto while ratifying.
+        nag_exempt = action == "goto" and not _goto_ratify_disabled()
+        if (not nag_exempt and len(self.action_history) > 0
+                and action in self.action_history[-3:]):
             self.updator.update(
                 freeform_updates=[
                     f"You are calling {action} multiple times in a row, which will not help you solve the task. Try calling something else. If you have tried all options, answer the user with your results."
