@@ -66,6 +66,7 @@ _is_gnn_checkpoint = checkpoint.is_gnn_checkpoint
 _resolve_text_edge_list = checkpoint.resolve_text_edge_list
 _resolve_edge_weights = checkpoint.resolve_edge_weights
 _resolve_injection_scope = checkpoint.resolve_injection_scope
+_resolve_response_format = checkpoint.resolve_response_format
 _load_checkpoint = checkpoint.load_checkpoint
 
 
@@ -286,6 +287,7 @@ def main(argv: list[str] | None = None) -> None:
         checkpoint = os.path.abspath(args.navigator_config)
         ckpt_name = os.path.splitext(os.path.basename(checkpoint))[0]
         text_edge_list, injection_scope = "none", "full_sequence"
+        response_format = "think_route"  # navigator route source; contract unused
         print(f"Loading navigator: {checkpoint}")
         model, edge_weights = _load_navigator(args.navigator_config)
         tokenizer = None
@@ -297,6 +299,7 @@ def main(argv: list[str] | None = None) -> None:
         text_edge_list = _resolve_text_edge_list(checkpoint, is_gnn, args.text_edge_list)
         edge_weights = _resolve_edge_weights(checkpoint)
         injection_scope = _resolve_injection_scope(checkpoint)
+        response_format = _resolve_response_format(checkpoint)
         print(f"Loading checkpoint: {checkpoint}")
         if args.backend == "vllm":
             from transformers import AutoTokenizer
@@ -325,6 +328,7 @@ def main(argv: list[str] | None = None) -> None:
         architecture = "graph-augmented" if is_gnn else "llm"
     print(f"  architecture: {architecture}  |  text_edge_list={text_edge_list}  |  "
           f"edge_weights={edge_weights}  |  injection_scope={injection_scope}  |  "
+          f"response_format={response_format}  |  "
           f"4bit={args.four_bit}  |  backend={args.backend}")
     print(f"  {len(samples_by_graph)} graph file(s)\n")
 
@@ -368,12 +372,14 @@ def main(argv: list[str] | None = None) -> None:
                     include_edges=(text_edge_list == "present"),
                     include_tools=include_tools, icl_examples=icl_examples,
                     permutation=permutation, edge_weights=edge_weights,
-                    injection_scope=injection_scope)
+                    injection_scope=injection_scope,
+                    response_format=response_format)
             else:
                 client = vg_client.VLLMInMemoryLLM(
                     vllm_engine, tokenizer,
                     include_edges=(text_edge_list == "present"),
-                    include_tools=include_tools, icl_examples=icl_examples)
+                    include_tools=include_tools, icl_examples=icl_examples,
+                    response_format=response_format)
 
         progress = _make_progress_printer(samples_by_graph)
         results = evaluate.eval_model_multiple_graphs(
@@ -386,6 +392,7 @@ def main(argv: list[str] | None = None) -> None:
             on_graph_done=progress,
             edge_weights=edge_weights,
             injection_scope=injection_scope,
+            response_format=response_format,
             client=client,
         )
 

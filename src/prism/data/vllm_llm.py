@@ -333,9 +333,14 @@ class VLLMSpineClient:
     planner turns into shared ``llm.generate`` calls.
     """
 
-    def __init__(self, model_id: Optional[str] = None, max_new_tokens: int = 4096):
+    def __init__(self, model_id: Optional[str] = None, max_new_tokens: int = 4096,
+                 enable_thinking: bool = True):
         self.llm, self.processor = load_vllm(model_id)
         self.max_new_tokens = max_new_tokens
+        # e20 path-only distillation: enable_thinking=False renders the Gemma
+        # chat template's no-think variant so the teacher answers directly.
+        # parse_response still runs (it is a no-op when no <think> block exists).
+        self.enable_thinking = enable_thinking
 
     def format_prompt(self, base_request: str, graph_as_json: str) -> List[dict]:
         return [
@@ -353,7 +358,7 @@ class VLLMSpineClient:
                 msg,
                 tokenize=False,
                 add_generation_prompt=True,
-                enable_thinking=True,
+                enable_thinking=self.enable_thinking,
             )
             params = SamplingParams(
                 temperature=0.01,

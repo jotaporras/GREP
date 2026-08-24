@@ -294,6 +294,16 @@ data:
   # last, so PE injection still scopes to the query graph). NOTE: those canned examples
   # call goto/map_region, so only pair icl_examples>0 with spine_tools=present.
   icl_examples: 0
+  # Target rendering for SFT (and the matching eval prompt contract).
+  # "think_route" (historical): assistant targets are <think>Relevant graph: ...
+  # Reasoning: ...</think><route>, byte-identical to every pre-e20 run.
+  # "route_only" (e20 path-only prediction): the target is the bare arrow route
+  # alone (a -> b -> c) — no <think> block, no reasoning; the system-prompt contract
+  # asks for exactly that. Requires spine_tools=none and icl_examples=0. Rollouts
+  # are squeezed to (task, final answer) and samples with no extractable route are
+  # dropped loudly (see data.preprocess_dataset). Recorded in train_config.json and
+  # load-bearing at eval rebuild: eval prompts follow the checkpoint's format.
+  response_format: think_route
   # GNN edge weighting over the scene-graph adjacency ("gaussian" | "binary").
   # "gaussian" (historical): edge_weight = exp(-d^2/2sigma^2), sigma = per-graph median
   # edge length (E1 Gaussian affinity), consumed by the R-PEARL/GT GCN. On SBM-with-

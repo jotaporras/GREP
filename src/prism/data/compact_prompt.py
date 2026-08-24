@@ -81,7 +81,7 @@ import ast
 import json
 import re
 from pathlib import Path
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Union
 
 
 def try_load_json(file: Union[str, Path]):
@@ -322,14 +322,34 @@ _SPINE_TOOLS_SECTION = (
 )
 
 
-def _answer_contract(include_tools: bool) -> str:
+def _answer_contract(include_tools: bool, route_only: bool = False) -> str:
     """The <think>…</think> output contract. Part 1 is shared; part 2 is the plan
     format, which is a SPINE action list with tools on and a bare arrow route with
     tools off (``_format_assistant`` / ``compact_output_to_spine_json`` are the exact
     inverse of this choice).
 
     The tools-off text is the pre-SPINE original, verbatim — that arm must not drift.
+
+    ``route_only`` (e20 path-only prediction) replaces the whole two-part contract
+    with a single instruction: emit ONLY the bare arrow route, no ``<think>`` block,
+    no reasoning of any kind. It is incompatible with ``include_tools`` (an action
+    list IS scaffolding beyond the route). The default ``False`` is the historical
+    format and a guaranteed no-op — the e17/e18/e19 lineage renders byte-identically.
     """
+    if route_only:
+        if include_tools:
+            raise ValueError(
+                "route_only is incompatible with include_tools: a SPINE action list "
+                "is exactly the scaffolding the path-only format removes."
+            )
+        return (
+            "Answer with the final plan ONLY: the route the robot follows, its nodes in "
+            "order joined by arrows (for example, "
+            "start_region -> middle_region -> goal_region). Output nothing else — no "
+            "reasoning, no <think> block, no labels, and no explanations."
+            "\n\nSeveral tasks may be asked about this same scene graph in turn; answer "
+            "each one independently in this same format."
+        )
     if include_tools:
         final = (
             "2. Immediately after </think>, give the plan ONLY as a SPINE action list in square "
@@ -359,7 +379,9 @@ def _answer_contract(include_tools: bool) -> str:
     )
 
 
-def compact_system_prompt(include_edges: bool, include_tools: bool) -> str:
+def compact_system_prompt(
+    include_edges: bool, include_tools: bool, route_only: bool = False
+) -> str:
     """The short compact-format system prompt.
 
     Prepended to the scene-graph block in the leading system message (both training
@@ -371,9 +393,13 @@ def compact_system_prompt(include_edges: bool, include_tools: bool) -> str:
     the original apart from the deliberately expanded latent-space note in
     ``_INTRO_LATENT``. ``include_tools=True`` inserts the SPINE tutorial between them
     and switches the contract's plan format to the action list.
+
+    ``route_only=True`` (e20 path-only) swaps the contract for the bare-route-only
+    instruction (:func:`_answer_contract`); the default ``False`` is byte-identical
+    to the pre-e20 prompt.
     """
     intro = _INTRO_WITH_EDGES if include_edges else _INTRO_LATENT
-    contract = _answer_contract(include_tools)
+    contract = _answer_contract(include_tools, route_only=route_only)
     if not include_tools:
         return f"{intro}\n\n{contract}"
     return f"{intro}\n\n{_SPINE_TOOLS_SECTION}\n\n{contract}"
@@ -412,7 +438,9 @@ def _graph_block(graph_dict: dict, include_edges: bool) -> str:
     return "\n".join(lines)
 
 
-def _system_content(graph_dict, include_edges: bool, include_tools: bool) -> str:
+def _system_content(
+    graph_dict, include_edges: bool, include_tools: bool, route_only: bool = False
+) -> str:
     """Leading system-message content: the system prompt + the scene-graph block.
 
     The prompt precedes the ``Scene graph:`` block, so ``find_last_graph_scope``
@@ -425,7 +453,8 @@ def _system_content(graph_dict, include_edges: bool, include_tools: bool) -> str
     ``graph_dict=None`` yields the prompt alone — the ICL layout, where the graph
     stays inline in the query ``user`` turn so it remains the LAST graph block.
     """
-    prompt = compact_system_prompt(include_edges=include_edges, include_tools=include_tools)
+    prompt = compact_system_prompt(
+        include_edges=include_edges, include_tools=include_tools, route_only=route_only)
     if graph_dict is None:
         return prompt
     block = _graph_block(graph_dict, include_edges=include_edges)
@@ -472,6 +501,7 @@ def build_conversation(
     include_edges: bool,
     include_tools: bool,
     icl_demos=(),
+    route_only: bool = False,
 ) -> List[Dict[str, str]]:
     """Assemble a chat ``messages`` list for ONE shared graph.
 
@@ -502,12 +532,17 @@ def build_conversation(
     if not turns:
         raise ValueError("build_conversation requires at least one turn")
     icl_demos = list(icl_demos)
+    if route_only and icl_demos:
+        raise ValueError(
+            "route_only does not support icl_demos: the canned few-shot examples "
+            "demonstrate <think> reasoning, contradicting the route-only contract.")
     messages: List[Dict[str, str]] = [{
         "role": "system",
         "content": _system_content(
             None if icl_demos else graph_dict,
             include_edges=include_edges,
             include_tools=include_tools,
+            route_only=route_only,
         ),
     }]
     messages.extend(_icl_demo_messages(icl_demos, include_edges=include_edges))
@@ -524,7 +559,8 @@ def build_conversation(
 
 
 def format_eval_messages(
-    graph_dict: dict, tasks, include_edges: bool, include_tools: bool, icl_demos=()
+    graph_dict: dict, tasks, include_edges: bool, include_tools: bool, icl_demos=(),
+    route_only: bool = False,
 ) -> List[Dict[str, str]]:
     """Build a compact eval prompt as a chat ``messages`` list (no answers).
 
@@ -562,6 +598,7 @@ def format_eval_messages(
         include_edges=include_edges,
         include_tools=include_tools,
         icl_demos=icl_demos,
+        route_only=route_only,
     )
 
 
@@ -580,6 +617,7 @@ def format_training_messages(
     include_edges: bool,
     include_tools: bool,
     icl_demos=(),
+    route_only: bool = False,
 ) -> List[Dict[str, str]]:
     """Build a compact training example (one SPINE rollout) as ``messages``.
 
@@ -594,10 +632,13 @@ def format_training_messages(
         include_edges=include_edges,
         include_tools=include_tools,
         icl_demos=icl_demos,
+        route_only=route_only,
     )
 
 
-def _parse_rollout(convo: List[Dict[str, str]], include_tools: bool):
+def _parse_rollout(
+    convo: List[Dict[str, str]], include_tools: bool, route_only: bool = False
+):
     """One logged SPINE rollout -> ``(scene_graph_dict, turn)``.
 
     ``strip_icl``-s the rollout, then reads the task and its scene graph off the real
@@ -611,7 +652,9 @@ def _parse_rollout(convo: List[Dict[str, str]], include_tools: bool):
     sg = _extract_scene_graph_dict(user_turn["content"])
     turn = {
         "task": _extract_task(user_turn["content"]),
-        "assistant": _format_assistant(assistant_turn["content"], include_tools=include_tools),
+        "assistant": _format_assistant(
+            assistant_turn["content"], include_tools=include_tools,
+            route_only=route_only),
     }
     return sg, turn
 
@@ -646,6 +689,7 @@ def assemble_training_conversation(
     include_edges: bool,
     include_tools: bool,
     icl_demos=(),
+    route_only: bool = False,
 ) -> List[Dict[str, str]]:
     """Merge per-task SPINE rollouts for ONE graph into a multi-task example.
 
@@ -672,7 +716,8 @@ def assemble_training_conversation(
     graph_names = None
     turns: List[Dict[str, str]] = []
     for convo in rollouts:
-        sg, turn = _parse_rollout(convo, include_tools=include_tools)
+        sg, turn = _parse_rollout(convo, include_tools=include_tools,
+                                  route_only=route_only)
         names = {n["name"] for n in sg["regions"] + sg["objects"]}
         if graph_dict is None:
             graph_dict, graph_names = sg, names
@@ -688,6 +733,7 @@ def assemble_training_conversation(
         include_edges=include_edges,
         include_tools=include_tools,
         icl_demos=icl_demos,
+        route_only=route_only,
     )
 
 
@@ -758,7 +804,31 @@ def _extract_scene_graph_dict(text: str) -> dict:
     return sg
 
 
-def _format_assistant(assistant_content: str, include_tools: bool) -> str:
+# Bare-route extraction (e20 route_only targets). Mirrors the arrow-chain parse in
+# ``prism.eval.path_validator`` (kept local: this module deliberately avoids the heavy
+# eval/torch import stack). ``u <=> v`` edge statements use ``<=>``, never ``->``, so
+# they cannot collide with a route hop.
+_ROUTE_NODE_TOKEN = re.compile(r"[A-Za-z0-9_]+")
+_ROUTE_ARROW_CHAIN = re.compile(
+    rf"{_ROUTE_NODE_TOKEN.pattern}(?:\s*->\s*{_ROUTE_NODE_TOKEN.pattern})+"
+)
+
+
+def extract_route(text: str) -> Optional[str]:
+    """Pull the LONGEST ``a -> b -> c`` arrow chain out of ``text``, normalized to
+    single ``" -> "`` separators. Returns ``None`` when no chain is present."""
+    if not text or not isinstance(text, str):
+        return None
+    chains = _ROUTE_ARROW_CHAIN.findall(text)
+    if not chains:
+        return None
+    best = max(chains, key=lambda c: c.count("->"))
+    return " -> ".join(_ROUTE_NODE_TOKEN.findall(best))
+
+
+def _format_assistant(
+    assistant_content: str, include_tools: bool, route_only: bool = False
+) -> str:
     """Render the assistant JSON answer as the compact target content.
 
     The think block holds the reasoning scaffolding, led by the relevant graph:
@@ -772,10 +842,26 @@ def _format_assistant(assistant_content: str, include_tools: bool) -> str:
     (``[goto(x), answer(a -> b)]``) so the target teaches tool calling; False unwraps
     ``[answer(…)]`` to the bare route (:func:`_unwrap_plan`). Either way it matches
     the plan format ``_answer_contract`` asks for.
+
+    ``route_only=True`` (e20 path-only) renders NO think block at all: the target is
+    the bare arrow route alone, extracted from the unwrapped plan (longest arrow
+    chain, so an ``answer(...)`` whose argument is prose containing the route still
+    yields a clean ``a -> b -> c``). A rollout with no extractable route raises
+    RuntimeError — deliberately NOT one of the exception types
+    ``spine_to_compact_messages`` tolerates, so a target that cannot be converted
+    fails the run loudly instead of silently training on scaffolding.
     """
     # strict=False tolerates literal control chars inside JSON strings, matching
     # SPINE's own try_parse (some rollouts embed raw newlines/tabs in reasoning).
     answer = json.loads(_strip_code_fence(assistant_content), strict=False)
+    if route_only:
+        route = extract_route(_unwrap_plan(_as_text(answer["plan"])))
+        if route is None:
+            raise RuntimeError(
+                "route_only target has no extractable 'a -> b' route in its plan: "
+                f"{_as_text(answer['plan'])[:200]!r}"
+            )
+        return route
     # Rollouts aren't always typed consistently: relevant_graph / plan / reasoning
     # may be a list instead of a string. Coerce so the compact target builds for
     # every rollout (this runs inside preprocess_dataset on real training data).
@@ -853,6 +939,7 @@ def spine_to_compact_messages(
     include_edges: bool,
     include_tools: bool,
     icl_examples: int,
+    route_only: bool = False,
 ) -> List[Dict[str, str]]:
     """FORWARD translator: a SPINE ``messages`` list -> compact ``messages``.
 
@@ -898,6 +985,12 @@ def spine_to_compact_messages(
     answers -> the ``<think>…</think>plan`` form via :func:`_format_assistant` (other
     assistant content kept verbatim).
     """
+    if route_only and (icl_examples != 0 or include_tools):
+        raise ValueError(
+            "route_only requires include_tools=False and icl_examples=0 (the SPINE "
+            f"API section and the canned few-shot examples both demonstrate "
+            f"reasoning); got include_tools={include_tools}, "
+            f"icl_examples={icl_examples}.")
     graph_idxs = [
         i for i, m in enumerate(messages)
         if m.get("role") == "user" and re.search(r"[Ss]cene graph:", m.get("content", ""))
@@ -931,7 +1024,8 @@ def spine_to_compact_messages(
                         sg, task, include_edges=include_edges)})
                 elif seen_graphs == 0:
                     out.append({"role": "system", "content": _system_content(
-                        sg, include_edges=include_edges, include_tools=include_tools)})
+                        sg, include_edges=include_edges, include_tools=include_tools,
+                        route_only=route_only)})
                     out.append({"role": "user", "content": task})
                 else:  # unreachable with keep_icl == 0 (only the query graph survives)
                     out.append({"role": "user", "content": task})
@@ -942,7 +1036,8 @@ def spine_to_compact_messages(
         # assistant
         content = m.get("content", "")
         try:
-            content = _format_assistant(content, include_tools=include_tools)
+            content = _format_assistant(content, include_tools=include_tools,
+                                        route_only=route_only)
         except (json.JSONDecodeError, KeyError, TypeError, AttributeError, ValueError):
             pass  # not a parseable 4-key SPINE answer — keep the turn verbatim
         out.append({"role": "assistant", "content": content})

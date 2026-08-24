@@ -264,6 +264,7 @@ def train_model(config: omegaconf.DictConfig):
             # how many few-shot examples the prompts carried (eval must match).
             "spine_tools": config.data.spine_tools,
             "icl_examples": config.data.icl_examples,
+            "response_format": config.data.response_format,
             "injection_scope": config.data.injection_scope,
             "edge_weights": config.data.edge_weights,
             # Two-group LR: structural (GT / PE) params train at structural_lr_mult × base LR
@@ -352,6 +353,7 @@ def train_model(config: omegaconf.DictConfig):
                 "text_edge_list": config.data.text_edge_list,
                 "spine_tools": config.data.spine_tools,
                 "icl_examples": config.data.icl_examples,
+                "response_format": config.data.response_format,
             },
             loss_target=config.trainer.loss_target,
         )
@@ -375,6 +377,7 @@ def train_model(config: omegaconf.DictConfig):
             eval_epoch_interval=config.eval.epoch_interval,
             edge_weights=config.data.edge_weights,
             injection_scope=config.data.injection_scope,
+            response_format=config.data.response_format,
         )
     )
 
@@ -400,6 +403,7 @@ def train_model(config: omegaconf.DictConfig):
             checkpoint_label=sft_args.output_dir,
             edge_weights=config.data.edge_weights,
             injection_scope=config.data.injection_scope,
+            response_format=config.data.response_format,
         )
     else:
         trainer.train()
@@ -430,6 +434,7 @@ def train_model(config: omegaconf.DictConfig):
             checkpoint_label=sft_args.output_dir,
             edge_weights=config.data.edge_weights,
             injection_scope=config.data.injection_scope,
+            response_format=config.data.response_format,
         )
 
     return trainer
@@ -616,13 +621,34 @@ def _validate_config(config: omegaconf.DictConfig) -> None:
     if config.data.spine_tools not in ("present", "none"):
         raise ValueError(
             f"data.spine_tools must be 'present' or 'none', got {config.data.spine_tools!r}")
+    if config.data.response_format not in ("think_route", "route_only"):
+        raise ValueError(
+            f"data.response_format must be 'think_route' or 'route_only', "
+            f"got {config.data.response_format!r}")
+    if config.data.response_format == "route_only":
+        # route_only is a whole-prompt contract ("output nothing else"): tool traces and
+        # few-shot think_route demos would contradict the very instruction being taught.
+        # preprocess_dataset enforces the same pair — this catches it before model load.
+        if config.data.spine_tools != "none":
+            raise ValueError(
+                "data.response_format='route_only' requires data.spine_tools='none' — "
+                "tool-call targets cannot coexist with a route-only answer contract.")
+        if config.data.icl_examples != 0:
+            raise ValueError(
+                "data.response_format='route_only' requires data.icl_examples=0 — "
+                "the stored few-shot demos are think_route transcripts.")
     # Train/eval prompt policy: always reported (measured, not assumed) because the two
     # sides are deliberately allowed to differ. The standard configuration TRAINS tool-free
     # and DEPLOYS with the SPINE API live; the seam handles it (bare route -> [answer(...)]).
     eval_tools = not evaluate._spine_tools_disabled()
     print(f"[prompt-policy] train: spine_tools={config.data.spine_tools} "
-          f"icl_examples={config.data.icl_examples}  |  eval: tools="
+          f"icl_examples={config.data.icl_examples} "
+          f"response_format={config.data.response_format}  |  eval: tools="
           f"{'on' if eval_tools else 'off'} use_icl={config.eval.use_icl}")
+    if config.data.response_format == "route_only" and eval_tools:
+        print("WARNING: response_format='route_only' but eval tools are ON "
+              "(PRISM_DISABLE_SPINE_TOOLS unset) — eval clients will refuse to build. "
+              "Set PRISM_DISABLE_SPINE_TOOLS=1 for route_only runs.")
     # Only the genuinely lossy directions warn. Trained WITH tool targets but evaluated
     # with tools off: the model emits action lists into a prompt that forbids them and a
     # simulator that no-ops them. ICL either way: the few-shot layout also relocates the

@@ -227,6 +227,7 @@ def eval_model_single_graph(
     permutation,
     edge_weights: str = "gaussian",
     injection_scope: str = "full_sequence",
+    response_format: str = "think_route",
     client=None,
 ) -> Tuple[float, List[Dict]]:
     """Run the planning-simulation loop over `eval_samples` (all same underlying graph).
@@ -241,6 +242,12 @@ def eval_model_single_graph(
     ``edge_weights`` ("gaussian" | "binary") sets the GNN edge weighting for the
     parsed scene graphs and MUST match the train-time ``data.edge_weights`` policy;
     the default is the historical Gaussian affinity.
+
+    ``response_format`` ("think_route" | "route_only") sets the answer contract of
+    the eval prompt and MUST match the train-time ``data.response_format`` (e20).
+    "route_only" requires tools off (PRISM_DISABLE_SPINE_TOOLS) and no ICL; the
+    model's bare route is wrapped as ``[answer(route)]`` by the compact seam, so
+    grading is unchanged.
 
     Returns `(accuracy, sample_results)`:
     - `accuracy` is the objective RegEx/NetworkX keyword accuracy (judge-free).
@@ -263,10 +270,27 @@ def eval_model_single_graph(
     include_tools = not _spine_tools_disabled()
     icl_examples = _compact_icl_examples(use_icl)
 
+    if response_format not in ("think_route", "route_only"):
+        raise ValueError(
+            f"response_format must be 'think_route' or 'route_only', got {response_format!r}")
+    if response_format == "route_only" and include_tools:
+        raise ValueError(
+            "response_format='route_only' requires eval tools OFF — set "
+            "PRISM_DISABLE_SPINE_TOOLS=1 (the route-only contract forbids action lists).")
+    if response_format == "route_only" and icl_examples:
+        raise ValueError(
+            "response_format='route_only' requires use_icl=False — the stored few-shot "
+            "demos are think_route transcripts and would contradict the contract.")
+
     if client is not None:
         # Graph-vs-plain still drives the permutation branch below; a provided
         # client declares it by type.
         is_gnn = isinstance(client, inference.GraphAugmentedInMemoryLLM)
+        client_fmt = getattr(client, "response_format", "think_route")
+        if client_fmt != response_format:
+            raise ValueError(
+                f"pre-built client has response_format={client_fmt!r} but the eval asked "
+                f"for {response_format!r} — build the client with the matching format.")
     else:
         is_gnn = _is_graph_augmented(model)
         if is_gnn:
@@ -279,6 +303,7 @@ def eval_model_single_graph(
                 permutation=permutation,
                 edge_weights=edge_weights,
                 injection_scope=injection_scope,
+                response_format=response_format,
             )
         else:
             client = inference.InMemoryLLM(
@@ -287,6 +312,7 @@ def eval_model_single_graph(
                 include_edges=include_edge_list,
                 include_tools=include_tools,
                 icl_examples=icl_examples,
+                response_format=response_format,
             )
 
 
@@ -457,6 +483,7 @@ def eval_model_multiple_graphs(
     on_graph_done: Optional[Callable[[str, GraphEvalResultSummary], None]],
     edge_weights: str = "gaussian",
     injection_scope: str = "full_sequence",
+    response_format: str = "think_route",
     client=None,
 ) -> Dict[str, GraphEvalResultSummary]:
     """Evaluate one model over many graphs; returns per-graph GraphEvalResultSummary dicts.
@@ -481,6 +508,7 @@ def eval_model_multiple_graphs(
             permutation=permutation,
             edge_weights=edge_weights,
             injection_scope=injection_scope,
+            response_format=response_format,
             client=client,
         )
         elapsed = time.time() - t0
@@ -986,6 +1014,7 @@ def evaluate_model(
     permutation=None,
     edge_weights: str = "gaussian",
     injection_scope: str = "full_sequence",
+    response_format: str = "think_route",
 ) -> Dict[str, "GraphEvalResultSummary"]:
     """Score a loaded model over a graph set and write per-graph cross-eval JSONs.
 
@@ -1013,6 +1042,9 @@ def evaluate_model(
         edge_weights: GNN edge weighting ("gaussian" | "binary") for the parsed
             scene graphs; MUST match training (caller's responsibility, like
             ``text_edge_list``). Default = historical Gaussian affinity.
+        response_format: answer contract of the eval prompt ("think_route" |
+            "route_only"); MUST match the train-time ``data.response_format``
+            (caller's responsibility, like ``text_edge_list``).
 
     Returns the ``{graph_name: GraphEvalResultSummary}`` dict.
     """
@@ -1032,6 +1064,7 @@ def evaluate_model(
         on_graph_done=None,
         edge_weights=edge_weights,
         injection_scope=injection_scope,
+        response_format=response_format,
     )
 
     for name, result in results.items():

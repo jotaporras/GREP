@@ -34,9 +34,10 @@ class VLLMInMemoryLLM(inference.InMemoryLLM):
     """Plain-LLM SPINE client over a stock vLLM engine."""
 
     def __init__(self, engine, tokenizer, include_edges: bool, include_tools: bool,
-                 icl_examples: int):
+                 icl_examples: int, response_format: str = "think_route"):
         super().__init__(_CpuAnchor(), tokenizer, include_edges=include_edges,
-                         include_tools=include_tools, icl_examples=icl_examples)
+                         include_tools=include_tools, icl_examples=icl_examples,
+                         response_format=response_format)
         self.engine = engine
 
     def _generate_tokens(self, input_ids, attention_mask, msg, max_new_tokens):
@@ -60,7 +61,8 @@ class VLLMGraphInMemoryLLM(inference.GraphAugmentedInMemoryLLM):
     def __init__(self, psi_producer, tokenizer, engine, include_edges: bool,
                  include_tools: bool, icl_examples: int, permutation=None,
                  edge_weights: str = "gaussian",
-                 injection_scope: str = "full_sequence"):
+                 injection_scope: str = "full_sequence",
+                 response_format: str = "think_route"):
         if injection_scope == "decode_consistent":
             raise ValueError(
                 "decode_consistent is a mask-arch policy (MaskDecodeInjector); "
@@ -68,7 +70,8 @@ class VLLMGraphInMemoryLLM(inference.GraphAugmentedInMemoryLLM):
         super().__init__(psi_producer, tokenizer, include_edges=include_edges,
                          include_tools=include_tools, icl_examples=icl_examples,
                          permutation=permutation, edge_weights=edge_weights,
-                         injection_scope=injection_scope)
+                         injection_scope=injection_scope,
+                         response_format=response_format)
         self.engine = engine
 
     def _generate_tokens(self, input_ids, attention_mask, pyg_graphs, max_new_tokens):

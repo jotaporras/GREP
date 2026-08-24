@@ -561,7 +561,10 @@ class DataGenerator:
         sg["robot_location"] = init_node
         messages = [
             {"role": "system", "content": f"path-only rollout ({mode})"},
-            {"role": "user", "content": f"task: {task}. scene graph {json.dumps(sg)}"},
+            # Marker format matches a real SPINE rollout's query turn
+            # ("task: <task>Scene graph:<dict>") so strip_icl and
+            # _extract_scene_graph_dict/_extract_task parse it identically.
+            {"role": "user", "content": f"task: {task}Scene graph:{json.dumps(sg)}"},
             {"role": "assistant", "content": assistant},
         ]
         tmp = f"{log_name}.partial"
@@ -605,7 +608,7 @@ class DataGenerator:
         msg = [{
             "role": "user",
             "content": (f"{self._PATH_ONLY_INSTRUCTION}\n\n"
-                        f"task: {task}. scene graph {json.dumps(sg)}"),
+                        f"task: {task}\nScene graph:{json.dumps(sg)}"),
         }]
         response, ok = spine_client.query_llm(msg)
         if not ok:

@@ -132,6 +132,21 @@ def resolve_injection_scope(checkpoint: str) -> str:
     return "full_sequence"
 
 
+def resolve_response_format(checkpoint: str) -> str:
+    """Recover the train-time ``data.response_format`` ("think_route" | "route_only")
+    so the eval prompt carries the same answer contract the targets taught (e20).
+
+    Read from ``train_config.json``, top level first and then the nested ``"gnn"``
+    block (same two-level rule as :func:`resolve_prompt_policy` — graph checkpoints
+    record run meta under ``"gnn"``). Missing from BOTH means the checkpoint predates
+    the knob, and every such run was trained on think_route targets — the exact
+    historical value, not a guess.
+    """
+    tc = _read_json(os.path.join(checkpoint, "train_config.json")) or {}
+    nested = tc.get("gnn") or {}
+    return tc.get("response_format", nested.get("response_format")) or "think_route"
+
+
 def load_checkpoint(checkpoint: str, four_bit: bool, device: int):
     """Load a trained checkpoint for eval. Returns ``(model, tokenizer, is_gnn)``.
 

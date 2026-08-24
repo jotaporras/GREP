@@ -32,6 +32,7 @@ class EvalCallback(TrainerCallback):
         eval_epoch_interval: float = 1.0,
         edge_weights: str = "gaussian",
         injection_scope: str = "full_sequence",
+        response_format: str = "think_route",
     ):
         self.eval_samples_by_graph = eval_samples_by_graph
         self.tokenizer = tokenizer
@@ -42,6 +43,9 @@ class EvalCallback(TrainerCallback):
         self.edge_weights = edge_weights
         # Train-time injection scope; "decode_consistent" arms decode-time injection.
         self.injection_scope = injection_scope
+        # "think_route" | "route_only"; eval prompts must carry the same answer
+        # contract the targets taught (e20).
+        self.response_format = response_format
         self._steps_per_interval: int | None = None
         self._last_eval_step: int = -1
         self.metrics = {}
@@ -65,6 +69,7 @@ class EvalCallback(TrainerCallback):
             on_graph_done=None,
             edge_weights=self.edge_weights,
             injection_scope=self.injection_scope,
+            response_format=self.response_format,
         )
         model.train()
 

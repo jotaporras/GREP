@@ -82,6 +82,40 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--path-only",
+        action="store_true",
+        help=(
+            "e20a: replace Phase-2 SPINE rollouts with ONE route-only teacher "
+            "query per task (no tools, no reasoning): the LLM must answer with "
+            "just the node sequence 'a -> b -> c'. Responses are graded with "
+            "the deterministic eval scorer and wrong routes are discarded to "
+            "*_failed.json; generated_plans/rollout_stats.json records the "
+            "teacher's pass rate per graph plus failure reasons (the monitor "
+            "for whether no-think prompting degrades the base model). "
+            "Requires PRISM_LLM_BACKEND=vllm or hf."
+        ),
+    )
+    parser.add_argument(
+        "--path-only-thinking",
+        action="store_true",
+        help=(
+            "With --path-only: keep the teacher's thinking mode ON (the "
+            "<think> block is stripped before the route is extracted). "
+            "Default OFF: the no-think chat template."
+        ),
+    )
+    parser.add_argument(
+        "--oracle-paths",
+        action="store_true",
+        help=(
+            "e20b: replace Phase-2 rollouts with LLM-free NetworkX ground-truth "
+            "routes (shortest path through the task's waypoints, avoided nodes "
+            "removed). No rollout model is loaded; each route is still "
+            "self-verified through the eval scorer before commit. Phase 1 "
+            "(populate) still needs an LLM unless --skip-populate."
+        ),
+    )
+    parser.add_argument(
         "--skip-populate",
         action="store_true",
         help=(
@@ -192,6 +226,20 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    if args.path_only and args.oracle_paths:
+        parser.error("--path-only and --oracle-paths are mutually exclusive")
+    if args.fake_edge_frac > 0 and (args.path_only or args.oracle_paths):
+        parser.error("--fake-edge-frac is a SPINE-rollout knob (prompt-graph "
+                     "corruption + goto ratification); it has no effect in "
+                     "--path-only/--oracle-paths modes — drop one of them")
+    if args.path_only_thinking and not args.path_only:
+        parser.error("--path-only-thinking requires --path-only")
+    rollout_mode = (
+        "path_only" if args.path_only
+        else "oracle" if args.oracle_paths
+        else "spine"
+    )
+
     Path(args.name).mkdir(parents=True, exist_ok=True)
     with open(f"{args.name}/data_gen_params.json", "w") as f:
         json.dump(vars(args), f)
@@ -265,6 +313,8 @@ if __name__ == "__main__":
         generated_data=generated_graphs_dirs,
         log_dir=output_generated_plans_dir,
         rollout_workers=args.rollout_workers,
+        rollout_mode=rollout_mode,
+        path_only_thinking=args.path_only_thinking,
     )
 
     # for graph in graphs:

@@ -230,6 +230,8 @@ RETRY_SLEEP="${PRISM_RETRY_SLEEP:-10}"
 attempt=1
 while true; do
   # shellcheck disable=SC2086
+  # EXTRA_GEN_ARGS: extra generate_data_spine.py flags (e.g. --oracle-paths /
+  # --path-only for the e20 corpora). Empty default = the historical pipeline.
   if python scripts/training_data_generation/generate_data_spine.py \
       --data-dir "$SKEL_DIR" \
       --name "$RUN_DIR" \
@@ -238,7 +240,7 @@ while true; do
       --n-longhop-tasks "$N_LONGHOP" \
       --max-graphs "$MAX_GRAPHS" \
       --seed "$GEN_SEED" \
-      $BACKEND_ARGS; then
+      $BACKEND_ARGS ${EXTRA_GEN_ARGS:-}; then
     echo "Stage 2 completed on attempt ${attempt}/${MAX_ATTEMPTS}."
     break
   else

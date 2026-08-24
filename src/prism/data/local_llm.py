@@ -365,9 +365,12 @@ class GemmaSpineClient:
     from being truncated before ``answer(...)`` is emitted.
     """
 
-    def __init__(self, model_id: Optional[str] = None, max_new_tokens: int = 4096):
+    def __init__(self, model_id: Optional[str] = None, max_new_tokens: int = 4096,
+                 enable_thinking: bool = True):
         self.model, self.processor = load_gemma(model_id)
         self.max_new_tokens = max_new_tokens
+        # e20 path-only distillation: False renders the no-think chat template.
+        self.enable_thinking = enable_thinking
         # pad token for generation; matches inference.InMemoryLLM's
         # pad_token_id=tokenizer.eos_token_id. Resolved defensively since
         # AutoProcessor wraps (but does not always expose) the tokenizer.
@@ -388,7 +391,7 @@ class GemmaSpineClient:
                 msg,
                 tokenize=False,
                 add_generation_prompt=True,
-                enable_thinking=True,
+                enable_thinking=self.enable_thinking,
             )
             inputs = self.processor(text=text, return_tensors="pt").to(
                 self.model.device

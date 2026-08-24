@@ -219,6 +219,7 @@ def preprocess_dataset(
     text_edge_list: str,
     spine_tools: str,
     icl_examples: int,
+    response_format: str = "think_route",
 ) -> datasets.Dataset:
     """Prepare a raw JSON dataset for training.
 
@@ -235,8 +236,20 @@ def preprocess_dataset(
        same few-shot examples eval sends — to each rollout before translation; the
        corpus itself is ICL-stripped (``utils.write_conversations``), so this is where
        train-side ICL comes from. Match it to ``eval.use_icl`` (which keeps 2).
+       ``response_format`` selects the target rendering: ``"think_route"`` (default,
+       the historical ``<think>…</think>route`` form, byte-identical to pre-e20 runs)
+       or ``"route_only"`` (e20 path-only: the bare arrow route alone). ``route_only``
+       requires ``spine_tools="none"`` and ``icl_examples=0``, SQUEEZES every rollout
+       to its (first real user turn, LAST assistant turn) pair — intermediate
+       receding-horizon turns carry tool scaffolding, exactly what this format
+       removes — and DROPS (loudly) samples whose final plan has no extractable
+       ``a -> b`` route.
     3. Tokenize, filter out examples with no assistant turn, and precompute graph-token index columns.
     """
+    if response_format not in ("think_route", "route_only"):
+        raise ValueError(
+            f"response_format must be 'think_route' or 'route_only', got {response_format!r}")
+    route_only = response_format == "route_only"
     @no_type_check
     def _tokenize(example):
         tokenized = tokenizer.apply_chat_template(
@@ -287,6 +300,45 @@ def preprocess_dataset(
         example["scene_graph_dict"] = sg
         return example
     
+    if route_only:
+        if spine_tools != "none" or icl_examples != 0:
+            raise ValueError(
+                "response_format='route_only' requires spine_tools='none' and "
+                f"icl_examples=0, got spine_tools={spine_tools!r}, "
+                f"icl_examples={icl_examples}.")
+
+        # Squeeze each rollout to (first real user turn, LAST assistant turn):
+        # intermediate receding-horizon turns carry the tool/feedback scaffolding
+        # that the path-only format removes. strip_icl is idempotent on the
+        # already-stripped corpus and re-locates the real task turn either way.
+        def _squeeze(example):
+            msgs = compact_prompt.strip_icl(list(example["conversations"]))
+            head = [msgs[0]] if msgs[0].get("role") == "system" else []
+            user = next(m for m in msgs if m["role"] == "user")
+            assistant = next(m for m in reversed(msgs) if m["role"] == "assistant")
+            example["conversations"] = head + [user, assistant]
+            return example
+
+        ds = ds.map(_squeeze)
+
+        # Discard (loudly) samples whose final plan has no extractable route —
+        # there is nothing path-only to train on in them.
+        def _has_route(example):
+            try:
+                compact_prompt._format_assistant(
+                    example["conversations"][-1]["content"], include_tools=False,
+                    route_only=True)
+                return True
+            except (RuntimeError, json.JSONDecodeError, KeyError, TypeError,
+                    AttributeError, ValueError):
+                return False
+
+        n_before = len(ds)
+        ds = ds.filter(_has_route)
+        if len(ds) != n_before:
+            print(f"[route_only] DROPPED {n_before - len(ds)}/{n_before} samples "
+                  "with no extractable 'a -> b' route in their final plan")
+
     ds = ds.map(lambda e: {"messages": e["conversations"]})
 
     # text_edge_list=="present" gates edge bullets in the LLM-facing text only;
@@ -311,6 +363,7 @@ def preprocess_dataset(
             include_edges=include_edges,
             include_tools=include_tools,
             icl_examples=icl_examples,
+            route_only=route_only,
         )
         return example
     ds = ds.map(_translate_to_compact)
@@ -380,7 +433,8 @@ def load_and_split_dataset(data_cfg, tokenizer):
 
     full_dataset = preprocess_dataset(
         full_dataset, tokenizer, text_edge_list=data_cfg.text_edge_list,
-        spine_tools=data_cfg.spine_tools, icl_examples=data_cfg.icl_examples)
+        spine_tools=data_cfg.spine_tools, icl_examples=data_cfg.icl_examples,
+        response_format=data_cfg.response_format)
 
     if data_cfg.val_files:
         train_dataset = full_dataset
@@ -389,7 +443,8 @@ def load_and_split_dataset(data_cfg, tokenizer):
             eval_dataset = eval_dataset.select(range(round(len(eval_dataset) * data_cfg.dataset_proportion)))
         eval_dataset = preprocess_dataset(
             eval_dataset, tokenizer, text_edge_list=data_cfg.text_edge_list,
-            spine_tools=data_cfg.spine_tools, icl_examples=data_cfg.icl_examples)
+            spine_tools=data_cfg.spine_tools, icl_examples=data_cfg.icl_examples,
+            response_format=data_cfg.response_format)
         print(f"Using pre-split val file: {len(train_dataset)} train / {len(eval_dataset)} eval")
     elif data_cfg.val_frac and data_cfg.val_frac > 0.0:
         dataset_size = len(full_dataset)

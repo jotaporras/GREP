@@ -82,7 +82,7 @@ class InMemoryLLM(spine_models.InMemoryLLM):
     """
 
     def __init__(self, model, tokenizer, include_edges: bool, include_tools: bool,
-                 icl_examples: int):
+                 icl_examples: int, response_format: str = "think_route"):
         # Reuse SPINE's __init__ for model/tokenizer/device; device is taken from
         # the model's own parameters rather than the SPINE "cuda" default.
         super().__init__(model, tokenizer, device=next(model.parameters()).device)
@@ -92,6 +92,10 @@ class InMemoryLLM(spine_models.InMemoryLLM):
         # match what the SPINE header actually carries; evaluate.py sets both.
         self.include_tools = include_tools
         self.icl_examples = icl_examples
+        # Answer contract ("think_route" | "route_only"); must match the train-time
+        # data.response_format. route_only prompts ask for a bare arrow route; the
+        # compact seam wraps it back as [answer(route)] so SPINE grading is unchanged.
+        self.response_format = response_format
         # SPINE mode gets SPINE_TOKEN_MULTIPLIER x the tool-free budget (see the constants).
         self.max_new_tokens = MAX_NEW_TOKENS * (SPINE_TOKEN_MULTIPLIER if include_tools else 1)
 
@@ -116,7 +120,8 @@ class InMemoryLLM(spine_models.InMemoryLLM):
         max_new_tokens = self.max_new_tokens if max_new_tokens is None else max_new_tokens
         llm_msg = compact_prompt.spine_to_compact_messages(
             msg, include_edges=self.include_edges, include_tools=self.include_tools,
-            icl_examples=self.icl_examples)
+            icl_examples=self.icl_examples,
+            route_only=(self.response_format == "route_only"))
         input = self.tokenizer.apply_chat_template(
             llm_msg, tokenize=True, add_generation_prompt=True, return_tensors="pt"
         )
@@ -157,9 +162,11 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
     def __init__(self, model, tokenizer, include_edges: bool, include_tools: bool,
                  icl_examples: int, permutation=None,
                  edge_weights: str = "gaussian",
-                 injection_scope: str = "full_sequence"):
+                 injection_scope: str = "full_sequence",
+                 response_format: str = "think_route"):
         super().__init__(model, tokenizer, include_edges=include_edges,
-                         include_tools=include_tools, icl_examples=icl_examples)
+                         include_tools=include_tools, icl_examples=icl_examples,
+                         response_format=response_format)
         self.permutation = permutation
         self.edge_weights = edge_weights
         self.injection_scope = injection_scope
@@ -186,7 +193,8 @@ class GraphAugmentedInMemoryLLM(InMemoryLLM):
         pyg_graphs = self._parse_all_pyg_graphs(msg)
         llm_msg = compact_prompt.spine_to_compact_messages(
             msg, include_edges=self.include_edges, include_tools=self.include_tools,
-            icl_examples=self.icl_examples)
+            icl_examples=self.icl_examples,
+            route_only=(self.response_format == "route_only"))
 
         input = self.tokenizer.apply_chat_template(
             llm_msg, tokenize=True, add_generation_prompt=True, return_tensors="pt"
