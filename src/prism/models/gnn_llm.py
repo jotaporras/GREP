@@ -1306,6 +1306,17 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             ).float().to(device)
             self.pf_norm = nn.ModuleList(
                 [nn.RMSNorm(hidden) for _ in range(n_ch)]).float().to(device)
+            # ControlNet-style init (e19 v2): ZERO the norm scales so the write
+            # is bitwise absent at step 0 (no perturbation tax — the first
+            # fleet stalled at ~3x the mask_a loss floor because RMSNorm pins
+            # the written vector at unit RMS regardless of W_k, so the
+            # optimizer could not anneal the random-init noise away). The
+            # gates stay OPEN (gain_init), so grad to the norm scale is full
+            # strength from step 0 — the scale, not the gate, is the learned
+            # per-channel volume knob. (Zeroing W_k instead would divide by
+            # rms(0) inside the norm; zeroing the scale is the clean no-op.)
+            for norm in self.pf_norm:
+                nn.init.zeros_(norm.weight)
             self.pf_ch_gain = nn.Parameter(torch.full(
                 (n_ch,), float(gain_init), dtype=torch.float32, device=device))
         layers = self._decoder_layers()

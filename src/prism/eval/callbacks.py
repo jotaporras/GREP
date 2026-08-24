@@ -333,6 +333,12 @@ class GradientDebugCallback(TrainerCallback):
             if getattr(inner, "_pf_hop_mode", "none") != "none":
                 for k, v in enumerate(inner.pf_ch_gain.detach().tolist()):
                     metrics[f"e19/pf_ch_gain_{k}"] = v
+                # v2 zero-init norm scales: THE opening signal — a channel is
+                # live only once its scale leaves zero (gates are open from
+                # step 0 and barely move).
+                for k, norm in enumerate(inner.pf_norm):
+                    metrics[f"e19/pf_norm_scale_{k}"] = (
+                        norm.weight.detach().abs().mean().item())
 
         if wandb.run is not None:
             wandb.log(metrics, step=state.global_step)

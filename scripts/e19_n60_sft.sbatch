@@ -49,6 +49,9 @@ export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-28}"
 # PATH prepend, not `conda activate`: compute-node batch shells have no conda
 # (e17 jobs 7639051-53 died exit 127).
 export PATH="$ENV_NAME/bin:$PATH"
+# First fleet's epoch-1 generation evals OOMed on ~44 GiB allocs with ~44 GiB
+# reserved-but-unallocated — fragmentation, not true pressure.
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
 test -f "$DATA_SPLIT/formatted_all_new__train.json" || { echo "missing $DATA_SPLIT/formatted_all_new__train.json"; exit 2; }
 

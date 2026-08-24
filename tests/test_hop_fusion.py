@@ -4,8 +4,11 @@ Invariants locked here, mirroring ``test_post_fusion.py``:
 
 - With ALL gains at 0 an enabled hop-mode pathway ("shift" and "depth") is a
   BITWISE no-op vs the plain mask forward.
-- ``post_fusion_gain_init`` opens the gates at construction (the e17/e18
-  zero-init-gates-never-open lesson) and the open pathway moves logits.
+- e19 v2 ControlNet-style init: OPEN gates (``post_fusion_gain_init``) with
+  ZERO RMSNorm scales are ALSO a bitwise no-op at init — no perturbation tax —
+  while the norm scale receives full-strength gradient through the open gate
+  (the e17 zero-GATE init killed that gradient; the first e19 fleet's open
+  gates + unit norm paid a ~3x loss-floor tax it never recovered from).
 - Channels are genuinely SEPARATE: opening different single channels produces
   different logits (per-channel matrices + gates, the experiment's point).
 - Hop parameters train at base LR (not in the damped structural group).
@@ -76,13 +79,30 @@ def test_zero_gain_is_bitwise_noop(hop_mode):
 
 
 @pytest.mark.parametrize("hop_mode", ["shift", "depth"])
-def test_gain_init_opens_gates_and_moves_logits(hop_mode):
+def test_open_gates_are_bitwise_noop_at_init(hop_mode):
+    # e19 v2 (ControlNet-style init): gates OPEN at 1.0 but the RMSNorm scales
+    # are zero-init, so the model is bitwise the plain mask at step 0 — no
+    # perturbation tax (the first fleet stalled ~3x above the mask_a floor).
+    m = _model(hop_mode=hop_mode, gain_init=1.0)
+    assert torch.all(m.pf_gain == 1.0) and torch.all(m.pf_ch_gain == 1.0)
+    for norm in m.pf_norm:
+        assert torch.all(norm.weight == 0.0)
+    m_plain = _model(hop_mode=hop_mode, post_fusion=False)
     ids, gs, imaps = _inputs()
     with torch.no_grad():
-        base = _model(hop_mode=hop_mode)(
-            input_ids=ids, graphs=gs, injection_maps=imaps).logits
-        m = _model(hop_mode=hop_mode, gain_init=1.0)
-        assert torch.all(m.pf_gain == 1.0) and torch.all(m.pf_ch_gain == 1.0)
+        out_pf = m(input_ids=ids, graphs=gs, injection_maps=imaps).logits
+        out_plain = m_plain(input_ids=ids, graphs=gs, injection_maps=imaps).logits
+    assert torch.equal(out_pf, out_plain)
+
+
+@pytest.mark.parametrize("hop_mode", ["shift", "depth"])
+def test_nonzero_norm_scale_moves_logits(hop_mode):
+    m = _model(hop_mode=hop_mode, gain_init=1.0)
+    ids, gs, imaps = _inputs()
+    with torch.no_grad():
+        base = m(input_ids=ids, graphs=gs, injection_maps=imaps).logits
+        for norm in m.pf_norm:
+            norm.weight.fill_(1.0)
         moved = m(input_ids=ids, graphs=gs, injection_maps=imaps).logits
     assert not torch.equal(base, moved)
 
@@ -94,6 +114,8 @@ def test_channels_are_separate(hop_mode):
     # single-channel outputs would coincide.
     m = _model(hop_mode=hop_mode)
     m.pf_gain.data.fill_(1.0)
+    for norm in m.pf_norm:
+        norm.weight.data.fill_(1.0)
     ids, gs, imaps = _inputs()
     outs = []
     with torch.no_grad():
@@ -108,8 +130,28 @@ def test_channels_are_separate(hop_mode):
 
 
 @pytest.mark.parametrize("hop_mode", ["shift", "depth"])
-def test_gradients_reach_channels(hop_mode):
+def test_gradients_reach_norm_scale_at_init(hop_mode):
+    # The ControlNet property: at init (zero norm scale, open gates) the ONLY
+    # live gradient is the norm scale's — full strength through the open gate.
+    # Everything upstream (W_k, tower, gains) is defined-but-zero until the
+    # scale moves; e17's zero-GATE init killed this gradient too.
     m = _model(hop_mode=hop_mode, gain_init=1.0)
+    ids, gs, imaps = _inputs()
+    loss = m(input_ids=ids, graphs=gs, injection_maps=imaps).logits.sum()
+    loss.backward()
+    for norm in m.pf_norm:
+        assert norm.weight.grad is not None and norm.weight.grad.abs().sum() > 0
+    assert m.pf_gain.grad is not None
+    assert m.pf_ch_gain.grad is not None
+    for proj in m.pf_proj:
+        assert proj.weight.grad is not None
+
+
+@pytest.mark.parametrize("hop_mode", ["shift", "depth"])
+def test_gradients_reach_channels_once_scale_opens(hop_mode):
+    m = _model(hop_mode=hop_mode, gain_init=1.0)
+    for norm in m.pf_norm:
+        norm.weight.data.fill_(1.0)
     ids, gs, imaps = _inputs()
     loss = m(input_ids=ids, graphs=gs, injection_maps=imaps).logits.sum()
     loss.backward()
@@ -117,7 +159,8 @@ def test_gradients_reach_channels(hop_mode):
     assert (m.pf_ch_gain.grad is not None
             and m.pf_ch_gain.grad.abs().sum() > 0)
     for proj in m.pf_proj:
-        assert proj.weight.grad is not None
+        assert (proj.weight.grad is not None
+                and proj.weight.grad.abs().sum() > 0)
     if hop_mode == "shift":
         assert any(p.grad is not None and p.grad.abs().sum() > 0
                    for p in m.pf_hop_gt.parameters())
