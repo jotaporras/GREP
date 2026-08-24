@@ -43,7 +43,7 @@ def main():
                     help="Grade and report only; do not rename anything.")
     args = ap.parse_args()
 
-    stats = {"graphs": {}, "kept": 0, "rejected": 0, "missing": 0}
+    stats = {"graphs": {}, "kept": 0, "rejected": 0, "missing": 0, "corrupt": 0}
     for gf in sorted(glob.glob(os.path.join(args.graphs_dir, "data_gen_*.json"))):
         stem = os.path.splitext(os.path.basename(gf))[0]
         ggg = stem.rsplit("_", 1)[-1]
@@ -58,8 +58,18 @@ def main():
             if not os.path.exists(sp):
                 stats["missing"] += 1
                 continue
-            with open(sp) as f:
-                messages = json.load(f)
+            try:
+                with open(sp) as f:
+                    messages = json.load(f)
+            except (json.JSONDecodeError, ValueError) as ex:
+                # A handful of rollouts land with trailing garbage (two JSON
+                # docs concatenated). split_train_val already skips those; the
+                # filter must not abort the whole run over them.
+                stats["corrupt"] += 1
+                print(f"  corrupt sample_{ggg}_{i:03d}: {ex}")
+                if not args.dry_run:
+                    os.replace(sp, sp[:-len(".json")] + "_corrupt.json")
+                continue
             content = fgp._final_assistant_content(messages)
             _, samples = fgp.grade_graph([es], [content], use_icl=False)
             if samples and samples[0].get("correct"):
@@ -76,7 +86,8 @@ def main():
 
     total = stats["kept"] + stats["rejected"]
     print(f"TOTAL kept {stats['kept']}/{total} "
-          f"({stats['missing']} missing){' [dry-run]' if args.dry_run else ''}")
+          f"({stats['missing']} missing, {stats['corrupt']} corrupt)"
+          f"{' [dry-run]' if args.dry_run else ''}")
     if not args.dry_run:
         out = os.path.join(args.plans_dir, "filter_stats.json")
         with open(out, "w") as f:
