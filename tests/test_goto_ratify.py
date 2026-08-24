@@ -81,6 +81,29 @@ def test_no_goto_nag_while_ratifying():
     assert "multiple times" not in sim.get_updator().form_updates()
 
 
+def test_corrupt_with_fake_edges_touches_only_partial_graph():
+    import numpy as np
+    sim = make_graph_sim()
+    picks = sim.corrupt_with_fake_edges(2, np.random.default_rng(0))
+    # only 2-hop non-adjacent region pair in the fixture: field_1 -- field_3
+    assert picks == [("field_1", "field_3")]
+    assert sim.partial_graph.graph.has_edge("field_1", "field_3")
+    assert not sim.graph.graph.has_edge("field_1", "field_3")
+    # the prompt string the planner sees includes the fake edge
+    assert "field_3" in sim.partial_graph.as_json_str
+
+
+def test_rejected_goto_retracts_fake_edge_from_observed_map():
+    import numpy as np
+    sim = make_graph_sim()
+    sim.corrupt_with_fake_edges(1, np.random.default_rng(0))
+    assert sim.take_action("goto", "field_3") is True
+    assert not sim.partial_graph.graph.has_edge("field_1", "field_3")
+    feedback = sim.get_updator().form_updates()
+    assert "remove_connections" in feedback
+    assert "rejected" in feedback
+
+
 class _ScriptedClient:
     """query_llm stub that plays back canned SPINE-JSON responses in order."""
 

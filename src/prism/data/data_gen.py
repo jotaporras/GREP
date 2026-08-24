@@ -89,11 +89,20 @@ class DataGenerator:
         complexity_proportions: Optional[List[float]] = None,
         seed: Optional[int] = None,
         n_longhop_tasks: int = 0,
+        fake_edge_frac: float = 0.0,
+        fake_edges_n: int = 2,
     ):
         self.unknown_pcts = graph_unknown
         self.task_proportions = task_proportions
         self.complexity_proportions = complexity_proportions
         self.n_longhop_tasks = n_longhop_tasks
+        # e19 SPINE closed loop: fraction of rollouts whose PROMPT graph gets
+        # fake 2-hop shortcut edges (GraphSim.corrupt_with_fake_edges); goto
+        # ratification against the true graph then produces rejection-recovery
+        # turns. Seeded per (seed, graph, task) so resume reruns are stable.
+        self.fake_edge_frac = fake_edge_frac
+        self.fake_edges_n = fake_edges_n
+        self._seed_base = 0 if seed is None else seed
         self.rng = np.random.default_rng(seed)
         self.context_gen = graph_gen.TaskGraphGen()
         self.planning_sim = planning_sim.PlanningSim()
@@ -424,6 +433,17 @@ class DataGenerator:
             graph_data_gen = graph_sim.GraphSim(graph_handle)
             unknown_pct = self.unknown_pcts[task_idx % len(self.unknown_pcts)]
             graph_data_gen.randomly_remove_nodes(pct=unknown_pct)
+            if self.fake_edge_frac > 0:
+                fe_rng = np.random.default_rng(
+                    [self._seed_base, idx, task_idx])
+                if fe_rng.random() < self.fake_edge_frac:
+                    fake = graph_data_gen.corrupt_with_fake_edges(
+                        self.fake_edges_n, fe_rng)
+                    if fake:
+                        print(
+                            f"sample_{idx:03d}_{task_idx:03d}: prompt graph "
+                            f"corrupted with fake edges {fake}"
+                        )
             planner = SPINE(
                 graph=graph_data_gen.partial_graph,
                 log_name=tmp_log,
@@ -464,26 +484,288 @@ class DataGenerator:
             return False
 
     @staticmethod
-    def _make_spine_client():
+    def _make_spine_client(enable_thinking: bool = True):
         """Pick the SPINE planner client from PRISM_LLM_BACKEND.
 
         "vllm" -> thread-safe batched vLLM client; "hf"/"gemma"/"local" ->
         eager HF Gemma client; anything else -> None so SPINE uses its own
         default (OpenAI). Built once so the model is reused across all tasks.
+        ``enable_thinking=False`` (e20 path-only) renders the no-think chat
+        template so the teacher answers without a reasoning block.
         """
         from prism.data import vllm_llm
 
         if vllm_llm.vllm_backend_enabled():
-            return vllm_llm.VLLMSpineClient()
+            return vllm_llm.VLLMSpineClient(enable_thinking=enable_thinking)
         if local_llm.hf_backend_enabled():
-            return local_llm.GemmaSpineClient()
+            return local_llm.GemmaSpineClient(enable_thinking=enable_thinking)
         return None
+
+    # ------------------------------------------------------------------
+    # e20 path-only rollout modes. Both produce sample files with the SAME
+    # message-list shape as a SPINE rollout ([system?, user "task: ... scene
+    # graph {...}", assistant SPINE-JSON answer]) so strip_icl / aggregate /
+    # split_train_val / compact_prompt all work unchanged; the assistant
+    # answer carries an empty think scaffold and `plan="[answer(a -> b)]"`.
+    # NOTE (leak check): sample and *_failed.json files must never contain the
+    # strings `acceptance_criterion` or a JSON `"answer":` key — the corpus
+    # driver greps generated_plans/ for exactly those (GT stays out of
+    # training text; grading uses it in-process only).
+    # ------------------------------------------------------------------
+
+    # Teacher instruction for path-only distillation. Mirrors the eval-side
+    # route_only answer contract (compact_prompt._answer_contract) so the
+    # teacher is graded under the same wording the student will be trained on.
+    _PATH_ONLY_INSTRUCTION = (
+        "You are a robot operating in the scene graph below. Complete the "
+        "navigation task by answering with the final route ONLY: the nodes the "
+        "robot visits in order, starting from its current location, joined by "
+        "arrows (for example, start_region -> middle_region -> goal_region). "
+        "Output nothing else — no reasoning, no explanations, no labels."
+    )
+
+    @staticmethod
+    def _grade_route(route_text: str, graph: dict, task_entry: dict):
+        """Deterministic verdict for a candidate route. Returns (ok, verdict).
+
+        Uses the SAME scorer as eval (path_validator.validate_structured with
+        ``full_response=None``: pure RegEx/NetworkX, no judge model, no rescue),
+        so "discard the ones that have errors" means exactly "would not have
+        been graded correct at eval time". The GT fields are consumed here
+        in-process and never written to disk.
+        """
+        from prism.eval import path_validator
+
+        verdict = path_validator.validate_structured(
+            route_text,
+            graph,
+            init_node=task_entry.get("init_node"),
+            answer=task_entry.get("answer"),
+            criterion=task_entry.get("acceptance_criterion"),
+            task=task_entry.get("task"),
+            full_response=None,
+        )
+        return bool(verdict and verdict.get("structured_correct")), verdict
+
+    @staticmethod
+    def _commit_plan_sample(log_name: str, *, task: str, graph: dict,
+                            init_node: str, route: str, mode: str) -> None:
+        """Atomically write a committed path-only sample file (message list)."""
+        assistant = json.dumps({
+            "primary_goal": task,
+            "relevant_graph": "",
+            "reasoning": "",
+            "plan": f"[answer({route})]",
+        })
+        sg = dict(graph)
+        sg["robot_location"] = init_node
+        messages = [
+            {"role": "system", "content": f"path-only rollout ({mode})"},
+            {"role": "user", "content": f"task: {task}. scene graph {json.dumps(sg)}"},
+            {"role": "assistant", "content": assistant},
+        ]
+        tmp = f"{log_name}.partial"
+        with open(tmp, "w") as f:
+            json.dump(messages, f)
+        os.replace(tmp, log_name)
+
+    @staticmethod
+    def _quarantine(failed_name: str, payload: dict) -> None:
+        """Write a *_failed.json diagnostic (never picked up by the split)."""
+        tmp = f"{failed_name}.partial"
+        with open(tmp, "w") as f:
+            json.dump(payload, f, indent=1)
+        os.replace(tmp, failed_name)
+
+    def _run_one_path_only(
+        self, *, idx: int, task_idx: int, task_entry: dict, graph: dict,
+        log_dir: str, spine_client,
+    ) -> bool:
+        """One single-turn path-only teacher query for (graph idx, task_idx).
+
+        The teacher sees ONLY the instruction + task text + full scene graph
+        (no GT, no tools, no exploration — unknown_pct does not apply since a
+        single-turn prediction has no way to discover hidden nodes). The
+        response is graded deterministically; wrong/unparseable routes are
+        quarantined as *_failed.json with a machine-readable ``reason`` so
+        ``rollout_stats.json`` can report the teacher's accuracy — the monitor
+        for whether no-think route-only prompting degrades the base model.
+        """
+        from prism.data import compact_prompt
+
+        log_name = f"{log_dir}/sample_{idx:03d}_{task_idx:03d}.json"
+        if self._has_valid_rollout(log_name):
+            print(f"Skipping sample_{idx:03d}_{task_idx:03d}: valid rollout already exists")
+            return True
+        failed_name = log_name.replace(".json", "_failed.json")
+        task = task_entry["task"]
+        init_node = task_entry["init_node"]
+        sg = dict(graph)
+        sg["robot_location"] = init_node
+        msg = [{
+            "role": "user",
+            "content": (f"{self._PATH_ONLY_INSTRUCTION}\n\n"
+                        f"task: {task}. scene graph {json.dumps(sg)}"),
+        }]
+        response, ok = spine_client.query_llm(msg)
+        if not ok:
+            self._quarantine(failed_name, {
+                "mode": "path_only", "reason": "generation_error",
+                "task": task, "response": response})
+            return False
+        route = compact_prompt.extract_route(response)
+        if route is None:
+            self._quarantine(failed_name, {
+                "mode": "path_only", "reason": "no_route",
+                "task": task, "response": response})
+            return False
+        graded_ok, verdict = self._grade_route(route, graph, task_entry)
+        if not graded_ok:
+            reason = "wrong_route" if verdict else "no_goal_resolved"
+            self._quarantine(failed_name, {
+                "mode": "path_only", "reason": reason, "task": task,
+                "route": route, "response": response,
+                "goal": (verdict or {}).get("goal"),
+                "full_path_valid": (verdict or {}).get("full_path_valid"),
+                "start_goal_ok": (verdict or {}).get("start_goal_ok"),
+                "waypoints_ok": (verdict or {}).get("waypoints_ok"),
+                "avoid_ok": (verdict or {}).get("avoid_ok")})
+            return False
+        self._commit_plan_sample(
+            log_name, task=task, graph=graph, init_node=init_node,
+            route=route, mode="path_only")
+        return True
+
+    @staticmethod
+    def _oracle_route(graph: dict, task_entry: dict):
+        """NetworkX ground-truth route for a nav task. Returns (route|None, reason).
+
+        Endpoints/waypoints/avoid come from the same resolver the scorer uses
+        (path_validator.derive_targets), so the produced route is by
+        construction the route the grader wants: shortest path through each
+        waypoint in order, with avoided nodes removed from the graph first.
+        """
+        import networkx as nx
+
+        from prism.eval import path_validator
+
+        init_node = task_entry.get("init_node")
+        goal, waypoints, avoid, _required, kind = path_validator.derive_targets(
+            graph,
+            init_node=init_node,
+            answer=task_entry.get("answer"),
+            criterion=task_entry.get("acceptance_criterion"),
+            task=task_entry.get("task"),
+        )
+        if goal is None:
+            return None, "no_goal_resolved"
+        if kind != "path":
+            return None, "not_a_path_task"
+        g = path_validator.build_graph(graph, directed=False)
+        protected = {init_node, goal, *waypoints}
+        g.remove_nodes_from([n for n in avoid if n not in protected])
+        hops = [init_node] + list(waypoints) + [goal]
+        route = [init_node]
+        for a, b in zip(hops, hops[1:]):
+            try:
+                seg = nx.shortest_path(g, a, b)
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                return None, "no_path"
+            route.extend(seg[1:])
+        return " -> ".join(route), ""
+
+    def _run_one_oracle(
+        self, *, idx: int, task_idx: int, task_entry: dict, graph: dict,
+        log_dir: str, spine_client=None,
+    ) -> bool:
+        """One LLM-free oracle rollout: the 'teacher response' is the NetworkX
+        ground-truth route (e20b — hardcoded generations, no rollout LLM).
+
+        The route is still self-verified through the eval scorer before commit
+        (catches any resolver/constructor disagreement instead of training on
+        it); failures are quarantined with a ``reason`` like the other modes.
+        """
+        log_name = f"{log_dir}/sample_{idx:03d}_{task_idx:03d}.json"
+        if self._has_valid_rollout(log_name):
+            print(f"Skipping sample_{idx:03d}_{task_idx:03d}: valid rollout already exists")
+            return True
+        failed_name = log_name.replace(".json", "_failed.json")
+        task = task_entry["task"]
+        init_node = task_entry["init_node"]
+        route, reason = self._oracle_route(graph, task_entry)
+        if route is None:
+            self._quarantine(failed_name, {
+                "mode": "oracle", "reason": reason, "task": task})
+            return False
+        graded_ok, verdict = self._grade_route(route, graph, task_entry)
+        if not graded_ok:
+            self._quarantine(failed_name, {
+                "mode": "oracle", "reason": "oracle_verify_failed", "task": task,
+                "route": route, "goal": (verdict or {}).get("goal"),
+                "waypoints_ok": (verdict or {}).get("waypoints_ok"),
+                "avoid_ok": (verdict or {}).get("avoid_ok")})
+            return False
+        self._commit_plan_sample(
+            log_name, task=task, graph=graph, init_node=init_node,
+            route=route, mode="oracle")
+        return True
+
+    @staticmethod
+    def _write_rollout_stats(log_dir: str, rollout_mode: str) -> None:
+        """Scan ``log_dir`` and write ``rollout_stats.json``: per-graph and total
+        pass/fail counts with failure reasons — the e20 teacher-accuracy monitor.
+
+        Counts are over (graph, task) ids present on disk: a task counts as
+        passed when its ``sample_GGG_TTT.json`` exists, failed when only the
+        ``*_failed.json`` does (a retried-then-passed task counts as passed).
+        """
+        passed, failed, reasons = {}, {}, {}
+        for f in Path(log_dir).glob("sample_*_failed.json"):
+            gid = f.name.split("_")[1]
+            key = f.name.replace("_failed.json", ".json")
+            if (Path(log_dir) / key).exists():
+                continue  # later retry committed a valid sample
+            failed[gid] = failed.get(gid, 0) + 1
+            try:
+                with open(f) as fh:
+                    reason = json.load(fh).get("reason", "spine_no_answer")
+            except Exception:
+                reason = "unreadable"
+            reasons[reason] = reasons.get(reason, 0) + 1
+        for f in Path(log_dir).glob("sample_*.json"):
+            if f.name.endswith("_failed.json"):
+                continue
+            gid = f.name.split("_")[1]
+            passed[gid] = passed.get(gid, 0) + 1
+        n_pass = sum(passed.values())
+        n_fail = sum(failed.values())
+        total = n_pass + n_fail
+        stats = {
+            "rollout_mode": rollout_mode,
+            "n_pass": n_pass,
+            "n_fail": n_fail,
+            "n_total": total,
+            "pass_rate": (n_pass / total) if total else None,
+            "fail_reasons": dict(sorted(reasons.items(), key=lambda kv: -kv[1])),
+            "per_graph": {
+                gid: {"pass": passed.get(gid, 0), "fail": failed.get(gid, 0)}
+                for gid in sorted(set(passed) | set(failed))
+            },
+        }
+        out = Path(log_dir) / "rollout_stats.json"
+        with open(out, "w") as f:
+            json.dump(stats, f, indent=1)
+        rate = f"{stats['pass_rate']:.3f}" if total else "n/a"
+        print(f"[{rollout_mode}] rollout stats: {n_pass}/{total} passed "
+              f"(rate {rate}); reasons {stats['fail_reasons']} -> {out}")
 
     def generate_example_plans(
         self,
         generated_data: List[str],
         log_dir: str,
         rollout_workers: int = 1,
+        rollout_mode: str = "spine",
+        path_only_thinking: bool = False,
     ) -> None:
         """Run SPINE rollouts for every (graph, task) pair.
 
@@ -502,16 +784,51 @@ class DataGenerator:
             historical sequential behavior. >1 requires a thread-safe planner
             client (PRISM_LLM_BACKEND=vllm) — concurrent dialogues are then
             micro-batched into shared vLLM generate calls.
+        rollout_mode : str
+            "spine" (default): the historical multi-turn SPINE planner rollout.
+            "path_only" (e20a): ONE route-only teacher query per task — no
+            tools, no reasoning scaffold in the target; responses are graded
+            with the eval scorer and wrong routes discarded.
+            "oracle" (e20b): NO rollout LLM — the target route is the NetworkX
+            ground-truth path (still self-verified through the eval scorer).
+            Both non-spine modes write ``rollout_stats.json`` (pass/fail per
+            graph + failure reasons — the teacher-accuracy monitor).
+        path_only_thinking : bool
+            path_only mode only: keep the teacher's thinking mode ON (the
+            think block is stripped before route extraction). Default False =
+            the no-think chat template, per the e20 hypothesis.
         """
 
         Path(log_dir).mkdir(parents=True, exist_ok=True)
 
-        spine_client = self._make_spine_client()
+        valid_modes = ("spine", "path_only", "oracle")
+        if rollout_mode not in valid_modes:
+            raise ValueError(
+                f"rollout_mode must be one of {valid_modes}, got {rollout_mode!r}")
+        if path_only_thinking and rollout_mode != "path_only":
+            raise ValueError(
+                "path_only_thinking only applies to rollout_mode='path_only'")
+
         from prism.data import vllm_llm
 
-        if rollout_workers > 1 and not isinstance(
-            spine_client, vllm_llm.VLLMSpineClient
-        ):
+        if rollout_mode == "oracle":
+            # LLM-free: routes come from NetworkX; never load a model.
+            spine_client = None
+        elif rollout_mode == "path_only":
+            spine_client = self._make_spine_client(
+                enable_thinking=path_only_thinking)
+            if spine_client is None:
+                raise ValueError(
+                    "rollout_mode='path_only' needs a local teacher client with "
+                    "query_llm; set PRISM_LLM_BACKEND=vllm (or hf) — the OpenAI "
+                    "default has no route-only single-turn path.")
+            print(f"[path_only] teacher thinking "
+                  f"{'ON (stripped)' if path_only_thinking else 'OFF (no-think template)'}")
+        else:
+            spine_client = self._make_spine_client()
+
+        if (rollout_workers > 1 and rollout_mode != "oracle"
+                and not isinstance(spine_client, vllm_llm.VLLMSpineClient)):
             raise ValueError(
                 f"rollout_workers={rollout_workers} needs the thread-safe vLLM "
                 "planner client; set PRISM_LLM_BACKEND=vllm (got backend "
@@ -567,9 +884,15 @@ class DataGenerator:
                     )
                 )
 
+        run_one = {
+            "spine": self._run_one_rollout,
+            "path_only": self._run_one_path_only,
+            "oracle": self._run_one_oracle,
+        }[rollout_mode]
+
         if rollout_workers <= 1:
             for job in jobs:
-                self._run_one_rollout(**job)
+                run_one(**job)
         else:
             # N dialogues in flight; their planner turns are micro-batched by
             # the vLLM client's generate gate. A fatal GPU error in any worker
@@ -579,7 +902,7 @@ class DataGenerator:
             from concurrent.futures import ThreadPoolExecutor
 
             with ThreadPoolExecutor(max_workers=rollout_workers) as pool:
-                futures = [pool.submit(self._run_one_rollout, **job) for job in jobs]
+                futures = [pool.submit(run_one, **job) for job in jobs]
                 fatal = None
                 for fut in futures:
                     try:
@@ -596,3 +919,6 @@ class DataGenerator:
             glob_str="sample*json",
             out_file=f"{log_dir}/formatted.json",
         )
+
+        if rollout_mode != "spine":
+            self._write_rollout_stats(str(log_dir), rollout_mode)

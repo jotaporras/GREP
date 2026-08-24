@@ -92,6 +92,39 @@ class GraphSim:
 
         self.partial_graph.as_json_str = self.partial_graph.to_json_str()
 
+    def corrupt_with_fake_edges(self, n_edges: int, rng) -> list:
+        """Add plausible-but-fake shortcut edges to the OBSERVED graph only.
+
+        Samples region pairs at ground-truth distance exactly 2 that have no
+        direct edge and adds them to the partial graph, so the agent's map
+        contains shortcuts that do not exist while goto ratification still
+        checks the ground truth. This mirrors the dominant navigator failure
+        mode (hallucinated 2-hop shortcut edges), making the planner walk into
+        rejections and produce recovery turns. Returns the fake edges added.
+        """
+        regions = [n for n, d in self.graph.graph.nodes(data=True)
+                   if d.get("type") == "region"]
+        candidates = set()
+        for u in regions:
+            for mid in self.graph.get_neighbors(u):
+                for v in self.graph.get_neighbors(mid):
+                    if (v != u and v in regions
+                            and not self.graph.graph.has_edge(u, v)):
+                        candidates.add(tuple(sorted((u, v))))
+        candidates = sorted(candidates)
+        if not candidates:
+            return []
+        picks = [candidates[i] for i in rng.choice(
+            len(candidates), size=min(n_edges, len(candidates)),
+            replace=False)]
+        for u, v in picks:
+            cu = np.array(self.graph.graph.nodes[u]["coords"], dtype=float)
+            cv = np.array(self.graph.graph.nodes[v]["coords"], dtype=float)
+            self.partial_graph.graph.add_edge(
+                u, v, type="region", weight=float(np.linalg.norm(cu - cv)))
+        self.partial_graph.as_json_str = self.partial_graph.to_json_str()
+        return picks
+
     def get_updator(self) -> UpdatePromptFormer:
         return self.updator
 
@@ -204,6 +237,13 @@ class GraphSim:
                         f"using only regions and edges that exist."])
                     self.have_updates = True
                 elif not self.graph.graph.has_edge(here, location):
+                    # Correct the observed map too: if the agent believed this
+                    # edge existed (e.g. a corrupted/hallucinated shortcut),
+                    # retract it with the update grammar the prompts teach.
+                    if self.partial_graph.graph.has_edge(here, location):
+                        self.partial_graph.graph.remove_edge(here, location)
+                        self.updator.update(
+                            removed_connections=[[here, location]])
                     self.updator.update(freeform_updates=[
                         f"goto({location}) rejected: there is no edge between "
                         f"{here} and {location}. You are still at {here}. "

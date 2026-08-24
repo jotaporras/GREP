@@ -173,6 +173,23 @@ if __name__ == "__main__":
         ),
     )
 
+    parser.add_argument(
+        "--fake-edge-frac",
+        type=float,
+        default=0.0,
+        help=(
+            "Fraction of rollouts whose PROMPT graph is corrupted with fake "
+            "2-hop shortcut edges (goto ratification against the true graph "
+            "then yields rejection-recovery turns). Default 0 = off."
+        ),
+    )
+    parser.add_argument(
+        "--fake-edges-n",
+        type=int,
+        default=2,
+        help="Fake shortcut edges added per corrupted rollout (default 2).",
+    )
+
     args = parser.parse_args()
 
     Path(args.name).mkdir(parents=True, exist_ok=True)
@@ -196,6 +213,8 @@ if __name__ == "__main__":
         complexity_proportions=args.complexity_proportions,
         seed=args.seed,
         n_longhop_tasks=args.n_longhop_tasks,
+        fake_edge_frac=args.fake_edge_frac,
+        fake_edges_n=args.fake_edges_n,
     )
 
     if args.skip_populate:
