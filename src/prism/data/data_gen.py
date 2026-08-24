@@ -89,6 +89,9 @@ class DataGenerator:
         complexity_proportions: Optional[List[float]] = None,
         seed: Optional[int] = None,
         n_longhop_tasks: int = 0,
+        longhop_max_boost: float = 1.0,
+        longhop_allow_avoid: bool = False,
+        grounding_directives: bool = False,
         fake_edge_frac: float = 0.0,
         fake_edges_n: int = 2,
         nav_walk_directive: bool = False,
@@ -97,6 +100,14 @@ class DataGenerator:
         self.task_proportions = task_proportions
         self.complexity_proportions = complexity_proportions
         self.n_longhop_tasks = n_longhop_tasks
+        # e21: weight multiplier for the DIAMETER hop bucket in longhop
+        # endpoint sampling (1.0 = the e19/e20 uniform sampler, bit-identical
+        # rng stream), plus prompt directives for avoid-constrained longhop
+        # tasks and start-reference diversity. All default to the historical
+        # no-op so pre-e21 corpora regenerate unchanged.
+        self.longhop_max_boost = longhop_max_boost
+        self.longhop_allow_avoid = longhop_allow_avoid
+        self.grounding_directives = grounding_directives
         # e19 SPINE closed loop: fraction of rollouts whose PROMPT graph gets
         # fake 2-hop shortcut edges (GraphSim.corrupt_with_fake_edges); goto
         # ratification against the true graph then produces rejection-recovery
@@ -138,7 +149,10 @@ class DataGenerator:
         longhop = None
         if self.n_longhop_tasks:
             longhop = graph_gen.sample_longhop_constraints(
-                json.loads(base_graph)["graph"], self.n_longhop_tasks, self.rng
+                json.loads(base_graph)["graph"],
+                self.n_longhop_tasks,
+                self.rng,
+                max_boost=self.longhop_max_boost,
             )
         return task_types, task_complexities, longhop
 
@@ -204,6 +218,8 @@ class DataGenerator:
                         task_complexities=task_complexities,
                         longhop_constraints=longhop,
                         reasoning_effort=reasoning_effort,
+                        grounding_directives=self.grounding_directives,
+                        longhop_allow_avoid=self.longhop_allow_avoid,
                     )
 
                     break

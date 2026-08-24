@@ -53,7 +53,13 @@ case "$DATASET" in
   # harness — the missing arm of the 2x2 (corpus x response_format) needed to
   # tell "route_only unlocked the baseline" from "the baseline always won".
   v3)       DATA_SPLIT=${DATA_SPLIT:-$PROJ/data/n_60_vllm_v3/gen/nav_n60_gemma_data/split} ;;
-  *) echo "unknown DATASET=$DATASET (pathonly|oracle|v3)"; exit 2 ;;
+  # e21 cells: oracle579 = oracle v1 train subsampled to the pathonly corpus
+  # size (579) — separates data-size from target-purity in the e20 oracle gain
+  # (built by scripts/e21_subsample_split.py). oracle_v2 = the 500-graph
+  # hop-stratified + grounding-diverse corpus (e21_n60_oracle_v2_generate).
+  oracle579) DATA_SPLIT=${DATA_SPLIT:-$PROJ/data/n_60_oracle_v1/gen/nav_n60_gemma_data/split_579} ;;
+  oracle_v2) DATA_SPLIT=${DATA_SPLIT:-$PROJ/data/n_60_oracle_v2/gen/nav_n60_gemma_data/split} ;;
+  *) echo "unknown DATASET=$DATASET (pathonly|oracle|v3|oracle579|oracle_v2)"; exit 2 ;;
 esac
 # Comparable eval: ALWAYS the frozen n60_v3 test graphs (same 7 graphs / 84
 # questions as e18/e19), regardless of which corpus trains the run.

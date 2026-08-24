@@ -197,7 +197,7 @@ def validate_task_refs(tasks: List[dict], graph: dict) -> None:
 
 
 def sample_longhop_constraints(
-    graph: dict, n: int, rng, min_hops: int = 3
+    graph: dict, n: int, rng, min_hops: int = 3, max_boost: float = 1.0
 ) -> List[dict]:
     """Sample ``n`` (init, goal) region pairs whose shortest-path length is
     uniform over [min_hops, diameter] of the region graph.
@@ -205,6 +205,10 @@ def sample_longhop_constraints(
     ``graph`` is the inner graph dict (regions + region_connections). Works on
     a skeleton and a populated graph alike: the rename map cannot alter
     topology, so a distance computed on the skeleton is exact after renaming.
+
+    ``max_boost`` multiplies the sampling weight of the DIAMETER bucket only
+    (e21): buckets [min_hops, diameter-1] keep weight 1, the diameter bucket
+    gets ``max_boost``. 1.0 reproduces the e19/e20 uniform sampler exactly.
     """
     adj: dict = {node["name"]: set() for node in graph["regions"]}
     for a, b in graph["region_connections"]:
@@ -230,28 +234,68 @@ def sample_longhop_constraints(
 
     diameter = max(dist.values())
     lo = min(min_hops, diameter)
+    if max_boost <= 0:
+        raise ValueError(f"max_boost must be > 0, got {max_boost}")
+    # max_boost == 1.0 keeps the exact legacy rng.integers stream so old seeds
+    # resample identically; the boosted path draws via inverse-CDF instead.
+    n_buckets = diameter - lo + 1
+    total_weight = (n_buckets - 1) + max_boost
     out = []
     for _ in range(n):
-        hops = int(rng.integers(lo, diameter + 1))
+        if max_boost == 1.0:
+            hops = int(rng.integers(lo, diameter + 1))
+        else:
+            u = float(rng.random()) * total_weight
+            hops = diameter if u >= n_buckets - 1 else lo + int(u)
         pairs = sorted(k for k, v in dist.items() if v == hops)
         init, goal = pairs[int(rng.integers(len(pairs)))]
         out.append({"init": init, "goal": goal, "hops": hops})
     return out
 
 
-def validate_longhop_tasks(tasks: List[dict], constraints: List[dict]) -> None:
+def validate_longhop_tasks(
+    tasks: List[dict], constraints: List[dict], graph: Optional[dict] = None
+) -> None:
     """The last ``len(constraints)`` tasks must honour their fixed endpoints.
 
     ``constraints`` carry FINAL (renamed) node ids. init_node must match
     exactly, and the goal must be named in both the acceptance_criterion and
     the answer regex so the deterministic grader resolves the intended
     destination — otherwise the sampled hop length silently drifts.
+
+    When ``graph`` (the RENAMED inner graph dict) is given, any avoided region
+    named in a constrained task's acceptance_criterion ("without using <node>")
+    must lie strictly OFF every shortest init->goal path — an on-path avoid
+    would lengthen the required route and silently break the sampled hop
+    stratification (e21 longhop_allow_avoid).
     """
     n = len(constraints)
     if len(tasks) < n:
         raise ValueError(
             f"expected >= {n} tasks to satisfy long-hop constraints, got {len(tasks)}"
         )
+    dists = None
+    if graph is not None:
+        adj: dict = {node["name"]: set() for node in graph["regions"]}
+        for a, b in graph["region_connections"]:
+            adj[a].add(b)
+            adj[b].add(a)
+
+        def _bfs(src):
+            seen = {src: 0}
+            frontier, d = [src], 0
+            while frontier:
+                d += 1
+                nxt = []
+                for u in frontier:
+                    for v in adj[u]:
+                        if v not in seen:
+                            seen[v] = d
+                            nxt.append(v)
+                frontier = nxt
+            return seen
+
+        dists = _bfs
     for i, (task, c) in enumerate(zip(tasks[-n:], constraints)):
         label = f"long-hop task {len(tasks) - n + i}"
         if task["init_node"] != c["init"]:
@@ -264,6 +308,27 @@ def validate_longhop_tasks(tasks: List[dict], constraints: List[dict]) -> None:
                 raise ValueError(
                     f"{label}: {field} does not name the required goal {c['goal']!r}"
                 )
+        if dists is not None:
+            crit = task["acceptance_criterion"]
+            avoid_span = re.search(r"without using\b([^.;]*)", crit, re.IGNORECASE)
+            if avoid_span:
+                d_init, d_goal = dists(c["init"]), dists(c["goal"])
+                base_len = d_init.get(c["goal"])
+                for a in NODE_TOKEN.findall(avoid_span.group(1)):
+                    if a in (c["init"], c["goal"]):
+                        raise ValueError(
+                            f"{label}: avoided region {a!r} is the start/goal"
+                        )
+                    if (
+                        base_len is not None
+                        and d_init.get(a) is not None
+                        and d_goal.get(a) is not None
+                        and d_init[a] + d_goal[a] == base_len
+                    ):
+                        raise ValueError(
+                            f"{label}: avoided region {a!r} lies on a shortest "
+                            f"{c['init']}->{c['goal']} path — hop length would drift"
+                        )
 
 
 UPDATED_QUERY = r"""
@@ -572,6 +637,8 @@ class TaskGraphGen:
         task_types: Optional[List[int]] = None,
         task_complexities: Optional[List[int]] = None,
         longhop_constraints: Optional[List[dict]] = None,
+        grounding_directives: bool = False,
+        longhop_allow_avoid: bool = False,
     ):
         query = (
             UPDATED_QUERY
@@ -623,8 +690,51 @@ class TaskGraphGen:
                 "name prefix and nothing disambiguates it, you MAY name the "
                 "destination id in the task text. The acceptance_criterion and "
                 "answer regex must name the start and destination by their NEW "
-                "node ids, as usual. Do not add waypoint or avoid constraints to "
-                "these tasks."
+                "node ids, as usual."
+            )
+            if longhop_allow_avoid:
+                # e21: avoid-constraint coverage WITHOUT perturbing the sampled
+                # hop length — the avoided region must already be off the
+                # optimal route, so the shortest path is unchanged.
+                query += (
+                    " Waypoint constraints are still FORBIDDEN on these tasks. "
+                    "You MAY add an avoided-area constraint (\"without using "
+                    "<area>\") to SOME of them, but ONLY naming a region that "
+                    "the optimal route already bypasses — never a region on the "
+                    "shortest path between the fixed endpoints, and never the "
+                    "start or destination — so the required route length stays "
+                    "exactly the sampled hop count. Name the avoided region in "
+                    "the acceptance_criterion as usual."
+                )
+            else:
+                query += " Do not add waypoint or avoid constraints to these tasks."
+
+        if grounding_directives:
+            # e21: the dominant residual eval errors are START-grounding — the
+            # planner routes correctly but from the wrong node when the start
+            # is a paraphrase, an ordinal sibling, or an object reference.
+            # Force that diversity into the training tasks.
+            query += (
+                "\n\nStart-reference diversity (Reachability/Navigability tasks)\n"
+                "Vary HOW the task text refers to the START region across tasks, "
+                "drawing from all of these styles:\n"
+                "- a natural-language paraphrase of the region's name (\"the "
+                "freight lift\" for freight_lift_1);\n"
+                "- an ORDINAL reference when sibling regions share a name prefix "
+                "(\"the second seed vault\" for seed_vault_2 — the ordinal must "
+                "match the _N index exactly);\n"
+                "- the region that CONTAINS a named object (\"the area holding "
+                "the crate\" for the region connected to crate_1);\n"
+                "- occasionally the robot's starting area (\"from the starting "
+                "area\").\n"
+                "At most one third of the route tasks may start at "
+                "robot_location; every other task must name a DIFFERENT start "
+                "region and set \"init_node\" to exactly the region the task "
+                "text references (for an object reference, the object's host "
+                "region). Apply the same reference-style variety to "
+                "destinations. Never leave the start ambiguous: if sibling "
+                "regions share the referenced prefix, the wording must single "
+                "out one of them."
             )
 
         if previous_tasks != "":
@@ -645,6 +755,8 @@ class TaskGraphGen:
         task_complexities: Optional[List[int]] = None,
         longhop_constraints: Optional[List[dict]] = None,
         reasoning_effort: str = "low",
+        grounding_directives: bool = False,
+        longhop_allow_avoid: bool = False,
     ) -> List[str]:
         """Get GPT generated tasks for putting planner data
 
@@ -679,6 +791,8 @@ class TaskGraphGen:
                 task_types=task_types,
                 task_complexities=task_complexities,
                 longhop_constraints=longhop_constraints,
+                grounding_directives=grounding_directives,
+                longhop_allow_avoid=longhop_allow_avoid,
             ),
             reasoning_effort=reasoning_effort,
         )
@@ -747,6 +861,7 @@ class TaskGraphGen:
                     }
                     for c in longhop_constraints
                 ],
+                graph=graph,
             )
         _validate_tasks(json_content)
         return json_content

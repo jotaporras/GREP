@@ -193,6 +193,36 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--longhop-max-boost",
+        type=float,
+        default=1.0,
+        help=(
+            "e21: weight multiplier for the DIAMETER hop bucket when sampling "
+            "long-hop endpoints (other buckets keep weight 1). 1.0 = the "
+            "historical uniform sampler, bit-identical rng stream."
+        ),
+    )
+    parser.add_argument(
+        "--longhop-allow-avoid",
+        action="store_true",
+        help=(
+            "e21: let the LLM add an avoided-area constraint to long-hop tasks, "
+            "restricted (and validated against the graph) to regions strictly "
+            "off every shortest init->goal path so the sampled hop length is "
+            "preserved. Waypoints stay forbidden on long-hop tasks."
+        ),
+    )
+    parser.add_argument(
+        "--grounding-directives",
+        action="store_true",
+        help=(
+            "e21: add start-reference diversity directives to the task-gen "
+            "prompt (paraphrase / ordinal-sibling / object-hosted starts; at "
+            "most 1/3 of route tasks start at robot_location) — targets the "
+            "start-grounding eval failures."
+        ),
+    )
+    parser.add_argument(
         "--max-graphs",
         type=int,
         default=None,
@@ -275,6 +305,9 @@ if __name__ == "__main__":
         complexity_proportions=args.complexity_proportions,
         seed=args.seed,
         n_longhop_tasks=args.n_longhop_tasks,
+        longhop_max_boost=args.longhop_max_boost,
+        longhop_allow_avoid=args.longhop_allow_avoid,
+        grounding_directives=args.grounding_directives,
         fake_edge_frac=args.fake_edge_frac,
         fake_edges_n=args.fake_edges_n,
         nav_walk_directive=args.nav_walk_directive,
