@@ -2,7 +2,7 @@
 
 ## experiment: e20 path-only prediction — results
 date: 2026-08-24
-status: results note — 5 of 6 cells complete; v3/text_edges control in cross-eval (updated in place)
+status: FINAL — all 6 cells complete
 sources: `outputs/e20_path_only_pred/*/eval_logs/` on betty, wandb tag `e20_path_only_pred`; design in [2026-08-24 e20_path_only_pred_design.md](2026-08-24%20e20_path_only_pred_design.md)
 
 # e20 — strictly-path-prediction targets on n60
@@ -65,7 +65,7 @@ compare within a column only.
 | `e20_oracle_hop_depth` (7828117, sfixkba6) | graph | oracle / route_only | 75.0 | 77.4 | **92.9** | **92.9** |
 | `e20_oracle_text_edges` (7828118, m2kn8nqs) | LLM+text edges | oracle / route_only | 79.8 | 78.6 | 81.0 | 89.3 |
 | `e20_v3_hop_depth_think_route` (7829068, yifhyvxn) | graph | v3 / think_route | 66.7 | 65.5 | 73.8 | 70.2 |
-| `e20_v3_text_edges_think_route` (7829067, 5q0j7owo) | LLM+text edges | v3 / think_route | 86.9 | 89.3 | 92.9 | *cross running* |
+| `e20_v3_text_edges_think_route` (7829067, 5q0j7owo) | LLM+text edges | v3 / think_route | 86.9 | 89.3 | 92.9 | **97.6** |
 
 ¹ Up to 8 epoch-1 samples in the route_only cells crashed on a fail-loud guard
 (`route_only target has no extractable route`, fired on the model's own degenerate
@@ -116,7 +116,17 @@ both graded wrong) and 1/84 (text_edges).
    (92.9 vs 81.0) — the first clean win for the graph channel over its control.
    Plausible reading: NetworkX tie-broken shortest paths are off-policy for the
    LLM's text-search priors, while the graph channel has no such prior to fight.
-5. **Known grading gaps**, both small: hop_opt up to 1.67 means non-shortest valid
+5. **The reasoning-is-noise effect is architecture-specific.** The completed 2×2
+   shows route_only is what unlocks the GRAPH arch (cross: 70.2 think_route →
+   83.3/92.9 route_only), while the text-edge LLM baseline moves the other way —
+   its best cross-eval is the original v3 reasoning corpus with think_route
+   (**97.6**, the highest cross number in the table; route_only gives it 89.3).
+   Consistent with the adviser's mechanism: non-graph target tokens dilute the
+   gradient signal reaching the graph channel, but for a plain LLM the reasoning
+   tokens are not noise. Caveat: these think_route controls run in the e20
+   no-tools/no-ICL harness, so their absolute numbers are not the e19-era
+   baseline numbers (the hop_depth control nonetheless reproduced 73.8 exactly).
+6. **Known grading gaps**, both small: hop_opt up to 1.67 means non-shortest valid
    routes count as correct, and one e20 "correct" answer visits `command_deck_1`
    twice (no simple-path check in the structural grader). Neither changes the
    ordering; both are worth fixing before a writeup.
