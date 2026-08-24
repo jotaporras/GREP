@@ -2,7 +2,7 @@
 
 ## experiment: e20 path-only prediction — results
 date: 2026-08-24
-status: results note — 4 of 6 cells complete, both v3/think_route controls still running (updated in place as they land)
+status: results note — 5 of 6 cells complete; v3/text_edges control in cross-eval (updated in place)
 sources: `outputs/e20_path_only_pred/*/eval_logs/` on betty, wandb tag `e20_path_only_pred`; design in [2026-08-24 e20_path_only_pred_design.md](2026-08-24%20e20_path_only_pred_design.md)
 
 # e20 — strictly-path-prediction targets on n60
@@ -64,8 +64,8 @@ compare within a column only.
 | `e20_pathonly_text_edges` (7827257, zalttwkb) | LLM+text edges | pathonly / route_only | 94.0 | 91.7 | **98.8** | 89.3 |
 | `e20_oracle_hop_depth` (7828117, sfixkba6) | graph | oracle / route_only | 75.0 | 77.4 | **92.9** | **92.9** |
 | `e20_oracle_text_edges` (7828118, m2kn8nqs) | LLM+text edges | oracle / route_only | 79.8 | 78.6 | 81.0 | 89.3 |
-| `e20_v3_hop_depth_think_route` (7829068, yifhyvxn) | graph | v3 / think_route | 66.7 | 65.5 | *running* | — |
-| `e20_v3_text_edges_think_route` (7829067, 5q0j7owo) | LLM+text edges | v3 / think_route | 86.9 | 89.3 | *running* | — |
+| `e20_v3_hop_depth_think_route` (7829068, yifhyvxn) | graph | v3 / think_route | 66.7 | 65.5 | 73.8 | 70.2 |
+| `e20_v3_text_edges_think_route` (7829067, 5q0j7owo) | LLM+text edges | v3 / think_route | 86.9 | 89.3 | 92.9 | *cross running* |
 
 ¹ Up to 8 epoch-1 samples in the route_only cells crashed on a fail-loud guard
 (`route_only target has no extractable route`, fired on the model's own degenerate
@@ -96,8 +96,10 @@ both graded wrong) and 1/84 (text_edges).
 1. **The adviser's hypothesis is supported — strongly.** For the graph arch,
    holding everything else fixed, targets went reasoning→route-only and accuracy
    went 73.8 (e19 best-ever) → 84.5 (pathonly) → **92.9 (oracle)**. The in-harness
-   think_route control (yifhyvxn, e1 66.7) is so far consistent with the e19 band,
-   supporting that the jump is the format/corpus, not the harness.
+   think_route control (yifhyvxn) landed on **73.8 at epoch 3 — an exact
+   replication of the e19 v6sy0uhi number** — so the jump is the target format
+   and corpus, not the harness. The 2×2 is closed for the graph arch:
+   think_route 73.8 vs route_only 84.5/92.9.
 2. **92.9/92.9 is the best graph-channel result in the project by ~19 pts**, it is
    the first run where per-epoch and cross-eval agree exactly, and it is achieved
    with *zero* edges in the prompt — 2.3 pts below the base model's zero-shot
