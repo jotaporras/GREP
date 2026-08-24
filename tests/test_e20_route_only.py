@@ -208,7 +208,11 @@ def _data_generator():
     pytest.importorskip("spine")
     pytest.importorskip("networkx")
     from prism.data.data_gen import DataGenerator
-    return DataGenerator(graph_unknown=[0] * 10, seed=0)
+    # __init__ eagerly builds Phase-1 LLM clients (TaskGraphGen -> OpenAI(),
+    # which demands OPENAI_API_KEY) that the e20 runners under test never
+    # touch — every helper they use is a staticmethod or self-free. Construct
+    # without __init__ so these tests run keyless on the login node.
+    return DataGenerator.__new__(DataGenerator)
 
 
 class TestOracleMode:
