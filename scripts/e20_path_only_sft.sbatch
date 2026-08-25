@@ -62,7 +62,10 @@ case "$DATASET" in
   # oracle_v2b = v2 minus grounding directives (same skeleton seeds 601-1100,
   # sharded gen e21_n60_oracle_v2b_generate.sbatch + e21_merge_shards.py).
   oracle_v2b) DATA_SPLIT=${DATA_SPLIT:-$PROJ/data/n_60_oracle_v2b/split} ;;
-  *) echo "unknown DATASET=$DATASET (pathonly|oracle|v3|oracle579|oracle_v2|oracle_v2b)"; exit 2 ;;
+  # oracle_v2c = v2b + restored "from the starting area" phrasing on 40% of the
+  # long-hop tasks (e21_n60_oracle_v2c_generate.sbatch + e21_merge_shards.py).
+  oracle_v2c) DATA_SPLIT=${DATA_SPLIT:-$PROJ/data/n_60_oracle_v2c/split} ;;
+  *) echo "unknown DATASET=$DATASET (pathonly|oracle|v3|oracle579|oracle_v2|oracle_v2b|oracle_v2c)"; exit 2 ;;
 esac
 # Comparable eval: ALWAYS the frozen n60_v3 test graphs (same 7 graphs / 84
 # questions as e18/e19), regardless of which corpus trains the run.

@@ -7,6 +7,9 @@ Covers docs/2026-08-24 e21_oracle_scale_design.md:
   init->goal path is rejected (hop drift), an off-path one passes.
 - build_prompt flags: grounding_directives / longhop_allow_avoid are
   byte-identical no-ops when off.
+- longhop_start_area_frac (v2c): marks that fraction of the constrained tasks
+  to be worded "from the starting area" while init_node / grading fields keep
+  naming the region, so hop stratification is untouched.
 """
 
 import collections
@@ -167,3 +170,43 @@ class TestPromptFlags:
         assert "Do not add waypoint or avoid constraints" not in p
         assert "optimal route already bypasses" in p
         assert "Waypoint constraints are still FORBIDDEN" in p
+
+
+MARKER = "Word this task's START as the robot's current position"
+
+
+class TestStartAreaPhrasing:
+    def _prompt(self, n_lh=10, **kw):
+        gen = graph_gen.TaskGraphGen.__new__(graph_gen.TaskGraphGen)
+        return gen.build_prompt(
+            base_graph="{}", n_tasks=12,
+            longhop_constraints=[
+                {"init": f"room_{i}", "goal": "room_6", "hops": 4}
+                for i in range(n_lh)
+            ], **kw)
+
+    def test_default_is_byte_identical_noop(self):
+        assert self._prompt() == self._prompt(longhop_start_area_frac=0.0)
+        assert MARKER not in self._prompt()
+
+    def test_fraction_marks_that_many_tasks(self):
+        # 0.4 x 10 constrained tasks -> 4 marked, the rest keep named starts.
+        assert self._prompt(longhop_start_area_frac=0.4).count(MARKER) == 4
+        assert self._prompt(longhop_start_area_frac=1.0).count(MARKER) == 10
+
+    def test_marked_tasks_still_ground_the_grading_fields(self):
+        # The whole point: the wording changes, the labels do not.
+        p = self._prompt(longhop_start_area_frac=0.4)
+        assert "init_node" in p
+        assert "must still name" in p and "NEW node id" in p
+
+    def test_endpoints_are_unchanged_by_the_flag(self):
+        # Hop stratification must survive: every task still states its fixed
+        # base-graph endpoints and hop count.
+        p = self._prompt(longhop_start_area_frac=0.4)
+        assert p.count("optimal route: 4 hops") == 10
+
+    def test_out_of_range_rejected(self):
+        for bad in (-0.1, 1.5):
+            with pytest.raises(ValueError, match="longhop_start_area_frac"):
+                self._prompt(longhop_start_area_frac=bad)

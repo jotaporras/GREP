@@ -92,6 +92,7 @@ class DataGenerator:
         longhop_max_boost: float = 1.0,
         longhop_allow_avoid: bool = False,
         grounding_directives: bool = False,
+        longhop_start_area_frac: float = 0.0,
         fake_edge_frac: float = 0.0,
         fake_edges_n: int = 2,
         nav_walk_directive: bool = False,
@@ -108,6 +109,7 @@ class DataGenerator:
         self.longhop_max_boost = longhop_max_boost
         self.longhop_allow_avoid = longhop_allow_avoid
         self.grounding_directives = grounding_directives
+        self.longhop_start_area_frac = longhop_start_area_frac
         # e19 SPINE closed loop: fraction of rollouts whose PROMPT graph gets
         # fake 2-hop shortcut edges (GraphSim.corrupt_with_fake_edges); goto
         # ratification against the true graph then produces rejection-recovery
@@ -220,6 +222,7 @@ class DataGenerator:
                         reasoning_effort=reasoning_effort,
                         grounding_directives=self.grounding_directives,
                         longhop_allow_avoid=self.longhop_allow_avoid,
+                        longhop_start_area_frac=self.longhop_start_area_frac,
                     )
 
                     break

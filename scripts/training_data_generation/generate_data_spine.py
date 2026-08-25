@@ -203,6 +203,19 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--longhop-start-area-frac",
+        type=float,
+        default=0.0,
+        help=(
+            "e21 v2c: fraction of the long-hop tasks whose START is worded as "
+            "the robot's current position (\"from the starting area\") instead "
+            "of naming the region. init_node, acceptance_criterion and the "
+            "answer regex still name it, so the sampled endpoints and hop "
+            "length are unchanged. 0.0 = off (the v2/v2b behaviour, where "
+            "N_LONGHOP=10/12 left only 2%% of tasks using that phrasing)."
+        ),
+    )
+    parser.add_argument(
         "--longhop-allow-avoid",
         action="store_true",
         help=(
@@ -307,6 +320,7 @@ if __name__ == "__main__":
         n_longhop_tasks=args.n_longhop_tasks,
         longhop_max_boost=args.longhop_max_boost,
         longhop_allow_avoid=args.longhop_allow_avoid,
+        longhop_start_area_frac=args.longhop_start_area_frac,
         grounding_directives=args.grounding_directives,
         fake_edge_frac=args.fake_edge_frac,
         fake_edges_n=args.fake_edges_n,

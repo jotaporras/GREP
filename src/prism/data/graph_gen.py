@@ -639,6 +639,7 @@ class TaskGraphGen:
         longhop_constraints: Optional[List[dict]] = None,
         grounding_directives: bool = False,
         longhop_allow_avoid: bool = False,
+        longhop_start_area_frac: float = 0.0,
     ):
         query = (
             UPDATED_QUERY
@@ -670,6 +671,19 @@ class TaskGraphGen:
 
         if longhop_constraints:
             n_lh = len(longhop_constraints)
+            # e21 v2c: with N_LONGHOP=10/12 nearly every task hands the author a
+            # named start node, which squeezed "from the starting area" phrasing
+            # down to 2% of the v2/v2b corpora (oracle v1: 25%) while 63% of the
+            # frozen eval questions use it. Mark a fraction of the constrained
+            # tasks to be worded from the robot's current position instead. The
+            # endpoints, init_node and grading fields are untouched, so hop
+            # stratification is preserved exactly.
+            if not 0.0 <= longhop_start_area_frac <= 1.0:
+                raise ValueError(
+                    "longhop_start_area_frac must be in [0, 1], got "
+                    f"{longhop_start_area_frac}"
+                )
+            n_start_area = int(round(longhop_start_area_frac * n_lh))
             query += (
                 "\n\nLong-hop routing constraints (OVERRIDE the type/complexity "
                 "lists for these tasks)\n"
@@ -683,6 +697,12 @@ class TaskGraphGen:
                     f"rename map gives that region. The destination is base-graph "
                     f"node \"{c['goal']}\" (optimal route: {c['hops']} hops).\n"
                 )
+                if k < n_start_area:
+                    query += (
+                        "  Word this task's START as the robot's current "
+                        "position (\"from the starting area\") instead of "
+                        "naming or describing that region.\n"
+                    )
             query += (
                 "For each constrained task: phrase the destination semantically "
                 "(by a contained object, its description, or its name theme) "
@@ -708,6 +728,17 @@ class TaskGraphGen:
                 )
             else:
                 query += " Do not add waypoint or avoid constraints to these tasks."
+
+            if n_start_area:
+                query += (
+                    " For the tasks marked to start from the robot's current "
+                    "position, the task text must NOT name or describe the "
+                    "start region — the robot begins there, so \"from the "
+                    "starting area\" is accurate. \"init_node\", the "
+                    "acceptance_criterion and the answer regex must still name "
+                    "that region by its NEW node id, exactly as for the other "
+                    "constrained tasks."
+                )
 
         if grounding_directives:
             # e21: the dominant residual eval errors are START-grounding — the
@@ -757,6 +788,7 @@ class TaskGraphGen:
         reasoning_effort: str = "low",
         grounding_directives: bool = False,
         longhop_allow_avoid: bool = False,
+        longhop_start_area_frac: float = 0.0,
     ) -> List[str]:
         """Get GPT generated tasks for putting planner data
 
@@ -793,6 +825,7 @@ class TaskGraphGen:
                 longhop_constraints=longhop_constraints,
                 grounding_directives=grounding_directives,
                 longhop_allow_avoid=longhop_allow_avoid,
+                longhop_start_area_frac=longhop_start_area_frac,
             ),
             reasoning_effort=reasoning_effort,
         )
