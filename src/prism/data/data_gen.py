@@ -312,6 +312,7 @@ class DataGenerator:
                     task_types=task_types,
                     task_complexities=task_complexities,
                     longhop_constraints=longhop,
+                    longhop_start_area_frac=self.longhop_start_area_frac,
                 )
             )
         responses = self.context_gen.client.batch_query_gpt_5(

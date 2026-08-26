@@ -210,3 +210,44 @@ class TestStartAreaPhrasing:
         for bad in (-0.1, 1.5):
             with pytest.raises(ValueError, match="longhop_start_area_frac"):
                 self._prompt(longhop_start_area_frac=bad)
+
+
+class TestBatchedPopulateThreadsTheFlag:
+    """The vLLM path builds its prompts in populate_graphs_and_tasks_batch, not
+    in get_tasks. v2c's corpus came out byte-identical to v2b's because that
+    path dropped the kwarg on the floor."""
+
+    def _batched_prompt(self, frac):
+        from prism.data import data_gen as dg
+
+        longhop = [{"init": f"room_{i}", "goal": "room_6", "hops": 4}
+                   for i in range(10)]
+        seen = {}
+
+        class _Client:
+            @staticmethod
+            def batch_query_gpt_5(prompts, **_kw):
+                seen["prompt"] = prompts[0]
+                return [""]
+
+        class _Ctx(graph_gen.TaskGraphGen):
+            def __init__(self):
+                self.client = _Client()
+
+            def parse_response(self, *_a, **_kw):
+                raise RuntimeError("stop after prompt construction")
+
+        gen = dg.DataGenerator.__new__(dg.DataGenerator)
+        gen.longhop_start_area_frac = frac
+        gen.context_gen = _Ctx()
+        gen._load_valid_populated = lambda _path: None
+        gen._sample_task_labels = lambda _g, _n: (None, None, longhop)
+
+        gen.populate_graphs_and_tasks_batch(["{}"], log_dir="/dev/null", n_tasks=12)
+        return seen["prompt"]
+
+    def test_flag_reaches_the_batched_prompt(self):
+        assert self._batched_prompt(0.4).count(MARKER) == 4
+
+    def test_default_batched_prompt_is_unmarked(self):
+        assert MARKER not in self._batched_prompt(0.0)
