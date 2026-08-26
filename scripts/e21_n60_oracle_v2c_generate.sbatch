@@ -35,7 +35,13 @@
 # total). After ALL tasks finish, merge the shard splits with:
 #
 #   python scripts/e21_merge_shards.py \
-#     --root $ALELAB_DRIVE/GREP-PRISM/data/n_60_oracle_v2c
+#     --root $ALELAB_DRIVE/GREP-PRISM/data/n_60_oracle_v2c_r2
+#
+# Root is n_60_oracle_v2c_r2: the first attempt (array 7851568) wrote
+# n_60_oracle_v2c, but populate_graphs_and_tasks_batch — the path the vLLM
+# backend takes — never forwarded longhop_start_area_frac to build_prompt, so
+# that corpus came out byte-identical to v2b (same md5, phrasing still 1.7%).
+# Fixed in a8013ec; the stale tree is left in place, unused.
 #
 # Submit:  sbatch scripts/e21_n60_oracle_v2c_generate.sbatch
 
@@ -65,7 +71,7 @@ export N_TASKS=12
 export N_LONGHOP=10
 
 SHARD="${SLURM_ARRAY_TASK_ID:?run via sbatch --array}"
-export DATA_ROOT="${ALELAB_DRIVE}/GREP-PRISM/data/n_60_oracle_v2c/shard${SHARD}"
+export DATA_ROOT="${ALELAB_DRIVE}/GREP-PRISM/data/n_60_oracle_v2c_r2/shard${SHARD}"
 export SEED_START=$((601 + 125 * SHARD))
 export VAL_IDS="123 124"
 
@@ -73,5 +79,5 @@ export EXTRA_GEN_ARGS="--oracle-paths --longhop-max-boost 3 --longhop-allow-avoi
 
 N_GRAPHS=125
 
-echo "=== v2c shard ${SHARD}: seeds ${SEED_START}-$((SEED_START + N_GRAPHS - 1)) -> ${DATA_ROOT} ==="
+echo "=== v2c_r2 shard ${SHARD}: seeds ${SEED_START}-$((SEED_START + N_GRAPHS - 1)) -> ${DATA_ROOT} ==="
 srun --ntasks=1 bash scripts/nav_n100_gemma_generate.sh 0 "$PRISM_HF_MODEL" "$N_GRAPHS"
