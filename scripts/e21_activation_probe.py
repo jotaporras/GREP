@@ -414,8 +414,18 @@ def main():
                     [h[qsel] for h in hs]).numpy()          # [L+1, nq, H]
         del hs_by_cond
 
+        # id -> string map for every vocab id the notebook may need to render
+        # (top-10 candidates under any condition + node first tokens).
+        vocab_ids = set(int(i) for i in node_first.flatten() if i >= 0)
+        for cond in CONDITIONS:
+            key = f"{cond}/ansnode_top10_ids"
+            if key in arrays:
+                vocab_ids.update(int(i) for i in arrays[key].flatten())
+        tok_str = {i: tokenizer.convert_ids_to_tokens(i) for i in sorted(vocab_ids)}
+
         meta = {
             "graph_name": stem, "idx": orig_idx, "tag": tag,
+            "tok_str": tok_str,
             "task": res["task"], "answer_key": res["answer_key"],
             "correct": bool(res["correct"]),
             "path_metrics": res.get("path_metrics"),
