@@ -29,6 +29,9 @@ ENV_NAME=${ENV_NAME:-$ALELAB/envs/GREP-PRISM-v3}
 ROOT=${ROOT:-$PROJ/data/n_geo_v1}
 GEN_SUBDIR=${GEN_SUBDIR:-gen/nav_ngeo_gemma_data/split}
 COMPARE=${COMPARE:-$PROJ/data/n_60_oracle_v2c_r2/split/formatted_all_new__train.json}
+# Populate coverage gate per region count. 0.9 is the design bar; geo_v1 was
+# accepted at 0.75 (130-region 92/120 after three resume passes, JP 2026-11-03).
+MIN_COVERAGE=${MIN_COVERAGE:-0.9}
 
 export HF_HOME=${HF_HOME:-$ALELAB/.cache/huggingface}
 export WANDB_MODE=offline
@@ -43,5 +46,5 @@ python scripts/e21_merge_shards.py --root "$ROOT" --gen-subdir "$GEN_SUBDIR"
 echo "=== audit ==="
 COMPARE_ARGS=()
 test -f "$COMPARE" && COMPARE_ARGS=(--compare "$COMPARE")
-python scripts/e22_corpus_audit.py --root "$ROOT" ${COMPARE_ARGS[@]+"${COMPARE_ARGS[@]}"}
+python scripts/e22_corpus_audit.py --root "$ROOT" --min-coverage "$MIN_COVERAGE" ${COMPARE_ARGS[@]+"${COMPARE_ARGS[@]}"}
 echo "[$(date --iso-8601=seconds)] e22 postgen gate PASSED for $ROOT"
