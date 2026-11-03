@@ -73,7 +73,8 @@ TAG=${TAG:-e22_geometric_scale}
 EVAL_EPOCH_INTERVAL=${EVAL_EPOCH_INTERVAL:-1}
 
 export WANDB_ENTITY=${WANDB_ENTITY:-alelab}
-export HF_HOME=${HF_HOME:-$ALELAB/hf_cache}
+# gemma-4-31B-it lives under $ALELAB/.cache/huggingface, not the older hf_cache dir.
+export HF_HOME=${HF_HOME:-$ALELAB/.cache/huggingface}
 export HF_DATASETS_CACHE="${TMPDIR:-/tmp}/hf_datasets_${SLURM_JOB_ID:-manual}"
 export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-28}"
 # PATH prepend, not `conda activate` (compute-node batch shells have no conda).

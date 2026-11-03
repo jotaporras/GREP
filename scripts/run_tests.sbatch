@@ -20,7 +20,7 @@ cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/..}"
 
 export ALELAB_DRIVE="${ALELAB_DRIVE:-/vast/projects/aribeiro/alelab/jporras}"
 ENV_NAME=${ENV_NAME:-/vast/projects/aribeiro/alelab/jporras/envs/GREP-PRISM-v3}
-export HF_HOME=${HF_HOME:-/vast/projects/aribeiro/alelab/jporras/hf_cache}
+export HF_HOME=${HF_HOME:-/vast/projects/aribeiro/alelab/jporras/.cache/huggingface}
 export WANDB_MODE=offline
 
 module load anaconda3 2>/dev/null || true

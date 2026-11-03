@@ -63,7 +63,9 @@ cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/..}"
 export ALELAB_DRIVE="${ALELAB_DRIVE:-/vast/projects/aribeiro/alelab/jporras}"
 
 ENV_NAME=${ENV_NAME:-/vast/projects/aribeiro/alelab/jporras/envs/GREP-PRISM-vllm}
-export HF_HOME=${HF_HOME:-/vast/projects/aribeiro/alelab/jporras/hf_cache}
+# gemma-4-31B-it lives under $ALELAB_DRIVE/.cache/huggingface (hub symlinked from
+# ~/.cache since 2026-09-01); the older hf_cache dir no longer holds it.
+export HF_HOME=${HF_HOME:-/vast/projects/aribeiro/alelab/jporras/.cache/huggingface}
 
 module load anaconda3 2>/dev/null || true
 source "$(conda info --base)/etc/profile.d/conda.sh"
