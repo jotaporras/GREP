@@ -2,10 +2,11 @@
 #SBATCH --job-name=grep-tests
 #SBATCH --output=/vast/projects/aribeiro/alelab/jporras/GREP-PRISM/slurm-%x-%j.out
 #SBATCH --time=01:30:00
-#SBATCH --partition=genoa-std-mem
+#SBATCH --partition=genoa-lrg-mem
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-# no --mem: the cli_filter derives memory from CPUs (5632M each on genoa-std-mem)
+# no --mem: the cli_filter derives memory from CPUs (~17G each on genoa-lrg-mem).
+# genoa-std-mem with 8 CPUs (44G) was OOM-killed at 93% of the suite (job 9986963).
 #
 # Run the pytest suite inside a CPU job (never on the login node).
 #
@@ -28,5 +29,5 @@ source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "$ENV_NAME"
 
 echo "[$(date --iso-8601=seconds)] host=$(hostname) commit=$(git rev-parse --short HEAD) python=$(which python)"
-python -m pytest "${@:-tests/}" -q -p no:cacheprovider -rfE
+python -m pytest "${@:-tests/}" -v -p no:cacheprovider -rfE --tb=short
 echo "[$(date --iso-8601=seconds)] pytest exit=$?"
