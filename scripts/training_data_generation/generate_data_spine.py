@@ -36,6 +36,7 @@ import argparse
 import json
 from pathlib import Path
 
+from prism.data import graph_gen
 from prism.data.data_gen import DataGenerator
 
 if __name__ == "__main__":
@@ -236,6 +237,54 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--longhop-hop-weights",
+        type=str,
+        default=None,
+        help=(
+            "e22: weighted hop targeting, e.g. \"1:0.04,2:0.04,...,15:0.01\". "
+            "Hop h is drawn with weight w_h over the buckets present in the "
+            "graph, then a uniform (init, goal) pair at exactly h hops. "
+            "Replaces --longhop-max-boost. Default: off (e19-e21 sampler, "
+            "byte-identical rng stream)."
+        ),
+    )
+    parser.add_argument(
+        "--longhop-named-start-frac",
+        type=float,
+        default=0.0,
+        help=(
+            "e22: fraction of the long-hop tasks whose text names a start "
+            "region that is NOT robot_location; those tasks carry "
+            "keep_robot_location=true and the sample writers keep the graph's "
+            "robot_location. --longhop-start-area-frac then applies to the "
+            "remaining tasks only. Needs --longhop-hop-weights."
+        ),
+    )
+    parser.add_argument(
+        "--longhop-allow-via",
+        type=float,
+        nargs="?",
+        const=0.2,
+        default=0.0,
+        metavar="FRAC",
+        help=(
+            "e22: give FRAC (flag alone: 0.2) of the long-hop tasks a required "
+            "waypoint off every shortest init->goal path; the oracle route is "
+            "init->via->goal and the recorded hops is that constrained length. "
+            "Needs --longhop-hop-weights."
+        ),
+    )
+    parser.add_argument(
+        "--longhop-object-goal-frac",
+        type=float,
+        default=0.0,
+        help=(
+            "e22: fraction of the long-hop tasks whose goal region contains an "
+            "object and whose text names the goal by that object (\"the area "
+            "with the drinks machine\"). Needs --longhop-hop-weights."
+        ),
+    )
+    parser.add_argument(
         "--max-graphs",
         type=int,
         default=None,
@@ -291,6 +340,11 @@ if __name__ == "__main__":
     if args.nav_walk_directive and (args.path_only or args.oracle_paths):
         parser.error("--nav-walk-directive is a SPINE-rollout knob; it has no "
                      "effect in --path-only/--oracle-paths modes")
+    if args.longhop_hop_weights is not None and args.longhop_max_boost != 1.0:
+        parser.error("--longhop-hop-weights replaces --longhop-max-boost; pass one")
+    if args.longhop_named_start_frac > 0 and not (args.path_only or args.oracle_paths):
+        parser.error("--longhop-named-start-frac needs --oracle-paths or --path-only "
+                     "(a SPINE rollout starts the robot at init_node)")
     rollout_mode = (
         "path_only" if args.path_only
         else "oracle" if args.oracle_paths
@@ -325,6 +379,13 @@ if __name__ == "__main__":
         fake_edge_frac=args.fake_edge_frac,
         fake_edges_n=args.fake_edges_n,
         nav_walk_directive=args.nav_walk_directive,
+        longhop_hop_weights=(
+            graph_gen.parse_hop_weights(args.longhop_hop_weights)
+            if args.longhop_hop_weights is not None else None
+        ),
+        longhop_named_start_frac=args.longhop_named_start_frac,
+        longhop_via_frac=args.longhop_allow_via,
+        longhop_object_goal_frac=args.longhop_object_goal_frac,
     )
 
     if args.skip_populate:

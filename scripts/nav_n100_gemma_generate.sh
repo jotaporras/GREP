@@ -106,7 +106,8 @@ DATA_ROOT="${DATA_ROOT:-data/n_100}"
 # pass INTER_PROB=0.25; see scripts/nav_small_vllm_generate.sbatch).
 INTRA_PROB="${INTRA_PROB:-0.6}"
 INTER_PROB="${INTER_PROB:-0.05}"
-OBJECT_RATE=0.3
+# Objects per region ~ Poisson(OBJECT_RATE); e22 floor plans use 0.4.
+OBJECT_RATE="${OBJECT_RATE:-0.3}"
 DESC_PROB=0.05
 # Tasks per graph; N_LONGHOP reserves the LAST k of them as fixed-endpoint
 # long-hop Navigability tasks (see generate_data_spine.py --n-longhop-tasks).
@@ -125,6 +126,25 @@ GEN_SEED=42
 NC="${GRAPH_COMMUNITIES:-7}"
 NPC="${GRAPH_NODES_PER_COMMUNITY:-11}"
 GRAPH_LABEL="${GRAPH_LABEL:-100}"
+
+# e22 skeleton layout (docs/2026-11-02 e22_geometric_scale_design.md §2).
+# LAYOUT=sbm (default) runs the historical SBM command above unchanged and
+# ignores every knob below. LAYOUT=floorplan|emst builds spatial graphs of
+# N_REGIONS regions; SIZE_TABLE (a file of "<seed> <n_regions>" lines) sets the
+# size per seed instead, for mixed-size corpora (scripts/e22_geo_v1_generate.sbatch).
+LAYOUT="${LAYOUT:-sbm}"
+N_REGIONS="${N_REGIONS:-100}"
+SIZE_TABLE="${SIZE_TABLE:-}"
+DOOR_EXTRA_MIN="${DOOR_EXTRA_MIN:-0.05}"
+DOOR_EXTRA_MAX="${DOOR_EXTRA_MAX:-0.20}"
+CORRIDOR_BIAS="${CORRIDOR_BIAS:-0.3}"
+ZONE_DEPTH="${ZONE_DEPTH:-3}"
+REGION_AREA="${REGION_AREA:-25.0}"
+ROBOT_LOCATION="${ROBOT_LOCATION:-region_1}"
+case "$LAYOUT" in sbm|floorplan|emst) ;; *) echo "ERROR: unknown LAYOUT=$LAYOUT (sbm|floorplan|emst)" >&2; exit 2 ;; esac
+if [[ -n "$SIZE_TABLE" && ! -f "$SIZE_TABLE" ]]; then
+  echo "ERROR: SIZE_TABLE=$SIZE_TABLE does not exist" >&2; exit 2
+fi
 
 # Output dirs carry the graph size so an N~30/N~60 run never lands in a
 # nav_n100_* directory.
@@ -159,6 +179,7 @@ if [[ "$PRISM_LLM_BACKEND" == "vllm" ]]; then
   echo "    vLLM: TP=${PRISM_VLLM_TP:-1} max_len=${PRISM_VLLM_MAX_LEN:-16384} rollout_workers=${ROLLOUT_WORKERS} (batched populate)"
 fi
 echo "    N_GRAPHS=${N_GRAPHS} x N_TASKS=${N_TASKS} = $((N_GRAPHS * N_TASKS)) (graph,task) pairs"
+echo "    LAYOUT=${LAYOUT}${SIZE_TABLE:+ SIZE_TABLE=${SIZE_TABLE}} OBJECT_RATE=${OBJECT_RATE}"
 
 echo ""
 echo "=== Preflight: verify data-gen code is current (fails fast vs. a 12-min load on a stale file) ==="
@@ -203,17 +224,42 @@ if [ "$all_skeletons_exist" = true ] && [ "$populated_count" -gt 0 ]; then
   echo "Skipping skeleton generation (use --fresh by clearing those dirs to regenerate)."
 else
   for SEED in "${seeds[@]}"; do
-    echo "--- N~${GRAPH_LABEL} (${NC} communities x ${NPC} nodes/community) seed=${SEED} ---"
-    python scripts/generate_eval_graphs.py \
-      --n-communities "$NC" \
-      --nodes-per-community "$NPC" \
-      --intra-community-prob "$INTRA_PROB" \
-      --inter-community-prob "$INTER_PROB" \
-      --object-rate "$OBJECT_RATE" \
-      --description-prob "$DESC_PROB" \
-      --n-tasks "$N_TASKS" \
-      --seed "$SEED" \
-      --output "${SKEL_DIR}/eval_graph_unique_${GRAPH_LABEL}_seed${SEED}.json"
+    if [[ "$LAYOUT" == "sbm" ]]; then
+      echo "--- N~${GRAPH_LABEL} (${NC} communities x ${NPC} nodes/community) seed=${SEED} ---"
+      python scripts/generate_eval_graphs.py \
+        --n-communities "$NC" \
+        --nodes-per-community "$NPC" \
+        --intra-community-prob "$INTRA_PROB" \
+        --inter-community-prob "$INTER_PROB" \
+        --object-rate "$OBJECT_RATE" \
+        --description-prob "$DESC_PROB" \
+        --n-tasks "$N_TASKS" \
+        --seed "$SEED" \
+        --output "${SKEL_DIR}/eval_graph_unique_${GRAPH_LABEL}_seed${SEED}.json"
+    else
+      NR="$N_REGIONS"
+      if [[ -n "$SIZE_TABLE" ]]; then
+        NR=$(awk -v s="$SEED" '$1 == s {print $2}' "$SIZE_TABLE")
+        if [[ -z "$NR" ]]; then
+          echo "ERROR: seed ${SEED} missing from SIZE_TABLE=${SIZE_TABLE}" >&2; exit 2
+        fi
+      fi
+      echo "--- ${LAYOUT} ${NR} regions seed=${SEED} ---"
+      python scripts/generate_eval_graphs.py \
+        --layout "$LAYOUT" \
+        --n-regions "$NR" \
+        --door-extra-min "$DOOR_EXTRA_MIN" \
+        --door-extra-max "$DOOR_EXTRA_MAX" \
+        --corridor-bias "$CORRIDOR_BIAS" \
+        --zone-depth "$ZONE_DEPTH" \
+        --region-area "$REGION_AREA" \
+        --robot-location "$ROBOT_LOCATION" \
+        --object-rate "$OBJECT_RATE" \
+        --description-prob "$DESC_PROB" \
+        --n-tasks "$N_TASKS" \
+        --seed "$SEED" \
+        --output "${SKEL_DIR}/eval_graph_unique_${GRAPH_LABEL}_seed${SEED}.json"
+    fi
   done
 fi
 

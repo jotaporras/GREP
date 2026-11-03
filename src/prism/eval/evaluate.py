@@ -176,11 +176,15 @@ class _NoToolsGraphSim(graph_sim.GraphSim):
 
 EvalSample = namedtuple(
     "EvalSample",
-    ["task", "answer", "graph", "init_node", "graph_name", "acceptance_criterion"],
+    ["task", "answer", "graph", "init_node", "graph_name", "acceptance_criterion",
+     "robot_location"],
 )
 # acceptance_criterion is optional: only e6-style datasets carry it. When present
 # it enables the path validator's Gemma judge; otherwise the validator falls back to regex/NetworkX.
-EvalSample.__new__.__defaults__ = (None,)
+# robot_location (e22 named-start tasks) is optional: where the robot is placed for
+# the prompt when it differs from init_node. None = place the robot at init_node
+# (the historical behaviour). init_node stays the route start for grading either way.
+EvalSample.__new__.__defaults__ = (None, None)
 # graph_name is a stable id (e.g. file stem "data_gen_004") stamped on every result dict.
 
 
@@ -339,7 +343,13 @@ def eval_model_single_graph(
         try:
             if permutation is not None and not is_gnn:
                 graph_dict = model_utils.permute_graph_dict(graph_dict, seed=permutation.seed)
-            graph_simulation.reset(graph_as_dict=graph_dict, current_location=init_node)
+            # e22 named start: the robot stays at the sample's robot_location and the
+            # task text names the start; grading still starts the route at init_node.
+            robot_location = init_node
+            if eval_sample.robot_location is not None:
+                robot_location = eval_sample.robot_location
+                graph_dict = {**graph_dict, "robot_location": robot_location}
+            graph_simulation.reset(graph_as_dict=graph_dict, current_location=robot_location)
             llm_planner.graph = graph_simulation.partial_graph
 
             planning_result = planner.run_planning(
@@ -705,8 +715,16 @@ def construct_eval_samples_from_dict(
     graph_dict: dict,
     tasks_list: List[dict],
     graph_name: str,
+    keep_robot_location: bool = False,
 ) -> List[EvalSample]:
-    """Convert graph_dict + tasks_list into EvalSamples, stamping graph_name on each."""
+    """Convert graph_dict + tasks_list into EvalSamples, stamping graph_name on each.
+
+    ``keep_robot_location`` (e22): keep the graph's own ``robot_location`` in the
+    prompt for every task instead of placing the robot at the task's ``init_node``.
+    A task flagged ``keep_robot_location: true`` (named start) always keeps it.
+    Mirrors ``rl_dataset._task_rows``.
+    """
+    graph_robot_location = graph_dict.get("robot_location")
     return [
         EvalSample(
             task=t["task"],
@@ -715,6 +733,9 @@ def construct_eval_samples_from_dict(
             init_node=t["init_node"],
             graph_name=graph_name,
             acceptance_criterion=t.get("acceptance_criterion"),
+            robot_location=(graph_robot_location
+                            if (keep_robot_location or t.get("keep_robot_location", False))
+                            else None),
         )
         for t in tasks_list
     ]

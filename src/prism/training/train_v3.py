@@ -366,7 +366,8 @@ def train_model(config: omegaconf.DictConfig):
         )
 
     eval_samples_by_graph = data.load_eval_samples_by_graph(
-        config.eval.data, config.eval.num_graphs
+        config.eval.data, config.eval.num_graphs,
+        keep_robot_location=config.eval.keep_robot_location,
     )
     trainer.add_callback(
         callbacks.EvalCallback(
@@ -417,7 +418,8 @@ def train_model(config: omegaconf.DictConfig):
     # + gnn weights — the boundary an in-memory eval would never exercise.
     if config.eval.post_train_graphs:
         samples_by_graph, graph_file_by_name = data.load_samples_by_graph(
-            config.eval.post_train_graphs
+            config.eval.post_train_graphs,
+            keep_robot_location=config.eval.keep_robot_location,
         )
         eval_model, eval_tokenizer, _ = checkpoint.load_checkpoint(
             sft_args.output_dir, four_bit=config.trainer.bit4, device=config.trainer.device

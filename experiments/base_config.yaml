@@ -391,6 +391,11 @@ eval:
   use_icl: false
   # Held-out graph set evaluated once post-training (reloaded from the saved checkpoint).
   post_train_graphs: null
+  # e22: true keeps each graph file's own robot_location in the prompt instead of
+  # placing the robot at the task's init_node (the robot sim's convention: the
+  # hospital sweep keeps plaza_1 and the task text names the start). Tasks flagged
+  # keep_robot_location: true keep it regardless of this switch.
+  keep_robot_location: false
 
 wandb:
   project: GREP-PRISM

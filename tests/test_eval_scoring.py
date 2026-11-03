@@ -109,6 +109,7 @@ def test_construct_eval_samples_maps_fields_and_stamps_graph_name():
     assert (s0.task, s0.answer, s0.init_node) == ("t0", "ans0", "a")
     assert s0.graph_name == "data_gen_004"
     assert s0.graph is graph
+    assert s0.robot_location is None               # default: robot placed at init_node
     assert s0.acceptance_criterion is None         # not provided -> default None
     assert s1.acceptance_criterion == "must reach b"
 
@@ -166,3 +167,19 @@ if __name__ == "__main__":
         if name.startswith("test_") and callable(fn):
             fn(); print(f"{name}: PASS")
     print("done")
+
+
+def test_construct_eval_samples_keep_robot_location():
+    """e22 named starts: a task flagged keep_robot_location, or the whole-set switch,
+    carries the graph file's robot_location; init_node is unchanged (route start)."""
+    graph = {"objects": {}, "regions": {}, "robot_location": "plaza_1"}
+    tasks = [
+        {"task": "t0", "answer": "ans0", "init_node": "a"},
+        {"task": "t1", "answer": "ans1", "init_node": "b", "keep_robot_location": True},
+    ]
+    s0, s1 = evaluate.construct_eval_samples_from_dict(graph, tasks, "hospital_v4")
+    assert (s0.robot_location, s0.init_node) == (None, "a")
+    assert (s1.robot_location, s1.init_node) == ("plaza_1", "b")
+    k0, k1 = evaluate.construct_eval_samples_from_dict(
+        graph, tasks, "hospital_v4", keep_robot_location=True)
+    assert (k0.robot_location, k1.robot_location) == ("plaza_1", "plaza_1")

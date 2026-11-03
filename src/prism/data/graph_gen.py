@@ -4,9 +4,18 @@ import re
 import sys
 from typing import List, Optional
 
+import numpy as np
+
 from prism.data import local_llm, utils, vllm_llm
+from prism.eval import path_validator
 
 FILL_TOKEN = "__FILL__"
+
+# Task text that grounds the start at the robot's position (SA_RE of notebook
+# 2026-11-01 hospital_graphs_analysis). A named-start (keep_robot_location)
+# task must not match: the robot is NOT at its init_node there.
+START_AREA_PHRASE = re.compile(
+    r"starting (area|location|point|position)|current (location|position)", re.IGNORECASE)
 
 # Skeleton names the LLM must replace (region_1, object_12, ...).
 PLACEHOLDER_NAME = re.compile(r"^(region|object)_\d+$")
@@ -196,8 +205,94 @@ def validate_task_refs(tasks: List[dict], graph: dict) -> None:
             )
 
 
+def parse_hop_weights(spec: str) -> dict:
+    """``"1:0.04,2:0.04,..."`` -> ``{1: 0.04, 2: 0.04, ...}`` (e22 CLI form)."""
+    weights = {}
+    for item in spec.split(","):
+        hops, w = item.split(":")
+        weights[int(hops)] = float(w)
+    if any(h < 1 for h in weights) or any(w < 0 for w in weights.values()) \
+            or sum(weights.values()) <= 0:
+        raise ValueError(f"bad hop weights {spec!r}: hops must be >= 1, weights >= 0, sum > 0")
+    return weights
+
+
+def _region_distances(graph: dict) -> dict:
+    """All-pairs BFS hop distances over region_connections: ``{src: {tgt: d}}``."""
+    adj: dict = {node["name"]: set() for node in graph["regions"]}
+    for a, b in graph["region_connections"]:
+        adj[a].add(b)
+        adj[b].add(a)
+    out = {}
+    for src in adj:
+        seen = {src: 0}
+        frontier, d = [src], 0
+        while frontier:
+            d += 1
+            nxt = []
+            for u in frontier:
+                for v in adj[u]:
+                    if v not in seen:
+                        seen[v] = d
+                        nxt.append(v)
+            frontier = nxt
+        out[src] = seen
+    return out
+
+
+def _object_hosts(graph: dict) -> set:
+    """Regions that contain at least one object."""
+    regions = {node["name"] for node in graph["regions"]}
+    return {x for edge in graph["object_connections"] for x in edge if x in regions}
+
+
+def _sample_weighted_constraints(
+    graph: dict, n: int, rng, hop_weights: dict, object_goal_frac: float
+) -> List[dict]:
+    """e22 hop targeting: hop ``h`` drawn with weight ``hop_weights[h]`` over
+    the buckets that exist in this graph, then a uniform (init, goal) pair at
+    exactly ``h``.
+
+    ``object_goal_frac``: that fraction of the draws (random positions) only
+    takes goals that contain an object, so the task can name the goal by its
+    object ("the area with the drinks machine"); their buckets are the hop
+    lengths such goals exist at.
+    """
+    dist = _region_distances(graph)
+    hosts = _object_hosts(graph)
+    pairs_by_hop: dict = {}
+    obj_pairs_by_hop: dict = {}
+    for src, row in dist.items():
+        for tgt, hops in row.items():
+            if hops:
+                pairs_by_hop.setdefault(hops, []).append((src, tgt))
+                if tgt in hosts:
+                    obj_pairs_by_hop.setdefault(hops, []).append((src, tgt))
+    for table in (pairs_by_hop, obj_pairs_by_hop):
+        for hops in table:
+            table[hops].sort()
+
+    n_obj = int(round(object_goal_frac * n))
+    obj_draws = set(rng.choice(n, size=n_obj, replace=False).tolist()) if n_obj else set()
+    out = []
+    for k in range(n):
+        table = obj_pairs_by_hop if k in obj_draws else pairs_by_hop
+        buckets = sorted(h for h, w in hop_weights.items() if w > 0 and h in table)
+        if not buckets:
+            raise ValueError(
+                f"no hop bucket of {sorted(hop_weights)} exists in this graph "
+                f"(object goal: {k in obj_draws})")
+        p = np.array([hop_weights[h] for h in buckets], dtype=float)
+        hops = buckets[int(rng.choice(len(buckets), p=p / p.sum()))]
+        init, goal = table[hops][int(rng.integers(len(table[hops])))]
+        out.append({"init": init, "goal": goal, "hops": hops,
+                    "object_goal": k in obj_draws})
+    return out
+
+
 def sample_longhop_constraints(
-    graph: dict, n: int, rng, min_hops: int = 3, max_boost: float = 1.0
+    graph: dict, n: int, rng, min_hops: int = 3, max_boost: float = 1.0,
+    hop_weights: Optional[dict] = None, object_goal_frac: float = 0.0,
 ) -> List[dict]:
     """Sample ``n`` (init, goal) region pairs whose shortest-path length is
     uniform over [min_hops, diameter] of the region graph.
@@ -209,7 +304,17 @@ def sample_longhop_constraints(
     ``max_boost`` multiplies the sampling weight of the DIAMETER bucket only
     (e21): buckets [min_hops, diameter-1] keep weight 1, the diameter bucket
     gets ``max_boost``. 1.0 reproduces the e19/e20 uniform sampler exactly.
+
+    ``hop_weights`` (e22, ``{hops: weight}``) replaces both ``min_hops`` and
+    ``max_boost``: see :func:`_sample_weighted_constraints`; each constraint
+    then also carries ``object_goal``. ``None`` = the legacy stream above.
     """
+    if hop_weights is not None:
+        if max_boost != 1.0:
+            raise ValueError("hop_weights replaces max_boost; set only one of them")
+        return _sample_weighted_constraints(graph, n, rng, hop_weights, object_goal_frac)
+    if object_goal_frac:
+        raise ValueError("object_goal_frac needs hop_weights (the e22 sampler)")
     adj: dict = {node["name"]: set() for node in graph["regions"]}
     for a, b in graph["region_connections"]:
         adj[a].add(b)
@@ -253,6 +358,65 @@ def sample_longhop_constraints(
     return out
 
 
+def _on_some_shortest_path(dist: dict, a: str, b: str) -> set:
+    """Nodes on at least one shortest a->b path (a and b included)."""
+    return {x for x in dist[a] if dist[a][x] + dist[x][b] == dist[a][b]}
+
+
+def via_candidates(dist: dict, init: str, goal: str) -> List[tuple]:
+    """``(via, constrained_hops)`` for every region that can be a waypoint.
+
+    A waypoint lies on NO shortest init->goal path (so it really constrains
+    the route), and every shortest init->via path meets every shortest
+    via->goal path only at the waypoint — so the oracle route
+    init -> via -> goal is a simple path whatever tie-break NetworkX takes.
+    """
+    direct = _on_some_shortest_path(dist, init, goal)
+    out = []
+    for v in sorted(dist):
+        if v in direct:
+            continue
+        if _on_some_shortest_path(dist, init, v) & _on_some_shortest_path(dist, v, goal) == {v}:
+            out.append((v, dist[init][v] + dist[v][goal]))
+    return out
+
+
+def assign_longhop_roles(
+    graph: dict, constraints: List[dict], rng, named_start_frac: float,
+    via_frac: float, max_via_hops: int,
+) -> List[dict]:
+    """e22 per-task roles on top of the sampled endpoints. Returns new dicts
+    with ``named_start`` and ``via`` set on every constraint.
+
+    ``named_start``: ``round(named_start_frac * n)`` random constraints whose
+    init is not the skeleton's ``robot_location``. Their task text names the
+    start and the pipeline keeps ``robot_location`` (``keep_robot_location``).
+
+    ``via``: ``round(via_frac * n)`` random constraints get a waypoint drawn
+    uniformly from :func:`via_candidates` with constrained length
+    <= ``max_via_hops``; ``hops`` becomes that constrained length and
+    ``direct_hops`` keeps the init->goal distance. A pair with no candidate
+    keeps ``via=None``.
+    """
+    n = len(constraints)
+    out = [dict(c, named_start=False, via=None) for c in constraints]
+    eligible = [i for i, c in enumerate(out) if c["init"] != graph["robot_location"]]
+    n_named = min(int(round(named_start_frac * n)), len(eligible))
+    for i in rng.choice(eligible, size=n_named, replace=False).tolist() if n_named else []:
+        out[i]["named_start"] = True
+    n_via = int(round(via_frac * n))
+    if n_via:
+        dist = _region_distances(graph)
+        for i in sorted(rng.choice(n, size=n_via, replace=False).tolist()):
+            c = out[i]
+            cands = [vc for vc in via_candidates(dist, c["init"], c["goal"])
+                     if vc[1] <= max_via_hops]
+            if cands:
+                via, hops = cands[int(rng.integers(len(cands)))]
+                c.update(via=via, direct_hops=c["hops"], hops=hops)
+    return out
+
+
 def validate_longhop_tasks(
     tasks: List[dict], constraints: List[dict], graph: Optional[dict] = None
 ) -> None:
@@ -268,6 +432,9 @@ def validate_longhop_tasks(
     must lie strictly OFF every shortest init->goal path — an on-path avoid
     would lengthen the required route and silently break the sampled hop
     stratification (e21 longhop_allow_avoid).
+
+    e22 constraints (from assign_longhop_roles, carrying ``via`` and
+    ``named_start``) additionally pass :func:`_validate_e22_roles`.
     """
     n = len(constraints)
     if len(tasks) < n:
@@ -296,6 +463,11 @@ def validate_longhop_tasks(
             return seen
 
         dists = _bfs
+    full_dist = None
+    if any("via" in c for c in constraints):
+        if graph is None:
+            raise ValueError("e22 long-hop constraints (via/named_start) need graph=")
+        full_dist = _region_distances(graph)
     for i, (task, c) in enumerate(zip(tasks[-n:], constraints)):
         label = f"long-hop task {len(tasks) - n + i}"
         if task["init_node"] != c["init"]:
@@ -311,7 +483,9 @@ def validate_longhop_tasks(
         if dists is not None:
             crit = task["acceptance_criterion"]
             avoid_span = re.search(r"without using\b([^.;]*)", crit, re.IGNORECASE)
-            if avoid_span:
+            # A waypoint task's route is init->via->goal, not the direct path;
+            # its avoids are checked against those segments below.
+            if avoid_span and not c.get("via"):
                 d_init, d_goal = dists(c["init"]), dists(c["goal"])
                 base_len = d_init.get(c["goal"])
                 for a in NODE_TOKEN.findall(avoid_span.group(1)):
@@ -329,6 +503,46 @@ def validate_longhop_tasks(
                             f"{label}: avoided region {a!r} lies on a shortest "
                             f"{c['init']}->{c['goal']} path — hop length would drift"
                         )
+        if "via" in c:
+            _validate_e22_roles(label, task, c, graph, full_dist)
+
+
+def _validate_e22_roles(label: str, task: dict, c: dict, graph: dict, dist: dict) -> None:
+    """e22 constraints (carrying ``via`` / ``named_start``): the eval grader
+    must resolve exactly the sampled targets, so the oracle route has the
+    recorded ``hops``.
+
+    - path_validator.derive_targets (the scorer's own resolver) must give
+      ``goal`` and exactly the sampled waypoint list ([] when ``via`` is None);
+    - an avoided region must be off every shortest segment of the
+      constrained route (init->via->goal) and must not be the waypoint;
+    - a named-start task must not word its start as the robot's position.
+    """
+    goal, waypoints, avoid, _required, kind = path_validator.derive_targets(
+        graph, init_node=c["init"], answer=task["answer"],
+        criterion=task["acceptance_criterion"], task=task["task"])
+    if kind != "path" or goal != c["goal"]:
+        raise ValueError(
+            f"{label}: grader resolves goal {goal!r} ({kind}), sampled {c['goal']!r}")
+    want = [c["via"]] if c["via"] else []
+    if waypoints != want:
+        raise ValueError(
+            f"{label}: grader resolves waypoints {waypoints}, sampled {want} — "
+            "hop length would drift")
+    if c["via"]:
+        if c["via"] in avoid:
+            raise ValueError(f"{label}: waypoint {c['via']!r} is also avoided")
+        on_route = (_on_some_shortest_path(dist, c["init"], c["via"])
+                    | _on_some_shortest_path(dist, c["via"], c["goal"]))
+        for a in avoid:
+            if a in on_route:
+                raise ValueError(
+                    f"{label}: avoided region {a!r} lies on a shortest segment of "
+                    f"{c['init']}->{c['via']}->{c['goal']} — hop length would drift")
+    if c["named_start"] and START_AREA_PHRASE.search(task["task"]):
+        raise ValueError(
+            f"{label}: named-start task words its start as the robot's position "
+            f"({task['task'][:80]!r})")
 
 
 UPDATED_QUERY = r"""
@@ -683,7 +897,15 @@ class TaskGraphGen:
                     "longhop_start_area_frac must be in [0, 1], got "
                     f"{longhop_start_area_frac}"
                 )
-            n_start_area = int(round(longhop_start_area_frac * n_lh))
+            # e22 roles (assign_longhop_roles): a named-start task keeps the
+            # skeleton's robot_location, so it can never say "starting area";
+            # the start-area fraction applies to the remaining tasks only.
+            # Legacy constraints carry no role keys: every task is "unnamed".
+            unnamed = [k for k, c in enumerate(longhop_constraints)
+                       if not c.get("named_start")]
+            n_start_area = int(round(longhop_start_area_frac * len(unnamed)))
+            start_area = set(unnamed[:n_start_area])
+            has_via = any(c.get("via") for c in longhop_constraints)
             query += (
                 "\n\nLong-hop routing constraints (OVERRIDE the type/complexity "
                 "lists for these tasks)\n"
@@ -691,17 +913,41 @@ class TaskGraphGen:
                 "with FIXED endpoints, chosen so the optimal route is long:\n"
             )
             for k, c in enumerate(longhop_constraints):
-                query += (
-                    f"- Task {n_tasks - n_lh + k + 1}: the robot starts at base-graph "
-                    f"node \"{c['init']}\" — set \"init_node\" to the NEW name your "
-                    f"rename map gives that region. The destination is base-graph "
-                    f"node \"{c['goal']}\" (optimal route: {c['hops']} hops).\n"
-                )
-                if k < n_start_area:
+                if c.get("via"):
+                    query += (
+                        f"- Task {n_tasks - n_lh + k + 1}: the robot starts at base-graph "
+                        f"node \"{c['init']}\" — set \"init_node\" to the NEW name your "
+                        f"rename map gives that region. The destination is base-graph "
+                        f"node \"{c['goal']}\". The route must pass through base-graph "
+                        f"node \"{c['via']}\" as a REQUIRED WAYPOINT (optimal route "
+                        f"through it: {c['hops']} hops): the task text must ask for "
+                        "it, the acceptance_criterion must say \"via <its NEW id>\", "
+                        "and the answer regex must name it between the start and "
+                        "the destination.\n"
+                    )
+                else:
+                    query += (
+                        f"- Task {n_tasks - n_lh + k + 1}: the robot starts at base-graph "
+                        f"node \"{c['init']}\" — set \"init_node\" to the NEW name your "
+                        f"rename map gives that region. The destination is base-graph "
+                        f"node \"{c['goal']}\" (optimal route: {c['hops']} hops).\n"
+                    )
+                if k in start_area:
                     query += (
                         "  Word this task's START as the robot's current "
                         "position (\"from the starting area\") instead of "
                         "naming or describing that region.\n"
+                    )
+                if c.get("named_start"):
+                    query += (
+                        "  NAMED START: the robot is NOT in this region. The task "
+                        "text must name the start explicitly so it is singled out.\n"
+                    )
+                if c.get("object_goal"):
+                    query += (
+                        "  Phrase the DESTINATION as the area containing one of its "
+                        "objects (\"the area with the drinks machine\"), not by the "
+                        "region's name.\n"
                     )
             query += (
                 "For each constrained task: phrase the destination semantically "
@@ -717,8 +963,12 @@ class TaskGraphGen:
                 # hop length — the avoided region must already be off the
                 # optimal route, so the shortest path is unchanged.
                 query += (
-                    " Waypoint constraints are still FORBIDDEN on these tasks. "
-                    "You MAY add an avoided-area constraint (\"without using "
+                    (" Waypoint constraints are FORBIDDEN on these tasks except "
+                     "the REQUIRED WAYPOINTS listed above; on those tasks an "
+                     "avoided region must also be off the route through the "
+                     "waypoint. " if has_via else
+                     " Waypoint constraints are still FORBIDDEN on these tasks. ")
+                    + "You MAY add an avoided-area constraint (\"without using "
                     "<area>\") to SOME of them, but ONLY naming a region that "
                     "the optimal route already bypasses — never a region on the "
                     "shortest path between the fixed endpoints, and never the "
@@ -726,8 +976,28 @@ class TaskGraphGen:
                     "exactly the sampled hop count. Name the avoided region in "
                     "the acceptance_criterion as usual."
                 )
+            elif has_via:
+                query += (" Do not add avoid constraints, or waypoints other than "
+                          "the REQUIRED WAYPOINTS listed above, to these tasks.")
             else:
                 query += " Do not add waypoint or avoid constraints to these tasks."
+
+            if any(c.get("named_start") for c in longhop_constraints):
+                # e22: 58/60 robot sweep tasks start at a named region that is
+                # not robot_location. Start-side styles reuse the
+                # grounding_directives text.
+                query += (
+                    " For the tasks marked NAMED START, refer to the start region "
+                    "in the task text by its plain name, a natural-language "
+                    "paraphrase (\"the freight lift\" for freight_lift_1), or an "
+                    "ORDINAL among siblings that share its name prefix (\"the "
+                    "second seed vault\" for seed_vault_2 — the ordinal must match "
+                    "the _N index exactly); vary the style across tasks. Never "
+                    "leave the start ambiguous between siblings, and never word "
+                    "it as the robot's current position or \"the starting area\": "
+                    "the robot stays at robot_location, which is a different "
+                    "region."
+                )
 
             if n_start_area:
                 query += (
@@ -766,6 +1036,26 @@ class TaskGraphGen:
                 "destinations. Never leave the start ambiguous: if sibling "
                 "regions share the referenced prefix, the wording must single "
                 "out one of them."
+            )
+
+        zones = json.loads(base_graph).get("_metadata", {}).get("zones")
+        if zones:
+            # e22 floor-plan skeletons: the robot's hospital names regions
+            # <zone>_<kind>_<k> with up to 6 siblings per kind (inner_west_hall_1..6);
+            # SBM skeletons carry no `zones` and never see this block.
+            query += (
+                "\n\nZone naming (OVERRIDES the region-naming rules of Step 2)\n"
+                "This base graph is a building floor plan; `_metadata.zones` maps "
+                "each region to a zone id (rooms of one wing or floor area; "
+                "`community_assignments` is the same map). Choose one short, "
+                "distinct zone name per zone id (e.g. `north_wing`, `inner_west`, "
+                "`east_annex`) and name EVERY region `<zone>_<kind>_<k>`, e.g. "
+                "`inner_west_hall_3`, `north_wing_storage_room_1`. Within one "
+                "zone, up to SIX regions may share a kind (`<zone>_<kind>_1` .. "
+                "`<zone>_<kind>_6`); the three-per-prefix limit does not apply "
+                "to region names here. Use kinds a building has (hall, corridor, "
+                "lobby, office, patient_room, storage_room, stairwell, restroom, "
+                "...). Objects keep the plain `type_N` rule."
             )
 
         if previous_tasks != "":
@@ -884,17 +1174,21 @@ class TaskGraphGen:
         validate_task_refs(json_content["tasks"], graph)
         if longhop_constraints:
             rename = llm_content["rename"]
-            validate_longhop_tasks(
-                json_content["tasks"],
-                [
-                    {
-                        "init": rename[c["init"]],
-                        "goal": rename[c["goal"]],
-                        "hops": c["hops"],
-                    }
-                    for c in longhop_constraints
-                ],
-                graph=graph,
-            )
+            # Every constraint key rides along (e22 roles: named_start,
+            # object_goal, via, direct_hops); node ids are translated.
+            final = []
+            for c in longhop_constraints:
+                f = {**c, "init": rename[c["init"]], "goal": rename[c["goal"]]}
+                if c.get("via"):
+                    f["via"] = rename[c["via"]]
+                final.append(f)
+            validate_longhop_tasks(json_content["tasks"], final, graph=graph)
+            # e22 named starts: the sample writers keep the graph's
+            # robot_location for these tasks instead of moving the robot to
+            # init_node. Set mechanically, never trusted to the LLM.
+            n_lh = len(final)
+            for task, c in zip(json_content["tasks"][-n_lh:], final):
+                if c.get("named_start"):
+                    task["keep_robot_location"] = True
         _validate_tasks(json_content)
         return json_content

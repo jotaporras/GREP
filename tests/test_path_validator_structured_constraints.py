@@ -130,6 +130,23 @@ def test_structured_avoid_violated_route_fails_despite_valid_path():
     assert m["structured_correct"] is False
 
 
+def test_structured_avoid_never_entering_phrasing():
+    """e22: the robot sim writes "reach X never entering Y" (data/hospital_graphs).
+    The avoided node must resolve as avoid, not as the goal; a route through it fails."""
+    g = _diamond_graph()
+    goal, waypoints, avoid, _req, kind = P.derive_targets(
+        g, init_node="start_1", answer="goal_1",
+        criterion="reach goal_1 never entering bad_1", task="navigate to goal_1")
+    assert (goal, waypoints, avoid, kind) == ("goal_1", [], ["bad_1"], "path")
+    m = P.validate_structured(
+        "plan: start_1 -> bad_1 -> goal_1", g,
+        init_node="start_1", answer="goal_1",
+        criterion="reach goal_1 never entering bad_1", task="navigate to goal_1",
+        full_response="plan: start_1 -> bad_1 -> goal_1")
+    assert m["avoid_ok"] is False
+    assert m["structured_correct"] is False
+
+
 # ----------------------------------------------------------------------------
 # Positionality grading (kind == "edges")
 # ----------------------------------------------------------------------------

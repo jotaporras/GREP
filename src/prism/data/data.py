@@ -23,16 +23,19 @@ from prism.models.gnn_llm import (
 )
 
 
-def load_eval_samples_by_graph(eval_data: str, num_graphs: int) -> Dict[str, List[evaluate.EvalSample]]:
+def load_eval_samples_by_graph(
+    eval_data: str, num_graphs: int, keep_robot_location: bool = False,
+) -> Dict[str, List[evaluate.EvalSample]]:
     """Resolve `eval_data` (file, directory, or glob) into `{graph_name: [EvalSample]}`,
     truncated to the first `num_graphs` graphs (sorted by file stem).
 
     Used by the train-time periodic `EvalCallback` and the `no_train` zero-shot
     baseline so both score the same multi-graph held-out set. A single-file
     `eval_data` resolves to one graph (back-compatible). `num_graphs <= 0` keeps
-    all resolved graphs.
+    all resolved graphs. `keep_robot_location` (e22) is forwarded to
+    `evaluate.construct_eval_samples_from_dict`.
     """
-    samples_by_graph, _ = load_samples_by_graph(eval_data)
+    samples_by_graph, _ = load_samples_by_graph(eval_data, keep_robot_location=keep_robot_location)
     if num_graphs and num_graphs > 0 and len(samples_by_graph) > num_graphs:
         kept = list(samples_by_graph.items())[:num_graphs]
         dropped = len(samples_by_graph) - num_graphs
@@ -42,12 +45,17 @@ def load_eval_samples_by_graph(eval_data: str, num_graphs: int) -> Dict[str, Lis
     return samples_by_graph
 
 
-def load_samples_by_graph(target: str) -> Tuple[Dict[str, List[evaluate.EvalSample]], Dict[str, str]]:
+def load_samples_by_graph(
+    target: str, keep_robot_location: bool = False,
+) -> Tuple[Dict[str, List[evaluate.EvalSample]], Dict[str, str]]:
     """Resolve `target` (file, directory, or glob) and load each graph JSON.
 
     Returns `(samples_by_graph, graph_file_by_name)`, both keyed by graph file
     stem (e.g. ``"data_gen_004"``): the per-graph `EvalSample` list ready for
     `evaluate.eval_model_multiple_graphs`, and the source path of each.
+    `keep_robot_location` (e22): keep every graph's own ``robot_location`` in
+    the prompt instead of placing the robot at each task's ``init_node``
+    (tasks flagged ``keep_robot_location`` always keep it).
 
     Raises `SystemExit` if `target` resolves to zero matching files.
     """
@@ -61,6 +69,7 @@ def load_samples_by_graph(target: str) -> Tuple[Dict[str, List[evaluate.EvalSamp
             payload = json.load(f)
         samples_by_graph[stem] = evaluate.construct_eval_samples_from_dict(
             payload["graph"], payload["tasks"], graph_name=stem,
+            keep_robot_location=keep_robot_location,
         )
         graph_file_by_name[stem] = gf
     return samples_by_graph, graph_file_by_name

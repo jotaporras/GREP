@@ -96,11 +96,29 @@ class DataGenerator:
         fake_edge_frac: float = 0.0,
         fake_edges_n: int = 2,
         nav_walk_directive: bool = False,
+        longhop_hop_weights: Optional[dict] = None,
+        longhop_named_start_frac: float = 0.0,
+        longhop_via_frac: float = 0.0,
+        longhop_object_goal_frac: float = 0.0,
     ):
         self.unknown_pcts = graph_unknown
         self.task_proportions = task_proportions
         self.complexity_proportions = complexity_proportions
         self.n_longhop_tasks = n_longhop_tasks
+        # e22 (docs/2026-11-02 e22_geometric_scale_design.md §3): weighted hop
+        # targeting ({hops: weight}; None = the e19-e21 sampler above) and
+        # per-task roles — named starts that keep robot_location, required
+        # waypoints, object-phrased goals. The roles ride on the e22 sampler
+        # only; each fraction 0.0 is off.
+        if longhop_hop_weights is None and (
+                longhop_named_start_frac or longhop_via_frac or longhop_object_goal_frac):
+            raise ValueError(
+                "named-start / via / object-goal fractions need longhop_hop_weights "
+                "(the e22 sampler)")
+        self.longhop_hop_weights = longhop_hop_weights
+        self.longhop_named_start_frac = longhop_named_start_frac
+        self.longhop_via_frac = longhop_via_frac
+        self.longhop_object_goal_frac = longhop_object_goal_frac
         # e21: weight multiplier for the DIAMETER hop bucket in longhop
         # endpoint sampling (1.0 = the e19/e20 uniform sampler, bit-identical
         # rng stream), plus prompt directives for avoid-constrained longhop
@@ -149,7 +167,24 @@ class DataGenerator:
             n_tasks=n_tasks, proportions=complexity_props, rng=self.rng
         )
         longhop = None
-        if self.n_longhop_tasks:
+        if self.n_longhop_tasks and self.longhop_hop_weights is not None:
+            graph = json.loads(base_graph)["graph"]
+            longhop = graph_gen.sample_longhop_constraints(
+                graph,
+                self.n_longhop_tasks,
+                self.rng,
+                hop_weights=self.longhop_hop_weights,
+                object_goal_frac=self.longhop_object_goal_frac,
+            )
+            longhop = graph_gen.assign_longhop_roles(
+                graph,
+                longhop,
+                self.rng,
+                named_start_frac=self.longhop_named_start_frac,
+                via_frac=self.longhop_via_frac,
+                max_via_hops=max(self.longhop_hop_weights),
+            )
+        elif self.n_longhop_tasks:
             longhop = graph_gen.sample_longhop_constraints(
                 json.loads(base_graph)["graph"],
                 self.n_longhop_tasks,
@@ -157,6 +192,20 @@ class DataGenerator:
                 max_boost=self.longhop_max_boost,
             )
         return task_types, task_complexities, longhop
+
+    def _prompt_flags(self) -> dict:
+        """Task-author prompt flags, shared by BOTH populate paths.
+
+        e21 lesson: populate_graphs_and_tasks_batch (the vLLM path) built its
+        prompts with a hand-copied kwarg list that dropped flags —
+        longhop_start_area_frac until a8013ec, and grounding_directives /
+        longhop_allow_avoid until e22. One dict for both call sites.
+        """
+        return dict(
+            grounding_directives=self.grounding_directives,
+            longhop_allow_avoid=self.longhop_allow_avoid,
+            longhop_start_area_frac=self.longhop_start_area_frac,
+        )
 
     @staticmethod
     def _record_longhop(log_dir, idx: int, longhop: Optional[list]) -> None:
@@ -220,9 +269,7 @@ class DataGenerator:
                         task_complexities=task_complexities,
                         longhop_constraints=longhop,
                         reasoning_effort=reasoning_effort,
-                        grounding_directives=self.grounding_directives,
-                        longhop_allow_avoid=self.longhop_allow_avoid,
-                        longhop_start_area_frac=self.longhop_start_area_frac,
+                        **self._prompt_flags(),
                     )
 
                     break
@@ -312,7 +359,7 @@ class DataGenerator:
                     task_types=task_types,
                     task_complexities=task_complexities,
                     longhop_constraints=longhop,
-                    longhop_start_area_frac=self.longhop_start_area_frac,
+                    **self._prompt_flags(),
                 )
             )
         responses = self.context_gen.client.batch_query_gpt_5(
@@ -572,6 +619,11 @@ class DataGenerator:
         "arrows (for example, start_region -> middle_region -> goal_region). "
         "Output nothing else — no reasoning, no explanations, no labels."
     )
+    # e22 named-start tasks (keep_robot_location): the robot stays at the
+    # graph's robot_location and the route starts at the region the task names.
+    _PATH_ONLY_INSTRUCTION_NAMED_START = _PATH_ONLY_INSTRUCTION.replace(
+        "starting from its current location",
+        "starting from the start region the task names (not the robot's location)")
 
     @staticmethod
     def _grade_route(route_text: str, graph: dict, task_entry: dict):
@@ -598,8 +650,13 @@ class DataGenerator:
 
     @staticmethod
     def _commit_plan_sample(log_name: str, *, task: str, graph: dict,
-                            init_node: str, route: str, mode: str) -> None:
-        """Atomically write a committed path-only sample file (message list)."""
+                            init_node: str, route: str, mode: str,
+                            keep_robot_location: bool) -> None:
+        """Atomically write a committed path-only sample file (message list).
+
+        ``keep_robot_location`` (e22 named-start task): the prompt graph keeps
+        its own robot_location instead of placing the robot at ``init_node``.
+        """
         assistant = json.dumps({
             "primary_goal": task,
             "relevant_graph": "",
@@ -607,7 +664,8 @@ class DataGenerator:
             "plan": f"[answer({route})]",
         })
         sg = dict(graph)
-        sg["robot_location"] = init_node
+        if not keep_robot_location:
+            sg["robot_location"] = init_node
         messages = [
             {"role": "system", "content": f"path-only rollout ({mode})"},
             # Marker format matches a real SPINE rollout's query turn
@@ -652,11 +710,15 @@ class DataGenerator:
         failed_name = log_name.replace(".json", "_failed.json")
         task = task_entry["task"]
         init_node = task_entry["init_node"]
+        keep_robot_location = task_entry.get("keep_robot_location", False)
         sg = dict(graph)
-        sg["robot_location"] = init_node
+        if not keep_robot_location:
+            sg["robot_location"] = init_node
+        instruction = (self._PATH_ONLY_INSTRUCTION_NAMED_START if keep_robot_location
+                       else self._PATH_ONLY_INSTRUCTION)
         msg = [{
             "role": "user",
-            "content": (f"{self._PATH_ONLY_INSTRUCTION}\n\n"
+            "content": (f"{instruction}\n\n"
                         f"task: {task}\nScene graph:{json.dumps(sg)}"),
         }]
         response, ok = spine_client.query_llm(msg)
@@ -685,7 +747,7 @@ class DataGenerator:
             return False
         self._commit_plan_sample(
             log_name, task=task, graph=graph, init_node=init_node,
-            route=route, mode="path_only")
+            route=route, mode="path_only", keep_robot_location=keep_robot_location)
         return True
 
     @staticmethod
@@ -759,7 +821,8 @@ class DataGenerator:
             return False
         self._commit_plan_sample(
             log_name, task=task, graph=graph, init_node=init_node,
-            route=route, mode="oracle")
+            route=route, mode="oracle",
+            keep_robot_location=task_entry.get("keep_robot_location", False))
         return True
 
     @staticmethod
@@ -925,6 +988,13 @@ class DataGenerator:
             print(f"Generating example data for tasks: {tasks}")
 
             for task_idx, task_entry in enumerate(task_entries):
+                # A SPINE rollout places the robot at init_node in the
+                # simulator; an e22 named start (robot elsewhere) has no
+                # rollout semantics there yet. Fail loudly, never drop it.
+                if rollout_mode == "spine" and task_entry.get("keep_robot_location"):
+                    raise ValueError(
+                        f"graph {idx} task {task_idx}: keep_robot_location tasks "
+                        "need rollout_mode 'oracle' or 'path_only', not 'spine'")
                 jobs.append(
                     dict(
                         idx=idx,

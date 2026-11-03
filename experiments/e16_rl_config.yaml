@@ -30,6 +30,9 @@ trainer:
     rollout_batch_size: 16
     # Dir (or glob) of data_gen_*.json graph/task files — the RL prompt source.
     data_files: data/n_30/gen/nav100_n30_gemma_data/split/train_graphs
+    # e22: true keeps each graph's own robot_location in the prompt (see
+    # eval.keep_robot_location in base_config.yaml); flagged tasks always keep it.
+    keep_robot_location: false
     num_generations: 8          # GRPO group size
     max_completion_length: 2048 # matches eval MAX_NEW_TOKENS (tool-free)
     temperature: 0.9

@@ -174,7 +174,8 @@ def train_rl(config: omegaconf.DictConfig) -> None:
     include_edges = gnn_config.get("text_edge_list") == "present"
     dataset = rl_dataset.load_rl_dataset(
         rl_cfg.data_files, tokenizer, include_edges=include_edges,
-        use_icl=False, icl_examples=0)
+        use_icl=False, icl_examples=0,
+        keep_robot_location=rl_cfg.get("keep_robot_location", False))
     print(f"[train_rl] {len(dataset)} prompts from {rl_cfg.data_files}")
 
     reward_weights = omegaconf.OmegaConf.to_container(rl_cfg.reward_weights) \

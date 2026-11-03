@@ -419,6 +419,10 @@ _VIA = re.compile(
     r"(.*?)(?:[.;]|->|\bwithout\b|\bavoid|\bstating\b|\broute\b|\band\s+lists?\b|$)", re.I)
 _AVOID = re.compile(
     r"(?:without\s+(?:using|passing\s+through|going\s+through|entering)|does\s+not\s+use|"
+    # "never entering X" / "never passing through X": the robot sim's own
+    # phrasing (data/hospital_graphs, 4 tasks). Without this alternative the
+    # avoided region fell through to the goal candidates (e22).
+    r"never\s+(?:entering|using|passing\s+through|going\s+through)|"
     r"avoid(?:s|ing)?|excluding|not\s+via|not\s+using)\b(.*?)(?:[.,;]|$)", re.I)
 # A path task (reachability/navigability) vs a positionality task (edges only).
 # `\breach` (no trailing boundary) matches reach / reaches / reachable /
