@@ -54,6 +54,11 @@ Environment
                             the checkpoint's native precision.
 ``PRISM_VLLM_GPU_UTIL``     ``gpu_memory_utilization`` (default 0.90).
 ``PRISM_VLLM_MAX_LEN``      ``max_model_len`` (default 16384).
+``PRISM_VLLM_MAX_NEW_TOKENS`` populate ``max_tokens`` per request (default 20480).
+                            Thinking and the JSON answer share it: 100-130-region
+                            floor-plan skeletons exhausted 20480 (e22, 2026-11-03),
+                            so set it with ``PRISM_VLLM_MAX_LEN`` large enough for
+                            prompt + budget.
 ``PRISM_VLLM_SEED``         engine seed (default 0) — set for reproducible runs.
 """
 
@@ -228,9 +233,13 @@ class VLLMQueryClient:
     by ``processor.parse_response`` exactly as on the HF backend.
     """
 
-    def __init__(self, model_id: Optional[str] = None, max_new_tokens: int = 20480):
+    def __init__(self, model_id: Optional[str] = None, max_new_tokens: Optional[int] = None):
         self.llm, self.processor = load_vllm(model_id)
-        self.max_new_tokens = max_new_tokens
+        # Thinking + answer share this budget; PRISM_VLLM_MAX_NEW_TOKENS overrides
+        # the historical 20480 (too small for 100-130-region populate prompts).
+        self.max_new_tokens = int(
+            max_new_tokens or os.environ.get("PRISM_VLLM_MAX_NEW_TOKENS", "20480")
+        )
 
     def _render(self, query: str) -> str:
         """Apply the Gemma chat template with thinking enabled (HF-backend parity)."""

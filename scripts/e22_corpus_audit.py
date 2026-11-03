@@ -5,6 +5,8 @@ Checks the §6 corpus criteria of docs/2026-11-02 e22_geometric_scale_design.md:
 - skeleton topology per size (mean degree, dead ends, bridges, cycles per
   region, diameter, clustering); the 100-region means must sit in the §2 band
   (generate_eval_graphs.TARGET_BAND_100);
+- populate coverage per size: populated graphs / skeletons >= --min-coverage
+  (0.9), because batched populate drops unparseable responses silently;
 - hop histogram of the sampled long-hop constraints (longhop_manifest.json) and
   of the committed routes: mode at 6-7, >= 15% at >= 10 hops;
 - named-start rate (keep_robot_location) 50 +- 5% of long-hop tasks, plus the
@@ -61,6 +63,25 @@ def skeleton_stats(shards, label):
             st = generate_eval_graphs.layout_statistics(region_graph(json.loads(f.read_text())["graph"]))
             by_size[st["n_regions"]].append(st)
     return by_size
+
+
+def populate_coverage(shards, label):
+    """Skeletons vs populated graphs per region count.
+
+    Batched populate skips a graph whose Gemma response is unparseable (no
+    ``data_gen_XXX.json`` is written) and the launch script does not retry, so
+    the corpus can silently lose a size bucket; job 9987719 kept 37 of 120
+    130-region skeletons. Skeleton index i of a shard is ``data_gen_{i:03d}``.
+    """
+    cov = collections.defaultdict(lambda: [0, 0])  # size -> [skeletons, populated]
+    for shard in shards:
+        skel = sorted((shard / "training" / f"nav_n{label}_skeletons").glob("*.json"))
+        pop = shard / "gen" / f"nav_n{label}_gemma_data" / "populated_graphs"
+        for i, f in enumerate(skel):
+            size = len(json.loads(f.read_text())["graph"]["regions"])
+            cov[size][0] += 1
+            cov[size][1] += (pop / f"data_gen_{i:03d}.json").exists()
+    return cov
 
 
 def task_audit(shards, label):
@@ -129,6 +150,8 @@ def main():
     ap.add_argument("--label", default="geo", help="GRAPH_LABEL of the run (nav_n<label>_*)")
     ap.add_argument("--compare", type=Path, default=None,
                     help="another corpus's formatted_all_new__train.json (e.g. v2c); md5 must differ")
+    ap.add_argument("--min-coverage", type=float, default=0.9,
+                    help="gate: populated/skeleton ratio required per region count")
     args = ap.parse_args()
 
     shards = sorted(p for p in args.root.glob("shard*") if p.is_dir())
@@ -146,6 +169,14 @@ def main():
         if size == 100:
             for k, (lo, hi) in generate_eval_graphs.TARGET_BAND_100.items():
                 gates.append((f"100-region {k} in [{lo}, {hi}]", lo <= mean[k] <= hi, f"{mean[k]:.3f}"))
+
+    print("\n== populate coverage (skeletons -> populated graphs) ==")
+    cov = populate_coverage(shards, args.label)
+    for size in sorted(cov):
+        n_skel, n_pop = cov[size]
+        print(f"{size:>8} {n_pop:>4}/{n_skel:<4} = {n_pop / n_skel:.2f}")
+        gates.append((f"{size}-region populate coverage >= {args.min_coverage}",
+                      n_pop / n_skel >= args.min_coverage, f"{n_pop}/{n_skel}"))
 
     print("\n== long-hop tasks ==")
     hops_manifest, rates, route_hops, loc = task_audit(shards, args.label)

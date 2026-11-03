@@ -73,8 +73,12 @@ conda activate "$ENV_NAME"
 
 export PRISM_LLM_BACKEND=vllm
 export VLLM_USE_FLASHINFER_SAMPLER=0
-# 130-region skeletons with zones roughly double the v2c populate prompt.
-export PRISM_VLLM_MAX_LEN=32768
+# 130-region skeletons with zones roughly double the v2c populate prompt, and
+# Gemma's thinking shares the per-request budget with the JSON answer: at
+# 20480 tokens / 32768 context the first run (job 9987719) lost 227 of 600
+# training graphs, almost all 100-130 regions (answer missing or truncated).
+export PRISM_VLLM_MAX_LEN=${PRISM_VLLM_MAX_LEN:-65536}
+export PRISM_VLLM_MAX_NEW_TOKENS=${PRISM_VLLM_MAX_NEW_TOKENS:-40960}
 export PRISM_VLLM_TP=1
 export PRISM_HF_MODEL="google/gemma-4-31B-it"
 export ROLLOUT_WORKERS="${ROLLOUT_WORKERS:-8}"

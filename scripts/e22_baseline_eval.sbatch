@@ -43,6 +43,9 @@ export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-28}"
 export PATH="$ENV_NAME/bin:$PATH"
 # route_only checkpoints: tools off, no ICL (same as the e20/e21 cross_eval jobs).
 export PRISM_DISABLE_SPINE_TOOLS=1
+# 100-region geo prompts + looping generations hit a 32 GiB attention alloc with
+# 63 GiB reserved-but-unallocated (job 9989430, 3 OOM tasks); let the allocator grow.
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
 test -f "$RUN_DIR/train_config.json" || { echo "missing $RUN_DIR/train_config.json"; exit 2; }
 test -d "$GRAPHS" || { echo "missing graphs dir $GRAPHS"; exit 2; }
