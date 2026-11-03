@@ -1,8 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=e22-geo-sft
 #SBATCH --output=/vast/projects/aribeiro/alelab/jporras/GREP-PRISM/slurm-%x-%j.out
-#SBATCH --time=24:00:00
+#SBATCH --time=48:00:00
 #SBATCH --partition=dgx-b200
+# 48 h: on geo_v1 (9905 conversations, 4 epochs = 19812 steps) hop_depth runs
+# ~2.3 s/step (~13 h) but text_edges ~5.9 s/step (~32 h; the edge list roughly
+# triples the prompt). The first text_edges cell (10019230) was cancelled at 24 h.
 #SBATCH --gpus=1
 # betty's SLURM cli_filter (2026-08-03) enforces EXACTLY 28 CPUs / 224 GB per
 # GPU on dgx-b200.

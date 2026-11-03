@@ -324,10 +324,12 @@ edges that exist? Keyword is therefore necessary-but-not-sufficient — an
 
 Decomposing each arm with that in mind:
 
-| arm | right endpoint AND valid route | right endpoint, invalid route | wrong endpoint | crash |
-| --- | --- | --- | --- | --- |
-| n30 edges | 69 | 1 | 0 | 0 |
-| n30 GT | 50 | **12** | **6** | 2 |
+
+| arm       | right endpoint AND valid route | right endpoint, invalid route | wrong endpoint | crash |
+| --------- | ------------------------------ | ----------------------------- | -------------- | ----- |
+| n30 edges | 69                             | 1                             | 0              | 0     |
+| n30 GT    | 50                             | **12**                        | **6**          | 2     |
+
 
 - **The GT arm's keyword shortfall is not an output-format defect** — it is 6
 samples that routed to the wrong place entirely. Its bigger loss is the middle

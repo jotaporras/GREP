@@ -37,6 +37,16 @@ Used to fill in placeholders in `~/.claude/skills/cluster-slurm/template.sbatch`
 - Repo path on cluster (code only): `~/sourcecode/GREP` (`/vast/home/j/jporras/sourcecode/GREP`). Code reaches the cluster via `git pull`, never rsync; artifacts live under `OUTPUT_BASE`, never in the repo.
 - Default partition: `dgx-b200`
 - Entry: `python -m prism.training.train_v3 --config-name=<config> [key=value ...]` (nested Hydra configs under `experiments/`; CLI `key=value` overrides supported)
+- betty envs for this project: `$ALELAB_DRIVE/envs/GREP-PRISM-v3`, `$ALELAB_DRIVE/envs/GREP-PRISM-rl` (activate with `source <env>/bin/activate`).
+- betty SLURM logs: `$ALELAB_DRIVE/GREP-PRISM/slurm-<jobname>-<jobid>.out`.
+- wandb: entity `alelab`, project `GREP-PRISM`.
+- Host access details (ssh, login shells, conda init) are in the global `~/.claude/CLAUDE.md`.
+
+## plaza (dev box) config for this project
+
+- Repo: `~/sourcecode/GREP-PRISM` (a clone of this repo). Python venv: `~/venvs/grep-rl` (`source ~/venvs/grep-rl/bin/activate`).
+- `prism.eval.scalability_evaluation` sets `CUDA_VISIBLE_DEVICES` itself from its `--device` flag (the env var is overridden — pass `--device N`).
+- 31B 4-bit runs on one 48 GB card need `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` and modest rollout batches (eager attention).
 
 
 ## Project Structure & Module Organization
