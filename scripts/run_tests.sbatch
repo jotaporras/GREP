@@ -5,7 +5,7 @@
 #SBATCH --partition=genoa-std-mem
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=48G
+# no --mem: the cli_filter derives memory from CPUs (5632M each on genoa-std-mem)
 #
 # Run the pytest suite inside a CPU job (never on the login node).
 #
