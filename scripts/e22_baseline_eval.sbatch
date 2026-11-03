@@ -46,7 +46,13 @@ export PRISM_DISABLE_SPINE_TOOLS=1
 # 100-region geo prompts + looping generations hit a 32 GiB attention alloc with
 # 63 GiB reserved-but-unallocated (job 9989430, 3 OOM tasks); let the allocator grow.
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+# Generation cap (prism.models.inference): a route_only answer never needs the
+# 2048 default; looping outputs ran to it and still OOMed (1 task even with
+# expandable_segments in job 10016958). Valid routes are unaffected.
+export PRISM_EVAL_MAX_NEW_TOKENS=${PRISM_EVAL_MAX_NEW_TOKENS:-512}
 
+# RUN_DIR may be a run dir or one of its checkpoint-N subdirs (both carry
+# train_config.json + gnn_weights.pt + the adapter); set OUT for a subdir.
 test -f "$RUN_DIR/train_config.json" || { echo "missing $RUN_DIR/train_config.json"; exit 2; }
 test -d "$GRAPHS" || { echo "missing graphs dir $GRAPHS"; exit 2; }
 mkdir -p "$OUT"

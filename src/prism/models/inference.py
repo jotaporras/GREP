@@ -1,3 +1,4 @@
+import os
 import re
 from ast import literal_eval
 from typing import List, Dict
@@ -37,6 +38,18 @@ DECODE_KWARGS = {"do_sample": False, "use_cache": True}
 # ratifying answers ran past 1k, so SPINE gets 4x the tool-free budget.
 MAX_NEW_TOKENS = 2048
 SPINE_TOKEN_MULTIPLIER = 4
+# PRISM_EVAL_MAX_NEW_TOKENS overrides the tool-free budget (the SPINE multiplier
+# still applies). e22: a route_only answer on a 130-region geo graph is < 200
+# tokens, but a degenerate "a -> a -> a" loop runs to the full 2048, takes
+# minutes, and once the per-graph multi-turn prompt grows past ~19k tokens the
+# attention alloc OOMs (job 10020785, 9 EVAL CRASH samples). Capping only
+# shortens outputs that are already wrong; valid routes stop at EOS unchanged.
+EVAL_MAX_NEW_TOKENS_ENV = "PRISM_EVAL_MAX_NEW_TOKENS"
+
+
+def _eval_max_new_tokens() -> int:
+    raw = os.environ.get(EVAL_MAX_NEW_TOKENS_ENV, "").strip()
+    return int(raw) if raw else MAX_NEW_TOKENS
 
 
 # Moved to gnn_llm (spine-free) so the RL trainer can import it; kept under the
@@ -96,8 +109,9 @@ class InMemoryLLM(spine_models.InMemoryLLM):
         # data.response_format. route_only prompts ask for a bare arrow route; the
         # compact seam wraps it back as [answer(route)] so SPINE grading is unchanged.
         self.response_format = response_format
-        # SPINE mode gets SPINE_TOKEN_MULTIPLIER x the tool-free budget (see the constants).
-        self.max_new_tokens = MAX_NEW_TOKENS * (SPINE_TOKEN_MULTIPLIER if include_tools else 1)
+        # SPINE mode gets SPINE_TOKEN_MULTIPLIER x the tool-free budget (see the constants);
+        # PRISM_EVAL_MAX_NEW_TOKENS replaces the tool-free budget when set.
+        self.max_new_tokens = _eval_max_new_tokens() * (SPINE_TOKEN_MULTIPLIER if include_tools else 1)
 
     def _decode(self, outputs) -> str:
         # clean_up_tokenization_spaces=False: WordPiece post-process corrupts BPE plan text.

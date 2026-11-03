@@ -85,6 +85,10 @@ export PATH="$ENV_NAME/bin:$PATH"
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 # route_only forbids SPINE tool prompts at eval (train_v3 validates this pair).
 export PRISM_DISABLE_SPINE_TOOLS=1
+# Per-epoch eval generation cap (prism.models.inference). Job 10020785's epoch-1
+# eval on set A looped 42/46 answers to the 2048-token default (~5 h per eval,
+# 9 OOM samples as the multi-turn prompt grew past 19k tokens).
+export PRISM_EVAL_MAX_NEW_TOKENS=${PRISM_EVAL_MAX_NEW_TOKENS:-512}
 
 test -f "$DATA_SPLIT/formatted_all_new__train.json" || { echo "missing $DATA_SPLIT/formatted_all_new__train.json"; exit 2; }
 test -d "$EVAL_GRAPHS" || { echo "missing $EVAL_GRAPHS"; exit 2; }
