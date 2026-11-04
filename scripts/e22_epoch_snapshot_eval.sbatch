@@ -62,6 +62,10 @@ mkdir -p "$SNAP"
 rsync -a --exclude optimizer.pt --exclude scheduler.pt --exclude rng_state.pth "$CK/" "$SNAP/"
 ls -la "$SNAP"
 
-JOB=$(RUN_DIR="$SNAP" GRAPHS="$GRAPHS" SET_NAME="$SET_NAME" OUT="$OUT" \
+# Nested sbatch inherits this job's SLURM_* environment; the child's srun then
+# dies with "SLURM_MEM_PER_CPU, SLURM_MEM_PER_GPU, and SLURM_MEM_PER_NODE are
+# mutually exclusive" (job 10037721). Drop every SLURM_* variable first.
+UNSET_SLURM=$(env | grep -oE '^SLURM_[A-Za-z0-9_]+' | sed 's/^/-u /' | tr '\n' ' ')
+JOB=$(env $UNSET_SLURM RUN_DIR="$SNAP" GRAPHS="$GRAPHS" SET_NAME="$SET_NAME" OUT="$OUT" \
       sbatch --parsable --job-name="e22-ep${EPOCH}-${SET_NAME}" scripts/e22_baseline_eval.sbatch)
 echo "[$(date --iso-8601=seconds)] submitted cross_eval job $JOB -> $OUT"
