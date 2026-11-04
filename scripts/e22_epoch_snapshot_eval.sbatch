@@ -13,7 +13,7 @@
 # best epoch on B (docs/2026-11-02 e22_geometric_scale_design.md §5).
 #
 #   1. poll (every 5 min) until <RUN_DIR>/checkpoint-<STEP> is complete
-#      (adapter + gnn_weights.pt + train_config.json + trainer_state.json);
+#      (adapter + train_config.json + trainer_state.json);
 #   2. rsync it to <RUN_DIR>_ep<EPOCH> without optimizer/scheduler/rng state;
 #   3. sbatch scripts/e22_baseline_eval.sbatch on the snapshot
 #      -> $PROJ/results/e22_geometric_scale/<run basename>_ep<EPOCH>/geo_test.
@@ -43,8 +43,10 @@ OUT=$PROJ/results/e22_geometric_scale/$(basename "$SNAP")/$SET_NAME
 
 echo "[$(date --iso-8601=seconds)] waiting for $CK (train job $TRAIN_JOB)"
 while true; do
-  if [[ -f "$CK/adapter_model.safetensors" && -f "$CK/gnn_weights.pt" \
-        && -f "$CK/train_config.json" && -f "$CK/trainer_state.json" ]]; then
+  # No gnn_weights.pt check: text_edges (gnn.arch=llm) checkpoints have none.
+  # trainer_state.json is the last file HF writes, after the model files.
+  if [[ -f "$CK/adapter_model.safetensors" && -f "$CK/train_config.json" \
+        && -f "$CK/trainer_state.json" ]]; then
     break
   fi
   state=$(sacct -j "$TRAIN_JOB" -X --format=State -n 2>/dev/null | tr -d ' ' | head -1 || true)
@@ -64,8 +66,10 @@ ls -la "$SNAP"
 
 # Nested sbatch inherits this job's SLURM_* environment; the child's srun then
 # dies with "SLURM_MEM_PER_CPU, SLURM_MEM_PER_GPU, and SLURM_MEM_PER_NODE are
-# mutually exclusive" (job 10037721). Drop every SLURM_* variable first.
-UNSET_SLURM=$(env | grep -oE '^SLURM_[A-Za-z0-9_]+' | sed 's/^/-u /' | tr '\n' ' ')
+# mutually exclusive" (job 10037721). Drop the SLURM_* variables first, but keep
+# SLURM_CONF: without it sbatch looks for /etc/slurm/cli_filter.lua, which compute
+# nodes lack (job 10059342).
+UNSET_SLURM=$(env | grep -oE '^SLURM_[A-Za-z0-9_]+' | grep -vx SLURM_CONF | sed 's/^/-u /' | tr '\n' ' ')
 JOB=$(env $UNSET_SLURM RUN_DIR="$SNAP" GRAPHS="$GRAPHS" SET_NAME="$SET_NAME" OUT="$OUT" \
       sbatch --parsable --job-name="e22-ep${EPOCH}-${SET_NAME}" scripts/e22_baseline_eval.sbatch)
 echo "[$(date --iso-8601=seconds)] submitted cross_eval job $JOB -> $OUT"
