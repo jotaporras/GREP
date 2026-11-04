@@ -29,6 +29,33 @@ def _bnb_config(load_in_4bit: bool):
     )
 
 
+def load_lora_state_dict(peft_model, state_dict: dict, path: str = "<adapter>") -> int:
+    """Load saved LoRA weights into ``peft_model`` and fail loud if any do not land.
+
+    ``save_pretrained`` writes keys WITHOUT the adapter name
+    (``...lora_A.weight``), while the live PeftModel names them
+    ``...lora_A.default.weight``. A ``strict=False`` load of the raw keys matches
+    nothing and silently leaves the fresh LoRA (B = 0, i.e. the untrained base
+    model): every plain-LLM cross_eval before 2026-11-04 ran that way (the
+    byte-identical text_edges generations of zalttwkb / m2kn8nqs / vk4qq3ps).
+    The graph loader already inserted ``.default``; this shares that remap and
+    adds the check. Returns the number of LoRA tensors loaded.
+    """
+    remapped = {}
+    for k, v in state_dict.items():
+        k = re.sub(r'base_model\.model\.llm\.model\.', 'base_model.model.model.', k)
+        k = re.sub(r'\.lora_([AB])\.weight$', r'.lora_\1.default.weight', k)
+        remapped[k] = v
+    missing, unexpected = peft_model.load_state_dict(remapped, strict=False)
+    missing_lora = [k for k in missing if "lora_" in k]
+    if unexpected or missing_lora:
+        raise RuntimeError(
+            f"LoRA weights from {path} did not load: {len(unexpected)} unexpected keys "
+            f"(e.g. {unexpected[:2]}), {len(missing_lora)} model LoRA keys left at init "
+            f"(e.g. {missing_lora[:2]}).")
+    return len(remapped)
+
+
 def from_pretrained(
     path: str,
     load_in_4bit: bool = False,
@@ -59,10 +86,7 @@ def from_pretrained(
             quantization_config=_bnb_config(load_in_4bit),
         )
         peft_model = get_peft_model(model, PeftConfig.from_pretrained(path))
-        state_dict = load_file(os.path.join(path, "adapter_model.safetensors"))
-        remapped = {re.sub(r'base_model\.model\.llm\.model\.', 'base_model.model.model.', k): v
-                    for k, v in state_dict.items()}
-        peft_model.load_state_dict(remapped, strict=False)
+        load_lora_state_dict(peft_model, load_file(os.path.join(path, "adapter_model.safetensors")), path)
     else:
         model = AutoModelForCausalLM.from_pretrained(
             path,
