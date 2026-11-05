@@ -332,6 +332,10 @@ class GradientDebugCallback(TrainerCallback):
         # pf_ch_gain — the "did the write path engage" telemetry the e17 runs
         # lacked. Per-channel values are logged individually so a single dead
         # hop channel is visible, not averaged away.
+        # e22 hop-table mask: the per-hop levels (GEGRv2 logs them as level_h).
+        if getattr(inner, "_mask_form", "psi") == "hop_table":
+            for h, v in enumerate(inner.mask_level.detach().tolist()):
+                metrics[f"e22/mask_level_{h}"] = v
         if getattr(inner, "_post_fusion", False):
             metrics["e19/pf_gain_mean"] = inner.pf_gain.mean().item()
             metrics["e19/pf_gain_absmax"] = inner.pf_gain.abs().max().item()

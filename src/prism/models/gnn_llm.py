@@ -456,6 +456,37 @@ def _wire_resolve_orig_attn_fn(wrapper, first_attn):
 
 MASK_LAYER_SCOPES = ("all", "dense", "dense_top_half", "dense_first")
 
+# Mask value form of LearnableGraphMaskLLM (e22 GEGRv2 port, docs/2026-11-05 note):
+# "psi" = log(α + (1−α)·sim(Ψ_i, Ψ_j)) on pairs within k_hops (the e17-e22 mask);
+# "hop_table" = GEGRv2's graded parameter-free table (e028 `hada_warm`, e033): one
+# learnable ADDITIVE level per hop distance 0..k_hops, hard block beyond. Ψ is absent
+# from the mask in that form — it reaches the LLM through post_fusion only.
+MASK_FORMS = ("psi", "hop_table")
+HOP_TABLE_ALPHA = 0.7   # GEGRv2 configs/sft_trainer.yaml graph.mask.alpha
+
+
+def hop_table_level_init(k_hops: int) -> list[float]:
+    """GEGRv2 ``MaskModule`` default ``level_init``: ``[α] + [α·0.5^h for h in range(k)]``
+    (k = 3 → 0.7, 0.7, 0.35, 0.175 for hop 0, 1, 2, 3)."""
+    return [HOP_TABLE_ALPHA] + [HOP_TABLE_ALPHA * 0.5 ** h for h in range(int(k_hops))]
+
+
+# Post-fusion depth-mode tap selection (e22): which ``forward_taps`` channels the
+# write reads. "first" = the R-PEARL tap alone (GEGRv2 e033 ``fusion_rpearl``, which
+# ties the four-tap e028 write), "last" = the final GT tap, "ends" = both.
+PF_HOP_TAPS = ("all", "first", "last", "ends")
+
+
+def select_pf_taps(taps: torch.Tensor, hop_taps: str) -> torch.Tensor:
+    """``[N, K, d]`` tap stack → the channels ``hop_taps`` selects, still ``[N, K', d]``."""
+    if hop_taps == "first":
+        return taps[:, :1]
+    if hop_taps == "last":
+        return taps[:, -1:]
+    if hop_taps == "ends":
+        return taps[:, [0, -1]]
+    return taps
+
 
 def resolve_mask_active_flags(layers, layer_scope) -> list[bool]:
     """Per-layer activation of the structural mask under ``layer_scope``.
@@ -579,6 +610,37 @@ def node_adjacency(g, device, k_hops: int = 1, symmetrize: bool = True,
             reach = reach | power
         adj = reach
     return adj
+
+
+def node_hops(g, device, k_hops: int, symmetrize: bool = True, use_edges: bool = True,
+              permutation=None) -> torch.Tensor:
+    """Long ``[N, N]`` hop distances (GEGRv2 ``mask.node_hops``): 0 on the diagonal,
+    ``h`` for pairs at distance ``h <= k_hops``, ``k_hops + 1`` beyond (and for every
+    off-diagonal pair when ``use_edges=False``).
+
+    Same adjacency construction as :func:`node_adjacency` (self-loops, optional
+    symmetrization, ``permutation`` applied to ``edge_index``), so
+    ``node_hops(...) <= k_hops`` is bitwise ``node_adjacency(...)``.
+    """
+    N = g.num_nodes
+    adj = torch.zeros(N, N, dtype=torch.bool, device=device)
+    ei = getattr(g, "edge_index", None)
+    if use_edges and ei is not None and ei.numel() > 0:
+        ei = ei.to(device)
+        if permutation is not None:
+            ei = permutation.apply(ei, N, device=device)
+        adj[ei[0], ei[1]] = True
+        if symmetrize:
+            adj = adj | adj.t()
+    hops = torch.full((N, N), int(k_hops) + 1, dtype=torch.long, device=device)
+    hops.fill_diagonal_(0)
+    reach = torch.eye(N, dtype=torch.bool, device=device)
+    f_adj = adj.float()
+    for h in range(1, int(k_hops) + 1):
+        new = ((reach.float() @ f_adj) > 0) & ~reach
+        hops[new] = h
+        reach = reach | new
+    return hops
 
 
 class GraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
@@ -837,11 +899,13 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
                  layer_scope: str = "dense", k_hops: int = 1, symmetrize: bool = True,
                  use_edges: bool = True, psi_scale: str = "cosine", eps: float = 1e-8,
                  buggy_causal_fold: bool = False, disable_graph_token_rope: bool = False,
+                 mask_form: str = "psi", mask_level_init=None,
                  post_fusion: bool = False,
                  post_fusion_layer_scope: str = "dense_top_half",
                  post_fusion_d_gt: int | None = None,
                  post_fusion_hop_mode: str = "none",
                  post_fusion_hop_k: int = 3,
+                 post_fusion_hop_taps: str = "all",
                  post_fusion_gain_init: float = 0.0,
                  post_fusion_codebook_size: int = 256,
                  post_fusion_hop_gt_layers: int = 3,
@@ -903,7 +967,24 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         self._mask_buggy_fold = bool(buggy_causal_fold)
         # Same attribute name GraphAugmentedLLM uses: inference.py duck-types on it.
         self._disable_graph_token_rope: bool = bool(disable_graph_token_rope)
-        if self._mask_psi_scale == "cosine" and not self._mask_use_edges:
+        # e22 GEGRv2 port: the graded hop table. One additive level per hop distance
+        # 0..k_hops (a direct parameter of the wrapper — on the LLM device, see the
+        # decision_gain note below); trained at BASE LR via _fusion_scalars.
+        if mask_form not in MASK_FORMS:
+            raise ValueError(f"mask_form must be one of {MASK_FORMS}, got {mask_form!r}")
+        self._mask_form = mask_form
+        if mask_form == "hop_table":
+            if mask_level_init is None:
+                mask_level_init = hop_table_level_init(self._mask_k_hops)
+            level = [float(x) for x in mask_level_init]
+            if len(level) != self._mask_k_hops + 1:
+                raise ValueError(
+                    f"mask_level_init needs k_hops + 1 = {self._mask_k_hops + 1} values "
+                    f"(one per hop distance 0..{self._mask_k_hops}), got {len(level)}")
+            self.mask_level = nn.Parameter(
+                torch.tensor(level, dtype=torch.float32, device=device))
+        if (self._mask_form == "psi" and self._mask_psi_scale == "cosine"
+                and not self._mask_use_edges):
             # Edgeless ⇒ adjacency is self-loops only; cosine self-similarity is the constant
             # 1, so every allowed entry is constant ⇒ the whole bias is constant ⇒ the GT gets
             # ZERO gradient (silent dead training). Fail loud like the alpha=1 guard.
@@ -964,6 +1045,7 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             self.enable_post_fusion(
                 post_fusion_layer_scope, post_fusion_d_gt,
                 hop_mode=post_fusion_hop_mode, hop_k=post_fusion_hop_k,
+                hop_taps=post_fusion_hop_taps,
                 gain_init=post_fusion_gain_init,
                 codebook_size=post_fusion_codebook_size,
                 hop_gt_layers=post_fusion_hop_gt_layers,
@@ -1230,6 +1312,7 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
 
     def enable_post_fusion(self, layer_scope: str, d_gt: int | None, *,
                            hop_mode: str = "none", hop_k: int = 3,
+                           hop_taps: str = "all",
                            gain_init: float = 0.0, codebook_size: int = 256,
                            hop_gt_layers: int = 3, hop_gt_heads: int = 8,
                            hop_gt_k: int = 1) -> None:
@@ -1272,6 +1355,14 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             raise ValueError(
                 f"post_fusion_hop_mode must be 'none', 'shift' or 'depth', "
                 f"got {hop_mode!r}")
+        if hop_taps not in PF_HOP_TAPS:
+            raise ValueError(
+                f"post_fusion_hop_taps must be one of {PF_HOP_TAPS}, got {hop_taps!r}")
+        if hop_taps != "all" and hop_mode != "depth":
+            raise ValueError(
+                "post_fusion_hop_taps selects forward_taps channels and needs "
+                f"post_fusion_hop_mode='depth'; got hop_mode={hop_mode!r}, "
+                f"hop_taps={hop_taps!r}")
         if hop_mode != "none" and self._pointer_fusion:
             raise ValueError(
                 "post_fusion hop modes and pointer_fusion are not wired together "
@@ -1293,7 +1384,10 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
                         "post_fusion_hop_mode='depth' taps the pe_model's blocks; "
                         f"{type(self.pe_model).__name__} has no forward_taps "
                         "(legacy TwoStagePE / stub producers are not supported).")
-                n_ch = int(self.pe_model.num_layers) + 1
+                n_all = int(self.pe_model.num_layers) + 1
+                # e22: the write may read a subset of the taps (GEGRv2 e033
+                # ``fusion_rpearl`` = "first": the R-PEARL tap alone).
+                n_ch = {"all": n_all, "first": 1, "last": 1, "ends": 2}[hop_taps]
             else:                                          # "shift"
                 from prism.models import gt as _gt_module
                 self.pf_hop_gt = _gt_module.HopShiftPsi(
@@ -1332,6 +1426,7 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         self._pf_layer_scope = layer_scope
         self._pf_d_gt = int(d_gt)
         self._pf_hop_mode = hop_mode
+        self._pf_hop_taps = hop_taps
         self.pf_out_features = hidden
         self._post_fusion = True
 
@@ -1370,7 +1465,8 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         """
         mode = getattr(self, "_pf_hop_mode", "none")
         if mode == "depth":
-            return self.pe_model.forward_taps(g, permutation=permutation).float()
+            taps = self.pe_model.forward_taps(g, permutation=permutation).float()
+            return select_pf_taps(taps, getattr(self, "_pf_hop_taps", "all"))
         if mode == "shift":
             return self.pf_hop_gt(g, permutation=permutation).float()
         return self.pe_model(g, permutation=permutation).float()
@@ -1751,6 +1847,8 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
             params.append(self.decision_gain)
         if self._struct_keys:
             params.append(self.sk_gain)
+        if getattr(self, "_mask_form", "psi") == "hop_table":
+            params.append(self.mask_level)
         return params
 
     def base_lr_parameters(self) -> list[nn.Parameter]:
@@ -1857,7 +1955,19 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
 
     def _node_mask_logits(self, g, device, permutation=None):
         """``(adj [N,N] bool, node_M [N,N] fp32 log-gate)`` — the per-node-pair values
-        every mask row (prefill, decode, decision) is assembled from."""
+        every mask row (prefill, decode, decision) is assembled from.
+
+        ``mask_form="hop_table"`` (e22 GEGRv2 port): ``node_M[i,j] = mask_level[hop(i,j)]``
+        for ``hop <= k_hops`` — an additive level, NOT a log-gate — and ``adj`` is
+        ``hop <= k_hops``. Ψ is not evaluated here (no gradient to pe_model from
+        the mask; the write pathway is its only route into the LLM)."""
+        if self._mask_form == "hop_table":
+            hops = node_hops(g, device, self._mask_k_hops,
+                             symmetrize=self._mask_symmetrize,
+                             use_edges=self._mask_use_edges, permutation=permutation)
+            adj = hops <= self._mask_k_hops
+            node_M = self.mask_level.to(device).float()[hops.clamp(max=self._mask_k_hops)]
+            return adj, node_M
         adj = self._node_adjacency(g, device, permutation=permutation)
         psi = self.pe_model(g, permutation=permutation).float()   # GT runs fp32
         if self._mask_psi_scale == "cosine":
@@ -1874,8 +1984,14 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         the goal mention and the rest of the prompt stay visible, neighbours of the
         current node are boosted by a NON-NEGATIVE amount. Multiplicative rather
         than ``gain + log-gate`` so ``gain=0`` is an exact no-op and a low-cosine
-        neighbour can never sit below a non-neighbour (which has no bias)."""
-        soft = self.decision_gain.to(node_M.device) * node_M.exp()
+        neighbour can never sit below a non-neighbour (which has no bias).
+
+        ``mask_form="hop_table"``: ``node_M`` is already the additive level, so the
+        row is ``decision_gain · mask_level[hop]`` on the support (no exp)."""
+        if self._mask_form == "hop_table":
+            soft = self.decision_gain.to(node_M.device) * node_M
+        else:
+            soft = self.decision_gain.to(node_M.device) * node_M.exp()
         return torch.where(adj, soft, torch.zeros_like(soft))
 
     def build_structural_mask(self, seq_len, graphs, injection_maps, device, dtype=None,
@@ -1887,6 +2003,9 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
 
             adjacent / self-loop:  bias = log(α + (1−α)·sim(Ψ_i, Ψ_j))  (multiplicative gate)
             non-adjacent:          bias = finfo.min   (hard block)
+
+        (``mask_form="hop_table"``: ``bias = mask_level[hop(i, j)]`` for pairs within
+        ``k_hops``, finfo.min beyond — see :meth:`_node_mask_logits`.)
 
         Every other pair (node↔non-node, non-node↔non-node) stays 0. The allowed
         entries carry gradient through ``sim → Ψ → pe_model``; blocked entries and

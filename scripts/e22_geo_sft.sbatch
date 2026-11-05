@@ -18,6 +18,9 @@
 #
 #   ARM=hop_depth                    e22_geo_hop_depth     (v2c recipe)
 #   ARM=text_edges                   e22_geo_text_edges    (edge list in prompt)
+#   ARM=greg | greg_a                e22_geo_greg[_a]      (GEGRv2 port: k=3 hop-table
+#                                    mask + R-PEARL-tap write on all dense layers;
+#                                    scripts/e22_arms.sh, docs/2026-11-05 note)
 #   ARM=hop_depth MODEL=<id> STAGE1_LORA=<its stage-1 LoRA>
 #                                    e22_geo_hop_depth_<model>  (deferred: no
 #                                    sub-31B base has a stage-1 LoRA yet)
@@ -39,6 +42,7 @@
 #
 # Submit:  ARM=hop_depth  sbatch scripts/e22_geo_sft.sbatch
 #          ARM=text_edges sbatch scripts/e22_geo_sft.sbatch
+#          ARM=greg       sbatch scripts/e22_geo_sft.sbatch
 
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/..}"
@@ -49,7 +53,7 @@ ENV_NAME=${ENV_NAME:-$ALELAB/envs/GREP-PRISM-v3}
 CHECKPOINT_DIR=${CHECKPOINT_DIR:-$PROJ/outputs/e22_geometric_scale}
 PE_DIR=$PROJ/pretrained_pe
 
-ARM="${ARM:?set ARM=hop_depth|text_edges}"
+ARM="${ARM:?set ARM=hop_depth|text_edges|greg|greg_a}"
 DATASET="${DATASET:-geo_v1}"
 MODEL="${MODEL:-google/gemma-4-31B-it}"
 # The 31B stage-1 LoRA does not fit another base model: a non-default MODEL
@@ -93,14 +97,17 @@ export PRISM_EVAL_MAX_NEW_TOKENS=${PRISM_EVAL_MAX_NEW_TOKENS:-512}
 test -f "$DATA_SPLIT/formatted_all_new__train.json" || { echo "missing $DATA_SPLIT/formatted_all_new__train.json"; exit 2; }
 test -d "$EVAL_GRAPHS" || { echo "missing $EVAL_GRAPHS"; exit 2; }
 
-# Arm tables: e18_arms.sh supplies mask_a + text_edges, e19_arms.sh the hop overlay.
+# Arm tables: e18_arms.sh supplies mask_a + text_edges, e19_arms.sh the hop overlay,
+# e22_arms.sh the GEGRv2 port.
 PE_GT="$PE_DIR/path_navigator_gt.pt"
 source scripts/e18_arms.sh
 source scripts/e19_arms.sh
+source scripts/e22_arms.sh
 case "$ARM" in
   hop_depth)  e19_arm_args hop_depth ;;
   text_edges) e18_arm_args text_edges ;;
-  *) echo "unknown ARM=$ARM (hop_depth|text_edges)"; exit 2 ;;
+  greg|greg_a) e22_arm_args "$ARM" ;;
+  *) echo "unknown ARM=$ARM (hop_depth|text_edges|greg|greg_a)"; exit 2 ;;
 esac
 
 echo "[$(date --iso-8601=seconds)] $RUN_NAME arm=$ARM model=$MODEL data=$DATA_SPLIT eval=$EVAL_GRAPHS max_len=$MAX_SEQ_LENGTH tag=$TAG"

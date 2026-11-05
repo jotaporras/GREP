@@ -46,6 +46,9 @@ def save_run_dir(model, gnn_config: dict, output_dir: str) -> None:
         # Post-fusion (e17): the residual-injection modules ride alongside; the
         # loader fails loud if post_fusion=true is recorded without them.
         weights = {"pe_model": model.pe_model.state_dict()}
+        # e22 hop-table mask: the per-hop levels are learned mask values.
+        if getattr(model, "_mask_form", "psi") == "hop_table":
+            weights["mask_level"] = model.mask_level.data
         if getattr(model, "_post_fusion", False):
             weights["pf_proj"] = model.pf_proj.state_dict()
             weights["pf_norm"] = model.pf_norm.state_dict()

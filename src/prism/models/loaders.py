@@ -396,6 +396,8 @@ def graph_augmented_llm_from_pretrained(
             symmetrize=gnn_cfg.get("mask_symmetrize", True),
             use_edges=gnn_cfg.get("mask_use_edges", True),
             psi_scale=gnn_cfg.get("mask_psi_scale", "cosine"),
+            mask_form=gnn_cfg.get("mask_form", "psi"),
+            mask_level_init=gnn_cfg.get("mask_level_init"),
             buggy_causal_fold=gnn_cfg.get("mask_buggy_causal_fold", False),
             disable_graph_token_rope=gnn_cfg.get("disable_graph_token_rope", False),
             post_fusion=gnn_cfg.get("post_fusion", False),
@@ -407,6 +409,7 @@ def graph_augmented_llm_from_pretrained(
             # and mis-shape pf_proj against the checkpointed ModuleList).
             post_fusion_hop_mode=gnn_cfg.get("post_fusion_hop_mode", "none"),
             post_fusion_hop_k=gnn_cfg.get("post_fusion_hop_k", 3),
+            post_fusion_hop_taps=gnn_cfg.get("post_fusion_hop_taps", "all"),
             post_fusion_gain_init=gnn_cfg.get("post_fusion_gain_init", 0.0),
             post_fusion_codebook_size=gnn_cfg.get("post_fusion_codebook_size", 256),
             post_fusion_hop_gt_layers=gnn_cfg.get("post_fusion_hop_gt_layers", 3),
@@ -446,6 +449,11 @@ def graph_augmented_llm_from_pretrained(
                     f"but is missing {missing} — the {flag} weights were not "
                     "checkpointed.")
 
+        if gnn_cfg.get("mask_form", "psi") == "hop_table":
+            # e22: the learned hop levels ARE the mask; reloading them at init
+            # would silently evaluate a different (untrained) mask.
+            _require("mask_form=hop_table", ("mask_level",))
+            model.mask_level.data.copy_(gnn_weights["mask_level"])
         if gnn_cfg.get("post_fusion", False):
             _require("post_fusion", ("pf_proj", "pf_norm", "pf_gain"))
             model.pf_proj.load_state_dict(gnn_weights["pf_proj"])
