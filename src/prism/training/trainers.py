@@ -104,9 +104,11 @@ GraphTokenAccuracyMixin = evaluate.GraphTokenAccuracyMixin
 from prism.training.run_dir import save_run_dir  # noqa: F401 — shared run-dir contract
 
 
-def create_two_group_optimizer(trainer, structural):
-    """Two learning-rate groups on ``trainer``: ``structural`` params at
-    ``structural_lr_mult`` × base LR, everything else trainable at base LR.
+def create_two_group_optimizer(trainer, structural, fusion=()):
+    """Learning-rate groups on ``trainer``: ``structural`` params at
+    ``structural_lr_mult`` × base LR, ``fusion`` params (the fresh fusion modules
+    and mask levels, ``base_lr_parameters``) at ``fusion_lr_mult`` × base LR,
+    everything else trainable at base LR. Both multipliers default to 1.0.
 
     Shared by the SFT and GRPO trainers (each passes its own model's
     ``structural_parameters()`` — the GRPO trainer's policy is PEFT-wrapped, so
@@ -115,21 +117,30 @@ def create_two_group_optimizer(trainer, structural):
     already exists), so callers fall through to ``super().create_optimizer()``.
     """
     mult = float(trainer.gnn_config.get("structural_lr_mult", 1.0))
+    fmult = float(trainer.gnn_config.get("fusion_lr_mult", 1.0))
+    fusion = list(fusion)
     opt_model = trainer.model
-    if trainer.optimizer is not None or mult == 1.0 or not structural:
+    boost_struct = mult != 1.0 and bool(structural)
+    boost_fusion = fmult != 1.0 and bool(fusion)
+    if trainer.optimizer is not None or not (boost_struct or boost_fusion):
         return None
 
     structural_ids = {id(p) for p in structural}
+    fusion_ids = {id(p) for p in fusion} - structural_ids
+
+    def _group_of(p):
+        return 0 if id(p) in structural_ids else 1 if id(p) in fusion_ids else 2
 
     decay_names = set(trainer.get_decay_parameter_names(opt_model))
     base_lr = trainer.args.learning_rate
     groups = []
-    # Structural at boosted LR, LLM/LoRA at base LR; each split into decay / no-decay.
-    for is_struct, lr in ((True, base_lr * mult), (False, base_lr)):
+    # Structural / fusion at their multipliers, LLM/LoRA at base LR; each split
+    # into decay / no-decay.
+    for gid, lr in ((0, base_lr * mult), (1, base_lr * fmult), (2, base_lr)):
         named = [
             (n, p)
             for n, p in opt_model.named_parameters()
-            if p.requires_grad and (id(p) in structural_ids) == is_struct
+            if p.requires_grad and _group_of(p) == gid
         ]
         decay = [p for n, p in named if n in decay_names]
         no_decay = [p for n, p in named if n not in decay_names]
@@ -152,9 +163,12 @@ def create_two_group_optimizer(trainer, structural):
     optimizer_kwargs.pop("lr", None)
     trainer.optimizer = optimizer_cls(groups, lr=base_lr, **optimizer_kwargs)
     n_struct = sum(p.numel() for p in structural if p.requires_grad)
+    n_fusion = sum(p.numel() for p in fusion if p.requires_grad and id(p) in fusion_ids)
     print(
         f"[train] structural LR group: {mult}x base = {base_lr * mult:.2e} "
-        f"({n_struct / 1e6:.2f}M params); LLM/LoRA at base LR {base_lr:.2e}"
+        f"({n_struct / 1e6:.2f}M params); fusion LR group: {fmult}x base = "
+        f"{base_lr * fmult:.2e} ({n_fusion / 1e6:.3f}M params); "
+        f"LLM/LoRA at base LR {base_lr:.2e}"
     )
     return trainer.optimizer
 
@@ -212,7 +226,9 @@ class GraphSFTTrainer(LossTargetMixin, GraphTokenAccuracyMixin, SFTTrainer):
         ``structural_lr_mult`` × base LR; LLM/LoRA at base LR. Falls back to the
         stock optimizer when the multiplier is 1.0.
         """
-        opt = create_two_group_optimizer(self, self.model.structural_parameters())
+        opt = create_two_group_optimizer(
+            self, self.model.structural_parameters(),
+            self._base_lr_parameters())
         return opt if opt is not None else super().create_optimizer()
 
     def training_step(self, model, inputs, num_items_in_batch=None, **kwargs):

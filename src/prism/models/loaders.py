@@ -445,7 +445,8 @@ def graph_augmented_llm_from_pretrained(
             missing = [k for k in keys if k not in gnn_weights]
             if missing:
                 raise KeyError(
-                    f"{os.path.join(path, 'gnn_weights.pt')} records {flag}=true "
+                    f"{os.path.join(path, 'gnn_weights.pt')} records "
+                    f"{flag if '=' in flag else flag + '=true'} "
                     f"but is missing {missing} — the {flag} weights were not "
                     "checkpointed.")
 

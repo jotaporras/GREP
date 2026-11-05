@@ -440,8 +440,12 @@ class GraphTransformer(nn.Module):
                 x = x * torch.tanh(self.output_gain).to(x.dtype)
         return x
 
-    def forward_taps(self, data, permutation=None) -> Tensor:
-        """Per-depth Ψ stack ``[N, num_layers+1, d_model]`` (e19 depth-mode channels).
+    def forward_taps(self, data, permutation=None, n_blocks: int | None = None) -> Tensor:
+        """Per-depth Ψ stack ``[N, n_blocks+1, d_model]`` (e19 depth-mode channels).
+
+        ``n_blocks`` (default: all) runs only the first ``n_blocks`` sparse-attention
+        blocks; ``0`` returns the R-PEARL tap alone (``post_fusion_hop_taps="first"``).
+        The channels returned are bitwise those of the full stack.
 
         Channel 0 is the R-PEARL PE (pre-blocks); channel ℓ is the output of
         sparse-attention block ℓ, so channels are ordered by receptive-field depth
@@ -476,7 +480,8 @@ class GraphTransformer(nn.Module):
                 data._khop_edge_index = self._expand_edge_index(edge_index, num_nodes)
             khop_edge_index = data._khop_edge_index
         taps = [x]
-        for block in self.blocks:
+        blocks = self.blocks if n_blocks is None else self.blocks[:n_blocks]
+        for block in blocks:
             if self.training and torch.is_grad_enabled():
                 x = checkpoint(block, x, khop_edge_index, use_reentrant=False)
             else:

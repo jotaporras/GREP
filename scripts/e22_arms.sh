@@ -29,6 +29,9 @@ e22_arm_args() {
         gnn.pe_gt_from="$PE_GT"
         gnn.semantic_gt_from=null
         gnn.structural_lr_mult=0.012
+        # Graph side other than Ψ (mask levels, post-fusion) at 5× base LR = GEGRv2
+        # structural_lr_mult=5.0 on the same base LR 2.5e-4 (e027_chain_pilot joint).
+        gnn.fusion_lr_mult=5.0
         # Mask: GEGRv2 graded hop table (e028 TABLE = learnable=false graded=true k_hops=3).
         gnn.mask_form=hop_table gnn.mask_k_hops=3 gnn.mask_layer_scope=dense
         gnn.mask_symmetrize=true gnn.mask_use_edges=true

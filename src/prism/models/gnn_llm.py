@@ -1341,7 +1341,9 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         experiment's point) and the Ψ stack from :meth:`pf_psi`:
 
         - ``"depth"``: channels are the shared pe_model GraphTransformer's
-          per-block taps (``forward_taps``; K = num_layers+1, no new tower);
+          per-block taps (``forward_taps``; K = num_layers+1, no new tower),
+          narrowed by ``hop_taps`` ("first" = the R-PEARL tap alone, K = 1;
+          "last" K = 1; "ends" K = 2) — e22 GEGRv2 port;
         - ``"shift"``: channels are a NO-R-PEARL :class:`gt.HopShiftPsi` tower's
           output under graph-shift powers (K = hop_k+1).
         """
@@ -1465,8 +1467,13 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         """
         mode = getattr(self, "_pf_hop_mode", "none")
         if mode == "depth":
-            taps = self.pe_model.forward_taps(g, permutation=permutation).float()
-            return select_pf_taps(taps, getattr(self, "_pf_hop_taps", "all"))
+            hop_taps = getattr(self, "_pf_hop_taps", "all")
+            # "first" needs the R-PEARL tap only: skip the GT blocks (they get no
+            # gradient from this consumer, and the mask no longer calls them).
+            n_blocks = 0 if hop_taps == "first" else None
+            taps = self.pe_model.forward_taps(
+                g, permutation=permutation, n_blocks=n_blocks).float()
+            return select_pf_taps(taps, hop_taps)
         if mode == "shift":
             return self.pf_hop_gt(g, permutation=permutation).float()
         return self.pe_model(g, permutation=permutation).float()
@@ -1954,8 +1961,10 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
                               permutation=permutation)
 
     def _node_mask_logits(self, g, device, permutation=None):
-        """``(adj [N,N] bool, node_M [N,N] fp32 log-gate)`` — the per-node-pair values
-        every mask row (prefill, decode, decision) is assembled from.
+        """``(adj [N,N] bool, node_M [N,N] fp32 additive bias)`` — the per-node-pair
+        values every mask row (prefill, decode, decision) is assembled from. ``node_M``
+        is the log-gate ``log(α + (1−α)·sim)`` in the psi form and the learned hop
+        level in the hop_table form; only ``adj`` entries are ever used.
 
         ``mask_form="hop_table"`` (e22 GEGRv2 port): ``node_M[i,j] = mask_level[hop(i,j)]``
         for ``hop <= k_hops`` — an additive level, NOT a log-gate — and ``adj`` is
@@ -1987,9 +1996,12 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         neighbour can never sit below a non-neighbour (which has no bias).
 
         ``mask_form="hop_table"``: ``node_M`` is already the additive level, so the
-        row is ``decision_gain · mask_level[hop]`` on the support (no exp)."""
+        row is ``decision_gain · max(mask_level[hop], 0)`` on the support (no exp);
+        the clamp keeps the non-negativity above when a level trains below 0 (the
+        GEGRv2 e028 end state has negative 2- and 3-hop levels). The support is
+        every node within k_hops, wider than the 1-hop e18-A rows."""
         if self._mask_form == "hop_table":
-            soft = self.decision_gain.to(node_M.device) * node_M
+            soft = self.decision_gain.to(node_M.device) * node_M.clamp_min(0)
         else:
             soft = self.decision_gain.to(node_M.device) * node_M.exp()
         return torch.where(adj, soft, torch.zeros_like(soft))
@@ -2008,7 +2020,8 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         ``k_hops``, finfo.min beyond — see :meth:`_node_mask_logits`.)
 
         Every other pair (node↔non-node, non-node↔non-node) stays 0. The allowed
-        entries carry gradient through ``sim → Ψ → pe_model``; blocked entries and
+        entries carry gradient through ``sim → Ψ → pe_model`` (psi form) or to
+        ``mask_level`` alone (hop_table form); blocked entries and
         non-node entries are constants. Each node row keeps its diagonal (self-loop)
         and BOS, so no row is fully masked (softmax safe).
 
@@ -2025,7 +2038,7 @@ class LearnableGraphMaskLLM(PreTrainedModel):  # ty:ignore[unsupported-base]
         ``permutation``: eval-time node relabelling (``--permutation-seed``), threaded to
         BOTH halves of the mask — ``pe_model`` (Ψ) and ``node_adjacency`` (A) — exactly as
         ``GraphAugmentedLLM.build_pe_signal`` / ``WireGraphLLM.build_wire_signal`` thread
-        it to their single Ψ call. Both are required: the mask is
+        it to their single Ψ call. Both are required: the psi-form mask is
         ``A ⊙ log-gate(ΨΨᵀ)``, so permuting one factor and not the other is not a
         permutation of the mask at all, and permuting neither (the pre-fix behaviour)
         makes the flag a silent no-op for this architecture.
@@ -3925,7 +3938,8 @@ def mask_node_values(model, pyg_graph, device, permutation=None) -> torch.Tensor
     """Per-node-pair decode bias values ``[N, N]`` for the mask archs.
 
     ``log(α + (1−α)·sim(Ψ_i, Ψ_j))`` on adjacent pairs (learned, for
-    :class:`LearnableGraphMaskLLM`; constant 0 for :class:`GraphMaskLLM`),
+    :class:`LearnableGraphMaskLLM` in the psi form; ``mask_level[hop]`` in its
+    hop_table form; constant 0 for :class:`GraphMaskLLM`),
     ``finfo.min`` on non-adjacent pairs — the same values
     ``build_structural_mask`` folds into the prefill bias, computed once per
     (graph, tower state) and reused for every decode step.

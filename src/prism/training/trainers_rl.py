@@ -140,7 +140,9 @@ class GraphGRPOTrainer(GRPOTrainer):
         """Two-group LR shared with the SFT trainer: tower at
         ``structural_lr_mult`` × base, LoRA at base. The policy is PEFT-wrapped,
         so structural params resolve on the unwrapped core."""
-        opt = create_two_group_optimizer(self, self._core.structural_parameters())
+        opt = create_two_group_optimizer(
+            self, self._core.structural_parameters(),
+            getattr(self._core, "base_lr_parameters", list)())
         return opt if opt is not None else super().create_optimizer()
 
     # ------------------------------------------------------------------ Ψ
@@ -514,7 +516,9 @@ class MaskGRPOTrainer(GRPOTrainer):
         self._ptr_pair_cache: dict[tuple, list] = {}
 
     def create_optimizer(self):
-        opt = create_two_group_optimizer(self, self._core.structural_parameters())
+        opt = create_two_group_optimizer(
+            self, self._core.structural_parameters(),
+            getattr(self._core, "base_lr_parameters", list)())
         return opt if opt is not None else super().create_optimizer()
 
     # ------------------------------------------------------------------ cache

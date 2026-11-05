@@ -109,6 +109,7 @@ gnn:
   # hop distance 0..mask_k_hops (init 0.7, 0.7, 0.35, 0.175 at k=3), hard block beyond.
   # Psi is NOT in the mask then; it reaches the LLM through post_fusion only.
   mask_form: psi             # psi | hop_table
+  fusion_lr_mult: 1.0        # LR multiplier of base_lr_parameters (fresh fusion modules, mask levels); GEGRv2 = 5.0
   mask_level_init: null      # hop_table: mask_k_hops+1 floats; null = the GEGRv2 default
   # e17 post-fusion (candidate A): gated residual injection of proj(Psi) at
   # query-role node positions on the scoped layers. tanh(gain) zero-init =>

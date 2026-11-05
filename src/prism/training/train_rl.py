@@ -85,7 +85,11 @@ def train_rl(config: omegaconf.DictConfig) -> None:
             model.enable_post_fusion(
                 layer_scope=gnn_config.get("post_fusion_layer_scope",
                                            "dense_top_half"),
-                d_gt=gnn_config["d_model"])
+                d_gt=gnn_config["d_model"],
+                hop_mode=gnn_config.get("post_fusion_hop_mode", "none"),
+                hop_k=int(gnn_config.get("post_fusion_hop_k", 3)),
+                hop_taps=gnn_config.get("post_fusion_hop_taps", "all"),
+                gain_init=float(gnn_config.get("post_fusion_gain_init", 0.0)))
         # e17 candidates D/E/C: same warm-start pattern — a gnn_overrides flag
         # on a checkpoint that predates the pathway attaches it fresh
         # (zero-init => bitwise no-op at init; RL owns it from step 0).

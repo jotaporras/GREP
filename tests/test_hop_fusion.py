@@ -38,10 +38,10 @@ class _StubTapPE(_StubPE):
 
     num_layers = 2
 
-    def forward_taps(self, g, permutation=None):
+    def forward_taps(self, g, permutation=None, n_blocks=None):
         x = self.forward(g, permutation=permutation)
-        return torch.stack([x * float(k + 1)
-                            for k in range(self.num_layers + 1)], dim=1)
+        n = self.num_layers if n_blocks is None else n_blocks
+        return torch.stack([x * float(k + 1) for k in range(n + 1)], dim=1)
 
 
 def _model(hop_mode="none", post_fusion=True, gain_init=0.0, hop_k=3,

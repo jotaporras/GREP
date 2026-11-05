@@ -270,6 +270,9 @@ def train_model(config: omegaconf.DictConfig):
             # Two-group LR: structural (GT / PE) params train at structural_lr_mult × base LR
             # (GraphSFTTrainer.create_optimizer). Default 1.0 = no boost.
             "structural_lr_mult": config.gnn.structural_lr_mult,
+            # e22: fresh fusion modules + mask levels (base_lr_parameters) at
+            # fusion_lr_mult × base LR (GEGRv2 trains them at its structural 5×).
+            "fusion_lr_mult": float(config.gnn.get("fusion_lr_mult", 1.0)),
             **{k: config.gnn[k] for k in _direct},
             **({k: config.gnn[k] for k in ("k_gt", "gt_num_layers", "gt_heads")}
                if config.gnn.arch in ("rpearl_gt_llm", "gt_llm", "learnable_graph_mask",
@@ -299,7 +302,12 @@ def train_model(config: omegaconf.DictConfig):
                                            "mask_buggy_causal_fold", "mask_layer_scope")}
                if config.gnn.arch in ("graph_mask_llm", "learnable_graph_mask") else {}),
             # learnable_graph_mask extra params (read back by loaders for eval).
-            **({k: config.gnn[k] for k in ("mask_alpha", "mask_psi_scale")}
+            # mask_form is LOAD-BEARING: an unrecorded hop_table rebuilds the psi
+            # form, ignores the checkpointed mask_level and raises nothing.
+            **({k: config.gnn[k] for k in ("mask_alpha", "mask_psi_scale", "mask_form")}
+               if config.gnn.arch == "learnable_graph_mask" else {}),
+            **({"mask_level_init": (omegaconf.OmegaConf.to_container(config.gnn.mask_level_init)
+                                    if config.gnn.mask_level_init is not None else None)}
                if config.gnn.arch == "learnable_graph_mask" else {}),
             # Fusion / identity pathways on learnable_graph_mask. LOAD-BEARING at
             # reload: loaders `.get(flag, False)`, so an unrecorded flag rebuilds a
@@ -309,7 +317,7 @@ def train_model(config: omegaconf.DictConfig):
             **({k: config.gnn[k] for k in (
                 "post_fusion", "post_fusion_layer_scope",
                 "post_fusion_hop_mode", "post_fusion_hop_k",
-                "post_fusion_gain_init", "post_fusion_codebook_size",
+                "post_fusion_hop_taps", "post_fusion_gain_init", "post_fusion_codebook_size",
                 "post_fusion_hop_gt_layers", "post_fusion_hop_gt_heads",
                 "post_fusion_hop_gt_k",
                 "graph_lora", "graph_lora_rank", "graph_lora_targets",
