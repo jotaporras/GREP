@@ -108,6 +108,14 @@ def _spine_tools_disabled() -> bool:
     )
 
 
+def _shared_episode() -> bool:
+    """True when PRISM_EVAL_SHARED_EPISODE=1 restores the pre-fix eval loop: one
+    GraphHandler + SPINE planner per graph file, so later tasks inherit task 0's
+    robot location and see earlier tasks as chat history. Repro only."""
+    return os.environ.get("PRISM_EVAL_SHARED_EPISODE", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def _compact_icl_examples(use_icl: bool) -> int:
     """How many SPINE few-shot examples the compact prompt keeps.
 
@@ -348,7 +356,22 @@ def eval_model_single_graph(
             robot_location = init_node
             if eval_sample.robot_location is not None:
                 robot_location = eval_sample.robot_location
+            # Every task is its own episode, as in training (one task per
+            # conversation, robot_location = init_node unless named start).
+            # SPINE's GraphHandler.reset only sets current_location while it is
+            # empty, and SPINE.request keeps the first task as base_request and
+            # appends later ones as history, so a handler/planner shared across
+            # tasks showed task 0's robot location and conversation to every
+            # later task (e22 set B/C "starting area" failures).
+            # PRISM_EVAL_SHARED_EPISODE=1 restores the old behavior for repro.
+            if _shared_episode():
+                if eval_sample.robot_location is not None:
+                    graph_dict = {**graph_dict, "robot_location": robot_location}
+            else:
                 graph_dict = {**graph_dict, "robot_location": robot_location}
+                graph_simulation = graph_sim_cls(graph_util.GraphHandler(""))
+                llm_planner = spine.SPINE(
+                    graph=graph_simulation.partial_graph, client=client, use_icl=use_icl)
             graph_simulation.reset(graph_as_dict=graph_dict, current_location=robot_location)
             llm_planner.graph = graph_simulation.partial_graph
 
