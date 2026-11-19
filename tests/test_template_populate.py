@@ -179,3 +179,180 @@ class TestMentions:
         forms = tp.region_forms("bio_lab_room_3", False)
         assert tp._styled(forms, "bare_the").startswith("the ")
         assert tp._styled(forms, "zposs_ord").startswith("the ")
+
+
+# --------------------------------------------------------------------------- e22 mix roles
+
+from prism.data.data_gen import DataGenerator  # noqa: E402
+from prism.eval import path_validator  # noqa: E402
+
+
+def _nxg(graph):
+    g = nx.Graph()
+    g.add_nodes_from(r["name"] for r in graph["regions"])
+    g.add_edges_from(map(tuple, graph["region_connections"]))
+    return g
+
+
+def _mix(skel, vocab, seed, mix="direct:1,avoid:1,via:1", n=18, detour=0.8):
+    """Name a skeleton (geo_v2 populate), then retask it with mix route types."""
+    populated, _ = _populate_one(skel, vocab, seed)
+    rng = np.random.default_rng([seed, 1])
+    weights = graph_gen.parse_hop_weights(V1_HOP_WEIGHTS)
+    cons = graph_gen.sample_longhop_constraints(populated["graph"], n, rng, hop_weights=weights,
+                                                object_goal_frac=0.5)
+    cons = tp.assign_mix_roles(populated["graph"], cons, rng, 0.5, tp.parse_role_mix(mix),
+                               detour, 40)
+    prefixes = tp.graph_prefixes(skel, populated["graph"])
+    new = tp.retask_graph(populated, prefixes, cons, vocab, rng, 0.46)
+    return new, cons
+
+
+@pytest.fixture(scope="module")
+def mixed(skel_dir, vocab):
+    out = []
+    for p in sorted(skel_dir.glob("*.json")):
+        for seed in (1, 2, 3):
+            out.append(_mix(json.loads(p.read_text()), vocab, seed))
+    return out
+
+
+class TestAvoidRole:
+    def test_validators_accept_mix(self, mixed):
+        for new, cons in mixed:
+            graph_gen.validate_task_refs(new["tasks"], new["graph"])
+            graph_gen.validate_longhop_tasks(new["tasks"], cons, new["graph"])
+
+    def test_oracle_misses_avoid_and_has_recorded_length(self, mixed):
+        kinds = collections.Counter()
+        for new, cons in mixed:
+            g = _nxg(new["graph"])
+            for c, t in zip(cons, new["tasks"]):
+                goal, way, avoid, _, kind = path_validator.derive_targets(
+                    new["graph"], init_node=t["init_node"], answer=t["answer"],
+                    criterion=t["acceptance_criterion"], task=t["task"])
+                assert goal == c["goal"] and kind == "path"
+                assert set(avoid) == ({c["avoid"]} if c["avoid"] else set())
+                assert way == ([c["via"]] if c["via"] else [])
+                route, why = DataGenerator._oracle_route(new["graph"], t)
+                assert route, why
+                nodes = route.split(" -> ")
+                assert len(nodes) - 1 == c["hops"]
+                d0 = nx.shortest_path_length(g, c["init"], c["goal"])
+                assert c["direct_hops"] == d0
+                if c["avoid"]:
+                    assert c["avoid"] not in nodes
+                    kinds[c["avoid_kind"]] += 1
+                    on_path = graph_gen._on_some_shortest_path(
+                        graph_gen._region_distances(new["graph"]), c["init"], c["goal"])
+                    assert c["avoid"] in on_path  # never a vacuous avoid
+                    if c["avoid_kind"] == "detour":
+                        assert c["hops"] > d0
+                    else:
+                        assert c["hops"] == d0
+                m = path_validator.evaluate_sample(
+                    t["task"], route, new["graph"], init_node=t["init_node"],
+                    answer=t["answer"], acceptance_criterion=t["acceptance_criterion"])
+                assert m["structured_correct"], (t["task"], route)
+        # floor plans rarely have equal-length alternatives, so nodetour slots
+        # mostly fall back to detour (counted in the corpus report)
+        assert kinds["detour"] > 0
+
+    def test_avoid_candidates_kinds(self):
+        """Square a-b-d / a-c-d: avoiding b is a nodetour (2 hops). Line a-b-d plus
+        a loop a-x-y-z-d... with c removed: avoiding b is a 4-hop detour."""
+        def graph(edges, robot="a"):
+            names = sorted({n for e in edges for n in e})
+            return {"regions": [{"name": n} for n in names], "region_connections": edges,
+                    "robot_location": robot, "objects": [], "object_connections": []}
+        sq = graph([["a", "b"], ["b", "d"], ["a", "c"], ["c", "d"]], robot="z0")
+        sq["regions"].append({"name": "z0"})
+        sq["region_connections"].append(["z0", "a"])
+        cand = tp.avoid_candidates(sq, graph_gen._region_distances(sq), "a", "d", 40)
+        assert cand == {"detour": [], "nodetour": [("b", 2), ("c", 2)]}
+        loop = graph([["a", "b"], ["b", "d"], ["a", "x"], ["x", "y"], ["y", "z"], ["z", "d"]],
+                     robot="y")
+        cand = tp.avoid_candidates(loop, graph_gen._region_distances(loop), "a", "d", 40)
+        assert cand == {"detour": [("b", 4)], "nodetour": []}
+        assert tp.avoid_candidates(loop, graph_gen._region_distances(loop), "a", "d", 3) == \
+            {"detour": [], "nodetour": []}  # constrained-length cap
+
+    def test_grader_ties_pass_and_violations_fail(self, mixed):
+        """Any equal-length valid route meeting the constraint passes; a route
+        through A, or one that skips V, fails the headline metric."""
+        n_tie = n_through = n_skip = 0
+        for new, cons in mixed:
+            g = _nxg(new["graph"])
+            for c, t in zip(cons, new["tasks"]):
+                kw = dict(init_node=t["init_node"], answer=t["answer"],
+                          acceptance_criterion=t["acceptance_criterion"])
+                if c["avoid"]:
+                    h = g.copy()
+                    h.remove_node(c["avoid"])
+                    for k, p in enumerate(nx.all_shortest_paths(h, c["init"], c["goal"])):
+                        if k == 4:
+                            break
+                        m = path_validator.evaluate_sample(t["task"], " -> ".join(p), new["graph"], **kw)
+                        assert m["structured_correct"]
+                        n_tie += 1
+                    through = (nx.shortest_path(g, c["init"], c["avoid"])
+                               + nx.shortest_path(g, c["avoid"], c["goal"])[1:])
+                    m = path_validator.evaluate_sample(t["task"], " -> ".join(through), new["graph"], **kw)
+                    assert m["avoid_ok"] is False and not m["structured_correct"]
+                    n_through += 1
+                elif c["via"]:
+                    p = nx.shortest_path(g, c["init"], c["goal"])  # V is off every shortest path
+                    m = path_validator.evaluate_sample(t["task"], " -> ".join(p), new["graph"], **kw)
+                    assert m["waypoints_ok"] is False and not m["structured_correct"]
+                    n_skip += 1
+        assert n_tie and n_through and n_skip
+
+    def test_every_avoid_phrasing_resolves_from_task_text(self, vocab):
+        """The task sentence alone (no criterion) names A for the grader's _AVOID."""
+        graph = {"regions": [{"name": n} for n in ("hall_a_1", "lab_b_2", "office_c_3")],
+                 "objects": [], "object_connections": [],
+                 "region_connections": [["hall_a_1", "lab_b_2"], ["lab_b_2", "office_c_3"]]}
+        for clause in tp.AVOID_CLAUSES:
+            for rest in ("", " and list the path.", "; list the path."):
+                text = "From hall_a_1, give the route to office_c_3" + clause.replace(
+                    "{A}", "lab_b_2") + ("," if clause.startswith(",") and rest.startswith(" and") else "") + rest
+                _, _, avoid, _, _ = path_validator.derive_targets(
+                    graph, init_node="hall_a_1", answer=r"(?i)\bhall_a_1\b.*\boffice_c_3\b",
+                    criterion=None, task=text)
+                assert set(avoid) == {"lab_b_2"}, text
+
+    def test_flag_off_keeps_old_validator(self, skel_dir, vocab):
+        """Constraints without the ``avoid`` key (geo_v2) keep the old rule: an
+        on-route "without using" avoid is rejected."""
+        skel = json.loads(sorted(skel_dir.glob("*.json"))[1].read_text())
+        populated, final = _populate_one(skel, vocab, 5)
+        assert all("avoid" not in c for c in final)
+        dist = graph_gen._region_distances(populated["graph"])
+        i, c = next((i, c) for i, c in enumerate(final) if not c["via"] and c["hops"] >= 3)
+        a = sorted(graph_gen._on_some_shortest_path(dist, c["init"], c["goal"]) - {c["init"], c["goal"]})[0]
+        tasks = [dict(t) for t in populated["tasks"]]
+        tasks[i]["acceptance_criterion"] = tasks[i]["acceptance_criterion"].rstrip(".") + f" without using {a}."
+        with pytest.raises(ValueError, match="hop length would drift"):
+            graph_gen.validate_longhop_tasks(tasks, final, populated["graph"])
+
+    def test_detour_fraction_and_counts(self, mixed):
+        for _, cons in mixed:
+            routes = collections.Counter(c["route"] for c in cons)
+            fell = sum(1 for c in cons if c.get("fallback", "").endswith("->direct"))
+            assert routes["avoid"] + routes["via"] + routes["direct"] == 18
+            assert routes["direct"] == 6 + fell
+
+    def test_constraints_eval_pairs(self, skel_dir):
+        skel = json.loads(sorted(skel_dir.glob("*.json"))[2].read_text())
+        rng = np.random.default_rng(3)
+        cons = tp.sample_paired_constraints(skel["graph"], 3, rng,
+                                            tp.parse_strata("1-6,7-15,16-30,31-999"))
+        by_pair = collections.defaultdict(list)
+        for c in cons:
+            by_pair[c["pair"]].append(c)
+        assert by_pair
+        for p, cs in by_pair.items():
+            assert {(c["init"], c["goal"]) for c in cs} == {(cs[0]["init"], cs[0]["goal"])}
+            routes = [c["route"] for c in cs]
+            assert routes[:2] == ["direct", "avoid"] and cs[1]["avoid_kind"] == "detour"
+            assert cs[1]["hops"] > cs[0]["hops"]

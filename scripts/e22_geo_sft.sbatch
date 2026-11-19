@@ -72,7 +72,10 @@ case "$DATASET" in
   # ~40 (scripts/e22_geo_v2_local.sh + e22_geo_v2_merge.py). 400-region
   # text_edges prompts are ~14k tokens, inside the 16384 default.
   geo_v2) DATA_SPLIT=${DATA_SPLIT:-$PROJ/data/n_geo_v2/split} ;;
-  *) echo "unknown DATASET=$DATASET (geo_v1|geo_v2)"; exit 2 ;;
+  # geo_v2_mix = the geo_v2 graphs and per-size totals, route types in thirds
+  # (direct / avoid / via), avoid mostly detour (scripts/e22_geo_v2_local.sh mix).
+  geo_v2_mix) DATA_SPLIT=${DATA_SPLIT:-$PROJ/data/n_geo_v2_mix/split} ;;
+  *) echo "unknown DATASET=$DATASET (geo_v1|geo_v2|geo_v2_mix)"; exit 2 ;;
 esac
 EVAL_GRAPHS=${EVAL_GRAPHS:-$PROJ/data/n_60_vllm_v3/gen/nav_n60_gemma_data/split/test_graphs}
 

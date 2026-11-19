@@ -485,7 +485,9 @@ def validate_longhop_tasks(
             avoid_span = re.search(r"without using\b([^.;]*)", crit, re.IGNORECASE)
             # A waypoint task's route is init->via->goal, not the direct path;
             # its avoids are checked against those segments below.
-            if avoid_span and not c.get("via"):
+            # e22 mix constraints (``avoid`` key) allow an on-route avoid: their
+            # recorded hops are the G - A length, checked in _validate_e22_roles.
+            if avoid_span and not c.get("via") and "avoid" not in c:
                 d_init, d_goal = dists(c["init"]), dists(c["goal"])
                 base_len = d_init.get(c["goal"])
                 for a in NODE_TOKEN.findall(avoid_span.group(1)):
@@ -539,6 +541,22 @@ def _validate_e22_roles(label: str, task: dict, c: dict, graph: dict, dist: dict
                 raise ValueError(
                     f"{label}: avoided region {a!r} lies on a shortest segment of "
                     f"{c['init']}->{c['via']}->{c['goal']} — hop length would drift")
+    if "avoid" in c:  # e22 mix route types (template_populate.assign_mix_roles)
+        want_av = {c["avoid"]} if c["avoid"] else set()
+        if set(avoid) != want_av:
+            raise ValueError(
+                f"{label}: grader resolves avoid {sorted(avoid)}, sampled {sorted(want_av)}")
+        if c["avoid"]:
+            from prism.data.template_populate import _adjacency, dist_without
+            d = dist_without(_adjacency(graph), c["init"], c["goal"], c["avoid"])
+            if d is None or d != c["hops"]:
+                raise ValueError(
+                    f"{label}: route length without {c['avoid']!r} is {d}, recorded {c['hops']}")
+            kind_ok = {"detour": d > c["direct_hops"], "nodetour": d == c["direct_hops"]}
+            if not kind_ok.get(c.get("avoid_kind"), False):
+                raise ValueError(
+                    f"{label}: avoid kind {c.get('avoid_kind')!r} but G-A length {d} vs "
+                    f"direct {c['direct_hops']}")
     if c["named_start"] and START_AREA_PHRASE.search(task["task"]):
         raise ValueError(
             f"{label}: named-start task words its start as the robot's position "

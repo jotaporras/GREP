@@ -14,7 +14,9 @@
 #   bash scripts/e22_geo_v2_local.sh train   # templated shards 4-6 (40-130, 200, 300, 400 regions)
 #   bash scripts/e22_geo_v2_local.sh merge   # merge + audit -> $ROOT/split
 #   bash scripts/e22_geo_v2_local.sh scale   # geo_scale evaluation set
-#   bash scripts/e22_geo_v2_local.sh all
+#   bash scripts/e22_geo_v2_local.sh all     # v1 + train + merge + scale (geo_v2 only)
+#   bash scripts/e22_geo_v2_local.sh mix     # n_geo_v2_mix: 1/3 direct, avoid, via (reads n_geo_v2)
+#   bash scripts/e22_geo_v2_local.sh cscale  # geo_scale_constraints evaluation set
 set -euo pipefail
 cd "$(dirname "$0")/.."
 PY=${PY:-python}
@@ -22,6 +24,8 @@ export PRISM_LLM_BACKEND=none        # graph_gen.TaskGraphGen builds no client
 OUT=${OUT:-outputs/e22_geometric_scale/geo_v2_local}
 ROOT=$OUT/n_geo_v2
 SCALE=$OUT/geo_scale
+MIX=$OUT/n_geo_v2_mix                  # e22 one-run corpus: direct / avoid / via thirds
+CSCALE=$OUT/geo_scale_constraints      # paired direct / detour-avoid / via eval set
 V1_SRC=${V1_SRC:-outputs/e22_geometric_scale/notebook_data/train}
 VOCAB=${VOCAB:-scripts/e22_template_vocab.json}
 SEED=${SEED:-7}
@@ -68,7 +72,7 @@ rollouts_and_split() {  # rollouts_and_split <shard dir> <val ids...>
   local run=$shard/$RUN_SUB
   $PY scripts/training_data_generation/generate_data_spine.py \
     --data-dir "$run/populated_graphs" --name "$run" --skip-populate --oracle-paths \
-    --n-tasks 16 --n-longhop-tasks 16 --seed 42 --task-proportions 0 0 0 1 > "$shard/rollouts.log" 2>&1
+    --n-tasks "${NT:-16}" --n-longhop-tasks "${NT:-16}" --seed 42 --task-proportions 0 0 0 1 > "$shard/rollouts.log" 2>&1
   tail -1 "$shard/rollouts.log"
   $PY scripts/training_data_generation/split_train_val.py --plans-dir "$run/generated_plans" \
     --graphs-dir "$run/populated_graphs" --output-dir "$run/split" --val-ids "$@" | tail -2
@@ -124,5 +128,49 @@ if [[ $STEP == scale || $STEP == all ]]; then
         --hop-strata "1-6,7-15,16-30,31-999" $ROLE_ARGS --seed "$SEED"
       rm -f "$d"/test_graphs/graph_gen_*.json
       mv "$d/test_graphs/longhop_manifest.json" "$d/longhop_manifest.json"  # keep only data_gen_*.json in the eval dir
+    done
+fi
+if [[ $STEP == mix ]]; then
+    # Same graphs as n_geo_v2 (read only): new templated tasks on every graph, names
+    # unchanged, then the per-size thirds merge with the Gemma conversations.
+    #   geo_v1 graphs (shards 0-3): 16 tasks, mostly avoid (the Gemma rows cover direct/via)
+    #   templated 40-130 (shard 4): 18 tasks; 200-400 (shards 5-7): 20 tasks; the merge
+    #   then takes equal thirds per size
+    MIX_ARGS="--named-start-frac 0.5 --start-area-frac 0.46 --object-goal-frac 0.5 --detour-frac ${DETOUR_FRAC:-0.8} --max-hops 40"
+    retask_shard() {  # retask_shard <shard#> <n tasks> <role mix> <hop weights> <val ids...>
+      local i=$1 nt=$2 mixw=$3 hw=$4; shift 4
+      echo "=== mix shard$i: $nt tasks, $mixw"
+      $PY scripts/e22_template_populate.py retask --vocab "$VOCAB" \
+        --populated-dir "$ROOT/shard$i/$RUN_SUB/populated_graphs" \
+        --skeleton-dir "$ROOT/shard$i/$SKEL_SUB" \
+        --out-dir "$MIX/shard$i/$RUN_SUB/populated_graphs" \
+        --n-tasks "$nt" --hop-weights "$hw" --role-mix "$mixw" $MIX_ARGS --seed "$SEED"
+      NT=$nt rollouts_and_split "$MIX/shard$i" "$@"
+    }
+    for i in 0 1 2 3; do
+      retask_shard $i 16 "direct:0.15,avoid:0.55,via:0.30" "$V1_HOP_WEIGHTS" 148 149
+    done
+    n4=$(ls "$ROOT/shard4/$SKEL_SUB" | wc -l | tr -d ' ')
+    # avoid weighted up: ~15-30% of avoid slots find no region whose removal keeps the
+    # goal reachable (BSP plans are tree-like) and fall back to direct
+    retask_shard 4 18 "direct:1,avoid:1.5,via:1.2" "$V1_HOP_WEIGHTS" $(printf '%03d ' $((n4 - 2)) $((n4 - 1)))
+    for i in 5 6 7; do
+      n=$(ls "$ROOT/shard$i/$SKEL_SUB" | wc -l | tr -d ' ')
+      retask_shard $i 20 "direct:1,avoid:1.4,via:1.3" "$LARGE_HOP_WEIGHTS" $(printf '%03d ' $((n - 2)) $((n - 1)))
+    done
+    $PY scripts/e22_geo_v2_mix_merge.py --gemma-root "$ROOT" --mix-root "$MIX" \
+      --geo-v2-split "$ROOT/split" --gen-subdir "$RUN_SUB/split" \
+      --gemma-cap "${GEMMA_CAP:-0.5}" --seed 0 --out "$MIX/split"
+    $PY scripts/e22_corpus_audit.py --root "$MIX" --min-coverage 0.75 || true
+fi
+if [[ $STEP == cscale ]]; then
+    # geo_scale_constraints: geo_scale's skeletons (read only) for 40/130/200/400/1000
+    # regions; per graph 3 (init, goal) pairs x {direct, detour-avoid, via}.
+    for nr in 40 130 200 400 1000; do
+      d=$CSCALE/n$(printf '%04d' "$nr")
+      $PY scripts/e22_template_populate.py constraints-eval --vocab "$VOCAB" \
+        --skeleton-dir "$SCALE/n$(printf '%04d' "$nr")/skeletons" --out-dir "$d" \
+        --pairs-per-graph "${PAIRS:-3}" --hop-strata "1-6,7-15,16-30,31-999" \
+        --named-start-frac 0.5 --start-area-frac 0.46 --seed "$SEED"
     done
 fi
