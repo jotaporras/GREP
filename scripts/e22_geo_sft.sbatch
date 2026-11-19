@@ -67,11 +67,19 @@ case "$DATASET" in
   # geo_v1 = BSP floor-plan skeletons, 40-130 regions, robot-scale long-hop
   # routes (e22_geo_v1_generate.sbatch + e21_merge_shards.py).
   geo_v1) DATA_SPLIT=${DATA_SPLIT:-$PROJ/data/n_geo_v1/split} ;;
-  *) echo "unknown DATASET=$DATASET (geo_v1)"; exit 2 ;;
+  # geo_v2 = geo_v1 (Gemma-named, 40-130) + templated (LLM-free) shards at
+  # 40-400 regions, ~40% of conversations on 200-400-region graphs, hop tail to
+  # ~40 (scripts/e22_geo_v2_local.sh + e22_geo_v2_merge.py). 400-region
+  # text_edges prompts are ~14k tokens, inside the 16384 default.
+  geo_v2) DATA_SPLIT=${DATA_SPLIT:-$PROJ/data/n_geo_v2/split} ;;
+  *) echo "unknown DATASET=$DATASET (geo_v1|geo_v2)"; exit 2 ;;
 esac
 EVAL_GRAPHS=${EVAL_GRAPHS:-$PROJ/data/n_60_vllm_v3/gen/nav_n60_gemma_data/split/test_graphs}
 
 MAX_STEPS=${MAX_STEPS:--1}
+# EPOCHS: 4 for geo_v1. geo_v2 text_edges does not fit 4 epochs in 48 h on one
+# GPU (larger prompts); see the e22 geo_v2 runbook for the per-arm choice.
+EPOCHS=${EPOCHS:-4}
 MAX_SEQ_LENGTH=${MAX_SEQ_LENGTH:-16384}
 RESPONSE_FORMAT=route_only
 MODEL_TAG=${MODEL_TAG:-$( [[ "$MODEL" == "google/gemma-4-31B-it" ]] && echo "" || echo "_${MODEL##*/}" )}
@@ -110,7 +118,7 @@ case "$ARM" in
   *) echo "unknown ARM=$ARM (hop_depth|text_edges|greg|greg_a)"; exit 2 ;;
 esac
 
-echo "[$(date --iso-8601=seconds)] $RUN_NAME arm=$ARM model=$MODEL data=$DATA_SPLIT eval=$EVAL_GRAPHS max_len=$MAX_SEQ_LENGTH tag=$TAG"
+echo "[$(date --iso-8601=seconds)] $RUN_NAME arm=$ARM model=$MODEL data=$DATA_SPLIT eval=$EVAL_GRAPHS max_len=$MAX_SEQ_LENGTH epochs=$EPOCHS tag=$TAG"
 echo "=== python: $(which python) ==="
 
 srun python -m prism.training.train_v3 \
@@ -124,7 +132,7 @@ srun python -m prism.training.train_v3 \
     data.max_seq_length="$MAX_SEQ_LENGTH" \
     data.spine_tools=none data.icl_examples=0 \
     trainer.freeze_lora=false trainer.freeze_pe=false \
-    trainer.learning_rate=0.00025 trainer.epochs=4 trainer.max_steps="$MAX_STEPS" \
+    trainer.learning_rate=0.00025 trainer.epochs="$EPOCHS" trainer.max_steps="$MAX_STEPS" \
     +trainer.sft.save_total_limit=1 \
     trainer.checkpoint_dir="$CHECKPOINT_DIR" \
     trainer.save_name="$RUN_NAME" \

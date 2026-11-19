@@ -835,6 +835,10 @@ class TaskGraphGen:
         # An explicit `client` always wins.
         if client is not None:
             self.client = client
+        elif os.environ.get("PRISM_LLM_BACKEND", "").lower() == "none":
+            # LLM-free runs (templated populate + --oracle-paths rollouts, e22
+            # geo_v2): no client is built, so no GPU, API key or model load.
+            self.client = None
         elif vllm_llm.vllm_backend_enabled():
             self.client = vllm_llm.VLLMQueryClient()
         elif local_llm.hf_backend_enabled():
